@@ -331,6 +331,20 @@ def train_task(
     # model = encoder + head
     model = ImageEncoder(clf).to(dev)
     model.clip_model.build_zeroshot_text_features(list(loaders.classnames), build_cfg)
+    zero_shot_val = (
+        model.top1(loaders.val, str(dev)) if hasattr(loaders, "val") and loaders.val is not None else float("nan")
+    )
+    zero_shot_test = model.top1(loaders.test, str(dev))
+    print(f"[{task}] zero-shot before finetuning  val={zero_shot_val:.4f}  test={zero_shot_test:.4f}")
+    if run_logger is not None:
+        run_logger.log_event(
+            "zero_shot_eval",
+            metrics={
+                f"zero_shot/{task}/val_top1": float(zero_shot_val),
+                f"zero_shot/{task}/test_top1": float(zero_shot_test),
+            },
+            context={"task": task},
+        )
 
     text_emb_ft_cfg = _resolve_text_embeddings_finetune_cfg(
         strategy_cfg,
@@ -507,6 +521,10 @@ def train_task(
             "num_classes": num_classes,
             "classnames": list(loaders.classnames),
             "metrics": {"val_top1": float(val_acc_i), "test_top1": float(test_acc_i)},
+            "zero_shot_metrics": {
+                "val_top1": float(zero_shot_val),
+                "test_top1": float(zero_shot_test),
+            },
         }
         if text_emb_ft_summary is not None:
             payload["text_embeddings_finetune"] = dict(text_emb_ft_summary)
@@ -659,6 +677,7 @@ def train_task(
                 test_acc_i=float(test_acc),
                 kind="best_ep",
             )
+            torch.save(best_state, task_dir / f"{ckpt_stem}_best_ep.pt")
         else:
             early_stopping_patience_current -= 1
             if early_stopping_patience_current <= 0 and early_stopping:
@@ -725,6 +744,7 @@ def train_task(
         "best_ckpt_path": str(best_ckpt_path),
         "last_ckpt_path": str(last_ckpt_path) if last_ckpt_path is not None else None,
         "metrics": best_state.get("metrics", {}),
+        "zero_shot_metrics": best_state.get("zero_shot_metrics", {}),
         "seconds": float(seconds),
         "trainable": trainable_info,
         "text_embeddings_finetune": text_emb_ft_summary,

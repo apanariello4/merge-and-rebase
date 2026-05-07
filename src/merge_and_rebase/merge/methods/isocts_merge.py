@@ -29,6 +29,9 @@ class IsoCTSMerge:
         method_params = get_method_params(kwargs)
 
         common_space_fraction = float(method_params.get("common_space_fraction", 0.8))
+        vector_1d_merge = str(method_params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("isocts_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
 
         tvs = [TaskVector.from_checkpoints(base, t, strict=strict) for t in tuned]
 
@@ -42,6 +45,12 @@ class IsoCTSMerge:
                 direction[k] = self._isocts_delta(
                     [d[k] for d in deltas], w=w, common_space_fraction=common_space_fraction
                 ).to(dtype=b.dtype, device=b.device)
+            elif b.ndim == 1 and vector_1d_merge == "average":
+                denom = float(w.sum().clamp_min(1e-12).item())
+                acc = torch.zeros_like(b)
+                for wi, d in zip(w, deltas, strict=True):
+                    acc = acc + float(wi) * d[k].to(dtype=acc.dtype, device=acc.device)
+                direction[k] = (acc / denom).to(dtype=b.dtype, device=b.device)
             else:
                 direction[k] = torch.zeros_like(b)
         return base, direction
@@ -65,6 +74,7 @@ class IsoCTSMerge:
             tuned=tuned,
             weights=weights,
             strict=strict,
+            **kwargs,
         )
         return self.apply(prepared, alpha=float(alpha))
 

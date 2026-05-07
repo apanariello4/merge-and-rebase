@@ -7,11 +7,21 @@
   "target_clip_pretrained": "laion400m_e32",
   "method": "theseus",
   "method_params": {
-    "num_batches": 1,
+    "num_batches": 10,
     "batch_size": 32,
     "seq_align": "interpolate2d",
     "split_qkv": true,
     "center_acts": false
+  },
+  "logging": {
+    "use_wandb": true,
+    "project": null,
+    "entity": null,
+    "tags": [],
+    "mode": "online",
+    "local_log_dir": "logs",
+    "log_every_n_steps": 50,
+    "run_name": null
   },
   "alpha_search": true,
   "alpha_selection": "per_task",

@@ -667,6 +667,9 @@ def split_openclip_vit_attn(
     return n_patched
 
 
+patch_openclip_vit_attn = split_openclip_vit_attn
+
+
 def merge_openclip_vit_attn(visual: nn.Module) -> int:
     """
     Recompose LoRAable attention modules under visual.transformer.resblocks.*.attn

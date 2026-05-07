@@ -43,20 +43,41 @@ def _to_pil_if_needed(x: Any):
     return x
 
 
+def _apply_emnist_orientation_fix(img: Any) -> Any:
+    import torchvision.transforms.functional as F
+
+    img = F.rotate(img, -90)
+    img = F.hflip(img)
+    return img
+
+
+@dataclass(frozen=True)
+class EMNISTFixTransform:
+    base: Callable[[Any], Any]
+
+    def __call__(self, img: Any) -> Any:
+        return _apply_emnist_orientation_fix(self.base(img))
+
+
 def emnist_fix_transform(base: Callable[[Any], Any]) -> Callable[[Any], Any]:
     """
     EMNIST samples often need rotation + flip to match expected orientation.
     """
+    return EMNISTFixTransform(base)
 
-    def _f(img):
-        img = base(img)
-        import torchvision.transforms.functional as F
 
-        img = F.rotate(img, -90)
-        img = F.hflip(img)
-        return img
-
-    return _f
+KMNIST_CLASSNAMES = [
+    "hiragana o",
+    "hiragana ki",
+    "hiragana su",
+    "hiragana tsu",
+    "hiragana na",
+    "hiragana ha",
+    "hiragana ma",
+    "hiragana ya",
+    "hiragana re",
+    "hiragana wo",
+]
 
 
 def batch_to_dict(batch, x_key: str = "x", y_key: str = "y") -> dict[str, Any]:
@@ -239,9 +260,7 @@ def load_hf_splits(
     if isinstance(ds, HFDataset):
         if wanted == ["train"]:
             return DatasetDict({"train": ds})
-        raise ValueError(
-            f"Dataset exposes a single unnamed split, but requested={wanted}. direct_errors={errors}"
-        )
+        raise ValueError(f"Dataset exposes a single unnamed split, but requested={wanted}. direct_errors={errors}")
     raise ValueError(f"Unexpected HF dataset type: {type(ds)}") from None
 
 
@@ -361,6 +380,8 @@ def build_vision_loaders(
             classnames_overrides = ["lymph node", "lymph node containing metastatic tumor tissue"]
         elif hf_path == "clip-benchmark/wds_fer2013":
             classnames_overrides = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"]
+        # elif hf_path == "tanganke/kmnist":
+        #     classnames_overrides = KMNIST_CLASSNAMES
         else:
             classnames_overrides = None
 

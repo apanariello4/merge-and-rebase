@@ -5,7 +5,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm import tqdm
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 
 @dataclass(frozen=True)

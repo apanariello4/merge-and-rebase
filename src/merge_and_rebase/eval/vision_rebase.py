@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +40,119 @@ from ..rebase import get_method, list_methods
 from ..rebase.runtime import (
     format_rebase_method_label,
     resolve_rebase_method_config,
-    transport_vision_task_vector,
 )
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
+
+
+def _legacy_visual_key(key: str) -> str | None:
+    if not key.startswith("visual."):
+        return None
+    out = key[len("visual.") :]
+    replacements = (
+        (".attn.q_proj.", ".attn.q."),
+        (".attn.k_proj.", ".attn.k."),
+        (".attn.v_proj.", ".attn.v."),
+        (".attn.out_proj.", ".attn.proj."),
+        (".mlp.c_fc.", ".mlp.fc1."),
+        (".mlp.c_proj.", ".mlp.fc2."),
+    )
+    for src, dst in replacements:
+        out = out.replace(src, dst)
+    return out
+
+
+def _legacy_visual_delta(delta: dict[str, torch.Tensor], *, drop_conv1: bool = False) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for key, value in delta.items():
+        legacy_key = _legacy_visual_key(key)
+        if legacy_key is None:
+            continue
+        if drop_conv1 and legacy_key == "conv1.weight":
+            continue
+        out[legacy_key] = value.detach().to(device="cpu", dtype=torch.float32)
+    return out
+
+
+def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
+    if not v.is_floating_point():
+        return False
+    if ".aligner." in k:
+        return False
+    return k.startswith("visual.")
+
+
+def _resolve_eval_loader(loaders_obj: Any, split: str):
+    if split == "val" and getattr(loaders_obj, "val", None) is not None:
+        return loaders_obj.val
+    return loaders_obj.test
+
+
+def _evaluate_source_model_top1(
+    *,
+    model: torch.nn.Module,
+    clf_source: OpenClipClassifier,
+    loaders_obj: Any,
+    classnames_task: list[str],
+    source_build_cfg_task: OpenClipBuildConfig,
+    split: str,
+    first_n_batches: int | None,
+    device: str,
+) -> float:
+    eval_clf = OpenClipClassifier(
+        model=model,
+        tokenizer=clf_source.tokenizer,
+        preprocess=clf_source.preprocess,
+        normalize=clf_source.normalize,
+        logit_scale=clf_source.logit_scale,
+    )
+    eval_loader = _resolve_eval_loader(loaders_obj, split)
+    if first_n_batches is not None:
+        eval_loader = itertools.islice(iter(eval_loader), max(1, int(first_n_batches)))
+
+    eval_clf.build_zeroshot_text_features(
+        classnames_task,
+        source_build_cfg_task,
+        cache_dir="src/.cache/zs_cache",
+        force_rebuild=False,
+    )
+    return float(eval_clf.top1(eval_loader, device=device))
+
+
+def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
+    w = float(weight)
+    if w == 1.0:
+        return delta_sd
+    return {k: (v * w) for k, v in delta_sd.items()}
+
+
+def _check_untransported_compatibility(
+    base_sd: dict[str, torch.Tensor],
+    delta_sd: dict[str, torch.Tensor],
+) -> tuple[bool, list[str]]:
+    issues: list[str] = []
+    for k, d in delta_sd.items():
+        b = base_sd.get(k)
+        if b is None:
+            issues.append(f"{k}: missing in target base")
+            continue
+        if tuple(d.shape) != tuple(b.shape):
+            issues.append(f"{k}: delta shape {tuple(d.shape)} != target shape {tuple(b.shape)}")
+    return (len(issues) == 0), issues
+
+
+def _norm_acc(result_acc: float, baseline_acc: float) -> float:
+    baseline_acc = float(baseline_acc)
+    if baseline_acc != baseline_acc or baseline_acc <= 0.0:
+        return float("nan")
+    return float(result_acc) / baseline_acc
+
+
+def _average_defined(values: list[float]) -> float:
+    defined = [float(v) for v in values if float(v) == float(v)]
+    return average_scores(defined) if defined else float("nan")
 
 
 def main() -> None:
@@ -92,10 +202,32 @@ def main() -> None:
         p.add_argument("--alpha-patience", type=int, default=None)
         p.add_argument("--save-merged", type=str, default=None)
         p.add_argument("--save-transported-tvs-dir", type=str, default=None)
+        p.add_argument(
+            "--eval-before-rebase",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Optionally evaluate source zero-shot/FT on target task dataset before rebase.",
+        )
+        p.add_argument(
+            "--block-extension-enabled",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable block-extension preprocess before task-vector transport when depth mismatch is found.",
+        )
+        p.add_argument(
+            "--block-extension-params",
+            type=str,
+            default=None,
+            help="JSON object for block-extension preprocess kwargs.",
+        )
         add_logging_args(p)
 
         args = p.parse_args()
         method_params_cli = parse_json_object_arg(args.method_params, arg_name="--method-params")
+        block_extension_params_cli = parse_json_object_arg(
+            args.block_extension_params,
+            arg_name="--block-extension-params",
+        )
 
         cfg: dict[str, Any] = {}
         if args.config is not None:
@@ -134,16 +266,38 @@ def main() -> None:
             "alpha": args.alpha,
             "save_merged": args.save_merged,
             "save_transported_tvs_dir": args.save_transported_tvs_dir,
+            "eval_before_rebase": args.eval_before_rebase,
+            "block_extension_enabled": args.block_extension_enabled,
+            "block_extension_params": block_extension_params_cli,
         }
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
         cfg["logging"] = logging_cfg
 
+        if "block_extension_enabled" not in cfg:
+            cfg["block_extension_enabled"] = True
+
         method_name, method_params = resolve_rebase_method_config(cfg)
         method = get_method(method_name)
         method_label = format_rebase_method_label(method_name, method_params)
+        block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
+        theseus_like_method = method_name in {"theseus", "theseus_reference"}
+        transfusion_mode = method_name == "transfusion"
+        eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
+        block_extension_eval_requested = bool(eval_before_rebase)
+        block_extension_eval_enabled = bool(block_extension_eval_requested and theseus_like_method)
+        block_extension_eval_split = str(cfg.get("block_extension_eval_split", "test")).strip().lower()
+        if block_extension_eval_split not in {"val", "test"}:
+            raise ValueError("block_extension_eval_split must be one of: val, test")
+        block_extension_eval_first_n_batches = block_extension_cfg.first_n_eval_batches
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
+
+        if block_extension_eval_requested and not theseus_like_method:
+            print(
+                "Block-extension target-dataset eval: requested but skipped "
+                f"(method='{method_name}' is not Theseus-like)."
+            )
 
         grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
         grad_imgs_per_class = int(cfg["grad_imgs_per_class"]) if cfg.get("grad_imgs_per_class") is not None else None
@@ -231,6 +385,35 @@ def main() -> None:
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
 
+        source_depth = int(len(clf_source.model.visual.transformer.resblocks))
+        target_depth = int(len(clf_target.model.visual.transformer.resblocks))
+        run_block_extension_prestep = bool(
+            theseus_like_method and block_extension_enabled and source_depth < target_depth
+        )
+        if theseus_like_method and block_extension_enabled and source_depth > target_depth:
+            raise ValueError(
+                "Block extension preprocess only supports growing the smaller source network. "
+                f"Got source depth {source_depth} > target depth {target_depth}."
+            )
+        if theseus_like_method:
+            if run_block_extension_prestep:
+                print(
+                    "Block extension preprocess: enabled "
+                    f"(source_depth={source_depth} -> target_depth={target_depth}, "
+                    f"split={block_extension_cfg.calibration_split}, "
+                    f"n_batches_act={block_extension_cfg.n_batches_act})."
+                )
+            else:
+                reason = "disabled by config"
+                if not block_extension_enabled:
+                    reason = "disabled by config"
+                elif source_depth == target_depth:
+                    reason = "source/target depth already match"
+                print(
+                    "Block extension preprocess: skipped "
+                    f"({reason}, source_depth={source_depth}, target_depth={target_depth})."
+                )
+
         attn_patch_cfg_raw = cfg.get("attn_patch_cfg", None)
         if attn_patch_cfg_raw is not None and not isinstance(attn_patch_cfg_raw, dict):
             raise ValueError("config['attn_patch_cfg'] must be a dict when provided.")
@@ -259,61 +442,6 @@ def main() -> None:
             source_base_sd = to_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
             target_base_sd = to_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
 
-        tuned_sds_by_task: dict[str, dict[str, torch.Tensor]] = {}
-        for t in tasks:
-            ckpt_path = str(tuned_by_task[t])
-            sd = load_ckpt(ckpt_path)
-            aligned = align_to_base_keys(sd, source_base_sd)
-            if not aligned:
-                raise ValueError(
-                    f"No tensors from tuned checkpoint aligned to source base keys for task '{t}': {ckpt_path}. "
-                    f"{'The base model was attention-patched before rebase, so the checkpoint must use the same patched keyspace.' if patch_attn_before_rebase else ''}"
-                )
-            tuned_sds_by_task[t] = to_cpu_fp32(aligned)
-            print(f"Loaded tuned checkpoint for '{t}' ({len(aligned)} keys)")
-
-        def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
-            if not v.is_floating_point():
-                return False
-            return k.startswith("visual.")
-
-        tvs_by_task: dict[str, TaskVector] = {}
-        for t in tasks:
-            tvs_by_task[t] = TaskVector.from_checkpoints(
-                source_base_sd,
-                tuned_sds_by_task[t],
-                strict=False,
-                key_filter=_visual_only_filter,
-            )
-        print(f"Computed {len(tvs_by_task)} task vectors (visual-only)")
-
-        def _legacy_visual_key(key: str) -> str | None:
-            if not key.startswith("visual."):
-                return None
-            out = key[len("visual.") :]
-            replacements = (
-                (".attn.q_proj.", ".attn.q."),
-                (".attn.k_proj.", ".attn.k."),
-                (".attn.v_proj.", ".attn.v."),
-                (".attn.out_proj.", ".attn.proj."),
-                (".mlp.c_fc.", ".mlp.fc1."),
-                (".mlp.c_proj.", ".mlp.fc2."),
-            )
-            for src, dst in replacements:
-                out = out.replace(src, dst)
-            return out
-
-        def _legacy_visual_delta(delta: dict[str, torch.Tensor], *, drop_conv1: bool = False) -> dict[str, torch.Tensor]:
-            out: dict[str, torch.Tensor] = {}
-            for key, value in delta.items():
-                legacy_key = _legacy_visual_key(key)
-                if legacy_key is None:
-                    continue
-                if drop_conv1 and legacy_key == "conv1.weight":
-                    continue
-                out[legacy_key] = value.detach().to(device="cpu", dtype=torch.float32)
-            return out
-
         use_humanized_classnames = not bool(cfg.get("no_humanize", True))
         print(f"Classname mode: {'humanized' if use_humanized_classnames else 'raw'}")
         print(f"Rebase method: {method_label}")
@@ -322,6 +450,9 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
         transported_artifacts: dict[str, list[str]] = {}
+        block_extension_eval_rows: list[dict[str, Any]] = []
+
+        transfusion_prepared: dict[str, Any] | None = None
 
         for task in tasks:
             hf_path, hf_config, split_map = suite.resolver(task)
@@ -355,6 +486,13 @@ def main() -> None:
                 dtype=target_cfg.dtype,
                 prompt_templates=templates,
             )
+            source_build_cfg_task = OpenClipBuildConfig(
+                model_name=source_cfg.model_name,
+                pretrained=source_cfg.pretrained,
+                device=source_cfg.device,
+                dtype=source_cfg.dtype,
+                prompt_templates=templates,
+            )
 
             per_task.append(
                 {
@@ -366,7 +504,7 @@ def main() -> None:
             )
 
             source_loaders = None
-            if getattr(method, "name", None) == "theseus":
+            if theseus_like_method or transfusion_mode:
                 source_loaders = build_vision_loaders(
                     hf_ds=hf_ds,
                     hf_path=hf_path,
@@ -380,30 +518,292 @@ def main() -> None:
                     seed=int(cfg.get("seed", 42)),
                 )
 
+            task_source_base_sd = source_base_sd
+
+            source_base_model_task: torch.nn.Module | None = None
+            source_ft_model_task: torch.nn.Module | None = None
+            if theseus_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
+                source_base_model_task = deepcopy(clf_source.model)
+                source_ft_model_task = deepcopy(clf_source.model)
+                load_into_model(source_base_model_task, source_base_sd, strict=False)
+                load_into_model(source_ft_model_task, source_base_sd, strict=False)
+
+            if block_extension_eval_enabled and source_loaders is not None:
+                eval_row: dict[str, Any] = {
+                    "task": task,
+                    "split": block_extension_eval_split,
+                    "first_n_batches": (
+                        int(block_extension_eval_first_n_batches)
+                        if block_extension_eval_first_n_batches is not None
+                        else None
+                    ),
+                    "extension_applied": bool(run_block_extension_prestep),
+                }
+                if source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Block-extension eval requested but source task models were not initialized.")
+
+                if run_block_extension_prestep:
+                    zero_pre = _evaluate_source_model_top1(
+                        model=source_base_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    ft_pre = _evaluate_source_model_top1(
+                        model=source_ft_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    eval_row["zero_shot_pre"] = float(zero_pre)
+                    eval_row["ft_pre"] = float(ft_pre)
+                else:
+                    zero_curr = _evaluate_source_model_top1(
+                        model=source_base_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    ft_curr = _evaluate_source_model_top1(
+                        model=source_ft_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    eval_row["zero_shot"] = float(zero_curr)
+                    eval_row["ft"] = float(ft_curr)
+
+                block_extension_eval_rows.append(eval_row)
+
+            if run_block_extension_prestep:
+                if source_loaders is None:
+                    raise ValueError("Block extension preprocess requires source_loaders for calibration.")
+                if source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Block extension preprocess expected initialized source task models.")
+
+                load_into_model(source_ft_model_task, load_ckpt(str(tuned_by_task[task])), strict=False)
+
+                calibration_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=source_loaders.train,
+                    test_loader=source_loaders.test,
+                    val_loader=source_loaders.val,
+                )
+                final_depth = run_block_extension(
+                    source_base_model=source_base_model_task,
+                    source_ft_model=source_ft_model_task,
+                    calibration_loader=calibration_loader,
+                    target_layers_total=target_depth,
+                    config=block_extension_cfg,
+                    device=device,
+                )
+                if final_depth != target_depth:
+                    raise RuntimeError(
+                        f"Block extension preprocess failed for task '{task}': "
+                        f"final_depth={final_depth}, expected={target_depth}."
+                    )
+
+                task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
+                task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
+                task_delta = TaskVector.from_checkpoints(
+                    task_source_base_sd,
+                    task_source_ft_sd,
+                    strict=False,
+                    key_filter=_visual_only_filter,
+                ).delta
+
+                if block_extension_eval_enabled:
+                    zero_post = _evaluate_source_model_top1(
+                        model=source_base_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    ft_post = _evaluate_source_model_top1(
+                        model=source_ft_model_task,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=block_extension_eval_split,
+                        first_n_batches=block_extension_eval_first_n_batches,
+                        device=device,
+                    )
+                    last_row = block_extension_eval_rows[-1]
+                    last_row["zero_shot_post"] = float(zero_post)
+                    last_row["ft_post"] = float(ft_post)
+                    print(
+                        f"  {task}: source target-dataset eval "
+                        f"zero_shot {last_row['zero_shot_pre']:.6f}->{zero_post:.6f} "
+                        f"ft {last_row['ft_pre']:.6f}->{ft_post:.6f}"
+                    )
+                    run_logger.log_event(
+                        "block_extension_eval",
+                        metrics={
+                            f"block_extension_eval/{task}/zero_shot_pre": float(last_row["zero_shot_pre"]),
+                            f"block_extension_eval/{task}/zero_shot_post": float(zero_post),
+                            f"block_extension_eval/{task}/ft_pre": float(last_row["ft_pre"]),
+                            f"block_extension_eval/{task}/ft_post": float(ft_post),
+                        },
+                        context=last_row,
+                    )
+                print(
+                    f"  {task}: block extension preprocess completed "
+                    f"(source_depth={source_depth} -> {final_depth}, delta_keys={len(task_delta)})."
+                )
+            elif block_extension_eval_enabled and block_extension_eval_rows:
+                last_row = block_extension_eval_rows[-1]
+                print(
+                    f"  {task}: source target-dataset eval "
+                    f"zero_shot={last_row['zero_shot']:.6f} ft={last_row['ft']:.6f}"
+                )
+                run_logger.log_event(
+                    "block_extension_eval",
+                    metrics={
+                        f"block_extension_eval/{task}/zero_shot": float(last_row["zero_shot"]),
+                        f"block_extension_eval/{task}/ft": float(last_row["ft"]),
+                    },
+                    context=last_row,
+                )
+
+            if not run_block_extension_prestep:
+                if transfusion_mode:
+                    if transfusion_prepared is None:
+                        transfusion_prepared = method.prepare(
+                            clf_source=clf_source,
+                            clf_target=clf_target,
+                            source_loaders=source_loaders,
+                            classnames=classnames,
+                            source_build_cfg=source_build_cfg_task,
+                            device=device,
+                            seed=int(cfg.get("seed", 42)),
+                            **method_params,
+                        )
+                        source_base_sd = transfusion_prepared["source_base_sd"]
+                        target_base_sd = transfusion_prepared["target_base_sd"]
+                        clf_target.model = transfusion_prepared["target_model_patched"]
+                        if transfusion_prepared.get("sanity_check_pre") is not None:
+                            print(
+                                f"  TransFusion perm sanity (once): "
+                                f"{transfusion_prepared['sanity_check_pre']:.6f} -> "
+                                f"{transfusion_prepared['sanity_check_post']:.6f} "
+                                f"(delta={transfusion_prepared['sanity_check_post'] - transfusion_prepared['sanity_check_pre']:+.6f})"
+                            )
+                            run_logger.log_event(
+                                "transfusion_perm_sanity",
+                                metrics={
+                                    f"transfusion/{task}/source_zeroshot": float(transfusion_prepared["sanity_check_pre"]),
+                                    f"transfusion/{task}/permuted_zeroshot": float(transfusion_prepared["sanity_check_post"]),
+                                    f"transfusion/{task}/perm_delta": float(
+                                        transfusion_prepared["sanity_check_post"] - transfusion_prepared["sanity_check_pre"]
+                                    ),
+                                },
+                                context={"task": task},
+                            )
+
+                    tuned_sd = method.load_task_checkpoint(
+                        str(tuned_by_task[task]),
+                        transfusion_prepared["source_model_unpatched"],
+                    )
+                    task_delta = method.compute_task_delta(tuned_sd, source_base_sd)
+                else:
+                    ckpt_path = str(tuned_by_task[task])
+                    sd = load_ckpt(ckpt_path)
+                    aligned = align_to_base_keys(sd, source_base_sd)
+                    if not aligned:
+                        raise ValueError(
+                            f"No tensors from tuned checkpoint aligned to source base keys for task '{task}': {ckpt_path}. "
+                            f"{'The base model was attention-patched before rebase, so the checkpoint must use the same patched keyspace.' if patch_attn_before_rebase else ''}"
+                        )
+                    tuned_sd = to_cpu_fp32(aligned)
+                    task_delta = TaskVector.from_checkpoints(
+                        source_base_sd,
+                        tuned_sd,
+                        strict=False,
+                        key_filter=_visual_only_filter,
+                    ).delta
+
+                n_keys = len(tuned_sd)
+                print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
+
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
-            transported_delta = transport_vision_task_vector(
-                method=method,
-                source_base=source_base_sd,
+
+            if method_name == "gradfix":
+                from ..eval.utils import build_grad_dataloader
+                from ..models.grad_recipes import clip_contrastive_recipe
+
+                grad_loader = build_grad_dataloader(
+                    loaders.train,
+                    loaders.train.dataset,
+                    grad_batch_size=grad_batch_size,
+                    grad_imgs_per_class=grad_imgs_per_class,
+                    grad_num_batches=grad_num_batches,
+                    num_workers=int(cfg.get("num_workers", 6)),
+                    seed=int(cfg.get("seed", 42)),
+                )
+                recipe = clip_contrastive_recipe(
+                    clf_target,
+                    classnames,
+                    build_cfg_task,
+                    device=device,
+                    reduction="none" if str(method_params.get("vote", "mean")) in {"majority", "max"} else "mean",
+                )
+                prepared = method.prepare(
+                    target_model=clf_target.model,
+                    target_dataloader=grad_loader,
+                    recipe=recipe,
+                    device=device,
+                    **method_params,
+                )
+            elif theseus_like_method:
+                source_model_for_theseus = deepcopy(clf_source.model)
+                target_model_for_theseus = deepcopy(clf_target.model)
+                load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
+                load_into_model(target_model_for_theseus, target_base_sd, strict=False)
+
+                prepared = method.prepare(
+                    source_model=source_model_for_theseus,
+                    target_model=target_model_for_theseus,
+                    source_dataloader=source_loaders.train,
+                    target_dataloader=loaders.train,
+                    target_base=target_base_sd,
+                    delta=task_delta,
+                    device=device,
+                    **method_params,
+                )
+            else:
+                prepared = transfusion_prepared
+
+            transported_delta = method.transport(
+                source_base=task_source_base_sd,
                 target_base=target_base_sd,
-                delta=tvs_by_task[task].delta,
-                clf_source=clf_source,
-                clf_target=clf_target,
-                task_name=task,
-                loaders=loaders,
-                source_loaders=source_loaders,
-                classnames=classnames,
-                build_cfg_task=build_cfg_task,
-                device=device,
+                delta=task_delta,
                 strict=strict_load,
-                method_params=method_params,
-                grad_batch_size=grad_batch_size,
-                grad_imgs_per_class=grad_imgs_per_class,
-                grad_num_batches=grad_num_batches,
-                num_workers=int(cfg.get("num_workers", 6)),
-                seed=int(cfg.get("seed", 42)),
+                prepared=prepared,
+                **method_params,
             )
             transported_deltas.append(transported_delta)
-            original_deltas.append(tvs_by_task[task].delta)
+            original_deltas.append(task_delta)
             print(f"  {task}: transported delta computed for {len(transported_delta)} params")
             run_logger.log_event(
                 "transport_task_end",
@@ -427,29 +827,9 @@ def main() -> None:
                 print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
                 transported_artifacts[task] = [native_path, legacy_path, legacy_no_conv1_path]
 
-        def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
-            w = float(weight)
-            if w == 1.0:
-                return delta_sd
-            return {k: (v * w) for k, v in delta_sd.items()}
-
         rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
         untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
         print(f"Prepared {len(tasks)} transported deltas (task-independent alpha mode)")
-
-        def _check_untransported_compatibility(
-            base_sd: dict[str, torch.Tensor],
-            delta_sd: dict[str, torch.Tensor],
-        ) -> tuple[bool, list[str]]:
-            issues: list[str] = []
-            for k, d in delta_sd.items():
-                b = base_sd.get(k)
-                if b is None:
-                    issues.append(f"{k}: missing in target base")
-                    continue
-                if tuple(d.shape) != tuple(b.shape):
-                    issues.append(f"{k}: delta shape {tuple(d.shape)} != target shape {tuple(b.shape)}")
-            return (len(issues) == 0), issues
 
         can_eval_untransported_by_task: list[bool] = []
         for task_name, delta_sd in zip(tasks, untransported_deltas, strict=True):
@@ -479,16 +859,6 @@ def main() -> None:
         def _eval_all_tasks(split: str) -> list[float]:
             return [_eval_task(item, split) for item in per_task]
 
-        def _average_defined(values: list[float]) -> float:
-            defined = [float(v) for v in values if float(v) == float(v)]
-            return average_scores(defined) if defined else float("nan")
-
-        def _norm_acc(result_acc: float, baseline_acc: float) -> float:
-            baseline_acc = float(baseline_acc)
-            if baseline_acc != baseline_acc or baseline_acc <= 0.0:
-                return float("nan")
-            return float(result_acc) / baseline_acc
-
         if all(can_eval_untransported_by_task):
             baseline_label = "untransported"
         elif any(can_eval_untransported_by_task):
@@ -508,16 +878,22 @@ def main() -> None:
         else:
             print("Using target zeroshot baseline for all tasks.")
 
+        def _load_into_target_model(sd: dict[str, torch.Tensor]) -> None:
+            if transfusion_mode:
+                method.load_into_target_visual(clf_target, sd, strict=False)
+            else:
+                load_into_model(clf_target.model, sd, strict=strict_load)
+
         def _eval_zeroshot_all_tasks(split: str) -> list[float]:
             if split not in baseline_cache_zeroshot:
-                load_into_model(clf_target.model, target_base_sd, strict=strict_load)
+                _load_into_target_model(target_base_sd)
                 baseline_cache_zeroshot[split] = _eval_all_tasks(split)
             return list(baseline_cache_zeroshot[split])
 
         def _eval_baseline_task(split: str, idx: int, alpha: float) -> float:
             if can_eval_untransported_by_task[idx]:
                 baseline_sd = axpy_state_dict(target_base_sd, untransported_deltas[idx], alpha=float(alpha))
-                load_into_model(clf_target.model, baseline_sd, strict=strict_load)
+                _load_into_target_model(baseline_sd)
                 del baseline_sd
                 return _eval_task(per_task[idx], split)
             return _eval_zeroshot_all_tasks(split)[idx]
@@ -529,7 +905,7 @@ def main() -> None:
             out: dict[int, float] = {}
             for idx in indices:
                 rebase_sd_task = axpy_state_dict(target_base_sd, rebased_deltas[idx], alpha=float(alpha))
-                load_into_model(clf_target.model, rebase_sd_task, strict=strict_load)
+                _load_into_target_model(rebase_sd_task)
                 del rebase_sd_task
                 out[idx] = _eval_task(per_task[idx], split)
             return out
@@ -719,7 +1095,7 @@ def main() -> None:
                 baseline_test_accs.append(_eval_baseline_task("test", idx, task_alpha))
 
                 rebase_sd_task = axpy_state_dict(target_base_sd, rebased_deltas[idx], alpha=task_alpha)
-                load_into_model(clf_target.model, rebase_sd_task, strict=strict_load)
+                _load_into_target_model(rebase_sd_task)
                 del rebase_sd_task
                 rebase_test_accs.append(_eval_task(item, "test"))
             best_alpha = float(sum(selected_alpha_by_task) / max(1, len(selected_alpha_by_task)))
@@ -765,6 +1141,7 @@ def main() -> None:
                 "avg_norm": float(sum(norm_accs) / len(norm_accs)),
             },
             "selected_alpha_by_task": {item["task"]: float(selected_alpha_by_task[i]) for i, item in enumerate(per_task)},
+            "block_extension_target_dataset_eval": block_extension_eval_rows,
             "transported_artifacts": transported_artifacts,
             "saved_merged_path": saved_merged_path,
         }

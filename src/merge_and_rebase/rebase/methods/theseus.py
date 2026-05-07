@@ -980,17 +980,17 @@ class TheseusRebase:
     ) -> TensorDict:
         del source_base
         log_prefix = f"[{self.name}]"
-        if source_model is None or target_model is None:
-            raise ValueError("Theseus transport requires both source_model and target_model.")
-        if source_dataloader is None or target_dataloader is None:
-            raise ValueError("Theseus transport requires both source_dataloader and target_dataloader.")
 
         if n_batches is None:
             n_batches = num_batches
 
-
         prepared_payload: Mapping[str, Any]
         if prepared is None:
+            if source_model is None or target_model is None:
+                raise ValueError("Theseus transport requires both source_model and target_model.")
+            if source_dataloader is None or target_dataloader is None:
+                raise ValueError("Theseus transport requires both source_dataloader and target_dataloader.")
+
             prepared_payload = self.prepare(
                 source_model=source_model,
                 target_model=target_model,

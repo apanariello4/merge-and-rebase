@@ -102,6 +102,9 @@ class TSVMerge:
 
         params = dict(method_params or {})
         w = default_weights(len(tuned), weights)
+        vector_1d_merge = str(params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("tsv_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
 
         sv_reduction = float(params.get("sv_reduction", 1.0 / max(1, len(tuned))))
         if not (0.0 < sv_reduction <= 1.0):
@@ -131,8 +134,6 @@ class TSVMerge:
             for k, b in base.items()
             if isinstance(b, torch.Tensor) and b.ndim == 2 and "text_projection" not in k and b.is_floating_point()
         }
-        if not base_candidates:
-            return {}
 
         common_keys: set[str] | None = None
         for i in range(len(tuned)):
@@ -153,8 +154,6 @@ class TSVMerge:
             del sd
 
         keys = sorted(common_keys or set())
-        if not keys:
-            return {}
 
         if strict:
             expected = set(base_candidates)
@@ -205,6 +204,36 @@ class TSVMerge:
             u_v, _, vh_v = torch.linalg.svd(sum_v.to(dtype=svd_dtype), full_matrices=False)
             merged = torch.linalg.multi_dot((u_u, vh_u, torch.diag(sum_s.to(dtype=svd_dtype)), u_v, vh_v))
             direction[k] = merged.to(dtype=b.dtype, device=b.device)
+
+        if vector_1d_merge == "average":
+            denom = float(w.sum().clamp_min(1e-12).item())
+            one_d_candidates: set[str] = {
+                k
+                for k, b in base.items()
+                if isinstance(b, torch.Tensor) and b.ndim == 1 and b.is_floating_point()
+            }
+            common_1d_keys: set[str] | None = None
+            for sd in tuned:
+                current: set[str] = set()
+                for k, t in sd.items():
+                    if k not in one_d_candidates:
+                        continue
+                    b = base[k]
+                    if not isinstance(t, torch.Tensor):
+                        continue
+                    if t.shape != b.shape:
+                        continue
+                    if not t.is_floating_point():
+                        continue
+                    current.add(k)
+                common_1d_keys = current if common_1d_keys is None else common_1d_keys.intersection(current)
+
+            for k in sorted(common_1d_keys or set()):
+                b = base[k]
+                acc = torch.zeros_like(b)
+                for wi, sd in zip(w, tuned, strict=True):
+                    acc = acc + float(wi) * (sd[k].to(dtype=acc.dtype, device=acc.device) - b)
+                direction[k] = acc / denom
 
         return direction
 

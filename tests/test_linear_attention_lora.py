@@ -7,6 +7,7 @@ from peft import LoraConfig, get_peft_model
 from merge_and_rebase.models.patch_openclip_attention import (
     LoRAableLinearMHA,
     merge_openclip_vit_attn,
+    patch_openclip_vit_attn,
     set_linear_attention_ramp_step,
     split_openclip_vit_attn,
 )
@@ -46,7 +47,7 @@ def test_linear_attention_forward_shape_matches_original() -> None:
 
 def test_patch_openclip_vit_attn_preserves_device_and_dtype() -> None:
     torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     dtype = torch.float64
     mha = nn.MultiheadAttention(embed_dim=16, num_heads=4, batch_first=True).to(device=device, dtype=dtype)
 

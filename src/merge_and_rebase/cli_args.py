@@ -140,6 +140,28 @@ def add_logging_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-every-n-steps", type=int, default=None)
 
 
+def add_postmerge_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--postmerge-method", type=str, default=None)
+    parser.add_argument("--postmerge-alpha-mode", type=str, choices=["task", "layer"], default=None)
+    parser.add_argument("--postmerge-loss", type=str, choices=["ce", "entropy"], default=None)
+    parser.add_argument("--postmerge-steps", type=int, default=None)
+    parser.add_argument("--postmerge-lr", type=float, default=None)
+    parser.add_argument("--postmerge-max-batches-per-task", type=int, default=None)
+
+
+def build_postmerge_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    raw = {
+        "method": getattr(args, "postmerge_method", None),
+        "alpha_mode": getattr(args, "postmerge_alpha_mode", None),
+        "loss": getattr(args, "postmerge_loss", None),
+        "steps": getattr(args, "postmerge_steps", None),
+        "lr": getattr(args, "postmerge_lr", None),
+        "max_batches_per_task": getattr(args, "postmerge_max_batches_per_task", None),
+    }
+    out = {k: v for k, v in raw.items() if v is not None}
+    return {"postmerge": out} if out else {}
+
+
 def build_logging_overrides(args: argparse.Namespace) -> dict[str, Any]:
     tags_raw = getattr(args, "wandb_tags", None)
     tags = parse_csv(tags_raw) if isinstance(tags_raw, str) and tags_raw.strip() else None

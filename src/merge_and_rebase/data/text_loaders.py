@@ -76,15 +76,15 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         label_int_map={0: "entailment", 1: "neutral", 2: "contradiction"},
     ),
     "sick": _TaskSpec(
-        hf_path="sick",
+        hf_path="yangwang825/sick",
         hf_configs=(None,),
         split_map={
             "train": ("train",),
             "validation": ("validation", "dev", "trial"),
             "test": ("test",),
         },
-        premise_keys=("sentence_A", "sentence1", "premise"),
-        hypothesis_keys=("sentence_B", "sentence2", "hypothesis"),
+        premise_keys=("text1", "sentence_A", "sentence1", "premise"),
+        hypothesis_keys=("text2", "sentence_B", "sentence2", "hypothesis"),
         label_keys=("label", "entailment_label"),
         labels=("entailment", "neutral", "contradiction"),
         label_texts=("entailment", "neutral", "contradiction"),

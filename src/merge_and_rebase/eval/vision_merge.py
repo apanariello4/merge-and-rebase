@@ -8,6 +8,12 @@ from typing import Any
 
 import torch
 
+from merge_and_rebase.hyperparam_search import (
+    SearchEvaluation,
+    build_search_planner,
+    describe_candidate,
+    summarize_search_results,
+)
 from merge_and_rebase.io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
 from merge_and_rebase.io.utils import atomic_write_json, read_json_silent
 from merge_and_rebase.utils.helpers import load_json, parse_csv
@@ -18,11 +24,13 @@ from ..cli_args import (
     add_device_dtype_args,
     add_logging_args,
     add_merge_io_args,
+    add_postmerge_args,
     add_suite_arg,
     add_tasks_arg,
     build_common_eval_overrides,
     build_common_merge_overrides,
     build_logging_overrides,
+    build_postmerge_overrides,
     merge_non_none,
     parse_json_object_arg,
 )
@@ -52,6 +60,7 @@ from ..merge.registry import get_method, list_methods  # methods are registered 
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..models.forward_modes import get_forward_mode, list_forward_modes
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ..postmerge import PostMergeContext, get_postmerge_method
 from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies, print_latex_task_rows
@@ -109,6 +118,21 @@ def _write_cached_top1(
     }
     atomic_write_json(cache_path, cache)
     print(f"{task}: [computed] {label}: {top1:.6f} (saved to {cache_path})")
+
+
+def _save_merged_state_dict_if_requested(
+    merged_sd: dict[str, torch.Tensor],
+    save_merged: Any,
+    *,
+    label: str,
+) -> str | None:
+    if save_merged is None:
+        return None
+    outp = Path(str(save_merged))
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(merged_sd, str(outp))
+    print(f"Saved {label} state_dict to {outp}")
+    return str(outp)
 
 
 # ---------------------------
@@ -198,6 +222,7 @@ def main() -> None:
         alpha_search_default=None,
         alpha_search_help="Enable linear search over alpha.",
     )
+    add_postmerge_args(p)
     p.add_argument(
         "--forward-mode",
         type=str,
@@ -209,6 +234,7 @@ def main() -> None:
 
     args = p.parse_args()
     method_params_cli = parse_json_object_arg(args.method_params, arg_name="--method-params")
+    postmerge_cli = build_postmerge_overrides(args).get("postmerge", {})
 
     # Load config file if provided (JSON), then override with CLI where meaningful.
     cfg: dict[str, Any] = {}
@@ -236,17 +262,15 @@ def main() -> None:
         build_common_merge_overrides(args=args, method_params=method_params_cli, strict_as_bool=True),
     )
     cfg = merge_non_none(cfg, cli_overrides)
+    if postmerge_cli:
+        existing_postmerge = cfg.get("postmerge", {})
+        if existing_postmerge is None:
+            existing_postmerge = {}
+        if not isinstance(existing_postmerge, dict):
+            raise ValueError("config['postmerge'] must be a dict when provided.")
+        cfg["postmerge"] = merge_non_none(dict(existing_postmerge), dict(postmerge_cli))
     logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
     cfg["logging"] = logging_cfg
-
-    alpha_search = bool(cfg.get("alpha_search", False))
-    if alpha_search:
-        a_min = float(cfg.get("alpha_min", 0.0))
-        a_max = float(cfg.get("alpha_max", 2.0))
-        a_step = float(cfg.get("alpha_step", 0.1))
-        alphas = torch.arange(a_min, a_max + 1e-9, a_step).tolist()
-    else:
-        alphas = [float(cfg.get("alpha", 1.0))]
 
     suite_name = cfg.get("suite", "vision8")
     if suite_name not in SUITES:
@@ -734,130 +758,246 @@ def main() -> None:
         "suite_name": suite_name,
     }
     prepared = None
-    if isinstance(method, PreparedMergeMethod):
-        print(f"\n🛠️ Preparing merge directions with method: {method.name}")
-        prepared = method.prepare(
+    search_planner = build_search_planner(cfg=cfg, base_method_params=method_params)
+    prepared_cache: dict[str, Any] = {}
+
+    def _prepared_for(candidate_method_params: dict[str, Any]) -> Any:
+        if not isinstance(method, PreparedMergeMethod):
+            return None
+        cache_prepared = bool(candidate_method_params.get("cache_prepared", True))
+        cache_key = str(sorted(candidate_method_params.items()))
+        if cache_prepared and cache_key in prepared_cache:
+            return prepared_cache[cache_key]
+        print(f"\nPreparing merge directions with method: {method.name} ({candidate_method_params})")
+        prepared_value = method.prepare(
             base=base_sd_for_merge,
             tuned=tuned_sds_list,
             weights=merge_weights,
             strict=strict_load,
             tasks=tasks,
             merge_context=merge_context,
-            method_params=method_params,
+            method_params=candidate_method_params,
         )
-    if prepared is not None:
-        print("Prepared merge directions will be reused across all alpha evaluations.")
+        if cache_prepared:
+            prepared_cache[cache_key] = prepared_value
+        return prepared_value
 
-    # Alpha search results (normalized vs single-task baseline)
-    alpha_results: dict[float, list[float]] = {}  # alpha -> list of accs over tasks
-    alpha_results_norm: dict[float, list[float]] = {}  # alpha -> list of norm accs over tasks
-    best_alpha_per_task: dict[str, float] = {}
-    best_norm_per_task: dict[str, float] = {}
-    max_avg_norm = 0.0
+    if isinstance(method, PreparedMergeMethod):
+        fixed_only = not search_planner.is_multi_param() and not bool(cfg.get("hyperparam_search"))
+        if fixed_only:
+            prepared = _prepared_for(method_params)
+            if prepared is not None:
+                print("Prepared merge directions will be reused across all alpha evaluations.")
 
-    for alpha in alphas:
-        print(f"\n=== Method = {method.name} - Space = {peft_subspace} - Alpha = {alpha:.3f} ===")
-        merged_sd = build_merged_state_for_alpha(
-            method=method,
-            prepared=prepared,
-            base_sd_for_merge=base_sd_for_merge,
-            tuned_sds_list=tuned_sds_list,
-            weights=merge_weights,
-            method_params=method_params,
-            alpha=float(alpha),
-            peft_subspace=peft_subspace,
-            subspace=subspace,
-            subspace_prepared=subspace_prepared,
-            peft_cfg=peft_cfg,
-            peft_state_by_task=peft_state_by_task,
-            tasks=tasks,
-            merge_base_sd=merge_base_sd,
+    postmerge_cfg_raw = cfg.get("postmerge", None)
+    if postmerge_cfg_raw is not None and not isinstance(postmerge_cfg_raw, dict):
+        raise ValueError("config['postmerge'] must be a dict when provided.")
+    postmerge_cfg = dict(postmerge_cfg_raw) if isinstance(postmerge_cfg_raw, dict) else {}
+    postmerge_name = postmerge_cfg.get("method", None)
+    if postmerge_name is not None:
+        postmerge_cfg.setdefault("device", device)
+        postmerge_method = get_postmerge_method(str(postmerge_name))
+        print(f"\n=== Postmerge method = {postmerge_method.name} ===")
+        t1 = time.time()
+        postmerge_result = postmerge_method.run(
+            PostMergeContext(
+                kind="vision",
+                model=clf.model,
+                base=base_sd_for_merge,
+                tuned=tuned_sds_list,
+                tasks=tasks,
+                weights=merge_weights,
+                peft_subspace=peft_subspace,
+                config=postmerge_cfg,
+                resources={
+                    "classifier": clf,
+                    "per_task": per_task,
+                    "device": device,
+                },
+            )
         )
+        print(f"Postmerge method '{postmerge_method.name}' completed in {time.time() - t1:.2f} seconds.")
 
-        miss, unexp = load_into_model(clf.model, merged_sd, strict=strict_load)
-        print(f"Loaded merged weights (alpha={alpha:.3f}). missing={miss}, unexpected={unexp}")
+        miss, unexp = load_into_model(clf.model, postmerge_result.merged_state, strict=strict_load)
+        print(f"Loaded postmerged weights. missing={miss}, unexpected={unexp}")
 
-        if (not alpha_search) and cfg.get("save_merged", None) is not None:
-            outp = Path(str(cfg["save_merged"]))
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(merged_sd, str(outp))
-            print(f"Saved merged state_dict to {outp}")
-
-        del merged_sd
-
-        if torch.cuda.is_available() and device != "cpu":
-            torch.cuda.empty_cache()
-
-        accs, norm_accs = eval_norm_accs_for_split(
+        merged_accs, norm_accs = eval_norm_accs_for_split(
             clf=clf,
             per_task=per_task,
             device=device,
-            split="val",
-            print_per_task=True,
+            split="test",
+            print_per_task=False,
         )
-        alpha_results[float(alpha)] = accs
-        alpha_results_norm[float(alpha)] = [float(norm) for norm in norm_accs]
-        for idx, item in enumerate(per_task):
-            task = str(item["task"])
-            norm = float(norm_accs[idx])
-            if (task not in best_norm_per_task) or (norm > best_norm_per_task[task]):
-                best_norm_per_task[task] = norm
-                best_alpha_per_task[task] = float(alpha)
-
-        avg_norm = sum(alpha_results_norm[float(alpha)]) / len(tasks)
-        avg_abs = sum(alpha_results[float(alpha)]) / len(tasks)
-        print(f"alpha={alpha:.3f}  avg_abs={avg_abs:.6f} avg_norm={avg_norm:.6f}")
+        result_method_name = f"{method.name}+{postmerge_method.name}"
+        pretty_print_task_accuracies(
+            suite_name,
+            result_method_name,
+            peft_subspace,
+            per_task,
+            merged_accs,
+            norm_accs,
+            single_accs=[item["single_acc"] for item in per_task],
+        )
+        print_latex_task_rows(per_task, merged_accs, norm_accs)
+        saved_merged_path = _save_merged_state_dict_if_requested(
+            postmerge_result.merged_state,
+            cfg.get("save_merged", None),
+            label="postmerged",
+        )
         if run_logger is not None:
-            run_logger.log_event(
-                "alpha_eval_end",
-                metrics={
-                    "alpha/value": float(alpha),
-                    "alpha/avg_acc": float(avg_abs),
-                    "alpha/avg_norm_acc": float(avg_norm),
-                },
-                context={
-                    "per_task_acc": {item["task"]: float(accs[idx]) for idx, item in enumerate(per_task)},
-                    "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
-                },
+            run_logger.log_summary(
+                {
+                    "suite": suite_name,
+                    "tasks": tasks,
+                    "method": method.name,
+                    "postmerge": postmerge_result.metadata,
+                    "peft_subspace": peft_subspace,
+                    "test_results": {
+                        "per_task_acc": {item["task"]: float(merged_accs[idx]) for idx, item in enumerate(per_task)},
+                        "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
+                        "avg_acc": float(sum(merged_accs) / len(merged_accs)),
+                        "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
+                    },
+                    "saved_merged_path": saved_merged_path,
+                }
+            )
+            run_logger.finish("success")
+        return
+
+    search_results: list[SearchEvaluation] = []
+    best_norm_per_task: dict[str, float] = {}
+    best_alpha_per_task: dict[str, float] = {}
+    best_method_params_per_task: dict[str, dict[str, Any]] = {}
+    best_result: SearchEvaluation | None = None
+    legacy_alpha_results: dict[float, list[float]] = {}
+    legacy_alpha_results_norm: dict[float, list[float]] = {}
+
+    while True:
+        batch = search_planner.next_batch()
+        if batch is None:
+            break
+        batch_results: list[SearchEvaluation] = []
+        batch_best_score = float("-inf")
+        for candidate in batch:
+            print(f"\n=== Method = {method.name} - Space = {peft_subspace} - {describe_candidate(candidate)} ===")
+            candidate_prepared = prepared if prepared is not None else _prepared_for(candidate.method_params)
+            merged_sd = build_merged_state_for_alpha(
+                method=method,
+                prepared=candidate_prepared,
+                base_sd_for_merge=base_sd_for_merge,
+                tuned_sds_list=tuned_sds_list,
+                weights=merge_weights,
+                method_params=candidate.method_params,
+                alpha=float(candidate.alpha),
+                peft_subspace=peft_subspace,
+                subspace=subspace,
+                subspace_prepared=subspace_prepared,
+                peft_cfg=peft_cfg,
+                peft_state_by_task=peft_state_by_task,
+                tasks=tasks,
+                merge_base_sd=merge_base_sd,
             )
 
-        if avg_norm > max_avg_norm:
-            max_avg_norm = avg_norm
-        else:
-            print("Avg norm did not improve, stopping alpha search early.")
-            break
+            miss, unexp = load_into_model(clf.model, merged_sd, strict=strict_load)
+            print(f"Loaded merged weights ({describe_candidate(candidate)}). missing={miss}, unexpected={unexp}")
 
-    # Summary
-    avg_norm_per_alpha = {a: sum(v) / len(v) for a, v in alpha_results_norm.items()}
-    best_alpha = max(avg_norm_per_alpha, key=lambda a: avg_norm_per_alpha[a])
+            del merged_sd
 
-    print("\n=== Alpha search summary ===")
-    for a in sorted(avg_norm_per_alpha):
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.empty_cache()
+
+            accs, norm_accs = eval_norm_accs_for_split(
+                clf=clf,
+                per_task=per_task,
+                device=device,
+                split="val",
+                print_per_task=True,
+            )
+            avg_norm = sum(float(norm) for norm in norm_accs) / len(tasks)
+            avg_abs = sum(float(acc) for acc in accs) / len(tasks)
+            result = SearchEvaluation(
+                candidate=candidate,
+                score=float(avg_norm),
+                avg_acc=float(avg_abs),
+                avg_norm_acc=float(avg_norm),
+                per_task_acc=[float(v) for v in accs],
+                per_task_norm_acc=[float(v) for v in norm_accs],
+            )
+            batch_results.append(result)
+            search_results.append(result)
+
+            if not search_planner.is_multi_param():
+                legacy_alpha_results[float(candidate.alpha)] = [float(v) for v in accs]
+                legacy_alpha_results_norm[float(candidate.alpha)] = [float(v) for v in norm_accs]
+
+            for idx, item in enumerate(per_task):
+                task = str(item["task"])
+                norm = float(norm_accs[idx])
+                if (task not in best_norm_per_task) or (norm > best_norm_per_task[task]):
+                    best_norm_per_task[task] = norm
+                    best_alpha_per_task[task] = float(candidate.alpha)
+                    best_method_params_per_task[task] = dict(candidate.method_params)
+
+            print(f"{describe_candidate(candidate)}  avg_abs={avg_abs:.6f} avg_norm={avg_norm:.6f}")
+            if run_logger is not None:
+                run_logger.log_event(
+                    "alpha_eval_end",
+                    metrics={
+                        "alpha/value": float(candidate.alpha),
+                        "alpha/avg_acc": float(avg_abs),
+                        "alpha/avg_norm_acc": float(avg_norm),
+                    },
+                    context={
+                        "search_stage": int(candidate.stage),
+                        "method_params": candidate.method_params,
+                        "search_values": candidate.values,
+                        "per_task_acc": {item["task"]: float(accs[idx]) for idx, item in enumerate(per_task)},
+                        "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
+                    },
+                )
+
+            if best_result is None or result.score > best_result.score:
+                best_result = result
+            if result.score > batch_best_score:
+                batch_best_score = result.score
+            elif len(batch) > 1:
+                print("Avg norm did not improve for this parameter setting, stopping this alpha sweep early.")
+                break
+
+        search_planner.observe(batch_results)
+
+    if best_result is None:
+        raise RuntimeError("Search produced no evaluated candidates.")
+
+    print("\n=== Search summary ===")
+    for result in search_results:
         print(
-            f"alpha={a:.3f}  avg_abs={sum(alpha_results[float(a)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[a]:.6f}"
+            f"{describe_candidate(result.candidate)}  avg_abs={result.avg_acc:.6f} avg_norm={result.avg_norm_acc:.6f}"
         )
+    best_alpha = float(best_result.candidate.alpha)
+    best_method_params = dict(best_result.candidate.method_params)
     print(
-        f"\nBest alpha: {best_alpha:.3f} -> avg_abs={sum(alpha_results[float(best_alpha)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[best_alpha]:.6f}"
+        f"\nBest setting: {describe_candidate(best_result.candidate)} -> "
+        f"avg_abs={best_result.avg_acc:.6f} avg_norm={best_result.avg_norm_acc:.6f}"
     )
 
-    print("\nBest alpha per task:")
+    print("\nBest setting per task:")
     for t in tasks:
         if t in best_alpha_per_task:
+            method_desc = best_method_params_per_task.get(t, {})
             print(
-                f"{t}: alpha={best_alpha_per_task[t]:.3f} avg_abs={sum(alpha_results[float(best_alpha_per_task[t])]) / len(tasks):.6f} avg_norm={best_norm_per_task[t]:.6f}"
+                f"{t}: alpha={best_alpha_per_task[t]:.3f} method_params={method_desc} avg_norm={best_norm_per_task[t]:.6f}"
             )
 
-    # Re-run best alpha once to report avg_top1 / avg_norm
-    print(f"\n(Re-running best alpha ({best_alpha:.3f}) once to report avg_top1)")
-    alpha = float(best_alpha)
+    print(f"\n(Re-running best setting ({describe_candidate(best_result.candidate)}) once to report avg_top1)")
     merged_sd = build_merged_state_for_alpha(
         method=method,
-        prepared=prepared,
+        prepared=(_prepared_for(best_method_params) if prepared is None else prepared),
         base_sd_for_merge=base_sd_for_merge,
         tuned_sds_list=tuned_sds_list,
         weights=merge_weights,
-        method_params=method_params,
-        alpha=alpha,
+        method_params=best_method_params,
+        alpha=best_alpha,
         peft_subspace=peft_subspace,
         subspace=subspace,
         subspace_prepared=subspace_prepared,
@@ -867,6 +1007,11 @@ def main() -> None:
         merge_base_sd=merge_base_sd,
     )
     load_into_model(clf.model, merged_sd, strict=strict_load)
+    saved_merged_path = _save_merged_state_dict_if_requested(
+        merged_sd,
+        cfg.get("save_merged", None),
+        label="best-alpha merged",
+    )
     del merged_sd
 
     merged_accs, norm_accs = eval_norm_accs_for_split(
@@ -896,9 +1041,15 @@ def main() -> None:
                 "method": method.name,
                 "peft_subspace": peft_subspace,
                 "best_alpha": float(best_alpha),
-                "alpha_results": {str(k): [float(v) for v in vals] for k, vals in alpha_results.items()},
-                "alpha_results_norm": {str(k): [float(v) for v in vals] for k, vals in alpha_results_norm.items()},
+                "best_method_params": best_method_params,
+                "search_strategy": search_planner.search_summary(),
+                "search_results": summarize_search_results(search_results),
+                "alpha_results": {str(k): [float(v) for v in vals] for k, vals in legacy_alpha_results.items()},
+                "alpha_results_norm": {
+                    str(k): [float(v) for v in vals] for k, vals in legacy_alpha_results_norm.items()
+                },
                 "best_alpha_per_task": {k: float(v) for k, v in best_alpha_per_task.items()},
+                "best_method_params_per_task": best_method_params_per_task,
                 "best_norm_per_task": {k: float(v) for k, v in best_norm_per_task.items()},
                 "test_results": {
                     "per_task_acc": {item["task"]: float(merged_accs[idx]) for idx, item in enumerate(per_task)},
@@ -906,7 +1057,7 @@ def main() -> None:
                     "avg_acc": float(sum(merged_accs) / len(merged_accs)),
                     "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
                 },
-                "saved_merged_path": cfg.get("save_merged"),
+                "saved_merged_path": saved_merged_path,
             }
         )
         run_logger.finish("success")

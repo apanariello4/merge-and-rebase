@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.func import functional_call
 
+from merge_and_rebase.hyperparam_search import (
+    SearchEvaluation,
+    build_search_planner,
+    describe_candidate,
+    summarize_search_results,
+)
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
 from ..cli_args import (
@@ -19,11 +26,13 @@ from ..cli_args import (
     add_device_dtype_args,
     add_logging_args,
     add_merge_io_args,
+    add_postmerge_args,
     add_suite_arg,
     add_tasks_arg,
     build_common_eval_overrides,
     build_common_merge_overrides,
     build_logging_overrides,
+    build_postmerge_overrides,
     merge_non_none,
     parse_json_object_arg,
 )
@@ -45,6 +54,8 @@ from ..merge.registry import get_method, list_methods
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..merge.task_vectors import default_key_filter
 from ..models.text_lm import TextBuildConfig, TextLM
+from ..postmerge import PostMergeContext, get_postmerge_method
+from ..postmerge.methods.adamerging import prediction_entropy
 from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .print_utils import pretty_print_task_accuracies
 
@@ -836,6 +847,154 @@ def _load_task_heads(path: str) -> dict[str, Any]:
     return out
 
 
+def _task_head_tensor_for_param(
+    *,
+    task_key: str,
+    name: str,
+    param: torch.Tensor,
+    value: torch.Tensor,
+    head_class_ids: list[int] | None = None,
+) -> torch.Tensor:
+    tgt = param.detach().clone()
+    src = value.to(device=tgt.device, dtype=tgt.dtype)
+    if tuple(src.shape) == tuple(tgt.shape):
+        return src
+
+    mapped_class_ids: list[int] | None = None
+    if head_class_ids is not None:
+        mapped_class_ids = [int(x) for x in head_class_ids]
+        if len(set(mapped_class_ids)) != len(mapped_class_ids):
+            raise ValueError(f"head_class_ids for task '{task_key}' must be unique. Got: {mapped_class_ids}")
+
+    if mapped_class_ids is not None:
+        if (
+            name.endswith("classification_head.out_proj.weight")
+            and src.ndim == 2
+            and tgt.ndim == 2
+            and src.shape[0] == len(mapped_class_ids)
+            and src.shape[1] == tgt.shape[1]
+        ):
+            if min(mapped_class_ids) < 0 or max(mapped_class_ids) >= tgt.shape[0]:
+                raise ValueError(
+                    f"head_class_ids out of range for task '{task_key}', param '{name}': "
+                    f"ids={mapped_class_ids}, target_rows={tgt.shape[0]}"
+                )
+            for i, cls_id in enumerate(mapped_class_ids):
+                tgt[int(cls_id)].copy_(src[i])
+            return tgt
+        if (
+            name.endswith("classification_head.out_proj.bias")
+            and src.ndim == 1
+            and tgt.ndim == 1
+            and src.shape[0] == len(mapped_class_ids)
+        ):
+            if min(mapped_class_ids) < 0 or max(mapped_class_ids) >= tgt.shape[0]:
+                raise ValueError(
+                    f"head_class_ids out of range for task '{task_key}', param '{name}': "
+                    f"ids={mapped_class_ids}, target_rows={tgt.shape[0]}"
+                )
+            for i, cls_id in enumerate(mapped_class_ids):
+                tgt[int(cls_id)].copy_(src[i])
+            return tgt
+
+    if name.endswith("classification_head.out_proj.weight"):
+        if src.ndim == 2 and tgt.ndim == 2 and src.shape[1] == tgt.shape[1] and src.shape[0] < tgt.shape[0]:
+            tgt[: src.shape[0]].copy_(src)
+            return tgt
+    if name.endswith("classification_head.out_proj.bias"):
+        if src.ndim == 1 and tgt.ndim == 1 and src.shape[0] < tgt.shape[0]:
+            tgt[: src.shape[0]].copy_(src)
+            return tgt
+
+    raise ValueError(
+        f"Head shape mismatch for task '{task_key}', param '{name}': "
+        f"model={tuple(tgt.shape)} payload={tuple(src.shape)}"
+    )
+
+
+def _task_head_param_overrides(
+    *,
+    model: Any,
+    task: str,
+    task_heads: dict[str, Any],
+    head_key_pattern: str,
+    head_class_ids: list[int] | None = None,
+) -> dict[str, torch.Tensor]:
+    task_key = str(task).strip().lower()
+    if task_key not in task_heads:
+        raise KeyError(f"Task '{task_key}' not found in task_heads.")
+    payload = task_heads[task_key]
+    named_params = {n: p for n, p in model.named_parameters()}
+    pattern = str(head_key_pattern)
+    out: dict[str, torch.Tensor] = {}
+
+    def _add_override(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
+        out[name] = _task_head_tensor_for_param(
+            task_key=task_key,
+            name=name,
+            param=param,
+            value=value,
+            head_class_ids=head_class_ids,
+        )
+
+    if isinstance(payload, torch.Tensor):
+        cands = [(n, p) for n, p in named_params.items() if pattern in n and tuple(p.shape) == tuple(payload.shape)]
+        if not cands:
+            by_shape = [(n, p) for n, p in named_params.items() if tuple(p.shape) == tuple(payload.shape)]
+            preferred = [
+                (n, p)
+                for n, p in by_shape
+                if n.endswith("score.weight")
+                or n.endswith("classifier.weight")
+                or n.endswith("classification_head.weight")
+            ]
+            if len(preferred) == 1:
+                cands = preferred
+            elif len(by_shape) == 1:
+                cands = by_shape
+        if len(cands) != 1:
+            names = [n for n, _ in cands]
+            shape_only = [n for n, p in named_params.items() if tuple(p.shape) == tuple(payload.shape)]
+            raise ValueError(
+                f"Could not uniquely match tensor head for task '{task_key}'. "
+                f"pattern='{pattern}', shape={tuple(payload.shape)}, candidates={names}, "
+                f"shape_only_matches={shape_only[:8]}"
+            )
+        name, param = cands[0]
+        _add_override(name, param, payload)
+        return out
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"task_heads['{task_key}'] must be a Tensor or dict. Got: {type(payload)}")
+
+    for hk, hv in payload.items():
+        if not isinstance(hv, torch.Tensor):
+            continue
+        key = str(hk)
+        if key in named_params:
+            _add_override(key, named_params[key], hv)
+            continue
+
+        suffix_matches = [(n, p) for n, p in named_params.items() if pattern in n and n.endswith(key)]
+        if len(suffix_matches) == 1:
+            n, p = suffix_matches[0]
+            _add_override(n, p, hv)
+            continue
+        if len(suffix_matches) == 0:
+            any_suffix_matches = [(n, p) for n, p in named_params.items() if n.endswith(key)]
+            if len(any_suffix_matches) == 1:
+                n, p = any_suffix_matches[0]
+                _add_override(n, p, hv)
+                continue
+        if len(suffix_matches) > 1:
+            raise ValueError(
+                f"Ambiguous suffix match for task '{task_key}', key='{key}', "
+                f"matches={[n for n, _ in suffix_matches]}"
+            )
+        raise KeyError(f"No parameter match for task '{task_key}' head key '{key}'.")
+    return out
+
+
 def _inject_task_head(
     *,
     model: Any,
@@ -851,65 +1010,16 @@ def _inject_task_head(
 
     named_params = {n: p for n, p in model.named_parameters()}
     pattern = str(head_key_pattern)
-    mapped_class_ids: list[int] | None = None
-    if head_class_ids is not None:
-        mapped_class_ids = [int(x) for x in head_class_ids]
-        if len(set(mapped_class_ids)) != len(mapped_class_ids):
-            raise ValueError(f"head_class_ids for task '{task_key}' must be unique. Got: {mapped_class_ids}")
 
     def _copy_param(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
-        tgt = param
-        src = value.to(device=tgt.device, dtype=tgt.dtype)
-        if tuple(src.shape) == tuple(tgt.shape):
-            tgt.copy_(src)
-            return
-
-        # If provided, place task-local class rows into explicit global head rows
-        # (e.g. qnli/rte: local [entailment, contradiction] -> global [0,2]).
-        if mapped_class_ids is not None:
-            if (
-                name.endswith("classification_head.out_proj.weight")
-                and src.ndim == 2
-                and tgt.ndim == 2
-                and src.shape[0] == len(mapped_class_ids)
-                and src.shape[1] == tgt.shape[1]
-            ):
-                if min(mapped_class_ids) < 0 or max(mapped_class_ids) >= tgt.shape[0]:
-                    raise ValueError(
-                        f"head_class_ids out of range for task '{task_key}', param '{name}': "
-                        f"ids={mapped_class_ids}, target_rows={tgt.shape[0]}"
-                    )
-                for i, cls_id in enumerate(mapped_class_ids):
-                    tgt[int(cls_id)].copy_(src[i])
-                return
-            if (
-                name.endswith("classification_head.out_proj.bias")
-                and src.ndim == 1
-                and tgt.ndim == 1
-                and src.shape[0] == len(mapped_class_ids)
-            ):
-                if min(mapped_class_ids) < 0 or max(mapped_class_ids) >= tgt.shape[0]:
-                    raise ValueError(
-                        f"head_class_ids out of range for task '{task_key}', param '{name}': "
-                        f"ids={mapped_class_ids}, target_rows={tgt.shape[0]}"
-                    )
-                for i, cls_id in enumerate(mapped_class_ids):
-                    tgt[int(cls_id)].copy_(src[i])
-                return
-
-        # Backward-compatible fallback when no class-id mapping is provided.
-        if name.endswith("classification_head.out_proj.weight"):
-            if src.ndim == 2 and tgt.ndim == 2 and src.shape[1] == tgt.shape[1] and src.shape[0] < tgt.shape[0]:
-                tgt[: src.shape[0]].copy_(src)
-                return
-        if name.endswith("classification_head.out_proj.bias"):
-            if src.ndim == 1 and tgt.ndim == 1 and src.shape[0] < tgt.shape[0]:
-                tgt[: src.shape[0]].copy_(src)
-                return
-
-        raise ValueError(
-            f"Head shape mismatch for task '{task_key}', param '{name}': "
-            f"model={tuple(tgt.shape)} payload={tuple(src.shape)}"
+        param.copy_(
+            _task_head_tensor_for_param(
+                task_key=task_key,
+                name=name,
+                param=param,
+                value=value,
+                head_class_ids=head_class_ids,
+            )
         )
 
     with torch.no_grad():
@@ -1317,11 +1427,13 @@ def main() -> None:
         alpha_step_default=None,
         alpha_search_default=None,
     )
+    add_postmerge_args(p)
     add_logging_args(p)
 
     args = p.parse_args()
 
     method_params_cli = parse_json_object_arg(args.method_params, arg_name="--method-params")
+    postmerge_cli = build_postmerge_overrides(args).get("postmerge", {})
 
     cfg: dict[str, Any] = {}
     if args.config is not None:
@@ -1363,6 +1475,13 @@ def main() -> None:
         build_common_merge_overrides(args=args, method_params=method_params_cli, strict_as_bool=False),
     )
     cfg = merge_non_none(cfg, cli_overrides)
+    if postmerge_cli:
+        existing_postmerge = cfg.get("postmerge", {})
+        if existing_postmerge is None:
+            existing_postmerge = {}
+        if not isinstance(existing_postmerge, dict):
+            raise ValueError("config['postmerge'] must be a dict when provided.")
+        cfg["postmerge"] = merge_non_none(dict(existing_postmerge), dict(postmerge_cli))
     logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
     cfg["logging"] = logging_cfg
 
@@ -1381,16 +1500,7 @@ def main() -> None:
     eval_mode = _resolve_eval_mode(str(cfg.get("eval_mode", "auto")), task_heads_path)
     head_key_pattern = str(cfg.get("head_key_pattern", "modules_to_save"))
 
-    alpha_search = bool(cfg.get("alpha_search", False))
-    if alpha_search:
-        a_min = float(cfg.get("alpha_min", 0.0))
-        a_max = float(cfg.get("alpha_max", 2.0))
-        a_step = float(cfg.get("alpha_step", 0.1))
-        if a_step <= 0:
-            raise ValueError("alpha_step must be > 0.")
-        alphas = torch.arange(a_min, a_max + 1e-9, a_step).tolist()
-    else:
-        alphas = [float(cfg.get("alpha", 1.0))]
+    search_planner = build_search_planner(cfg=cfg, base_method_params=method_params)
     run_summary_path = default_summary_path(
         entrypoint="eval.llm_merge",
         logging_cfg=logging_cfg,
@@ -1624,7 +1734,8 @@ def main() -> None:
         "head_class_ids_for_task": _head_class_ids_for_task,
     }
 
-    if (not zero_shot_only) and prepared is None and isinstance(method, PreparedMergeMethod):
+    enable_global_prepare = (not search_planner.is_multi_param()) and (cfg.get("hyperparam_search") is None)
+    if (not zero_shot_only) and prepared is None and isinstance(method, PreparedMergeMethod) and enable_global_prepare:
         print(f"\nPreparing merge directions with method: {method.name}")
         prepared = method.prepare(
             base=base_sd_for_merge,
@@ -1793,9 +1904,9 @@ def main() -> None:
 
     alpha_to_task_accs: dict[float, list[float]] = {}
     alpha_to_task_norm_accs: dict[float, list[float]] = {}
-    best_alpha: float | None = None
-    best_score = -1.0
-    prev_avg_norm_acc: float | None = None
+    search_results: list[SearchEvaluation] = []
+    best_result: SearchEvaluation | None = None
+    prepared_cache: dict[str, Any] = {}
 
     if method is None:
         raise RuntimeError("Internal error: merge method was not initialized.")
@@ -1814,146 +1925,361 @@ def main() -> None:
         tasks=tasks,
         merge_base_sd=merge_base_sd,
     )
-    for alpha in alphas:
-        t0 = time.time()
-        merged_sd = None
-        # Any method that prepared (base, direction) can be applied in-place.
-        can_use_inplace = (
-            peft_subspace == "full" and use_inplace_task_arithmetic and prepared_base_direction is not None
-        )
-        if can_use_inplace:
-            if prepared_base_direction is None:
-                raise RuntimeError("In-place prepared merge expects prepared=(base, direction).")
-            miss, unexp = _load_prepared_direction_into_model(
-                model=llm.model,
-                base=prepared_base_direction[0],
-                direction=prepared_base_direction[1],
-                alpha=float(alpha),
-                strict=strict_load,
-            )
-        else:
-            merged_sd = _build_merged_state_from_context(merge_context, alpha=float(alpha))
-            miss, unexp = load_into_model(llm.model, merged_sd, strict=strict_load)
 
-        accs: list[float] = []
-        norm_accs: list[float] = []
-        print(f"\nalpha={float(alpha):.3f}  missing={miss}  unexpected={unexp}")
-        for i, td in enumerate(task_data):
-            if eval_mode == "head_logits":
-                if task_heads is None:
-                    raise RuntimeError("head_logits mode requires loaded task_heads.")
+    def _prepared_for(candidate_method_params: dict[str, Any]) -> Any:
+        if not isinstance(method, PreparedMergeMethod):
+            return None
+        cache_key = str(sorted(candidate_method_params.items()))
+        if cache_key in prepared_cache:
+            return prepared_cache[cache_key]
+        print(f"\nPreparing merge directions with method: {method.name} ({candidate_method_params})")
+        prepared_value = method.prepare(
+            base=base_sd_for_merge,
+            tuned=tuned_sds_list,
+            weights=merge_weights,
+            strict=strict_load,
+            merge_context=merge_context,
+            method_params=candidate_method_params,
+        )
+        prepared_cache[cache_key] = prepared_value
+        return prepared_value
+
+    postmerge_cfg_raw = cfg.get("postmerge", None)
+    if postmerge_cfg_raw is not None and not isinstance(postmerge_cfg_raw, dict):
+        raise ValueError("config['postmerge'] must be a dict when provided.")
+    postmerge_cfg = dict(postmerge_cfg_raw) if isinstance(postmerge_cfg_raw, dict) else {}
+    postmerge_name = postmerge_cfg.get("method", None)
+    if postmerge_name is not None:
+        if eval_mode != "head_logits":
+            raise ValueError("AdaMerging v1 for llm_merge supports eval_mode='head_logits' only.")
+        if task_heads is None:
+            raise RuntimeError("AdaMerging head_logits mode requires loaded task_heads.")
+        if not tuned_sds_list:
+            tuned_sds_list, base_sd_for_merge = _load_tuned_sequence_for_preparation(
+                tuned_refs=tuned_ckpts,
+                base_sd=base_sd,
+                build_cfg=build_cfg,
+                model=llm.model,
+                strict_load=strict_load,
+                use_low_memory_prepare=True,
+            )
+        postmerge_cfg.setdefault("device", build_cfg.device)
+        postmerge_cfg.setdefault("init_alpha", float(cfg.get("alpha", 1.0)))
+        postmerge_method = get_postmerge_method(str(postmerge_name))
+        max_batches_per_task = postmerge_cfg.get("max_batches_per_task", None)
+        max_batches_per_task = None if max_batches_per_task is None else int(max_batches_per_task)
+        entropy_temperature = float(postmerge_cfg.get("entropy_temperature", 1.0))
+
+        def _llm_entropy_loss(bank, alpha_values: torch.Tensor, alpha_mode: str) -> torch.Tensor:
+            base_params = bank.merged_parameter_dict(
+                llm.model,
+                alpha_values,
+                mode=alpha_mode,
+                device=build_cfg.device,
+            )
+            losses: list[torch.Tensor] = []
+            for i, td in enumerate(task_data):
                 tk = tokenized_task_data[i]
-                _inject_task_head(
+                head_overrides = _task_head_param_overrides(
                     model=llm.model,
                     task=td.task,
                     task_heads=task_heads,
                     head_key_pattern=head_key_pattern,
                     head_class_ids=list(tk.meta.get("head_class_ids", [])),
                 )
-                acc = llm.sequence_classification_accuracy(
-                    tk.loader,
-                    device=build_cfg.device,
-                    mask_class=tk.mask_class,
-                    print_every=print_every,
-                )
-            else:
-                tpl = user_prompt_template if isinstance(user_prompt_template, str) else _default_prompt_for_task(td)
-                acc = llm.nli_accuracy(
-                    examples=td.examples,
-                    label_texts=td.label_texts,
-                    prompt_template=tpl,
-                    device=build_cfg.device,
-                    max_prompt_tokens=max_prompt_tokens,
-                    print_every=print_every,
-                )
-            accs.append(acc)
+                task_params = dict(base_params)
+                task_params.update(head_overrides)
+                for batch_idx, batch in enumerate(tk.loader):
+                    if max_batches_per_task is not None and batch_idx >= max_batches_per_task:
+                        break
+                    model_kwargs = {
+                        k: v.to(build_cfg.device, non_blocking=True)
+                        for k, v in batch.items()
+                        if k != "labels" and torch.is_tensor(v)
+                    }
+                    out = functional_call(llm.model, task_params, (), kwargs=model_kwargs)
+                    logits = out.logits
+                    if logits.ndim != 2:
+                        raise ValueError(
+                            f"AdaMerging head_logits mode expects [B, C] logits, got shape {tuple(logits.shape)}."
+                        )
+                    if tk.mask_class is not None:
+                        idx = torch.tensor(tk.mask_class, device=logits.device, dtype=torch.long)
+                        logits = logits.index_select(dim=1, index=idx)
+                    losses.append(prediction_entropy(logits, temperature=entropy_temperature))
+            if not losses:
+                raise RuntimeError("AdaMerging LLM loss did not receive any validation batches.")
+            return torch.stack(losses).mean()
+
+        print(f"\n=== Postmerge method = {postmerge_method.name} ===")
+        postmerge_result = postmerge_method.run(
+            PostMergeContext(
+                kind="llm",
+                model=llm.model,
+                base=base_sd_for_merge,
+                tuned=tuned_sds_list,
+                tasks=tasks,
+                weights=merge_weights,
+                peft_subspace=peft_subspace,
+                config=postmerge_cfg,
+                entropy_loss_fn=_llm_entropy_loss,
+            )
+        )
+        miss, unexp = load_into_model(llm.model, postmerge_result.merged_state, strict=strict_load)
+        print(f"Loaded postmerged weights. missing={miss}, unexpected={unexp}")
+
+        postmerge_accs: list[float] = []
+        postmerge_norm_accs: list[float] = []
+        for i, td in enumerate(task_data):
+            tk = tokenized_task_data[i]
+            _inject_task_head(
+                model=llm.model,
+                task=td.task,
+                task_heads=task_heads,
+                head_key_pattern=head_key_pattern,
+                head_class_ids=list(tk.meta.get("head_class_ids", [])),
+            )
+            acc = llm.sequence_classification_accuracy(
+                tk.loader,
+                device=build_cfg.device,
+                mask_class=tk.mask_class,
+                print_every=print_every,
+            )
+            postmerge_accs.append(acc)
             if norm_reference_acc is not None and td.task in norm_reference_acc:
                 norm = _normalized_acc(acc, norm_reference_acc[td.task])
-                norm_accs.append(norm)
-                print(f"{td.task}: acc={acc:.6f}  norm_acc={norm:.3f}")
+                postmerge_norm_accs.append(norm)
+                print(f"{td.task}: postmerge_acc={acc:.6f}  norm_acc={norm:.3f}")
             else:
-                print(f"{td.task}: acc={acc:.6f}")
+                print(f"{td.task}: postmerge_acc={acc:.6f}")
 
-        avg_acc = sum(accs) / max(1, len(accs))
-        avg_norm_acc = sum(norm_accs) / max(1, len(norm_accs)) if norm_accs else 0.0
-        score = avg_norm_acc if norm_accs else avg_acc
-        alpha_to_task_accs[float(alpha)] = accs
-        alpha_to_task_norm_accs[float(alpha)] = norm_accs
-        if run_logger is not None:
-            run_logger.log_event(
-                "alpha_eval_end",
-                metrics={
-                    "alpha/value": float(alpha),
-                    "alpha/avg_acc": float(avg_acc),
-                    "alpha/avg_norm_acc": float(avg_norm_acc),
-                },
-                context={
-                    "per_task_acc": {td.task: float(accs[i]) for i, td in enumerate(task_data)},
-                    "per_task_norm_acc": {
-                        td.task: float(norm_accs[i]) for i, td in enumerate(task_data[: len(norm_accs)])
-                    },
-                },
+        avg_acc = sum(postmerge_accs) / max(1, len(postmerge_accs))
+        avg_norm_acc = (
+            sum(postmerge_norm_accs) / max(1, len(postmerge_norm_accs)) if postmerge_norm_accs else 0.0
+        )
+        print(f"\nPostmerge avg_acc={avg_acc:.6f}")
+        if postmerge_norm_accs:
+            print(f"Postmerge avg_norm_acc={avg_norm_acc:.3f}")
+        if norm_reference_acc is not None:
+            per_task_rows = [{"task": td.task} for td in task_data]
+            single_accs = [
+                _to_unit_acc(norm_reference_acc[td.task]) if td.task in norm_reference_acc else 0.0
+                for td in task_data
+            ]
+            norm_ratio = [
+                (postmerge_accs[i] / single_accs[i]) if single_accs[i] > 0 else 0.0
+                for i in range(len(postmerge_accs))
+            ]
+            pretty_print_task_accuracies(
+                suite_name or "nli6",
+                f"{method.name}+{postmerge_method.name}",
+                peft_subspace,
+                per_task_rows,
+                postmerge_accs,
+                norm_ratio,
+                single_accs=single_accs,
             )
-        if norm_accs:
-            print(
-                f"alpha={float(alpha):.3f}  avg_acc={avg_acc:.6f}  avg_norm_acc={avg_norm_acc:.3f}  "
-                f"seconds={time.time() - t0:.2f}"
-            )
-        else:
-            print(f"alpha={float(alpha):.3f}  avg_acc={avg_acc:.6f}  seconds={time.time() - t0:.2f}")
-
-        if score > best_score:
-            best_score = float(score)
-            best_alpha = float(alpha)
-
-        if alpha_search and norm_accs:
-            if prev_avg_norm_acc is not None and avg_norm_acc < prev_avg_norm_acc:
-                print(
-                    f"avg_norm_acc dropped ({avg_norm_acc:.3f} < {prev_avg_norm_acc:.3f}); stopping alpha search early."
-                )
-                break
-            prev_avg_norm_acc = float(avg_norm_acc)
-
-        if (not alpha_search) and cfg.get("save_merged", None) is not None:
+        if cfg.get("save_merged", None) is not None:
             outp = Path(str(cfg["save_merged"]))
             outp.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(postmerge_result.merged_state, str(outp))
+            print(f"Saved postmerged state_dict to {outp}")
+        if run_logger is not None:
+            run_logger.log_summary(
+                {
+                    "tasks": [td.task for td in task_data],
+                    "method": method.name,
+                    "postmerge": postmerge_result.metadata,
+                    "peft_subspace": peft_subspace,
+                    "test_results": {
+                        "per_task_acc": {td.task: float(postmerge_accs[i]) for i, td in enumerate(task_data)},
+                        "per_task_norm_acc": {
+                            td.task: float(postmerge_norm_accs[i])
+                            for i, td in enumerate(task_data[: len(postmerge_norm_accs)])
+                        },
+                        "avg_acc": float(avg_acc),
+                        "avg_norm_acc": float(avg_norm_acc),
+                    },
+                    "saved_merged_path": cfg.get("save_merged"),
+                }
+            )
+            run_logger.finish("success")
+        return
+
+    while True:
+        batch = search_planner.next_batch()
+        if batch is None:
+            break
+        batch_results: list[SearchEvaluation] = []
+        prev_avg_norm_acc: float | None = None
+        for candidate in batch:
+            t0 = time.time()
+            candidate_prepared = prepared if prepared is not None else _prepared_for(candidate.method_params)
+            candidate_prepared_base_direction = _prepared_base_direction(candidate_prepared)
+            candidate_context = _AlphaMergeContext(
+                method=method,
+                prepared=candidate_prepared,
+                base_sd_for_merge=base_sd_for_merge,
+                tuned_sds_list=tuned_sds_list,
+                weights=merge_weights,
+                method_params=candidate.method_params,
+                peft_subspace=peft_subspace,
+                subspace=subspace,
+                subspace_prepared=subspace_prepared,
+                peft_cfg=peft_cfg,
+                peft_state_by_task=peft_state_by_task,
+                tasks=tasks,
+                merge_base_sd=merge_base_sd,
+            )
+            merged_sd = None
+            can_use_inplace = (
+                peft_subspace == "full"
+                and use_inplace_task_arithmetic
+                and candidate_prepared_base_direction is not None
+            )
             if can_use_inplace:
-                merged_sd = _build_merged_state_from_context(merge_context, alpha=float(alpha))
-            if merged_sd is None:
-                raise RuntimeError("No merged state dict available to save.")
-            torch.save(merged_sd, str(outp))
-            print(f"Saved merged state_dict to {outp}")
+                miss, unexp = _load_prepared_direction_into_model(
+                    model=llm.model,
+                    base=candidate_prepared_base_direction[0],
+                    direction=candidate_prepared_base_direction[1],
+                    alpha=float(candidate.alpha),
+                    strict=strict_load,
+                )
+            else:
+                merged_sd = _build_merged_state_from_context(candidate_context, alpha=float(candidate.alpha))
+                miss, unexp = load_into_model(llm.model, merged_sd, strict=strict_load)
 
-        if merged_sd is not None:
-            del merged_sd
-        if torch.cuda.is_available() and build_cfg.device != "cpu":
-            torch.cuda.empty_cache()
+            accs: list[float] = []
+            norm_accs: list[float] = []
+            print(f"\n{describe_candidate(candidate)}  missing={miss}  unexpected={unexp}")
+            for i, td in enumerate(task_data):
+                if eval_mode == "head_logits":
+                    if task_heads is None:
+                        raise RuntimeError("head_logits mode requires loaded task_heads.")
+                    tk = tokenized_task_data[i]
+                    _inject_task_head(
+                        model=llm.model,
+                        task=td.task,
+                        task_heads=task_heads,
+                        head_key_pattern=head_key_pattern,
+                        head_class_ids=list(tk.meta.get("head_class_ids", [])),
+                    )
+                    acc = llm.sequence_classification_accuracy(
+                        tk.loader,
+                        device=build_cfg.device,
+                        mask_class=tk.mask_class,
+                        print_every=print_every,
+                    )
+                else:
+                    tpl = user_prompt_template if isinstance(user_prompt_template, str) else _default_prompt_for_task(td)
+                    acc = llm.nli_accuracy(
+                        examples=td.examples,
+                        label_texts=td.label_texts,
+                        prompt_template=tpl,
+                        device=build_cfg.device,
+                        max_prompt_tokens=max_prompt_tokens,
+                        print_every=print_every,
+                    )
+                accs.append(acc)
+                if norm_reference_acc is not None and td.task in norm_reference_acc:
+                    norm = _normalized_acc(acc, norm_reference_acc[td.task])
+                    norm_accs.append(norm)
+                    print(f"{td.task}: acc={acc:.6f}  norm_acc={norm:.3f}")
+                else:
+                    print(f"{td.task}: acc={acc:.6f}")
 
-    if best_alpha is None:
+            avg_acc = sum(accs) / max(1, len(accs))
+            avg_norm_acc = sum(norm_accs) / max(1, len(norm_accs)) if norm_accs else 0.0
+            score = avg_norm_acc if norm_accs else avg_acc
+            result = SearchEvaluation(
+                candidate=candidate,
+                score=float(score),
+                avg_acc=float(avg_acc),
+                avg_norm_acc=float(avg_norm_acc),
+                per_task_acc=[float(v) for v in accs],
+                per_task_norm_acc=[float(v) for v in norm_accs],
+            )
+            batch_results.append(result)
+            search_results.append(result)
+            if not search_planner.is_multi_param():
+                alpha_to_task_accs[float(candidate.alpha)] = [float(v) for v in accs]
+                alpha_to_task_norm_accs[float(candidate.alpha)] = [float(v) for v in norm_accs]
+            if run_logger is not None:
+                run_logger.log_event(
+                    "alpha_eval_end",
+                    metrics={
+                        "alpha/value": float(candidate.alpha),
+                        "alpha/avg_acc": float(avg_acc),
+                        "alpha/avg_norm_acc": float(avg_norm_acc),
+                    },
+                    context={
+                        "search_stage": int(candidate.stage),
+                        "method_params": candidate.method_params,
+                        "search_values": candidate.values,
+                        "per_task_acc": {td.task: float(accs[i]) for i, td in enumerate(task_data)},
+                        "per_task_norm_acc": {
+                            td.task: float(norm_accs[i]) for i, td in enumerate(task_data[: len(norm_accs)])
+                        },
+                    },
+                )
+            if norm_accs:
+                print(
+                    f"{describe_candidate(candidate)}  avg_acc={avg_acc:.6f}  avg_norm_acc={avg_norm_acc:.3f}  "
+                    f"seconds={time.time() - t0:.2f}"
+                )
+            else:
+                print(f"{describe_candidate(candidate)}  avg_acc={avg_acc:.6f}  seconds={time.time() - t0:.2f}")
+
+            if best_result is None or result.score > best_result.score:
+                best_result = result
+
+            if norm_accs:
+                if prev_avg_norm_acc is not None and avg_norm_acc < prev_avg_norm_acc:
+                    print(
+                        f"avg_norm_acc dropped ({avg_norm_acc:.3f} < {prev_avg_norm_acc:.3f}); stopping this alpha sweep early."
+                    )
+                    if merged_sd is not None:
+                        del merged_sd
+                    if torch.cuda.is_available() and build_cfg.device != "cpu":
+                        torch.cuda.empty_cache()
+                    break
+                prev_avg_norm_acc = float(avg_norm_acc)
+
+            if merged_sd is not None:
+                del merged_sd
+            if torch.cuda.is_available() and build_cfg.device != "cpu":
+                torch.cuda.empty_cache()
+
+        search_planner.observe(batch_results)
+
+    if best_result is None:
         raise RuntimeError("Alpha sweep produced no results.")
 
     print("\n=== Alpha search summary (higher is better) ===")
-    for a in sorted(alpha_to_task_accs):
-        vals = alpha_to_task_accs[a]
-        nvals = alpha_to_task_norm_accs.get(a, [])
-        if nvals:
+    for result in search_results:
+        if result.per_task_norm_acc:
             print(
-                f"alpha={a:.3f}  avg_acc={sum(vals) / max(1, len(vals)):.6f}  "
-                f"avg_norm_acc={sum(nvals) / max(1, len(nvals)):.3f}"
+                f"{describe_candidate(result.candidate)}  avg_acc={result.avg_acc:.6f}  "
+                f"avg_norm_acc={result.avg_norm_acc:.3f}"
             )
         else:
-            print(f"alpha={a:.3f}  avg_acc={sum(vals) / max(1, len(vals)):.6f}")
-    best_acc = sum(alpha_to_task_accs[best_alpha]) / max(1, len(alpha_to_task_accs[best_alpha]))
-    best_norm_vals = alpha_to_task_norm_accs.get(best_alpha, [])
+            print(f"{describe_candidate(result.candidate)}  avg_acc={result.avg_acc:.6f}")
+    best_alpha = float(best_result.candidate.alpha)
+    best_method_params = dict(best_result.candidate.method_params)
+    best_acc = float(best_result.avg_acc)
+    best_norm_vals = list(best_result.per_task_norm_acc)
     if best_norm_vals:
-        best_norm = sum(best_norm_vals) / max(1, len(best_norm_vals))
-        print(f"\nBest alpha: {best_alpha:.3f} -> avg_acc={best_acc:.6f}  avg_norm_acc={best_norm:.3f}")
+        best_norm = float(best_result.avg_norm_acc)
+        print(
+            f"\nBest setting: {describe_candidate(best_result.candidate)} -> avg_acc={best_acc:.6f}  "
+            f"avg_norm_acc={best_norm:.3f}"
+        )
     else:
-        print(f"\nBest alpha: {best_alpha:.3f} -> avg_acc={best_acc:.6f}")
+        print(f"\nBest setting: {describe_candidate(best_result.candidate)} -> avg_acc={best_acc:.6f}")
 
     print("\nPer-task accuracy at best alpha:")
-    best_vals = alpha_to_task_accs[best_alpha]
-    best_norm_vals = alpha_to_task_norm_accs.get(best_alpha, [])
+    best_vals = list(best_result.per_task_acc)
+    best_norm_vals = list(best_result.per_task_norm_acc)
     for i, td in enumerate(task_data):
         if i < len(best_norm_vals):
             print(f"{td.task}: acc={best_vals[i]:.6f}  norm_acc={best_norm_vals[i]:.3f}")
@@ -1981,8 +2307,23 @@ def main() -> None:
             single_accs=single_accs,
         )
 
-    if alpha_search and cfg.get("save_merged", None) is not None:
-        merged_best_sd = _build_merged_state_from_context(merge_context, alpha=float(best_alpha))
+    if cfg.get("save_merged", None) is not None:
+        best_context = _AlphaMergeContext(
+            method=method,
+            prepared=(prepared if prepared is not None else _prepared_for(best_method_params)),
+            base_sd_for_merge=base_sd_for_merge,
+            tuned_sds_list=tuned_sds_list,
+            weights=merge_weights,
+            method_params=best_method_params,
+            peft_subspace=peft_subspace,
+            subspace=subspace,
+            subspace_prepared=subspace_prepared,
+            peft_cfg=peft_cfg,
+            peft_state_by_task=peft_state_by_task,
+            tasks=tasks,
+            merge_base_sd=merge_base_sd,
+        )
+        merged_best_sd = _build_merged_state_from_context(best_context, alpha=float(best_alpha))
         outp = Path(str(cfg["save_merged"]))
         outp.parent.mkdir(parents=True, exist_ok=True)
         torch.save(merged_best_sd, str(outp))
@@ -1994,6 +2335,9 @@ def main() -> None:
                 "method": method.name,
                 "peft_subspace": peft_subspace,
                 "best_alpha": float(best_alpha),
+                "best_method_params": best_method_params,
+                "search_strategy": search_planner.search_summary(),
+                "search_results": summarize_search_results(search_results),
                 "alpha_to_task_accs": {str(k): [float(v) for v in vals] for k, vals in alpha_to_task_accs.items()},
                 "alpha_to_task_norm_accs": {
                     str(k): [float(v) for v in vals] for k, vals in alpha_to_task_norm_accs.items()

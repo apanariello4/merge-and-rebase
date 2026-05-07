@@ -208,10 +208,21 @@ Built-in merge methods:
 - `cart_merge`: low-rank CART merge for 2D parameters
 - `pcb` and `pcb_merge`: PCB merge on flattened task vectors
 
+For `tsv_merge`, `isoc_merge`, and `isocts_merge`, 2D parameters use the method-specific SVD rule. 1D parameters default to zero task-vector deltas, matching the current repo behavior. To use the paper-style average for 1D parameters instead, set:
+
+```json
+{
+  "method_params": {
+    "vector_1d_merge": "average"
+  }
+}
+```
+
 The functional API in `merge_and_rebase.merge.methods.functional` mirrors these methods through `merge_*` helpers for direct Python use.
 
 Supported evaluation features:
 - alpha search for merged evaluation with caching
+- multi-parameter search across `alpha` and merge `method_params` with sequential grids or Sobol refinement
 
 Evaluation is always performed on the full test set of each dataset.
 
@@ -240,6 +251,42 @@ Or force strict checkpoint-only text features:
 ```
 
 Command-line parameters always override config values.
+
+Multi-parameter search is configured with `hyperparam_search`. Sequential search evaluates ordered method-parameter combinations and sweeps `alpha` inside each combination. Sobol search samples a coarse low-discrepancy set, then refines around the best region.
+
+Example:
+
+```json
+{
+  "method": "ties_merge",
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": {"min": 0.0, "max": 1.0, "step": 0.1},
+    "method_params": {
+      "topk": [0.1, 0.2, 0.5, 1.0]
+    }
+  }
+}
+```
+
+Sobol example:
+
+```json
+{
+  "method": "cart_merge",
+  "hyperparam_search": {
+    "strategy": "sobol",
+    "num_samples": 16,
+    "refinement_steps": 1,
+    "refine_factor": 0.5,
+    "alpha": {"min": 0.0, "max": 1.0, "step": 0.1},
+    "method_params": {
+      "pruning_rank": {"min": 1, "max": 8, "step": 1, "type": "int"},
+      "scaling_coeffs": {"min": 0.0, "max": 1.0, "step": 0.1}
+    }
+  }
+}
+```
 
 For Llama-style causal LMs on NLI tasks such as SNLI, MNLI, SICK, QNLI, RTE, and SciTail:
 
@@ -352,21 +399,3 @@ Key config fields:
 | `alpha` | Fixed scaling factor when `alpha_search` is disabled | `1.0` |
 | `weights` | Per-task composition weights, with `null` meaning uniform weights | `null` |
 | `tuned_ckpts` | Mapping from task name to checkpoint path | — |
-
----
-
-## Citation
-
-If you use this repository in your work, please cite it as:
-
-```bibtex
-@software{panariello2026merge_and_rebase,
-  author = {Panariello, Aniello and Rinaldi, Filippo},
-  title = {merge-and-rebase},
-  year = {2026},
-  url = {https://github.com/apanariello4/merge-and-rebase},
-  version = {0.1.0}
-}
-```
-
-GitHub citation metadata is also available in `CITATION.cff`.

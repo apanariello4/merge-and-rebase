@@ -108,6 +108,13 @@ def _tsv_merge_impl(
     w: torch.Tensor,
     params: Mapping[str, Any],
 ) -> torch.Tensor:
+    if matrices[0].ndim == 1:
+        vector_1d_merge = str(params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("tsv_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
+        if vector_1d_merge == "zero":
+            return torch.zeros_like(matrices[0])
+        return _weighted_average_impl(matrices, w, {"normalize": "sumw"})
     _require_2d(matrices, "tsv_merge")
 
     sv_reduction = float(params.get("sv_reduction", 1.0 / max(1, len(matrices))))
@@ -154,6 +161,13 @@ def _isoc_merge_impl(
     w: torch.Tensor,
     params: Mapping[str, Any],
 ) -> torch.Tensor:
+    if matrices[0].ndim == 1:
+        vector_1d_merge = str(params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("isoc_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
+        if vector_1d_merge == "zero":
+            return torch.zeros_like(matrices[0])
+        return _weighted_average_impl(matrices, w, {"normalize": "sumw"})
     _require_2d(matrices, "isoc_merge")
     svd_dtype = _parse_dtype(str(params.get("svd_dtype", "float64")))
     if svd_dtype not in {torch.float32, torch.float64}:
@@ -176,6 +190,13 @@ def _isocts_merge_impl(
     w: torch.Tensor,
     params: Mapping[str, Any],
 ) -> torch.Tensor:
+    if matrices[0].ndim == 1:
+        vector_1d_merge = str(params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("isocts_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
+        if vector_1d_merge == "zero":
+            return torch.zeros_like(matrices[0])
+        return _weighted_average_impl(matrices, w, {"normalize": "sumw"})
     _require_2d(matrices, "isocts_merge")
     common_space_fraction = float(params.get("common_space_fraction", 0.8))
     svd_dtype = _parse_dtype(str(params.get("svd_dtype", "float64")))

@@ -7,7 +7,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm import tqdm
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 from ..base import TensorDict
 from ..registry import register
@@ -74,7 +78,8 @@ def compute_gradient_signs(
     if vote_mode == "majority":
         sign_sums = {}
 
-    for batch in tqdm(dataloader, desc="Computing gradient signs"):
+    iterator = tqdm(dataloader, desc="Computing gradient signs") if tqdm is not None else dataloader
+    for batch in iterator:
         loss, named_params = recipe(model, batch)
 
         # First-batch initialisation
@@ -264,20 +269,24 @@ class GradFixRebase:
         mask_mode: str = "normal",
         vote: str = "mean",
         gradient_signs: Mapping[str, torch.Tensor] | None = None,
+        prepared: Mapping[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> TensorDict:
         """
         Full pipeline: prepare (if signs not provided) then apply.
 
         You can either:
-          - pass ``gradient_signs`` directly (if you already called ``prepare``)
+          - pass ``gradient_signs`` or ``prepared`` directly (if you already called ``prepare``)
           - pass ``target_model`` + ``target_dataloader`` + ``recipe``
             and signs will be computed here.
         """
+        if gradient_signs is None and prepared is not None:
+            gradient_signs = prepared
+
         if gradient_signs is None:
             if target_model is None or target_dataloader is None or recipe is None:
                 raise ValueError(
-                    "GradFix.transport requires either gradient_signs or (target_model + target_dataloader + recipe)."
+                    "GradFix.transport requires either gradient_signs/prepared or (target_model + target_dataloader + recipe)."
                 )
             gradient_signs = self.prepare(
                 target_model=target_model,

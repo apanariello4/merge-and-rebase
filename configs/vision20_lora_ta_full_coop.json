@@ -21,11 +21,11 @@
         "OxfordIIITPet": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/OxfordIIITPet/peft_lora_last_ep.pt",
         "PCAM": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/PCAM/peft_lora_last_ep.pt",
         "FER2013": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/FER2013/peft_lora_last_ep.pt",
-        "EMNIST": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/EMNIST/peft_lora_last_ep.pt",
+        "EMNIST": "src/checkpoints/finetune/ViT-B-32/openai/EMNIST/full_last_ep.pt",
         "CIFAR10": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/CIFAR10/peft_lora_last_ep.pt",
         "Food101": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/Food101/peft_lora_last_ep.pt",
         "FashionMNIST": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/FashionMNIST/peft_lora_last_ep.pt",
         "RenderedSST2": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/RenderedSST2/peft_lora_last_ep.pt",
-        "KMNIST": "src/checkpoints/finetune_two_stage_coop/ViT-B-32/openai/KMNIST/peft_lora_last_ep.pt"
+        "KMNIST": "src/checkpoints/finetune/ViT-B-32/openai/KMNIST/full_last_ep.pt"
     }
 }

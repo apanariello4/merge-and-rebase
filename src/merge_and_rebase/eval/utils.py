@@ -8,7 +8,11 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 try:
     from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict

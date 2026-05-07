@@ -20,11 +20,11 @@
         "OxfordIIITPet": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/OxfordIIITPetVal/nonlinear_finetuned.pt",
         "PCAM": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/PCAMVal/nonlinear_finetuned.pt",
         "FER2013": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/FER2013Val/nonlinear_finetuned.pt",
-        "EMNIST": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/EMNISTVal/nonlinear_finetuned.pt",
+        "EMNIST": "src/checkpoints/finetune/ViT-B-32/openai/EMNIST/full_last_ep.pt",
         "CIFAR10": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/CIFAR10Val/nonlinear_finetuned.pt",
         "Food101": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/Food101Val/nonlinear_finetuned.pt",
         "FashionMNIST": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/FashionMNISTVal/nonlinear_finetuned.pt",
         "RenderedSST2": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/RenderedSST2Val/nonlinear_finetuned.pt",
-        "KMNIST": "src/checkpoints/tsv/models/checkpoints/ViT-B-32/KMNISTVal/nonlinear_finetuned.pt"
+        "KMNIST": "src/checkpoints/finetune/ViT-B-32/openai/KMNIST/full_last_ep.pt"
     }
 }

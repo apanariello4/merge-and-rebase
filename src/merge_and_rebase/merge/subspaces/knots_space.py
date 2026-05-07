@@ -6,7 +6,7 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
-from .core_space import build_lora_groups
+from .core_space import _lora_scaling_for_layer, build_lora_groups
 from .registry import register
 
 
@@ -51,8 +51,8 @@ class KnotsSpace:
                 layer = layer_groups[task].get(layer_key, None)
                 if layer is None:
                     raise ValueError(f"Missing LoRA layer '{layer_key}' for task '{task}'.")
-                # scale = _lora_scaling_for_layer(layer_key, layer, peft_cfg)
-                delta = layer.b.to(dtype=torch.float32) @ layer.a.to(dtype=torch.float32)
+                scale = _lora_scaling_for_layer(layer_key, layer, peft_cfg)
+                delta = scale * (layer.b.to(dtype=torch.float32) @ layer.a.to(dtype=torch.float32))
                 full_updates.append(delta)
                 if in_dim is None:
                     in_dim = int(delta.shape[1])

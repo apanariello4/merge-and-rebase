@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import sys
 import importlib.machinery
-from types import ModuleType
-from pathlib import Path
-from types import SimpleNamespace
+import sys
 from contextlib import nullcontext
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -50,10 +49,10 @@ _attention_stub.sdpa_kernel = lambda *args, **kwargs: nullcontext()
 _attention_stub.__spec__ = importlib.machinery.ModuleSpec("torch.nn.attention", loader=None)
 sys.modules.setdefault("torch.nn.attention", _attention_stub)
 
-from merge_and_rebase.eval import vision_merge
-from merge_and_rebase.finetune import train_text, train_vision
-from merge_and_rebase.models.text_lm import TextBuildConfig
-from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
+from merge_and_rebase.eval import vision_merge  # noqa: E402
+from merge_and_rebase.finetune import train_text, train_vision  # noqa: E402
+from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig  # noqa: E402
+from merge_and_rebase.models.text_lm import TextBuildConfig  # noqa: E402
 
 
 class _FakeLogger:
@@ -305,3 +304,23 @@ def test_vision_merge_zero_shot_logs_summary(tmp_path: Path, monkeypatch):
 
     assert fake_logger.summaries
     assert fake_logger.summaries[-1]["mode"] == "zero_shot_only"
+
+
+def test_vision_merge_save_helper_writes_raw_state_dict(tmp_path: Path):
+    out_path = tmp_path / "merged.pt"
+    state = {
+        "weight": torch.tensor([1.0, 2.0]),
+        "bias": torch.tensor([0.5]),
+    }
+
+    saved_path = vision_merge._save_merged_state_dict_if_requested(
+        state,
+        out_path,
+        label="test merged",
+    )
+
+    assert saved_path == str(out_path)
+    loaded = torch.load(out_path, map_location="cpu")
+    assert set(loaded) == {"weight", "bias"}
+    assert torch.equal(loaded["weight"], state["weight"])
+    assert torch.equal(loaded["bias"], state["bias"])

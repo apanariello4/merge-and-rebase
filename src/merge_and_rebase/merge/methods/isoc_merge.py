@@ -9,7 +9,7 @@ from tqdm import tqdm
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights
+from ._common import axpy_state_dict, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,10 @@ class IsoCMerge:
         **kwargs,
     ) -> tuple[TensorDict, TensorDict]:
         w = default_weights(len(tuned), weights)
+        method_params = get_method_params(kwargs)
+        vector_1d_merge = str(method_params.get("vector_1d_merge", "zero")).strip().lower()
+        if vector_1d_merge not in {"zero", "average"}:
+            raise ValueError("isoc_merge method_params['vector_1d_merge'] must be 'zero' or 'average'.")
 
         tvs = [TaskVector.from_checkpoints(base, t, strict=strict) for t in tuned]
 
@@ -37,6 +41,12 @@ class IsoCMerge:
             b = base[k]
             if b.ndim == 2 and "text_projection" not in k:
                 direction[k] = self._isoc_delta([d[k] for d in deltas], w=w).to(dtype=b.dtype, device=b.device)
+            elif b.ndim == 1 and vector_1d_merge == "average":
+                denom = float(w.sum().clamp_min(1e-12).item())
+                acc = torch.zeros_like(b)
+                for wi, d in zip(w, deltas, strict=True):
+                    acc = acc + float(wi) * d[k].to(dtype=acc.dtype, device=acc.device)
+                direction[k] = (acc / denom).to(dtype=b.dtype, device=b.device)
             else:
                 direction[k] = torch.zeros_like(b)
         return base, direction
@@ -60,6 +70,7 @@ class IsoCMerge:
             tuned=tuned,
             weights=weights,
             strict=strict,
+            **kwargs,
         )
         return self.apply(prepared, alpha=float(alpha))
 
