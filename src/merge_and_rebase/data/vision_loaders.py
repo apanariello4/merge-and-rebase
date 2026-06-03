@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -9,10 +10,27 @@ import torch
 from datasets import ClassLabel, DatasetDict, Features
 from datasets import Dataset as HFDataset
 from datasets import load_dataset as hf_load_dataset
-from PIL import ImageFile
+from PIL import ExifTags, Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def _ensure_pillow_exif_compat() -> None:
+    # datasets may access PIL.Image.ExifTags.Base.Orientation, which is missing
+    # in older Pillow versions. Provide a minimal compatibility shim.
+    if not hasattr(Image, "ExifTags"):
+        Image.ExifTags = ExifTags
+    if not hasattr(Image.ExifTags, "Base"):
+        orientation = 274
+        for tag, name in getattr(ExifTags, "TAGS", {}).items():
+            if name == "Orientation":
+                orientation = int(tag)
+                break
+        Image.ExifTags.Base = SimpleNamespace(Orientation=orientation)
+
+
+_ensure_pillow_exif_compat()
 
 LabelRemap = dict[int, int] | Sequence[int] | np.ndarray | Callable[[int], int] | None
 

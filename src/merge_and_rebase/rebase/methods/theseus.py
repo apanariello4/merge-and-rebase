@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -513,7 +514,7 @@ def _compute_procrustes_map_from_cov(cov: torch.Tensor) -> torch.Tensor:
 
 
 def _transport_weight(delta_weight: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor, *, key: str) -> torch.Tensor:
-    if key == "proj":
+    if key == "proj" or key.endswith(".proj"):
         return (t_out.T @ delta_weight.T @ t_in).T
     return t_out.T @ delta_weight @ t_in
 
@@ -529,6 +530,87 @@ def _param_to_module(visual_model: torch.nn.Module) -> dict[str, str]:
             full_name = f"{module_name}.{param_name}" if module_name else param_name
             out[full_name] = module_name
     return out
+
+
+_RESBLOCK_RE = re.compile(r"^transformer\.resblocks\.(\d+)(?:\.(.*))?$")
+
+
+def _activation_group(module_name: str, *, granularity: str) -> str:
+    if granularity == "param":
+        return module_name
+    if granularity == "global":
+        return "global"
+
+    match = _RESBLOCK_RE.match(module_name)
+    if match is None:
+        return module_name
+
+    block_idx = match.group(1)
+    suffix = match.group(2) or ""
+
+    if granularity == "block":
+        return f"transformer.resblocks.{block_idx}"
+
+    if granularity == "module_type":
+        if suffix:
+            return f"transformer.resblocks.*.{suffix}"
+        return "transformer.resblocks.*"
+
+    raise ValueError(
+        "Unsupported transform_granularity. Expected one of: param, module_type, block, global. "
+        f"Got: {granularity}"
+    )
+
+
+def _build_grouped_covariances(
+    activation_registry: Mapping[str, ActivationStore],
+    *,
+    center_acts: bool,
+    granularity: str,
+) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
+    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+
+    for act_key, store in activation_registry.items():
+        if act_key.endswith(".in"):
+            side = "in"
+            module_name = act_key[: -len(".in")]
+        elif act_key.endswith(".out"):
+            side = "out"
+            module_name = act_key[: -len(".out")]
+        else:
+            continue
+
+        cov = store.get_covariance(center=center_acts)
+        if cov is None:
+            continue
+
+        group = _activation_group(module_name, granularity=granularity)
+        shape_key = (int(cov.shape[0]), int(cov.shape[1]))
+        key = (group, side, shape_key)
+        if key in grouped_covariances:
+            grouped_covariances[key] = grouped_covariances[key] + cov
+        else:
+            grouped_covariances[key] = cov.clone()
+
+    return grouped_covariances
+
+
+def _build_grouped_transforms(
+    grouped_covariances: Mapping[tuple[str, str, tuple[int, int]], torch.Tensor],
+    *,
+    show_progress: bool,
+    method_name: str,
+) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
+    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+    items = _iter_with_progress(
+        grouped_covariances.items(),
+        total=len(grouped_covariances),
+        desc=f"{method_name}.prepare: compute shared transforms",
+        enabled=show_progress,
+    )
+    for key, cov in items:
+        grouped_transforms[key] = _compute_procrustes_map_from_cov(cov)
+    return grouped_transforms
 
 
 def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) -> Any:
@@ -602,6 +684,25 @@ class _LayerTransform:
     t_out: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class _PrecomputeDiagnostics:
+    assigned_keys: int
+    shared_transform_count: int
+    shared_group_count: int
+
+
+@dataclass(frozen=True)
+class _ApplyDiagnostics:
+    transformed_weight: int
+    transformed_bias: int
+    zero_passthrough: int
+    missing_transform: int
+    transport_failures: int
+    wrong_shape: int
+    wrong_shape_examples: tuple[str, ...]
+    skipped_not_in_target_visual: int
+
+
 def _precompute_transforms(
     *,
     target_model: torch.nn.Module,
@@ -609,18 +710,54 @@ def _precompute_transforms(
     visual_delta: Mapping[str, torch.Tensor],
     activation_registry: Mapping[str, ActivationStore],
     center_acts: bool,
+    transform_granularity: str,
     show_progress: bool,
     method_name: str,
-) -> dict[str, _LayerTransform]:
+) -> tuple[dict[str, _LayerTransform], _PrecomputeDiagnostics]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
     visual_model = _visual_module(target_model)
     param_to_module = _param_to_module(visual_model)
+    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+
+    if transform_granularity != "param":
+        grouped_covariances = _build_grouped_covariances(
+            activation_registry,
+            center_acts=center_acts,
+            granularity=transform_granularity,
+        )
+        grouped_transforms = _build_grouped_transforms(
+            grouped_covariances,
+            show_progress=show_progress,
+            method_name=method_name,
+        )
+
+    def _transform_for(
+        module_name: str,
+        *,
+        side: str,
+        expected_shape: tuple[int, int],
+        fallback_key: str,
+    ) -> torch.Tensor | None:
+        if transform_granularity == "param":
+            store = activation_registry.get(fallback_key)
+            if store is None:
+                return None
+            cov = store.get_covariance(center=center_acts)
+            if cov is None:
+                return None
+            if (int(cov.shape[0]), int(cov.shape[1])) != expected_shape:
+                return None
+            return _compute_procrustes_map_from_cov(cov)
+
+        group = _activation_group(module_name, granularity=transform_granularity)
+        return grouped_transforms.get((group, side, expected_shape))
 
     items = _iter_with_progress(
         visual_delta.items(),
         total=len(visual_delta),
-        desc=f"{method_name}.prepare: compute transforms",
+        desc=f"{method_name}.prepare: assign transforms",
         enabled=show_progress,
     )
     for key, delta_source in items:
@@ -636,22 +773,29 @@ def _precompute_transforms(
         if key == "proj":
             in_key = "ln_post.out"
             out_key = ".out"
+            in_module = "ln_post"
+            out_module = ""
         else:
             in_key = f"{module_name}.in"
             out_key = f"{module_name}.out"
+            in_module = module_name
+            out_module = module_name
 
         if delta_source.ndim == 2:
-            in_store = activation_registry.get(in_key)
-            out_store = activation_registry.get(out_key)
-            if in_store is not None and out_store is not None:
-                cov_in = in_store.get_covariance(center=center_acts)
-                cov_out = out_store.get_covariance(center=center_acts)
-                if cov_in is not None and cov_out is not None:
-                    t_in = _compute_procrustes_map_from_cov(cov_in)
-                    t_out = _compute_procrustes_map_from_cov(cov_out)
+            target_ref = target_visual_base[key]
+            if key == "proj":
+                expected_in = (int(delta_source.shape[0]), int(target_ref.shape[0]))
+                expected_out = (int(delta_source.shape[1]), int(target_ref.shape[1]))
+            else:
+                expected_in = (int(delta_source.shape[1]), int(target_ref.shape[1]))
+                expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
 
-                    transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
-                    continue
+            t_in = _transform_for(in_module, side="in", expected_shape=expected_in, fallback_key=in_key)
+            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
+            if t_in is not None and t_out is not None:
+
+                transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+                continue
             transforms_by_key[key] = _LayerTransform(kind="weight")
             continue
 
@@ -670,20 +814,24 @@ def _precompute_transforms(
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=cached_t_out)
                 continue
 
-            out_store = activation_registry.get(out_key)
-            if out_store is not None:
-                cov_out = out_store.get_covariance(center=center_acts)
-                if cov_out is not None:
-                    t_out = _compute_procrustes_map_from_cov(cov_out)
-                    t_out_cache[out_key] = t_out
-                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
-                    continue
+            target_ref = target_visual_base[key]
+            expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
+            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
+            if t_out is not None:
+                t_out_cache[out_key] = t_out
+                transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+                continue
             transforms_by_key[key] = _LayerTransform(kind="bias")
             continue
 
         transforms_by_key[key] = _LayerTransform(kind="unsupported")
 
-    return transforms_by_key
+    diagnostics = _PrecomputeDiagnostics(
+        assigned_keys=len(transforms_by_key),
+        shared_transform_count=(len(grouped_transforms) if transform_granularity != "param" else 0),
+        shared_group_count=(len(grouped_covariances) if transform_granularity != "param" else 0),
+    )
+    return transforms_by_key, diagnostics
 
 
 def _apply_transforms_to_visual_delta(
@@ -693,8 +841,16 @@ def _apply_transforms_to_visual_delta(
     transforms_by_key: Mapping[str, _LayerTransform],
     show_progress: bool,
     method_name: str,
-) -> TensorDict:
+) -> tuple[TensorDict, _ApplyDiagnostics]:
     aligned: TensorDict = {}
+    transformed_weight = 0
+    transformed_bias = 0
+    zero_passthrough = 0
+    missing_transform = 0
+    transport_failures = 0
+    wrong_shape = 0
+    wrong_shape_examples: list[str] = []
+    skipped_not_in_target_visual = 0
 
     items = _iter_with_progress(
         visual_delta.items(),
@@ -705,23 +861,37 @@ def _apply_transforms_to_visual_delta(
     for key, delta_source in items:
         if key not in target_visual_base:
             print(f"Theseus align: skipping task vector key:{key} as it is not in target visual base.")
+            skipped_not_in_target_visual += 1
             continue
 
         target_ref = target_visual_base[key]
         transported = torch.zeros_like(target_ref, dtype=torch.float32, device="cpu")
 
         transform = transforms_by_key.get(key)
+        applied = False
         if transform is not None:
+            if transform.kind == "zero":
+                zero_passthrough += 1
+                applied = True
             if transform.kind == "weight" and delta_source.ndim == 2 and transform.t_in is not None and transform.t_out is not None:
                 try:
                     transported = _transport_weight(delta_source.float().cpu(), transform.t_in, transform.t_out, key=key)
+                    transformed_weight += 1
+                    applied = True
                 except RuntimeError as exc:
                     logger.warning("Theseus transport failed for %s: %s", key, exc)
+                    transport_failures += 1
             elif transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None:
                 try:
                     transported = _transport_bias(delta_source.float().cpu(), transform.t_out)
+                    transformed_bias += 1
+                    applied = True
                 except ValueError as exc:
                     logger.warning("Theseus vector transport failed for %s: %s", key, exc)
+                    transport_failures += 1
+
+        if not applied and key in target_visual_base:
+            missing_transform += 1
 
         if transported.shape != target_ref.shape:
             logger.warning(
@@ -730,11 +900,24 @@ def _apply_transforms_to_visual_delta(
                 tuple(transported.shape),
                 tuple(target_ref.shape),
             )
+            wrong_shape += 1
+            if len(wrong_shape_examples) < 5:
+                wrong_shape_examples.append(key)
             transported = torch.zeros_like(target_ref, dtype=torch.float32, device="cpu")
 
         aligned[key] = transported.to(dtype=target_ref.dtype, device=target_ref.device)
 
-    return aligned
+    diagnostics = _ApplyDiagnostics(
+        transformed_weight=transformed_weight,
+        transformed_bias=transformed_bias,
+        zero_passthrough=zero_passthrough,
+        missing_transform=missing_transform,
+        transport_failures=transport_failures,
+        wrong_shape=wrong_shape,
+        wrong_shape_examples=tuple(wrong_shape_examples),
+        skipped_not_in_target_visual=skipped_not_in_target_visual,
+    )
+    return aligned, diagnostics
 
 
 @dataclass(frozen=True)
@@ -765,6 +948,9 @@ class TheseusRebase:
         split_qkv = kwargs.pop("split_qkv", None)
         if split_qkv is not None:
             patch_qkv = bool(split_qkv)
+        transform_granularity = str(kwargs.pop("transform_granularity", "param")).strip().lower()
+        if transform_granularity not in {"param", "module_type", "block", "global"}:
+            raise ValueError("transform_granularity must be one of: param, module_type, block, global")
         del kwargs
         #Config fallbacks num_batches -> n_batches
         if n_batches is None:
@@ -774,7 +960,8 @@ class TheseusRebase:
         if verbose:
             print(
                 f"{log_prefix} prepare: start "
-                f"(seq_align={seq_align}, center_acts={bool(center_acts)}, n_batches={n_batches}, seed={int(seed)})"
+                f"(seq_align={seq_align}, center_acts={bool(center_acts)}, n_batches={n_batches}, "
+                f"seed={int(seed)}, transform_granularity={transform_granularity})"
             )
 
         patched_source = 0
@@ -796,6 +983,7 @@ class TheseusRebase:
 
         activation_registry: dict[str, ActivationStore] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
+        precompute_diag = _PrecomputeDiagnostics(assigned_keys=0, shared_transform_count=0, shared_group_count=0)
         split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
@@ -832,17 +1020,24 @@ class TheseusRebase:
                     target_visual_base = _split_fused_qkv_state(target_visual_base)
                     visual_delta = _split_fused_qkv_state(visual_delta)
 
-                transforms_by_key = _precompute_transforms(
+                transforms_by_key, precompute_diag = _precompute_transforms(
                     target_model=target_model,
                     target_visual_base=target_visual_base,
                     visual_delta=visual_delta,
                     activation_registry=activation_registry,
                     center_acts=bool(center_acts),
+                    transform_granularity=transform_granularity,
                     show_progress=bool(show_progress),
                     method_name=self.name,
                 )
                 if verbose:
-                    print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
+                    if transform_granularity == "param":
+                        print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
+                    else:
+                        print(
+                            f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)} "
+                            f"(shared={precompute_diag.shared_transform_count}, groups={precompute_diag.shared_group_count})"
+                        )
             elif verbose:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
         finally:
@@ -870,6 +1065,12 @@ class TheseusRebase:
             "patched_target_blocks": patched_target,
             "unpatched_source_blocks": unpatched_source,
             "unpatched_target_blocks": unpatched_target,
+            "transform_granularity": transform_granularity,
+            "precompute_diagnostics": {
+                "assigned_keys": precompute_diag.assigned_keys,
+                "shared_transform_count": precompute_diag.shared_transform_count,
+                "shared_group_count": precompute_diag.shared_group_count,
+            },
         }
 
     def apply(
@@ -913,7 +1114,7 @@ class TheseusRebase:
         if strict and not visual_delta_work:
             raise ValueError("Theseus did not find any visual delta keys to transport.")
 
-        aligned_visual = _apply_transforms_to_visual_delta(
+        aligned_visual, apply_diag = _apply_transforms_to_visual_delta(
             target_visual_base=target_visual_base_work,
             visual_delta=visual_delta_work,
             transforms_by_key=transforms_by_key,
@@ -950,6 +1151,17 @@ class TheseusRebase:
                 raise KeyError(f"Theseus did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
+            if apply_diag.wrong_shape > 0:
+                print(
+                    f"{log_prefix} apply: warnings wrong_shape={apply_diag.wrong_shape} "
+                    f"examples={list(apply_diag.wrong_shape_examples)}"
+                )
+            print(
+                f"{log_prefix} apply: diagnostics "
+                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
+                f"zero={apply_diag.zero_passthrough} "
+                f"missing={apply_diag.missing_transform} failures={apply_diag.transport_failures}"
+            )
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out
