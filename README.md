@@ -10,8 +10,6 @@
 
 `merge-and-rebase` is a research codebase for model merging, task-vector transport, and configurable fine-tuning across vision and text models. It is built for fast iteration on checkpoint merging, rebasing, and evaluation workflows.
 
-> Code for reproducing the results of **DELTA: Distilling Linearized Behavior into Non-Linear Fine-Tuning for Effective Task Arithmetic** ([paper](https://arxiv.org/pdf/2605.18993)) and **TAK: Dataless Weight Disentanglement in Task Arithmetic via Kronecker-Factored Approximate Curvature** ([paper](https://arxiv.org/pdf/2602.17385)) will be available soon.
-
 ## Highlights
 
 - Config-driven OpenCLIP fine-tuning across multiple datasets
@@ -220,7 +218,7 @@ For `tsv_merge`, `isoc_merge`, and `isocts_merge`, 2D parameters use the method-
 }
 ```
 
-The functional API in `merge_and_rebase.merge.methods.functional` mirrors these methods through `merge_*` helpers for direct Python use.
+The functional API in `merge_and_rebase.merge.methods.functional` exposes the raw-matrix helpers for the functional merge methods.
 
 Supported evaluation features:
 - alpha search for merged evaluation with caching
@@ -401,3 +399,21 @@ Key config fields:
 | `alpha` | Fixed scaling factor when `alpha_search` is disabled | `1.0` |
 | `weights` | Per-task composition weights, with `null` meaning uniform weights | `null` |
 | `tuned_ckpts` | Mapping from task name to checkpoint path | — |
+
+---
+
+## Citation
+
+If you use this repository in your work, please cite it as:
+
+```bibtex
+@software{panariello2026merge_and_rebase,
+  author = {Panariello, Aniello and Rinaldi, Filippo},
+  title = {merge-and-rebase},
+  year = {2026},
+  url = {https://github.com/apanariello4/merge-and-rebase},
+  version = {0.1.0}
+}
+```
+
+GitHub citation metadata is also available in `CITATION.cff`.

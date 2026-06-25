@@ -3,8 +3,31 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
+from huggingface_hub import hf_hub_download
 
 TensorDict = dict[str, torch.Tensor]
+
+_HF_HUB_CACHE: dict[str, str] = {}
+
+
+def resolve_ckpt_path(path: str) -> str:
+    if not path.startswith("hf-hub:"):
+        return path
+    ref = path[len("hf-hub:"):]
+    parts = ref.split("/", 2)
+    if len(parts) < 3:
+        raise ValueError(
+            f"Invalid hf-hub reference '{path}'. Expected format: "
+            "hf-hub:org/repo/path/to/file.pt"
+        )
+    repo_id = f"{parts[0]}/{parts[1]}"
+    filename = parts[2]
+    cache_key = f"{repo_id}/{filename}"
+    if cache_key not in _HF_HUB_CACHE:
+        _HF_HUB_CACHE[cache_key] = hf_hub_download(
+            repo_id=repo_id, filename=filename, repo_type="model"
+        )
+    return _HF_HUB_CACHE[cache_key]
 
 
 def unwrap_state_dict(obj) -> TensorDict:

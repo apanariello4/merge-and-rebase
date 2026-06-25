@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "merge-and-rebase"
 version = "0.1.0"
+authors = [
+  {name = "Aniello Panariello", email = "a.panariello4@gmail.com"},
+  {name = "Filippo Rinaldi", email = "filippo.rinaldi@unimore.it"}
+]
 description = "Codebase for model merging and rebasin"
 license = {file = "LICENSE"}
 readme = "README.md"
@@ -16,8 +20,11 @@ dependencies = [
   "pyyaml>=6.0.1",
   "open_clip_torch>=2.24.0",
   "torchvision>=0.16",
-  "transformers>=4.38",
+  "transformers>=4.45",
   "peft>=0.14.0",
+  "accelerate>=0.26",
+  "safetensors>=0.4",
+  "Pillow>=10.0.0",
   "protobuf>=6.33.5",
   "sentencepiece>=0.2.1",
   "tiktoken>=0.12.0",
@@ -29,7 +36,6 @@ dependencies = [
 # Core data stack for your vision benchmarks (HF datasets + PIL + hub)
 data = [
   "datasets>=2.16",
-  "Pillow>=10.0.0",
   "huggingface-hub>=0.20",
 ]
 

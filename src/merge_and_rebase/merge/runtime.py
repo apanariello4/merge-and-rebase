@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from merge_and_rebase.io.peft_helpers import normalize_peft_visual_state_dict_keys
+
 
 def to_cpu_fp32(sd: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {k: v.detach().cpu().to(dtype=torch.float32) for k, v in sd.items()}
@@ -24,6 +26,7 @@ def extract_peft_components(ckpt_obj: dict[str, Any]) -> tuple[dict[str, torch.T
     if not isinstance(peft_cfg_map, dict) or not peft_cfg_map:
         raise ValueError("Invalid PEFT checkpoint: missing 'peft_config'.")
     state = {str(k): v.detach().cpu() for k, v in peft_state.items() if torch.is_tensor(v)}
+    state = normalize_peft_visual_state_dict_keys(state)
     if not state:
         raise ValueError("Invalid PEFT checkpoint: 'peft_state_dict' contains no tensors.")
     return state, peft_cfg_map
@@ -89,6 +92,50 @@ def compose_weighted_deltas(
     return out
 
 
+def build_dense_delta_branch(
+    *,
+    tasks: Sequence[str],
+    full_tuned_by_task: Mapping[str, Mapping[str, torch.Tensor]],
+    lora_only_tuned_by_task: Mapping[str, Mapping[str, torch.Tensor]],
+    base_sd: Mapping[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[dict[str, torch.Tensor]]]:
+    dense_keys: set[str] = set()
+    dense_by_task: dict[str, dict[str, torch.Tensor]] = {}
+
+    for task in tasks:
+        full_sd = full_tuned_by_task[task]
+        lora_sd = lora_only_tuned_by_task[task]
+        task_dense: dict[str, torch.Tensor] = {}
+        candidate_keys = set(full_sd.keys()) | set(lora_sd.keys())
+        for key in candidate_keys:
+            if key not in base_sd:
+                continue
+            base_value = base_sd[key]
+            full_value = full_sd.get(key, base_value)
+            lora_value = lora_sd.get(key, base_value)
+            if torch.equal(full_value, lora_value):
+                continue
+            task_dense[key] = full_value.to(dtype=base_value.dtype) - lora_value.to(dtype=base_value.dtype)
+        dense_by_task[task] = task_dense
+        dense_keys.update(task_dense.keys())
+
+    if not dense_keys:
+        return {}, []
+
+    ordered_keys = sorted(dense_keys)
+    dense_base = {key: torch.zeros_like(base_sd[key]) for key in ordered_keys}
+    dense_tuned: list[dict[str, torch.Tensor]] = []
+    for task in tasks:
+        task_dense = dense_by_task[task]
+        dense_tuned.append(
+            {
+                key: task_dense.get(key, torch.zeros_like(base_sd[key]))
+                for key in ordered_keys
+            }
+        )
+    return dense_base, dense_tuned
+
+
 def build_merged_state_for_alpha(
     *,
     method: Any,
@@ -105,6 +152,9 @@ def build_merged_state_for_alpha(
     peft_state_by_task: dict[str, dict[str, torch.Tensor]] | None = None,
     tasks: list[str] | None = None,
     merge_base_sd: dict[str, torch.Tensor] | None = None,
+    dense_prepared: Any = None,
+    dense_base_sd_for_merge: dict[str, torch.Tensor] | None = None,
+    dense_tuned_sds_list: Sequence[Mapping[str, torch.Tensor]] | None = None,
 ) -> dict[str, torch.Tensor]:
     merge_alpha = 1.0 if peft_subspace != "full" else float(alpha)
     if prepared is not None:
@@ -128,12 +178,40 @@ def build_merged_state_for_alpha(
     if peft_state_by_task is None or tasks[0] not in peft_state_by_task:
         raise RuntimeError("Subspace lifting requires PEFT state templates by task.")
 
+    refine_merged_core = getattr(subspace, "refine_merged_core", None)
+    if callable(refine_merged_core):
+        merged_sd = refine_merged_core(
+            subspace_prepared,
+            merged_core=merged_sd,
+            tuned_cores=tuned_sds_list,
+            weights=weights,
+            method_params=method_params,
+            tasks=tasks,
+            peft_cfg=peft_cfg,
+        )
+
     merged_delta = subspace.lift(
         subspace_prepared,
         merged_core=merged_sd,
         lora_template=peft_state_by_task[tasks[0]],
         peft_cfg=peft_cfg,
     )
+    if dense_tuned_sds_list and dense_base_sd_for_merge:
+        if dense_prepared is not None:
+            merged_dense_delta = method.apply(prepared=dense_prepared, alpha=1.0)
+        else:
+            merged_dense_delta = method.merge(
+                base=dense_base_sd_for_merge,
+                tuned=dense_tuned_sds_list,
+                weights=weights,
+                alpha=1.0,
+                method_params=method_params,
+            )
+        for key, value in merged_dense_delta.items():
+            if key in merged_delta:
+                merged_delta[key] = merged_delta[key] + value.to(dtype=merged_delta[key].dtype, device=merged_delta[key].device)
+            else:
+                merged_delta[key] = value
     if float(alpha) != 1.0:
         merged_delta = {k: v * float(alpha) for k, v in merged_delta.items()}
     return apply_delta(merge_base_sd, merged_delta)

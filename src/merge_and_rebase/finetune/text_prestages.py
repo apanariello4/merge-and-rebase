@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from .strategies.full import cosine_lr
+from .schedulers import build_lr_scheduler
 
 
 def _optimizer_from_name(params, name: str, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -77,6 +77,7 @@ def _resolve_text_embeddings_finetune_cfg(
         "optimizer": str(cfg.get("optimizer", "adamw")),
         "lr": float(cfg.get("lr", default_lr)),
         "weight_decay": float(cfg.get("weight_decay", default_weight_decay)),
+        "scheduler_name": str(cfg.get("scheduler_name", "cosine")),
         "warmup_length": warmup_length,
         "clip_grad_norm": float(cfg.get("grad_clip_norm", default_clip_grad_norm)),
         "accumulate_grad_batches": accumulate_grad_batches,
@@ -151,6 +152,7 @@ def _resolve_text_prompt_tuning_cfg(
         "optimizer": str(cfg.get("optimizer", "adamw")),
         "lr": float(cfg.get("lr", default_lr)),
         "weight_decay": float(cfg.get("weight_decay", default_weight_decay)),
+        "scheduler_name": str(cfg.get("scheduler_name", "cosine")),
         "warmup_length": warmup_length,
         "clip_grad_norm": float(cfg.get("grad_clip_norm", default_clip_grad_norm)),
         "accumulate_grad_batches": accumulate_grad_batches,
@@ -304,7 +306,13 @@ def _run_text_feature_optimization_stage(
     accumulate_grad_batches = int(cfg["accumulate_grad_batches"])
     steps_per_epoch = math.ceil(len(loaders.train) / accumulate_grad_batches)
     total_steps = max(1, int(cfg["epochs"]) * steps_per_epoch)
-    scheduler = cosine_lr(opt, float(cfg["lr"]), int(cfg["warmup_length"]), total_steps)
+    scheduler = build_lr_scheduler(
+        opt,
+        name=str(cfg.get("scheduler_name", "cosine")),
+        base_lrs=float(cfg["lr"]),
+        warmup_length=int(cfg["warmup_length"]),
+        steps=total_steps,
+    )
     loss_fn = nn.CrossEntropyLoss()
     patience_left = int(cfg["early_stopping_patience"])
 
@@ -323,9 +331,11 @@ def _run_text_feature_optimization_stage(
     best_epoch = 0
     best_text = init_text.detach().clone()
     best_aux = capture_best_state() if capture_best_state is not None else None
+    best_elapsed_seconds = 0.0
     last_val = float("nan")
     last_test = float("nan")
     last_epoch = 0
+    last_elapsed_seconds = 0.0
     global_step = 0
     t_start = time.time()
 
@@ -391,6 +401,8 @@ def _run_text_feature_optimization_stage(
         last_epoch = epoch
         last_val = float(val_acc)
         last_test = float(test_acc)
+        epoch_elapsed_seconds = float(time.time() - t_start)
+        last_elapsed_seconds = epoch_elapsed_seconds
         monitor = float(val_acc) if not math.isnan(val_acc) else float(test_acc)
 
         if monitor > best_metric:
@@ -400,6 +412,7 @@ def _run_text_feature_optimization_stage(
             best_epoch = int(epoch)
             best_text = eval_text.detach().clone()
             best_aux = capture_best_state() if capture_best_state is not None else None
+            best_elapsed_seconds = epoch_elapsed_seconds
             patience_left = int(cfg["early_stopping_patience"])
         else:
             patience_left -= 1
@@ -427,9 +440,11 @@ def _run_text_feature_optimization_stage(
         "initial_val_top1": float(init_val),
         "initial_test_top1": float(init_test),
         "best_epoch": int(best_epoch),
+        "best_elapsed_seconds": float(best_elapsed_seconds),
         "best_val_top1": float(best_val),
         "best_test_top1": float(best_test),
         "last_epoch": int(last_epoch),
+        "last_elapsed_seconds": float(last_elapsed_seconds),
         "last_val_top1": float(last_val),
         "last_test_top1": float(last_test),
     }

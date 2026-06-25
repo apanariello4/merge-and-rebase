@@ -27,10 +27,9 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
     if method_name == "theseus":
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        granularity = str(method_params.get("transform_granularity", "param"))
-        if granularity == "param":
-            return f"theseus(batches={batches}, align={seq_align})"
-        return f"theseus(batches={batches}, align={seq_align}, granularity={granularity})"
+        whiten_power = float(method_params.get("whiten_power", 0.0))
+        covariance_mode = str(method_params.get("covariance_mode", "activations"))
+        return f"theseus(batches={batches}, align={seq_align}, cov={covariance_mode}, whiten={whiten_power:g})"
     if method_name == "theseus_reference":
         batches = int(method_params.get("num_batches", 1))
         token_strategy = str(method_params.get("token_strategy", "interpolate_2d"))
@@ -40,12 +39,4 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         max_iter = int(method_params.get("max_iter", 100))
         intra_head = bool(method_params.get("intra_head", True))
         return f"transfusion(iter={max_iter}, intra_head={intra_head})"
-    if method_name == "bico":
-        batches = int(method_params.get("num_batches", 1))
-        seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico(batches={batches}, align={seq_align})"
-    if method_name == "bico_gradin":
-        batches = int(method_params.get("num_batches", 1))
-        seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico_gradin(batches={batches}, align={seq_align}, in=grad)"
     return method_name

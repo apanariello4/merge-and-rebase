@@ -123,6 +123,12 @@ def add_alpha_args(
         default=alpha_search_default,
         help=alpha_search_help,
     )
+    parser.add_argument(
+        "--alpha-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop alpha search early when the average normalized accuracy starts decreasing.",
+    )
     parser.add_argument("--alpha-min", type=float, default=alpha_min_default)
     parser.add_argument("--alpha-max", type=float, default=alpha_max_default)
     parser.add_argument("--alpha-step", type=float, default=alpha_step_default)
@@ -202,6 +208,7 @@ def build_common_merge_overrides(
         "strict_load": strict_value,
         "peft_subspace": getattr(args, "peft_subspace", None),
         "alpha_search": getattr(args, "alpha_search", None),
+        "alpha_early_stop": getattr(args, "alpha_early_stop", None),
         "alpha_min": getattr(args, "alpha_min", None),
         "alpha_max": getattr(args, "alpha_max", None),
         "alpha_step": getattr(args, "alpha_step", None),

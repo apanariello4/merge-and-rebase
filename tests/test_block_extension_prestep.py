@@ -111,7 +111,7 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
         extension_strategy="duplicate",
         dampening_factor=1.0,
         n_batches_act=1,
-        skip_ln_correction=True,
+        skip_correction=True,
         skip_final_ln=True,
     )
 

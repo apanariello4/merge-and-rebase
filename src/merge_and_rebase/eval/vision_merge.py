@@ -14,7 +14,11 @@ from merge_and_rebase.hyperparam_search import (
     describe_candidate,
     summarize_search_results,
 )
-from merge_and_rebase.io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
+from merge_and_rebase.io.peft_helpers import (
+    is_peft_adapter_dir_ckpt,
+    load_peft_adapter_dir_components,
+    normalize_peft_adapter_dir_checkpoint,
+)
 from merge_and_rebase.io.utils import atomic_write_json, read_json_silent
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
@@ -40,6 +44,7 @@ from ..eval.utils import (
     TaskAttentionMeta,
     acc_cache_key,
     assert_qkv_patched_before_linearizing,
+    build_dense_delta_branch,
     build_merged_state_for_alpha,
     ensure_peft_cfg_map,
     eval_norm_accs_for_split,
@@ -49,16 +54,25 @@ from ..eval.utils import (
     get_peft_cfg,
     humanize,
     is_peft_checkpoint,
+    load_vision_checkpoint_reference,
     materialize_peft_sd_from_adapter,
     maybe_patch_base_for_task_attn,
+    stable_method_params_cache_key,
     to_cpu_fp32,
 )
-from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
+from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
 from ..merge import subspaces as _subspaces  # noqa: F401
 from ..merge.base import PreparedMergeMethod
+from ..merge.methods._common import resolve_merge_weights
 from ..merge.registry import get_method, list_methods  # methods are registered on import
 from ..merge.subspaces.registry import get_subspace, list_subspaces
-from ..models.forward_modes import get_forward_mode, list_forward_modes
+from ..models.forward_modes import (
+    get_forward_mode,
+    list_forward_modes,
+    normalize_forward_mode_params,
+    resolve_auto_forward_mode,
+    resolve_shared_forward_mode_params,
+)
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..postmerge import PostMergeContext, get_postmerge_method
 from ..run_logging import default_summary_path, merge_logging_config, start_run
@@ -149,6 +163,7 @@ def main() -> None:
     add_tasks_arg(p, help_text="Comma-separated task names, or 'all'.")
 
     # open_clip model
+    p.add_argument("--backbone-name", type=str, default=None, choices=["openclip", "openai_clip"])
     p.add_argument("--clip-model", type=str, default=None)
     p.add_argument("--clip-pretrained", type=str, default=None)
     add_device_dtype_args(p, device_default="cuda", dtype_default=None)
@@ -228,7 +243,7 @@ def main() -> None:
         type=str,
         choices=["auto", *list_forward_modes()],
         default="auto",
-        help="Inference forward mode. 'auto' uses linearized_ntk when all tuned checkpoints have strategy='ntk'.",
+        help="Inference forward mode. 'auto' uses linearized_ntk when all tuned checkpoints explicitly saved forward_mode='linearized_ntk'.",
     )
     add_logging_args(p)
 
@@ -242,6 +257,7 @@ def main() -> None:
         cfg = load_json(args.config)
 
     cli_overrides: dict[str, Any] = {
+        "backbone_name": args.backbone_name,
         "clip_model": args.clip_model,
         "clip_pretrained": args.clip_pretrained,
         "batch_size": args.batch_size,
@@ -303,8 +319,11 @@ def main() -> None:
             "summary_path": str(run_summary_path),
         },
     )
+    subspace_artifact_dir = run_summary_path.with_name(f"{run_summary_path.stem}.artifacts")
 
     tuned_by_task = cfg.get("tuned_ckpts", None)
+    if tuned_by_task is not None:
+        tuned_by_task = {t: resolve_ckpt_path(str(p)) for t, p in tuned_by_task.items()}
     zero_shot_only = _resolve_zero_shot_only(cfg)
     if zero_shot_only:
         if tuned_by_task is not None:
@@ -321,20 +340,32 @@ def main() -> None:
     method_params = dict(method_params)
     strict_load = bool(cfg.get("strict_load", False))
     merge_weights = cfg.get("weights", None)
+    merge_weights_raw = merge_weights
 
     # Build open_clip classifier (single instance used for everything to keep memory bounded)
+    backbone_name = cfg.get("backbone_name", "openclip")
+    dtype = cfg.get("dtype", None)
+    if dtype is None and backbone_name == "openai_clip":
+        # OpenAI CLIP often loads in fp16 on GPU; keep eval in fp32 unless the config
+        # explicitly opts into a lower precision to avoid image/weight dtype mismatches.
+        dtype = "fp32"
+
     build_cfg = OpenClipBuildConfig(
+        loader=backbone_name,
         model_name=cfg.get("clip_model", "ViT-B-32"),
         pretrained=cfg.get("clip_pretrained", "openai"),
         device=cfg.get("device", "cuda"),
-        dtype=cfg.get("dtype", None),
+        dtype=dtype,
     )
     clf = OpenClipClassifier.build(build_cfg)
 
     # Base state dict (CPU) for merging
     base_ckpt = cfg.get("base_ckpt", None)
     if base_ckpt is None:
-        print(f"Using open_clip {build_cfg.model_name} (pretrain={build_cfg.pretrained}) weights as base checkpoint")
+        print(
+            f"Using {build_cfg.loader} {build_cfg.model_name} (pretrain={build_cfg.pretrained}) "
+            "weights as base checkpoint"
+        )
         base_sd = {k: v.detach().cpu() for k, v in clf.model.state_dict().items()}
     else:
         print(f"Loading base checkpoint from {base_ckpt}")
@@ -345,8 +376,10 @@ def main() -> None:
 
     tuned_sds_by_task: dict[str, dict[str, torch.Tensor]] = {}
     peft_state_by_task: dict[str, dict[str, torch.Tensor]] = {}
+    peft_dense_state_by_task: dict[str, dict[str, torch.Tensor]] = {}
     attn_meta_by_task: dict[str, TaskAttentionMeta] = {}
-    strategy_by_task: dict[str, str | None] = {}
+    forward_mode_by_task: dict[str, str | None] = {}
+    forward_mode_params_by_task: dict[str, dict[str, Any] | None] = {}
     tuned_text_features_by_task: dict[str, torch.Tensor | None] = {}
     peft_cfg_map: dict[str, Any] | None = None
     peft_cfg: dict[str, Any] | None = None
@@ -354,15 +387,24 @@ def main() -> None:
     subspace_prepared = None
     base_patched_for_attn = False
     tuned_sds_list: list[dict[str, torch.Tensor]] = []
+    dense_tuned_sds_list: list[dict[str, torch.Tensor]] = []
+    dense_base_sd_for_merge: dict[str, torch.Tensor] = {}
     base_sd_for_merge = to_cpu_fp32(base_sd)
     merge_base_sd = to_cpu_fp32(base_sd)
+    resolved_merge_weights = resolve_merge_weights(len(tasks), merge_weights) if tasks else []
 
     if not zero_shot_only:
         for t in tasks:
-            ckpt_path = str(tuned_by_task[t])
-            obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt_ref = str(tuned_by_task[t])
+            ckpt_path, obj = load_vision_checkpoint_reference(ckpt_ref=ckpt_ref)
+            obj = normalize_peft_adapter_dir_checkpoint(obj, checkpoint_path=ckpt_path)
             print(f"Loaded checkpoint for task '{t}' from {ckpt_path}")
-            strategy_by_task[t] = obj.get("strategy", None) if isinstance(obj, dict) else None
+            forward_mode_by_task[t] = obj.get("forward_mode", None) if isinstance(obj, dict) else None
+            forward_mode_params_by_task[t] = (
+                normalize_forward_mode_params(str(forward_mode_by_task[t]), obj.get("forward_mode_params", None))
+                if isinstance(obj, dict) and forward_mode_by_task[t] is not None
+                else None
+            )
             attn_meta_by_task[t] = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=ckpt_path)
             # Merge/eval stays stage-agnostic: it only consumes final tuned_text_features.
             # Stage-specific artifacts (e.g. tuned_prompt_context) are ignored here.
@@ -374,9 +416,10 @@ def main() -> None:
             is_peft = False
             state: dict[str, torch.Tensor] | None = None
             cfg_map: dict[str, Any] | None = None
+            dense_state = dict(obj.get("peft_dense_state", {})) if isinstance(obj, dict) and isinstance(obj.get("peft_dense_state", {}), dict) else {}
 
             if is_peft_adapter_dir_ckpt(obj):
-                state, cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"])
+                state, cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"], checkpoint_path=ckpt_path)
                 is_peft = True
             elif is_peft_checkpoint(obj) and isinstance(obj, dict):
                 state, cfg_map = extract_peft_components(obj)
@@ -388,6 +431,7 @@ def main() -> None:
                 assert state is not None and cfg_map is not None
                 peft_cfg_map = ensure_peft_cfg_map(peft_cfg_map, cfg_map)
                 peft_state_by_task[t] = state
+                peft_dense_state_by_task[t] = dense_state
             else:
                 base_sd, base_patched_for_attn = maybe_patch_base_for_task_attn(
                     task_meta=attn_meta_by_task[t],
@@ -407,6 +451,7 @@ def main() -> None:
                         base_sd=base_sd,
                         build_cfg=build_cfg,
                         peft_cfg=get_peft_cfg(cfg_map),
+                        peft_dense_state=dense_state,
                         strict_load=strict_load,
                         patched_attn=attn_meta_by_task[t].patched_attn,
                         attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
@@ -446,18 +491,28 @@ def main() -> None:
                 strict_load=strict_load,
                 base_sd=base_sd,
             )
+        merge_base_sd = to_cpu_fp32(base_sd)
 
         if peft_subspace != "full":
             if peft_cfg_map is None:
                 raise ValueError(f"peft_subspace='{peft_subspace}' requires peft_config in checkpoints.")
             peft_cfg = get_peft_cfg(peft_cfg_map)
             subspace = get_subspace(peft_subspace)
-            subspace_prepared = subspace.prepare(lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
+            subspace_prepared = subspace.prepare(
+                lora_by_task=peft_state_by_task,
+                peft_cfg=peft_cfg,
+                method_params=method_params,
+                weights=resolved_merge_weights,
+                artifact_dir=subspace_artifact_dir,
+            )
+            if getattr(subspace_prepared, "merge_weight_override", None) is not None:
+                merge_weights = list(subspace_prepared.merge_weight_override)
             projected_by_task = subspace.project(subspace_prepared, lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
             if not projected_by_task:
                 raise ValueError("Subspace projection returned empty projected_by_task.")
             tuned_sds_list = [projected_by_task[t] for t in tasks]
             base_sd_for_merge = {k: torch.zeros_like(v) for k, v in tuned_sds_list[0].items()}
+            lora_only_sds_by_task: dict[str, dict[str, torch.Tensor]] = {}
 
             # Build full-space tuned checkpoints once for single-task baseline eval.
             for t in tasks:
@@ -466,6 +521,7 @@ def main() -> None:
                     base_sd=base_sd,
                     build_cfg=build_cfg,
                     peft_cfg=peft_cfg,
+                    peft_dense_state=peft_dense_state_by_task.get(t, None),
                     strict_load=strict_load,
                     patched_attn=attn_meta_by_task[t].patched_attn,
                     attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
@@ -477,12 +533,34 @@ def main() -> None:
                         "Check checkpoint key prefixes and model compatibility."
                     )
                 tuned_sds_by_task[t] = to_cpu_fp32(aligned)
+                lora_only_sd = materialize_peft_sd_from_adapter(
+                    peft_state=peft_state_by_task[t],
+                    base_sd=base_sd,
+                    build_cfg=build_cfg,
+                    peft_cfg=peft_cfg,
+                    peft_dense_state=None,
+                    strict_load=strict_load,
+                    patched_attn=attn_meta_by_task[t].patched_attn,
+                    attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
+                )
+                lora_only_aligned = align_to_base_keys(lora_only_sd, base_sd)
+                if not lora_only_aligned:
+                    raise ValueError(
+                        f"No tensors from LoRA-only checkpoint aligned to base keys for task '{t}'. "
+                        "Check checkpoint key prefixes and model compatibility."
+                    )
+                lora_only_sds_by_task[t] = to_cpu_fp32(lora_only_aligned)
             base_sd_for_merge = to_cpu_fp32(base_sd_for_merge)
+            dense_base_sd_for_merge, dense_tuned_sds_list = build_dense_delta_branch(
+                tasks=tasks,
+                full_tuned_by_task=tuned_sds_by_task,
+                lora_only_tuned_by_task=lora_only_sds_by_task,
+                base_sd=merge_base_sd,
+            )
         else:
             tuned_sds_list = [tuned_sds_by_task[t] for t in tasks]
             base_sd_for_merge = to_cpu_fp32(base_sd)
 
-        merge_base_sd = to_cpu_fp32(base_sd)
         needs_linear_attention = any(attn_meta_by_task[t].linearized_attn for t in tasks)
         assert_qkv_patched_before_linearizing(
             needs_linear_attention=needs_linear_attention,
@@ -494,18 +572,30 @@ def main() -> None:
 
     requested_forward_mode = str(cfg.get("forward_mode", "auto"))
     if requested_forward_mode == "auto":
-        all_ntk = (not zero_shot_only) and bool(tasks) and all(strategy_by_task.get(t) == "ntk" for t in tasks)
-        resolved_forward_mode = "linearized_ntk" if all_ntk else "standard"
+        resolved_forward_mode = (
+            resolve_auto_forward_mode([forward_mode_by_task.get(t) for t in tasks])
+            if (not zero_shot_only) and bool(tasks)
+            else "standard"
+        )
     else:
         resolved_forward_mode = requested_forward_mode
 
+    resolved_forward_mode_params = resolve_shared_forward_mode_params(
+        resolved_forward_mode,
+        [
+            forward_mode_params_by_task.get(t)
+            for t in tasks
+            if forward_mode_by_task.get(t) == "linearized_ntk"
+        ],
+    )
     forward_mode = get_forward_mode(resolved_forward_mode)
     forward_mode.bind(
         clf=clf,
         base_sd=merge_base_sd,
         strict_load=strict_load,
+        params=resolved_forward_mode_params,
     )
-    print(f"Using forward mode: {resolved_forward_mode}")
+    print(f"Using forward mode: {resolved_forward_mode} params={resolved_forward_mode_params}")
 
     if not zero_shot_only:
         print("base keys:", len(base_sd_for_merge))
@@ -545,6 +635,7 @@ def main() -> None:
             hf_ds=hf_ds,
             hf_path=hf_path,
             preprocess=clf.preprocess,
+            train_preprocess=None,
             ft_epochs=1,
             split_map=split_map,
             batch_size=int(cfg.get("batch_size", 128)),
@@ -563,6 +654,7 @@ def main() -> None:
             raise ValueError(f"get_templates('{task}') returned empty list")
 
         build_cfg_task = OpenClipBuildConfig(
+            loader=build_cfg.loader,
             model_name=build_cfg.model_name,
             pretrained=build_cfg.pretrained,
             device=build_cfg.device,
@@ -596,6 +688,7 @@ def main() -> None:
                 chk_path=str(tuned_by_task[task]),
                 baseline_mode="tuned",
                 forward_mode=resolved_forward_mode,
+                forward_mode_params=resolved_forward_mode_params,
                 classnames_mode=classnames_mode,
                 text_features_mode=task_text_features_mode,
             )
@@ -647,6 +740,7 @@ def main() -> None:
                 chk_path=str(base_ckpt) if base_ckpt is not None else "open_clip_pretrained",
                 baseline_mode="zero_shot",
                 forward_mode=resolved_forward_mode,
+                forward_mode_params=resolved_forward_mode_params,
                 classnames_mode=classnames_mode,
                 text_features_mode="zero_shot",
             )
@@ -759,27 +853,149 @@ def main() -> None:
     }
     prepared = None
     search_planner = build_search_planner(cfg=cfg, base_method_params=method_params)
+    subspace_state_cache: dict[str, dict[str, Any]] = {}
     prepared_cache: dict[str, Any] = {}
+    
+    dense_prepared_cache: dict[str, Any] = {}
+
+    def _subspace_state_for(candidate_method_params: dict[str, Any]) -> dict[str, Any]:
+        if peft_subspace == "full" or subspace is None or peft_cfg is None:
+            return {
+                "subspace_prepared": subspace_prepared,
+                "tuned_sds_list": tuned_sds_list,
+                "base_sd_for_merge": base_sd_for_merge,
+                "weights": merge_weights,
+            }
+
+        cache_key = stable_method_params_cache_key(candidate_method_params)
+        if cache_key in subspace_state_cache:
+            return subspace_state_cache[cache_key]
+
+        print(f"\nPreparing PEFT subspace: {peft_subspace} ({candidate_method_params})")
+        candidate_subspace_prepared = subspace.prepare(
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+            method_params=candidate_method_params,
+            weights=resolved_merge_weights,
+            artifact_dir=subspace_artifact_dir,
+        )
+        candidate_weights = (
+            list(candidate_subspace_prepared.merge_weight_override)
+            if getattr(candidate_subspace_prepared, "merge_weight_override", None) is not None
+            else merge_weights_raw
+        )
+        projected_by_task = subspace.project(
+            candidate_subspace_prepared,
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+        )
+        if not projected_by_task:
+            raise ValueError("Subspace projection returned empty projected_by_task.")
+        candidate_tuned_sds_list = [projected_by_task[t] for t in tasks]
+        candidate_base_sd_for_merge = to_cpu_fp32({k: torch.zeros_like(v) for k, v in candidate_tuned_sds_list[0].items()})
+        state = {
+            "subspace_prepared": candidate_subspace_prepared,
+            "tuned_sds_list": candidate_tuned_sds_list,
+            "base_sd_for_merge": candidate_base_sd_for_merge,
+            "weights": candidate_weights,
+        }
+        subspace_state_cache[cache_key] = state
+        return state
+
+    def _subspace_state_for(candidate_method_params: dict[str, Any]) -> dict[str, Any]:
+        if peft_subspace == "full" or subspace is None or peft_cfg is None:
+            return {
+                "subspace_prepared": subspace_prepared,
+                "tuned_sds_list": tuned_sds_list,
+                "base_sd_for_merge": base_sd_for_merge,
+                "weights": merge_weights,
+            }
+
+        cache_key = stable_method_params_cache_key(candidate_method_params)
+        if cache_key in subspace_state_cache:
+            return subspace_state_cache[cache_key]
+
+        print(f"\nPreparing PEFT subspace: {peft_subspace} ({candidate_method_params})")
+        candidate_subspace_prepared = subspace.prepare(
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+            method_params=candidate_method_params,
+            weights=resolved_merge_weights,
+            artifact_dir=subspace_artifact_dir,
+        )
+        candidate_weights = (
+            list(candidate_subspace_prepared.merge_weight_override)
+            if getattr(candidate_subspace_prepared, "merge_weight_override", None) is not None
+            else merge_weights_raw
+        )
+        projected_by_task = subspace.project(
+            candidate_subspace_prepared,
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+        )
+        if not projected_by_task:
+            raise ValueError("Subspace projection returned empty projected_by_task.")
+        candidate_tuned_sds_list = [projected_by_task[t] for t in tasks]
+        candidate_base_sd_for_merge = to_cpu_fp32({k: torch.zeros_like(v) for k, v in candidate_tuned_sds_list[0].items()})
+        state = {
+            "subspace_prepared": candidate_subspace_prepared,
+            "tuned_sds_list": candidate_tuned_sds_list,
+            "base_sd_for_merge": candidate_base_sd_for_merge,
+            "weights": candidate_weights,
+        }
+        subspace_state_cache[cache_key] = state
+        return state
 
     def _prepared_for(candidate_method_params: dict[str, Any]) -> Any:
         if not isinstance(method, PreparedMergeMethod):
             return None
+        candidate_subspace_state = _subspace_state_for(candidate_method_params)
         cache_prepared = bool(candidate_method_params.get("cache_prepared", True))
-        cache_key = str(sorted(candidate_method_params.items()))
+        cache_key = stable_method_params_cache_key(candidate_method_params)
         if cache_prepared and cache_key in prepared_cache:
             return prepared_cache[cache_key]
         print(f"\nPreparing merge directions with method: {method.name} ({candidate_method_params})")
+        candidate_merge_context = dict(merge_context)
+        candidate_merge_context["subspace_prepared"] = candidate_subspace_state["subspace_prepared"]
         prepared_value = method.prepare(
-            base=base_sd_for_merge,
-            tuned=tuned_sds_list,
-            weights=merge_weights,
+            base=candidate_subspace_state["base_sd_for_merge"],
+            tuned=candidate_subspace_state["tuned_sds_list"],
+            weights=candidate_subspace_state["weights"],
             strict=strict_load,
             tasks=tasks,
-            merge_context=merge_context,
+            merge_context=candidate_merge_context,
             method_params=candidate_method_params,
         )
         if cache_prepared:
             prepared_cache[cache_key] = prepared_value
+        return prepared_value
+
+    def _dense_prepared_for(candidate_method_params: dict[str, Any]) -> Any:
+        if not isinstance(method, PreparedMergeMethod):
+            return None
+        if peft_subspace == "full" or not dense_tuned_sds_list or not dense_base_sd_for_merge:
+            return None
+        cache_prepared = bool(candidate_method_params.get("cache_prepared", True))
+        cache_key = str(sorted(candidate_method_params.items()))
+        if cache_prepared and cache_key in dense_prepared_cache:
+            return dense_prepared_cache[cache_key]
+        prepared_value = method.prepare(
+            base=dense_base_sd_for_merge,
+            tuned=dense_tuned_sds_list,
+            weights=merge_weights,
+            strict=strict_load,
+            tasks=tasks,
+            merge_context={
+                "kind": "vision_dense_delta",
+                "cfg": cfg,
+                "tasks": tasks,
+                "suite_name": suite_name,
+                "peft_subspace": peft_subspace,
+            },
+            method_params=candidate_method_params,
+        )
+        if cache_prepared:
+            dense_prepared_cache[cache_key] = prepared_value
         return prepared_value
 
     if isinstance(method, PreparedMergeMethod):
@@ -864,6 +1080,8 @@ def main() -> None:
             run_logger.finish("success")
         return
 
+    alpha_early_stop = bool(cfg.get("alpha_early_stop", True))
+
     search_results: list[SearchEvaluation] = []
     best_norm_per_task: dict[str, float] = {}
     best_alpha_per_task: dict[str, float] = {}
@@ -880,22 +1098,27 @@ def main() -> None:
         batch_best_score = float("-inf")
         for candidate in batch:
             print(f"\n=== Method = {method.name} - Space = {peft_subspace} - {describe_candidate(candidate)} ===")
+            candidate_subspace_state = _subspace_state_for(candidate.method_params)
             candidate_prepared = prepared if prepared is not None else _prepared_for(candidate.method_params)
+            candidate_dense_prepared = _dense_prepared_for(candidate.method_params)
             merged_sd = build_merged_state_for_alpha(
                 method=method,
                 prepared=candidate_prepared,
-                base_sd_for_merge=base_sd_for_merge,
-                tuned_sds_list=tuned_sds_list,
-                weights=merge_weights,
+                base_sd_for_merge=candidate_subspace_state["base_sd_for_merge"],
+                tuned_sds_list=candidate_subspace_state["tuned_sds_list"],
+                weights=candidate_subspace_state["weights"],
                 method_params=candidate.method_params,
                 alpha=float(candidate.alpha),
                 peft_subspace=peft_subspace,
                 subspace=subspace,
-                subspace_prepared=subspace_prepared,
+                subspace_prepared=candidate_subspace_state["subspace_prepared"],
                 peft_cfg=peft_cfg,
                 peft_state_by_task=peft_state_by_task,
                 tasks=tasks,
                 merge_base_sd=merge_base_sd,
+                dense_prepared=candidate_dense_prepared,
+                dense_base_sd_for_merge=dense_base_sd_for_merge,
+                dense_tuned_sds_list=dense_tuned_sds_list,
             )
 
             miss, unexp = load_into_model(clf.model, merged_sd, strict=strict_load)
@@ -960,7 +1183,7 @@ def main() -> None:
                 best_result = result
             if result.score > batch_best_score:
                 batch_best_score = result.score
-            elif len(batch) > 1:
+            elif len(batch) > 1 and alpha_early_stop:
                 print("Avg norm did not improve for this parameter setting, stopping this alpha sweep early.")
                 break
 
@@ -990,21 +1213,26 @@ def main() -> None:
             )
 
     print(f"\n(Re-running best setting ({describe_candidate(best_result.candidate)}) once to report avg_top1)")
+    best_dense_prepared = _dense_prepared_for(best_method_params)
+    best_subspace_state = _subspace_state_for(best_method_params)
     merged_sd = build_merged_state_for_alpha(
         method=method,
         prepared=(_prepared_for(best_method_params) if prepared is None else prepared),
-        base_sd_for_merge=base_sd_for_merge,
-        tuned_sds_list=tuned_sds_list,
-        weights=merge_weights,
+        base_sd_for_merge=best_subspace_state["base_sd_for_merge"],
+        tuned_sds_list=best_subspace_state["tuned_sds_list"],
+        weights=best_subspace_state["weights"],
         method_params=best_method_params,
         alpha=best_alpha,
         peft_subspace=peft_subspace,
         subspace=subspace,
-        subspace_prepared=subspace_prepared,
+        subspace_prepared=best_subspace_state["subspace_prepared"],
         peft_cfg=peft_cfg,
         peft_state_by_task=peft_state_by_task,
         tasks=tasks,
         merge_base_sd=merge_base_sd,
+        dense_prepared=best_dense_prepared,
+        dense_base_sd_for_merge=dense_base_sd_for_merge,
+        dense_tuned_sds_list=dense_tuned_sds_list,
     )
     load_into_model(clf.model, merged_sd, strict=strict_load)
     saved_merged_path = _save_merged_state_dict_if_requested(
@@ -1012,6 +1240,7 @@ def main() -> None:
         cfg.get("save_merged", None),
         label="best-alpha merged",
     )
+    subspace_prepared = best_subspace_state["subspace_prepared"]
     del merged_sd
 
     merged_accs, norm_accs = eval_norm_accs_for_split(
@@ -1058,6 +1287,11 @@ def main() -> None:
                     "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
                 },
                 "saved_merged_path": saved_merged_path,
+                "subspace_artifacts": (
+                    {"similarity_artifact_path": getattr(subspace_prepared, "similarity_artifact_path", None)}
+                    if subspace_prepared is not None
+                    else {}
+                ),
             }
         )
         run_logger.finish("success")

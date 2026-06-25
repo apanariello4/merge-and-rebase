@@ -239,6 +239,7 @@ def test_train_vision_task_emits_epoch_and_task_events(tmp_path: Path, monkeypat
         val_fraction=0.1,
         early_stopping=False,
         early_stopping_patience=3,
+        text_only=False,
         seed=0,
         device="cpu",
         out_dir=tmp_path,

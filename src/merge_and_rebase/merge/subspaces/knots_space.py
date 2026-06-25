@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -32,10 +34,16 @@ class KnotsSpace:
         *,
         lora_by_task: dict[str, dict[str, torch.Tensor]],
         peft_cfg: dict[str, Any],
+        method_params: dict[str, Any] | None = None,
+        weights: Sequence[float] | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> KnotsPrepared:
         if not lora_by_task:
             raise ValueError("lora_by_task is empty.")
 
+        _ = method_params
+        _ = weights
+        _ = artifact_dir
         svd_eps = float(peft_cfg.get("knots_svd_eps", 1e-5))
 
         tasks = tuple(lora_by_task.keys())

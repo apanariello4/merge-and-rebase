@@ -38,6 +38,7 @@ common:
 
   strategy:
     name: peft_lora               # full | linear_probe | peft_lora
+    forward_mode: standard        # standard | linearized_ntk
     peft:
       # For Llama-like blocks. For T5, use target_modules like ["q", "k", "v", "o"].
       target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

@@ -14,6 +14,8 @@ class SuiteSpec:
 VISION8_TASKS = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
 VISION14_TASKS = VISION8_TASKS + ["CIFAR100", "STL10", "Flowers102", "OxfordIIITPet", "PCAM", "FER2013"]
 VISION20_TASKS = VISION14_TASKS + ["EMNIST", "CIFAR10", "Food101", "FashionMNIST", "RenderedSST2", "KMNIST"]
+VISION_IMAGENET_TASKS = ["ImageNet1K", "ImageNet21KP"]
+VISION_SUPPORTED_TASKS = VISION20_TASKS + VISION_IMAGENET_TASKS
 
 
 def _vision_spec(task: str) -> tuple[str, str | None, dict[str, str]]:
@@ -38,9 +40,11 @@ def _vision_spec(task: str) -> tuple[str, str | None, dict[str, str]]:
         "RenderedSST2": ("nateraw/rendered-sst2", None, {"train": "train", "test": "test"}),
         "KMNIST": ("tanganke/kmnist", None, {"train": "train", "test": "test"}),
         "SVHN": ("ufldl-stanford/svhn", "cropped_digits", {"train": "train", "test": "test"}),
+        "ImageNet1K": ("ILSVRC/imagenet-1k", None, {"train": "train", "test": "validation"}),
+        "ImageNet21KP": ("timm/imagenet-w21-p", None, {"train": "train", "test": "validation"}),
     }
     if task not in mapping:
-        raise ValueError(f"Unknown vision task '{task}'. Choose from {VISION8_TASKS}")
+        raise ValueError(f"Unknown vision task '{task}'. Choose from {VISION_SUPPORTED_TASKS}")
     return mapping[task]
 
 

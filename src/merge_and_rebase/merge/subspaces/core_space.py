@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -60,6 +62,9 @@ def _normalize_prefix(prefix: str) -> str:
         if prefix.startswith(p):
             prefix = prefix[len(p) :]
             break
+    if prefix.startswith("encoder.layers."):
+        prefix = "visual.transformer.resblocks." + prefix[len("encoder.layers.") :]
+    prefix = prefix.replace(".self_attn.", ".attn.")
     # If adapter was applied to visual, PEFT keys may start at transformer.*
     if prefix.startswith("transformer."):
         prefix = "visual." + prefix
@@ -100,6 +105,7 @@ class CorePrepared:
     Stores shared bases per layer.
     """
 
+    basis_method: str
     bases: dict[str, dict[str, torch.Tensor]]  # layer_key -> {"U": U, "V": V}
 
 
@@ -107,15 +113,46 @@ class CorePrepared:
 class CoreSpace:
     name: str = "core"
 
+    @staticmethod
+    def _resolve_basis_method(method_params: dict[str, Any] | None) -> str:
+        params = method_params or {}
+        basis_method = str(params.get("core_basis_method", params.get("basis_method", "qr"))).strip().lower()
+        if basis_method not in {"svd", "qr"}:
+            raise ValueError(f"core subspace basis_method must be one of: 'svd', 'qr' (got {basis_method!r}).")
+        return basis_method
+
+    @staticmethod
+    def _build_basis(
+        *,
+        a_stack: torch.Tensor,
+        b_stack: torch.Tensor,
+        basis_method: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if basis_method == "svd":
+            _u_a, _s_a, v_a_h = torch.linalg.svd(a_stack.to(torch.float64), full_matrices=False)
+            u_b, _s_b, _v_b_h = torch.linalg.svd(b_stack.to(torch.float64), full_matrices=False)
+            return u_b, v_a_h
+        if basis_method == "qr":
+            u_b = torch.linalg.qr(b_stack.double(), mode="reduced")[0]
+            v_a_h = torch.linalg.qr(a_stack.T.double(), mode="reduced")[0].T
+            return u_b, v_a_h
+        raise AssertionError(f"Unhandled core basis method: {basis_method}")
+
     def prepare(
         self,
         *,
         lora_by_task: dict[str, dict[str, torch.Tensor]],
         peft_cfg: dict[str, Any],
+        method_params: dict[str, Any] | None = None,
+        weights: Sequence[float] | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> CorePrepared:
         if not lora_by_task:
             raise ValueError("lora_by_task is empty.")
 
+        _ = weights
+        _ = artifact_dir
+        basis_method = self._resolve_basis_method(method_params)
         tasks = list(lora_by_task.keys())
         layer_groups = {t: build_lora_groups(lora_by_task[t]) for t in tasks}
         if not layer_groups[tasks[0]]:
@@ -137,16 +174,18 @@ class CoreSpace:
             a_stack = torch.cat(a_list, dim=0)  # (N*r, in)
             b_stack = torch.cat(b_list, dim=1)  # (out, N*r)
 
-            # SVD
-            _u_a, _s_a, v_a_h = torch.linalg.svd(a_stack.to(torch.float64), full_matrices=False)
-            u_b, _s_b, _v_b_h = torch.linalg.svd(b_stack.to(torch.float64), full_matrices=False)
+            u_b, v_a_h = self._build_basis(
+                a_stack=a_stack,
+                b_stack=b_stack,
+                basis_method=basis_method,
+            )
 
             bases[layer_key] = {
                 "U": u_b.to(dtype=torch.float32).contiguous(),
                 "V": v_a_h.to(dtype=torch.float32).contiguous(),
             }
 
-        return CorePrepared(bases=bases)
+        return CorePrepared(basis_method=basis_method, bases=bases)
 
     def project(
         self,

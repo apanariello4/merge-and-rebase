@@ -1,0 +1,38 @@
+{
+  "_note": "Template config: replace tuned_ckpts with checkpoints fine-tuned from the source base ViT-B-16 / datacomp_xl_s13b_b90k before running.",
+  "suite": "vision8",
+  "tasks": "all",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-B-16",
+  "target_clip_pretrained": "laion2b_s34b_b88k",
+  "method": "gradfix",
+  "method_params": {
+    "mask_mode": "normal",
+    "vote": "mean"
+  },
+  "alpha_search": true,
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha": 0.3,
+  "batch_size": 128,
+  "num_workers": 6,
+  "val_fraction": 0.1,
+  "seed": 42,
+  "no_humanize": true,
+  "grad_imgs_per_class": 10,
+  "grad_batch_size": null,
+  "grad_num_batches": null,
+  "weights": null,
+  "tuned_ckpts": {
+    "Cars": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_CARS_CHECKPOINT",
+    "DTD": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_DTD_CHECKPOINT",
+    "MNIST": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_MNIST_CHECKPOINT",
+    "SVHN": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_SVHN_CHECKPOINT",
+    "EuroSAT": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_EUROSAT_CHECKPOINT",
+    "GTSRB": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_GTSRB_CHECKPOINT",
+    "RESISC45": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_RESISC45_CHECKPOINT",
+    "SUN397": "REPLACE_WITH_DATACOMP_XL_VIT_B_16_SUN397_CHECKPOINT"
+  }
+}

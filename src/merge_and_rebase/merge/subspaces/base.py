@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import torch
@@ -14,6 +16,9 @@ class Subspace(Protocol):
         *,
         lora_by_task: dict[str, dict[str, torch.Tensor]],
         peft_cfg: dict[str, Any],
+        method_params: dict[str, Any] | None = None,
+        weights: Sequence[float] | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> Any:
         """
         Build any shared bases / metadata needed for projection.

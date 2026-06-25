@@ -1049,12 +1049,15 @@ name = "merge-and-rebase"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "accelerate" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "open-clip-torch" },
     { name = "peft" },
+    { name = "pillow" },
     { name = "protobuf" },
     { name = "pyyaml" },
+    { name = "safetensors" },
     { name = "sentencepiece" },
     { name = "tiktoken" },
     { name = "torch" },
@@ -1068,7 +1071,6 @@ dependencies = [
 data = [
     { name = "datasets" },
     { name = "huggingface-hub" },
-    { name = "pillow" },
 ]
 dev = [
     { name = "pytest" },
@@ -1081,6 +1083,7 @@ gdrive = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", specifier = ">=0.26" },
     { name = "datasets", marker = "extra == 'data'", specifier = ">=2.16" },
     { name = "gdown", marker = "extra == 'gdrive'", specifier = ">=5.2.0" },
     { name = "huggingface-hub", marker = "extra == 'data'", specifier = ">=0.20" },
@@ -1088,18 +1091,19 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "open-clip-torch", specifier = ">=2.24.0" },
     { name = "peft", specifier = ">=0.14.0" },
-    { name = "pillow", marker = "extra == 'data'", specifier = ">=10.0.0" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "protobuf", specifier = ">=6.33.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
+    { name = "safetensors", specifier = ">=0.4" },
     { name = "sentencepiece", specifier = ">=0.2.1" },
     { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "torch", specifier = ">=2.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = ">=0.16", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", specifier = ">=4.66" },
-    { name = "transformers", specifier = ">=4.38" },
+    { name = "transformers", specifier = ">=4.45" },
     { name = "wandb", specifier = ">=0.22" },
 ]
 provides-extras = ["data", "gdrive", "dev"]

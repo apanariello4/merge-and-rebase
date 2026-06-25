@@ -7,15 +7,20 @@ from merge_and_rebase.merge.methods.functional import list_functional_methods, m
 from merge_and_rebase.merge.registry import get_method
 
 ALL_FUNCTIONAL_METHODS = [
+    "actmerge",
+    "actmat",
     "task_arithmetic",
     "weighted_average",
+    "wudi",
     "tsv_merge",
     "isoc_merge",
     "isocts_merge",
+    "dc_merge",
     "dare_merge",
     "ties_merge",
     "pcb",
     "pcb_merge",
+    "wudi_merge",
     "cart_merge",
 ]
 
@@ -93,7 +98,7 @@ def test_merge_functional_unknown_method_raises() -> None:
 
 def test_vector_methods_accept_1d() -> None:
     mats = _toy_matrices_1d()
-    for name in ["task_arithmetic", "weighted_average", "dare_merge", "ties_merge", "pcb", "pcb_merge"]:
+    for name in ["task_arithmetic", "weighted_average", "wudi", "wudi_merge", "dare_merge", "ties_merge", "pcb", "pcb_merge"]:
         merged = merge_functional(
             name,
             matrices=mats,
@@ -114,7 +119,7 @@ def test_matrix_only_methods_reject_1d() -> None:
 
 def test_svd_methods_zero_1d_by_default() -> None:
     mats = _toy_matrices_1d()
-    for name in ["tsv_merge", "isoc_merge", "isocts_merge"]:
+    for name in ["tsv_merge", "isoc_merge", "isocts_merge", "dc_merge"]:
         merged = merge_functional(name, matrices=mats)
         assert torch.equal(merged, torch.zeros_like(mats[0]))
 
@@ -122,7 +127,7 @@ def test_svd_methods_zero_1d_by_default() -> None:
 def test_svd_methods_can_average_1d() -> None:
     mats = _toy_matrices_1d()
     expected = torch.stack(mats).mean(dim=0)
-    for name in ["tsv_merge", "isoc_merge", "isocts_merge"]:
+    for name in ["tsv_merge", "isoc_merge", "isocts_merge", "dc_merge"]:
         merged = merge_functional(name, matrices=mats, method_params={"vector_1d_merge": "average"})
         assert torch.allclose(merged, expected)
 

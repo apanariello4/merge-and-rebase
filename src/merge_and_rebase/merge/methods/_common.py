@@ -16,6 +16,10 @@ def default_weights(n: int, weights: Sequence[float] | None) -> torch.Tensor:
     return torch.tensor([float(w) for w in weights], dtype=torch.float32)
 
 
+def resolve_merge_weights(n: int, weights: Sequence[float] | None) -> list[float]:
+    return [float(weight) for weight in default_weights(int(n), weights).tolist()]
+
+
 def axpy_state_dict(base: TensorDict, delta: TensorDict, alpha: float) -> TensorDict:
     out: TensorDict = dict(base)
     for k in TaskVector.common_keys(base, [delta]):

@@ -9,10 +9,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
 class OpenClipBuildConfig:
+    loader: str = "openclip"  # "openclip" | "openai_clip"
     model_name: str = "ViT-B-32"
     pretrained: str = "openai"  # examples: "openai", "laion2b_s34b_b79k", depends on model
     device: str = "cuda"
@@ -25,6 +27,21 @@ class OpenClipBuildConfig:
 
 def _is_hf_hub_ref(value: str | None) -> bool:
     return isinstance(value, str) and value.strip().startswith("hf-hub:")
+
+
+_OPENAI_CLIP_MODEL_NAME_MAP = {
+    "ViT-B-16": "ViT-B/16",
+    "ViT-B-32": "ViT-B/32",
+    "ViT-L-14": "ViT-L/14",
+    "ViT-L-14-336": "ViT-L/14@336px",
+}
+
+
+def _resolve_loader(cfg: OpenClipBuildConfig) -> str:
+    loader = str(getattr(cfg, "loader", "openclip")).strip().lower()
+    if loader not in {"openclip", "openai_clip"}:
+        raise ValueError("OpenClipBuildConfig.loader must be one of: openclip, openai_clip")
+    return loader
 
 
 def _resolve_openclip_load_args(cfg: OpenClipBuildConfig) -> tuple[str, str | None, bool]:
@@ -43,6 +60,10 @@ def _resolve_openclip_load_args(cfg: OpenClipBuildConfig) -> tuple[str, str | No
         return pretrained, None, False
 
     return model_name, pretrained, (pretrained == "openai")
+
+
+def _resolve_openai_clip_model_name(model_name: str) -> str:
+    return _OPENAI_CLIP_MODEL_NAME_MAP.get(model_name, model_name)
 
 
 def _template_id(t) -> str:
@@ -91,6 +112,29 @@ def _fingerprint(cfg_dict: dict[str, Any], classnames: Sequence[str], normalize:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def normalize_features(features: torch.Tensor, *, eps: float = 1.0e-12) -> torch.Tensor:
+    return F.normalize(features, dim=-1, eps=float(eps))
+
+
+def zero_shot_logits_from_features(
+    classifier: Any,
+    image_features: torch.Tensor,
+    *,
+    normalize_image_features: bool | None = None,
+) -> torch.Tensor:
+    text_features = getattr(classifier, "_zs_text_features", None)
+    if not isinstance(text_features, torch.Tensor) or text_features.numel() == 0:
+        raise RuntimeError("Call build_zeroshot_text_features() before forward in zero-shot mode.")
+
+    should_normalize = bool(getattr(classifier, "normalize", False)) if normalize_image_features is None else bool(
+        normalize_image_features
+    )
+    if should_normalize:
+        image_features = normalize_features(image_features)
+    text_features = text_features.to(device=image_features.device, dtype=image_features.dtype)
+    return float(getattr(classifier, "logit_scale")) * (image_features @ text_features.t())
+
+
 class OpenClipClassifier(nn.Module):
     """
     Zero-shot classifier using open_clip.
@@ -103,6 +147,7 @@ class OpenClipClassifier(nn.Module):
         model: nn.Module,
         tokenizer,
         preprocess,  # callable PIL->Tensor (or any transform)
+        train_preprocess=None,
         *,
         normalize: bool = True,
         logit_scale: float = 100.0,
@@ -111,6 +156,7 @@ class OpenClipClassifier(nn.Module):
         self.model = model
         self.tokenizer = tokenizer
         self.preprocess = preprocess
+        self.train_preprocess = train_preprocess if train_preprocess is not None else preprocess
         self.normalize = normalize
         self.logit_scale = float(logit_scale)
         self.register_buffer("_zs_text_features", torch.empty(0), persistent=False)
@@ -118,13 +164,50 @@ class OpenClipClassifier(nn.Module):
 
     @staticmethod
     def build(cfg: OpenClipBuildConfig) -> OpenClipClassifier:
+        loader = _resolve_loader(cfg)
+        dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+        if cfg.dtype is not None and cfg.dtype not in dtype_map:
+            raise ValueError(f"Unknown dtype {cfg.dtype}. Choose from {sorted(dtype_map)}")
+
+        if loader == "openai_clip":
+            try:
+                import clip
+            except Exception as e:
+                raise ImportError("openai clip support requires: pip install git+https://github.com/openai/CLIP.git") from e
+            try:
+                import open_clip
+            except Exception as e:
+                raise ImportError("openai clip support also requires: pip install -e '.[openclip]'") from e
+
+            openai_model_name = _resolve_openai_clip_model_name(str(cfg.model_name).strip())
+            model, preprocess = clip.load(openai_model_name, device=cfg.device, jit=False)
+            openclip_model_name = str(cfg.model_name).strip()
+            _, train_preprocess, _ = open_clip.create_model_and_transforms(
+                openclip_model_name,
+                pretrained="openai",
+                device="cpu",
+                quick_gelu=True,
+            )
+            tokenizer = clip.tokenize
+            if cfg.dtype is not None:
+                model = model.to(dtype=dtype_map[cfg.dtype])
+            model.eval()
+            return OpenClipClassifier(
+                model=model,
+                tokenizer=tokenizer,
+                preprocess=preprocess,
+                train_preprocess=train_preprocess,
+                normalize=cfg.normalize,
+                logit_scale=cfg.logit_scale,
+            )
+
         try:
             import open_clip
         except Exception as e:
             raise ImportError("open_clip support requires: pip install -e '.[openclip]'") from e
 
         model_name, pretrained, quick_gelu = _resolve_openclip_load_args(cfg)
-        model, _, preprocess = open_clip.create_model_and_transforms(
+        model, train_preprocess, preprocess = open_clip.create_model_and_transforms(
             model_name,
             pretrained=pretrained,
             device=cfg.device,
@@ -134,9 +217,6 @@ class OpenClipClassifier(nn.Module):
 
         # dtype casting
         if cfg.dtype is not None:
-            dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
-            if cfg.dtype not in dtype_map:
-                raise ValueError(f"Unknown dtype {cfg.dtype}. Choose from {sorted(dtype_map)}")
             model = model.to(dtype=dtype_map[cfg.dtype])
 
         model.eval()
@@ -144,6 +224,7 @@ class OpenClipClassifier(nn.Module):
             model=model,
             tokenizer=tokenizer,
             preprocess=preprocess,
+            train_preprocess=train_preprocess,
             normalize=cfg.normalize,
             logit_scale=cfg.logit_scale,
         )
@@ -229,14 +310,14 @@ class OpenClipClassifier(nn.Module):
             text_feats = self.model.encode_text(tokens)  # [T, D]
 
             if self.normalize:
-                text_feats = text_feats / (text_feats.norm(dim=-1, keepdim=True) + 1e-12)
+                text_feats = normalize_features(text_feats)
 
             text_feats = text_feats.mean(dim=0, keepdim=True)  # [1, D]
             all_text_feats.append(text_feats)
 
         feats = torch.cat(all_text_feats, dim=0)  # [C, D]
         if self.normalize:
-            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-12)
+            feats = normalize_features(feats)
 
         return feats
 
@@ -323,7 +404,7 @@ class OpenClipClassifier(nn.Module):
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         text_feats = text_features.to(device=dev)
         if self.normalize:
-            text_feats = text_feats / (text_feats.norm(dim=-1, keepdim=True) + 1e-12)
+            text_feats = normalize_features(text_feats)
 
         prev_text = self._zs_text_features
         prev_fingerprint = self._zs_text_fingerprint
@@ -337,14 +418,13 @@ class OpenClipClassifier(nn.Module):
 
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        img_feats = self.model.encode_image(images)  # [B, D]
-        if self.normalize:
-            img_feats = img_feats / (img_feats.norm(dim=-1, keepdim=True) + 1e-12)
-
-        if self._zs_text_features.numel() == 0:
-            raise RuntimeError("Call build_zeroshot_text_features() before forward in zero-shot mode.")
-
-        return self.logit_scale * (img_feats @ self._zs_text_features.t())
+        visual_features = self.model.encode_image(images)  # [B, D]
+        image_features = normalize_features(visual_features) if self.normalize else visual_features
+        logits = zero_shot_logits_from_features(self, image_features, normalize_image_features=False)
+        self._last_visual_features = visual_features
+        self._last_image_features = image_features
+        self._last_logits = logits
+        return logits
 
     @torch.no_grad()
     def top1(self, loader, device: str) -> float:

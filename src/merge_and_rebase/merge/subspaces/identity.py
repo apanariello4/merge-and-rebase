@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,7 +23,15 @@ class IdentitySpace:
         *,
         lora_by_task: dict[str, dict[str, torch.Tensor]],
         peft_cfg: dict[str, Any],
+        method_params: dict[str, Any] | None = None,
+        weights: Sequence[float] | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> Any:
+        _ = lora_by_task
+        _ = peft_cfg
+        _ = method_params
+        _ = weights
+        _ = artifact_dir
         return None
 
     def project(

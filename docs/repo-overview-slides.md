@@ -399,7 +399,6 @@ Built-in vision strategies:
 
 - `full`: train all parameters
 - `linear_probe`: train only the classification head
-- `ntk`: first-order linearized training around initialization
 - `peft_lora`: LoRA on the OpenCLIP visual backbone
 
 ---
@@ -409,13 +408,44 @@ Built-in vision strategies:
 ```yaml
 strategy:
   name: peft_lora
+  forward_mode: linearized_ntk
   peft:
     r: 16
     lora_alpha: 16
     target_modules: [q_proj, k_proj, v_proj, out_proj]
 ```
 
-This tells the repo to fine-tune only low-rank adapters on selected visual modules.
+This tells the repo to fine-tune only low-rank adapters on selected visual modules while training in the linearized NTK regime.
+
+---
+
+# **Text Pre-Stages**
+
+`train_vision.py` can optionally tune the text side before vision training.
+
+Options:
+
+- `text_embeddings_finetune`
+- `text_prompt_tuning`
+
+Purpose:
+
+- adapt zero-shot text features before tuning the image encoder
+
+---
+
+# **Text Pre-Stage Example**
+
+```yaml
+strategy:
+  name: full
+  text_prompt_tuning:
+    enabled: true
+    context_length: 16
+    epochs: 1
+```
+
+This is the CoOp-style route: learn prompt context vectors first, then run the main vision strategy.
 
 ---
 
@@ -868,7 +898,7 @@ It replaces the normal forward pass with a first-order linearization around base
 
 In practice:
 
-- useful when checkpoints were trained with the `ntk` strategy
+- useful when checkpoints were trained with `strategy.forward_mode: linearized_ntk`
 - helps evaluation match the intended linearized training regime
 
 Core helper:

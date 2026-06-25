@@ -6,13 +6,13 @@
     "alpha": 0.3,
     "weights": null,
     "tuned_ckpts": {
-        "Cars": "src/checkpoints/finetune/ViT-B-32/openai/Cars/ntk.pt",
-        "DTD": "src/checkpoints/finetune/ViT-B-32/openai/DTD/ntk.pt",
-        "MNIST": "src/checkpoints/finetune/ViT-B-32/openai/MNIST/ntk.pt",
-        "SVHN": "src/checkpoints/finetune/ViT-B-32/openai/SVHN/ntk.pt",
-        "EuroSAT": "src/checkpoints/finetune/ViT-B-32/openai/EuroSAT/ntk.pt",
-        "GTSRB": "src/checkpoints/finetune/ViT-B-32/openai/GTSRB/ntk.pt",
-        "RESISC45": "src/checkpoints/finetune/ViT-B-32/openai/RESISC45/ntk.pt",
-        "SUN397": "src/checkpoints/finetune/ViT-B-32/openai/SUN397/ntk.pt"
+        "Cars": "src/checkpoints/finetune/ViT-B-32/openai/Cars/full__linearized_ntk_last_ep.pt",
+        "DTD": "src/checkpoints/finetune/ViT-B-32/openai/DTD/full__linearized_ntk_last_ep.pt",
+        "MNIST": "src/checkpoints/finetune/ViT-B-32/openai/MNIST/full__linearized_ntk_last_ep.pt",
+        "SVHN": "src/checkpoints/finetune/ViT-B-32/openai/SVHN/full__linearized_ntk_last_ep.pt",
+        "EuroSAT": "src/checkpoints/finetune/ViT-B-32/openai/EuroSAT/full__linearized_ntk_last_ep.pt",
+        "GTSRB": "src/checkpoints/finetune/ViT-B-32/openai/GTSRB/full__linearized_ntk_last_ep.pt",
+        "RESISC45": "src/checkpoints/finetune/ViT-B-32/openai/RESISC45/full__linearized_ntk_last_ep.pt",
+        "SUN397": "src/checkpoints/finetune/ViT-B-32/openai/SUN397/full__linearized_ntk_last_ep.pt"
     }
 }

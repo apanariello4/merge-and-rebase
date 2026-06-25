@@ -30,7 +30,8 @@ common:
     early_stopping_patience: 5
 
   strategy:
-    name: full                # full | linear_probe | ntk | peft_lora
+    name: full                # full | linear_probe | peft_lora
+    forward_mode: standard    # standard | linearized_ntk
     params: {}
     text_prompt_tuning:
       enabled: true
@@ -153,7 +154,8 @@ datasets:
   # Example of strategy override on one dataset (if you ever need it)
   # SomeDataset:
   #   strategy:
-  #     name: ntk
+  #     name: full
+  #     forward_mode: linearized_ntk
   #     params:
   #       freeze_backbone: true
   #   train:

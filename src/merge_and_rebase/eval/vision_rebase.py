@@ -31,7 +31,7 @@ from ..eval.utils import (
     patch_base_for_attn,
     to_cpu_fp32,
 )
-from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
+from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
 from ..io.peft_helpers import normalize_attn_patch_cfg
 from ..merge.methods._common import axpy_state_dict
 from ..merge.task_vectors import TaskVector
@@ -200,6 +200,7 @@ def main() -> None:
         )
         p.add_argument("--alpha-selection", type=str, choices=["shared", "per_task"], default=None)
         p.add_argument("--alpha-patience", type=int, default=None)
+        p.add_argument("--alpha-search-split", type=str, default=None, choices=["val", "test"])
         p.add_argument("--save-merged", type=str, default=None)
         p.add_argument("--save-transported-tvs-dir", type=str, default=None)
         p.add_argument(
@@ -260,6 +261,7 @@ def main() -> None:
             "alpha_search": getattr(args, "alpha_search", None),
             "alpha_selection": getattr(args, "alpha_selection", None),
             "alpha_patience": args.alpha_patience,
+            "alpha_search_split": args.alpha_search_split,
             "alpha_min": args.alpha_min,
             "alpha_max": args.alpha_max,
             "alpha_step": args.alpha_step,
@@ -282,12 +284,10 @@ def main() -> None:
         method_label = format_rebase_method_label(method_name, method_params)
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
         theseus_like_method = method_name in {"theseus", "theseus_reference"}
-        blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
         transfusion_mode = method_name == "transfusion"
-        bico_mode = method_name in ("bico", "bico_gradin")
         eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
         block_extension_eval_requested = bool(eval_before_rebase)
-        block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
+        block_extension_eval_enabled = bool(block_extension_eval_requested and theseus_like_method)
         block_extension_eval_split = str(cfg.get("block_extension_eval_split", "test")).strip().lower()
         if block_extension_eval_split not in {"val", "test"}:
             raise ValueError("block_extension_eval_split must be one of: val, test")
@@ -295,10 +295,10 @@ def main() -> None:
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
-        if block_extension_eval_requested and not blockext_like_method:
+        if block_extension_eval_requested and not theseus_like_method:
             print(
                 "Block-extension target-dataset eval: requested but skipped "
-                f"(method='{method_name}' does not support block-extension)."
+                f"(method='{method_name}' is not Theseus-like)."
             )
 
         grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
@@ -310,6 +310,10 @@ def main() -> None:
         alpha_patience = int(alpha_patience_raw) if alpha_patience_raw is not None else 0
         if alpha_patience < 0:
             raise ValueError("alpha_patience must be >= 0")
+
+        alpha_search_split = str(cfg.get("alpha_search_split", "val")).strip().lower()
+        if alpha_search_split not in {"val", "test"}:
+            raise ValueError("alpha_search_split must be one of: val, test")
 
         if alpha_search:
             a_min = float(cfg.get("alpha_min", 0.0))
@@ -360,6 +364,8 @@ def main() -> None:
         )
 
         tuned_by_task = cfg.get("tuned_ckpts", None)
+        if tuned_by_task is not None:
+            tuned_by_task = {t: resolve_ckpt_path(str(p)) for t, p in tuned_by_task.items()}
         if not tuned_by_task:
             raise ValueError("Provide tuned checkpoints via --tuned-ckpts or config 'tuned_ckpts'.")
 
@@ -390,14 +396,14 @@ def main() -> None:
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
         run_block_extension_prestep = bool(
-            blockext_like_method and block_extension_enabled and source_depth < target_depth
+            theseus_like_method and block_extension_enabled and source_depth < target_depth
         )
-        if blockext_like_method and block_extension_enabled and source_depth > target_depth:
+        if theseus_like_method and block_extension_enabled and source_depth > target_depth:
             raise ValueError(
                 "Block extension preprocess only supports growing the smaller source network. "
                 f"Got source depth {source_depth} > target depth {target_depth}."
             )
-        if blockext_like_method:
+        if theseus_like_method:
             if run_block_extension_prestep:
                 print(
                     "Block extension preprocess: enabled "
@@ -506,7 +512,7 @@ def main() -> None:
             )
 
             source_loaders = None
-            if theseus_like_method or transfusion_mode or bico_mode:
+            if theseus_like_method or transfusion_mode:
                 source_loaders = build_vision_loaders(
                     hf_ds=hf_ds,
                     hf_path=hf_path,
@@ -524,11 +530,12 @@ def main() -> None:
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
-            if blockext_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
+            if theseus_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
                 load_into_model(source_base_model_task, source_base_sd, strict=False)
                 load_into_model(source_ft_model_task, source_base_sd, strict=False)
+                load_into_model(source_ft_model_task, load_ckpt(str(tuned_by_task[task])), strict=False)
 
             if block_extension_eval_enabled and source_loaders is not None:
                 eval_row: dict[str, Any] = {
@@ -599,8 +606,6 @@ def main() -> None:
                 if source_base_model_task is None or source_ft_model_task is None:
                     raise RuntimeError("Block extension preprocess expected initialized source task models.")
 
-                load_into_model(source_ft_model_task, load_ckpt(str(tuned_by_task[task])), strict=False)
-
                 calibration_loader = select_loader(
                     block_extension_cfg.calibration_split,
                     train_loader=source_loaders.train,
@@ -662,10 +667,10 @@ def main() -> None:
                     run_logger.log_event(
                         "block_extension_eval",
                         metrics={
-                            f"block_extension_eval/{task}/zero_shot_pre": float(last_row["zero_shot_pre"]),
-                            f"block_extension_eval/{task}/zero_shot_post": float(zero_post),
-                            f"block_extension_eval/{task}/ft_pre": float(last_row["ft_pre"]),
-                            f"block_extension_eval/{task}/ft_post": float(ft_post),
+                            f"block_extension/eval/{task}/zero_shot_pre": float(last_row["zero_shot_pre"]),
+                            f"block_extension/eval/{task}/zero_shot_post": float(zero_post),
+                            f"block_extension/eval/{task}/ft_pre": float(last_row["ft_pre"]),
+                            f"block_extension/eval/{task}/ft_post": float(ft_post),
                         },
                         context=last_row,
                     )
@@ -682,8 +687,8 @@ def main() -> None:
                 run_logger.log_event(
                     "block_extension_eval",
                     metrics={
-                        f"block_extension_eval/{task}/zero_shot": float(last_row["zero_shot"]),
-                        f"block_extension_eval/{task}/ft": float(last_row["ft"]),
+                        f"block_extension/eval/{task}/zero_shot": float(last_row["zero_shot"]),
+                        f"block_extension/eval/{task}/ft": float(last_row["ft"]),
                     },
                     context=last_row,
                 )
@@ -778,12 +783,9 @@ def main() -> None:
                     **method_params,
                 )
             elif theseus_like_method:
-                if run_block_extension_prestep and source_base_model_task is not None:
-                    source_model_for_theseus = source_base_model_task
-                else:
-                    source_model_for_theseus = deepcopy(clf_source.model)
-                    load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
+                source_model_for_theseus = deepcopy(clf_source.model)
                 target_model_for_theseus = deepcopy(clf_target.model)
+                load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
                 load_into_model(target_model_for_theseus, target_base_sd, strict=False)
 
                 prepared = method.prepare(
@@ -796,43 +798,6 @@ def main() -> None:
                     device=device,
                     **method_params,
                 )
-            elif bico_mode:
-                from ..models.grad_recipes import clip_contrastive_recipe
-
-                if run_block_extension_prestep and source_base_model_task is not None:
-                    source_model_for_bico = source_base_model_task
-                else:
-                    source_model_for_bico = deepcopy(clf_source.model)
-                    load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
-                target_model_for_bico = deepcopy(clf_target.model)
-                load_into_model(target_model_for_bico, target_base_sd, strict=False)
-
-                source_recipe = clip_contrastive_recipe(
-                    clf_source,
-                    classnames,
-                    source_build_cfg_task,
-                    device=device,
-                )
-                target_recipe = clip_contrastive_recipe(
-                    clf_target,
-                    classnames,
-                    build_cfg_task,
-                    device=device,
-                )
-
-                prepared = method.prepare(
-                    source_model=source_model_for_bico,
-                    target_model=target_model_for_bico,
-                    source_dataloader=source_loaders.train,
-                    target_dataloader=loaders.train,
-                    source_recipe=source_recipe,
-                    target_recipe=target_recipe,
-                    target_base=target_base_sd,
-                    delta=task_delta,
-                    device=device,
-                    **method_params,
-                )
-                del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
             else:
                 prepared = transfusion_prepared
 
@@ -959,11 +924,11 @@ def main() -> None:
             shared_bad_steps = 0
 
             for alpha in alphas:
-                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: val, mode: shared) ===")
+                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: {alpha_search_split}, mode: shared) ===")
 
                 idxs = list(range(len(per_task)))
-                baseline_by_idx = _eval_baseline_task_indices("val", idxs, float(alpha))
-                rebase_by_idx = _eval_rebased_task_indices("val", idxs, float(alpha))
+                baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, idxs, float(alpha))
+                rebase_by_idx = _eval_rebased_task_indices(alpha_search_split, idxs, float(alpha))
                 baseline_accs = [baseline_by_idx[i] for i in idxs]
                 rebase_accs = [rebase_by_idx[i] for i in idxs]
 
@@ -1056,10 +1021,10 @@ def main() -> None:
                     print("\nAll tasks have early-stopped; ending per-task alpha sweep.")
                     break
 
-                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: val, mode: per_task) ===")
+                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: {alpha_search_split}, mode: per_task) ===")
 
-                baseline_by_idx = _eval_baseline_task_indices("val", active_indices, float(alpha))
-                rebase_by_idx = _eval_rebased_task_indices("val", active_indices, float(alpha))
+                baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, active_indices, float(alpha))
+                rebase_by_idx = _eval_rebased_task_indices(alpha_search_split, active_indices, float(alpha))
 
                 baseline_accs = [baseline_by_idx[idx] for idx in active_indices]
                 rebase_accs = [rebase_by_idx[idx] for idx in active_indices]

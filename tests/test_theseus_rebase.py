@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.methods import theseus as theseus_mod
 from merge_and_rebase.rebase.registry import get_method, list_methods
+from merge_and_rebase.rebase.runtime import format_rebase_method_label
 
 
 class _TinyVisual(nn.Module):
@@ -78,62 +79,38 @@ def test_theseus_transport_smoke() -> None:
         assert tensor.dtype == target_base[key].dtype
 
 
-def test_theseus_transform_granularity_param_matches_default() -> None:
-    torch.manual_seed(123)
+def test_partial_whitening_changes_alignment_map() -> None:
+    store = theseus_mod.ActivationStore(store_a_gram=True, store_b_gram=True)
+    source_rows = torch.tensor([[3.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    target_rows = torch.tensor([[1.0, 2.0], [2.0, 0.0], [0.0, 1.0]])
+    store.update(source_rows, target_rows)
+
+    raw_map = theseus_mod._compute_alignment_map(
+        store,
+        center=False,
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+    )
+    whitened_map = theseus_mod._compute_alignment_map(
+        store,
+        center=False,
+        whiten_power=0.5,
+        whiten_eps=1e-6,
+    )
+
+    assert raw_map is not None
+    assert whitened_map is not None
+    assert raw_map.shape == whitened_map.shape == (2, 2)
+    assert not torch.allclose(raw_map, whitened_map)
+
+
+def test_theseus_transport_with_partial_whitening_smoke() -> None:
     source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
     target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
 
     source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
     target_base = {k: v.detach().clone() for k, v in target_model.state_dict().items()}
-    delta = {
-        key: torch.randn_like(tensor)
-        for key, tensor in source_base.items()
-        if key.startswith("visual.") and tensor.is_floating_point()
-    }
 
-    loader = _make_loader(in_dim=6)
-    method = get_method("theseus")
-
-    transported_default = method.transport(
-        source_base=source_base,
-        target_base=target_base,
-        delta=delta,
-        source_model=source_model,
-        target_model=target_model,
-        source_dataloader=loader,
-        target_dataloader=loader,
-        device="cpu",
-        seq_align="mean",
-        num_batches=1,
-        strict=True,
-    )
-
-    transported_param = method.transport(
-        source_base=source_base,
-        target_base=target_base,
-        delta=delta,
-        source_model=source_model,
-        target_model=target_model,
-        source_dataloader=loader,
-        target_dataloader=loader,
-        device="cpu",
-        seq_align="mean",
-        num_batches=1,
-        strict=True,
-        transform_granularity="param",
-    )
-
-    assert set(transported_default.keys()) == set(transported_param.keys())
-    for key in transported_default:
-        assert torch.allclose(transported_default[key], transported_param[key])
-
-
-def test_theseus_transform_granularity_block_smoke() -> None:
-    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
-    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
-
-    source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
-    target_base = {k: v.detach().clone() for k, v in target_model.state_dict().items()}
     delta = {
         key: torch.randn_like(tensor)
         for key, tensor in source_base.items()
@@ -153,9 +130,9 @@ def test_theseus_transform_granularity_block_smoke() -> None:
         target_dataloader=loader,
         device="cpu",
         seq_align="mean",
+        whiten_power=0.25,
         num_batches=1,
         strict=True,
-        transform_granularity="block",
     )
 
     assert transported
@@ -165,34 +142,30 @@ def test_theseus_transform_granularity_block_smoke() -> None:
         assert tensor.dtype == target_base[key].dtype
 
 
-def test_theseus_transform_granularity_global_smoke() -> None:
+def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
     source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
     target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
 
     source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
     target_base = {k: v.detach().clone() for k, v in target_model.state_dict().items()}
+
     delta = {
         key: torch.randn_like(tensor)
         for key, tensor in source_base.items()
         if key.startswith("visual.") and tensor.is_floating_point()
     }
 
-    loader = _make_loader(in_dim=6)
     method = get_method("theseus")
-
     transported = method.transport(
         source_base=source_base,
         target_base=target_base,
         delta=delta,
         source_model=source_model,
         target_model=target_model,
-        source_dataloader=loader,
-        target_dataloader=loader,
         device="cpu",
-        seq_align="mean",
-        num_batches=1,
+        covariance_mode="data_free",
+        whiten_power=0.25,
         strict=True,
-        transform_granularity="global",
     )
 
     assert transported
@@ -202,77 +175,53 @@ def test_theseus_transform_granularity_global_smoke() -> None:
         assert tensor.dtype == target_base[key].dtype
 
 
-def test_theseus_transform_granularity_module_type_smoke() -> None:
-    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
-    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
+def test_data_free_covariance_map_uses_weight_proxies() -> None:
+    source = torch.tensor([[2.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    rotation = torch.tensor([[0.0, -1.0], [1.0, 0.0]], dtype=torch.float32)
+    target = source @ rotation
 
-    source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
-    target_base = {k: v.detach().clone() for k, v in target_model.state_dict().items()}
-    delta = {
-        key: torch.randn_like(tensor)
-        for key, tensor in source_base.items()
-        if key.startswith("visual.") and tensor.is_floating_point()
-    }
-
-    loader = _make_loader(in_dim=6)
-    method = get_method("theseus")
-
-    transported = method.transport(
-        source_base=source_base,
-        target_base=target_base,
-        delta=delta,
-        source_model=source_model,
-        target_model=target_model,
-        source_dataloader=loader,
-        target_dataloader=loader,
-        device="cpu",
-        seq_align="mean",
-        num_batches=1,
-        strict=True,
-        transform_granularity="module_type",
+    t_in = theseus_mod._compute_alignment_map_from_matrix_proxies(
+        source,
+        target,
+        side="input",
+        whiten_power=0.0,
+        whiten_eps=1e-6,
     )
 
-    assert transported
-    assert set(transported.keys()) == set(delta.keys())
-    for key, tensor in transported.items():
-        assert tensor.shape == target_base[key].shape
-        assert tensor.dtype == target_base[key].dtype
+    assert t_in.shape == (2, 2)
+    source_cov = source.T @ source
+    target_cov = target.T @ target
+    aligned_cov = t_in.T @ source_cov @ t_in
+    assert torch.allclose(aligned_cov, target_cov, atol=1e-5, rtol=1e-5)
 
 
-def test_theseus_transform_granularity_invalid_raises() -> None:
-    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
-    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
+def test_theseus_runtime_label_includes_covariance_mode() -> None:
+    label = format_rebase_method_label(
+        "theseus",
+        {"num_batches": 3, "seq_align": "mean", "covariance_mode": "data_free", "whiten_power": 0.25},
+    )
+    assert label == "theseus(batches=3, align=mean, cov=data_free, whiten=0.25)"
 
-    source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
-    target_base = {k: v.detach().clone() for k, v in target_model.state_dict().items()}
-    delta = {
-        key: torch.randn_like(tensor)
-        for key, tensor in source_base.items()
-        if key.startswith("visual.") and tensor.is_floating_point()
-    }
 
-    loader = _make_loader(in_dim=6)
-    method = get_method("theseus")
+def test_data_free_proj_transform_uses_swapped_axes() -> None:
+    source_ref = torch.randn(8, 5)
+    target_ref = torch.randn(7, 6)
+    visual_delta = {"proj": torch.randn_like(source_ref)}
+    transforms = theseus_mod._precompute_transforms_data_free(
+        source_visual_base={"proj": source_ref},
+        target_visual_base={"proj": target_ref},
+        visual_delta=visual_delta,
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+        show_progress=False,
+        method_name="theseus",
+    )
 
-    try:
-        method.transport(
-            source_base=source_base,
-            target_base=target_base,
-            delta=delta,
-            source_model=source_model,
-            target_model=target_model,
-            source_dataloader=loader,
-            target_dataloader=loader,
-            device="cpu",
-            seq_align="mean",
-            num_batches=1,
-            strict=True,
-            transform_granularity="not_a_mode",
-        )
-    except ValueError as exc:
-        assert "transform_granularity" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for invalid transform_granularity")
+    transform = transforms["proj"]
+    assert transform.t_in is not None
+    assert transform.t_out is not None
+    assert transform.t_in.shape == (8, 7)
+    assert transform.t_out.shape == (5, 6)
 
 
 def test_fused_qkv_split_merge_roundtrip() -> None:
@@ -325,14 +274,3 @@ def test_random_dataset_subsampling_uses_randperm_seed() -> None:
     g2.manual_seed(124)
     expected_other_seed = torch.randperm(20, generator=g2)[:12].tolist()
     assert seen != expected_other_seed
-
-
-def test_transport_weight_proj_suffix_uses_proj_formula() -> None:
-    delta = torch.randn(7, 5)
-    t_in = torch.randn(7, 9)
-    t_out = torch.randn(5, 11)
-
-    proj_plain = theseus_mod._transport_weight(delta, t_in, t_out, key="proj")
-    proj_prefixed = theseus_mod._transport_weight(delta, t_in, t_out, key="visual.proj")
-
-    assert torch.allclose(proj_plain, proj_prefixed)

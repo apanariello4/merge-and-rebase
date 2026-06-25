@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -9,11 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - optional dependency fallback
-    tqdm = None
+from tqdm import tqdm
 
 from ...models.patch_openclip_attention import merge_openclip_vit_attn, split_openclip_vit_attn
 from ..base import TensorDict
@@ -31,6 +26,9 @@ _V_PROJ_WEIGHT = ".attn.v_proj.weight"
 _Q_PROJ_BIAS = ".attn.q_proj.bias"
 _K_PROJ_BIAS = ".attn.k_proj.bias"
 _V_PROJ_BIAS = ".attn.v_proj.bias"
+
+_ACTIVATION_COVARIANCE_MODES = {"activation", "activations"}
+_DATA_FREE_COVARIANCE_MODES = {"data_free", "data-free", "weight", "weights", "weight_space", "weight-space"}
 
 
 def _resolve_device(device: str | torch.device) -> torch.device:
@@ -96,8 +94,6 @@ def _split_fused_qkv_if_needed(model: torch.nn.Module) -> int:
     ref_param = next(visual.parameters(), None)
     ref_device = ref_param.device if ref_param is not None else torch.device("cpu")
     ref_dtype = ref_param.dtype if ref_param is not None else None
-
-    
 
     n_patched = int(
         split_openclip_vit_attn(
@@ -248,7 +244,7 @@ def _interp_2d_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
         return torch.cat([cls_token, resized], dim=1) if cls_token is not None else resized
 
     src_side = int(patch_tokens.shape[1] ** 0.5)
-    tgt_side = int(target_patch_tokens ** 0.5)
+    tgt_side = int(target_patch_tokens**0.5)
     x = patch_tokens.reshape(tokens.shape[0], src_side, src_side, patch_tokens.shape[-1]).permute(0, 3, 1, 2)
     x = F.interpolate(x, size=(tgt_side, tgt_side), mode="bilinear", align_corners=False)
     resized = x.permute(0, 2, 3, 1).reshape(tokens.shape[0], tgt_side * tgt_side, patch_tokens.shape[-1])
@@ -263,8 +259,7 @@ def _align_features(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if source_feat.shape[0] != target_feat.shape[0]:
         raise ValueError(
-            "Theseus calibration expects aligned batch sizes. "
-            f"Got {source_feat.shape[0]} and {target_feat.shape[0]}."
+            f"Theseus calibration expects aligned batch sizes. Got {source_feat.shape[0]} and {target_feat.shape[0]}."
         )
 
     source_tokens = _to_tokens(source_feat, batch_size=int(source_feat.shape[0]))
@@ -499,22 +494,107 @@ def collect_activations(
     return registry
 
 
-def _compute_procrustes_map(source_rows: torch.Tensor, target_rows: torch.Tensor, *, center: bool) -> torch.Tensor:
-    if center:
-        source_rows = source_rows - source_rows.mean(dim=0, keepdim=True)
-        target_rows = target_rows - target_rows.mean(dim=0, keepdim=True)
-    cov = source_rows.double().T @ target_rows.double()
-    u, _, v_h = torch.linalg.svd(cov, full_matrices=False)
-    return (u @ v_h).float()
-
-
 def _compute_procrustes_map_from_cov(cov: torch.Tensor) -> torch.Tensor:
     u, _, v_h = torch.linalg.svd(cov.double(), full_matrices=False)
     return (u @ v_h).float()
 
 
+def _matrix_power_psd(matrix: torch.Tensor, *, power: float, eps: float) -> torch.Tensor:
+    sym = 0.5 * (matrix + matrix.T)
+    evals, evecs = torch.linalg.eigh(sym)
+    powered = evals.clamp_min(float(eps)).pow(float(power))
+    return (evecs * powered.unsqueeze(0)) @ evecs.T
+
+
+def _partially_whiten_covariance(
+    cov: torch.Tensor,
+    *,
+    a_gram: torch.Tensor,
+    b_gram: torch.Tensor,
+    power: float,
+    eps: float,
+) -> torch.Tensor:
+    if power <= 0.0:
+        return cov
+    left = _matrix_power_psd(a_gram, power=-power, eps=eps)
+    right = _matrix_power_psd(b_gram, power=-power, eps=eps)
+    return left @ cov @ right
+
+
+def _compute_alignment_map(
+    store: ActivationStore,
+    *,
+    center: bool,
+    whiten_power: float,
+    whiten_eps: float,
+) -> torch.Tensor | None:
+    cov = store.get_covariance(center=center)
+    if cov is None:
+        return None
+    if whiten_power > 0.0:
+        a_gram = store.get_a_gram(center=center, epsilon=whiten_eps)
+        b_gram = store.get_b_gram(center=center, epsilon=whiten_eps)
+        if a_gram is not None and b_gram is not None:
+            cov = _partially_whiten_covariance(
+                cov,
+                a_gram=a_gram,
+                b_gram=b_gram,
+                power=whiten_power,
+                eps=whiten_eps,
+            )
+        else:
+            logger.warning(
+                "Theseus whitening requested but Gram statistics were unavailable; falling back to raw Procrustes."
+            )
+    return _compute_procrustes_map_from_cov(cov)
+
+
+def _resolve_covariance_mode(mode: str) -> str:
+    key = str(mode).strip().lower()
+    if key in _ACTIVATION_COVARIANCE_MODES:
+        return "activations"
+    if key in _DATA_FREE_COVARIANCE_MODES:
+        return "data_free"
+    raise ValueError(
+        "Theseus covariance_mode must be one of: activations, activation, data_free, data-free, weights, weight_space."
+    )
+
+
+def _compute_alignment_map_from_matrix_proxies(
+    source_proxy: torch.Tensor,
+    target_proxy: torch.Tensor,
+    *,
+    side: str,
+    whiten_power: float,
+    whiten_eps: float,
+) -> torch.Tensor:
+    source = source_proxy.detach().cpu().to(torch.float64)
+    target = target_proxy.detach().cpu().to(torch.float64)
+
+    if side == "input":
+        a_gram = source.T @ source
+        b_gram = target.T @ target
+    elif side == "output":
+        a_gram = source @ source.T
+        b_gram = target @ target.T
+    else:  # pragma: no cover - defensive
+        raise ValueError(f"Unsupported alignment side '{side}'.")
+
+    u_a, s_a, _ = torch.linalg.svd(a_gram, full_matrices=False)
+    u_b, s_b, _ = torch.linalg.svd(b_gram, full_matrices=False)
+    rank = min(int(u_a.shape[1]), int(u_b.shape[1]))
+    basis_power = 0.5 - float(whiten_power)
+    scale_a = s_a[:rank].clamp_min(float(whiten_eps)).pow(basis_power)
+    scale_b = s_b[:rank].clamp_min(float(whiten_eps)).pow(basis_power)
+    source_basis = u_a[:, :rank] * scale_a.unsqueeze(0)
+    target_basis = u_b[:, :rank] * scale_b.unsqueeze(0)
+    cov = source_basis @ target_basis.T
+
+    return _compute_procrustes_map_from_cov(cov)
+
+
 def _transport_weight(delta_weight: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor, *, key: str) -> torch.Tensor:
-    if key == "proj" or key.endswith(".proj"):
+    if key == "proj":
         return (t_out.T @ delta_weight.T @ t_in).T
     return t_out.T @ delta_weight @ t_in
 
@@ -530,87 +610,6 @@ def _param_to_module(visual_model: torch.nn.Module) -> dict[str, str]:
             full_name = f"{module_name}.{param_name}" if module_name else param_name
             out[full_name] = module_name
     return out
-
-
-_RESBLOCK_RE = re.compile(r"^transformer\.resblocks\.(\d+)(?:\.(.*))?$")
-
-
-def _activation_group(module_name: str, *, granularity: str) -> str:
-    if granularity == "param":
-        return module_name
-    if granularity == "global":
-        return "global"
-
-    match = _RESBLOCK_RE.match(module_name)
-    if match is None:
-        return module_name
-
-    block_idx = match.group(1)
-    suffix = match.group(2) or ""
-
-    if granularity == "block":
-        return f"transformer.resblocks.{block_idx}"
-
-    if granularity == "module_type":
-        if suffix:
-            return f"transformer.resblocks.*.{suffix}"
-        return "transformer.resblocks.*"
-
-    raise ValueError(
-        "Unsupported transform_granularity. Expected one of: param, module_type, block, global. "
-        f"Got: {granularity}"
-    )
-
-
-def _build_grouped_covariances(
-    activation_registry: Mapping[str, ActivationStore],
-    *,
-    center_acts: bool,
-    granularity: str,
-) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
-    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
-
-    for act_key, store in activation_registry.items():
-        if act_key.endswith(".in"):
-            side = "in"
-            module_name = act_key[: -len(".in")]
-        elif act_key.endswith(".out"):
-            side = "out"
-            module_name = act_key[: -len(".out")]
-        else:
-            continue
-
-        cov = store.get_covariance(center=center_acts)
-        if cov is None:
-            continue
-
-        group = _activation_group(module_name, granularity=granularity)
-        shape_key = (int(cov.shape[0]), int(cov.shape[1]))
-        key = (group, side, shape_key)
-        if key in grouped_covariances:
-            grouped_covariances[key] = grouped_covariances[key] + cov
-        else:
-            grouped_covariances[key] = cov.clone()
-
-    return grouped_covariances
-
-
-def _build_grouped_transforms(
-    grouped_covariances: Mapping[tuple[str, str, tuple[int, int]], torch.Tensor],
-    *,
-    show_progress: bool,
-    method_name: str,
-) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
-    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
-    items = _iter_with_progress(
-        grouped_covariances.items(),
-        total=len(grouped_covariances),
-        desc=f"{method_name}.prepare: compute shared transforms",
-        enabled=show_progress,
-    )
-    for key, cov in items:
-        grouped_transforms[key] = _compute_procrustes_map_from_cov(cov)
-    return grouped_transforms
 
 
 def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) -> Any:
@@ -684,25 +683,6 @@ class _LayerTransform:
     t_out: torch.Tensor | None = None
 
 
-@dataclass(frozen=True)
-class _PrecomputeDiagnostics:
-    assigned_keys: int
-    shared_transform_count: int
-    shared_group_count: int
-
-
-@dataclass(frozen=True)
-class _ApplyDiagnostics:
-    transformed_weight: int
-    transformed_bias: int
-    zero_passthrough: int
-    missing_transform: int
-    transport_failures: int
-    wrong_shape: int
-    wrong_shape_examples: tuple[str, ...]
-    skipped_not_in_target_visual: int
-
-
 def _precompute_transforms(
     *,
     target_model: torch.nn.Module,
@@ -710,54 +690,20 @@ def _precompute_transforms(
     visual_delta: Mapping[str, torch.Tensor],
     activation_registry: Mapping[str, ActivationStore],
     center_acts: bool,
-    transform_granularity: str,
+    whiten_power: float,
+    whiten_eps: float,
     show_progress: bool,
     method_name: str,
-) -> tuple[dict[str, _LayerTransform], _PrecomputeDiagnostics]:
+) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
     visual_model = _visual_module(target_model)
     param_to_module = _param_to_module(visual_model)
-    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
-    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
-
-    if transform_granularity != "param":
-        grouped_covariances = _build_grouped_covariances(
-            activation_registry,
-            center_acts=center_acts,
-            granularity=transform_granularity,
-        )
-        grouped_transforms = _build_grouped_transforms(
-            grouped_covariances,
-            show_progress=show_progress,
-            method_name=method_name,
-        )
-
-    def _transform_for(
-        module_name: str,
-        *,
-        side: str,
-        expected_shape: tuple[int, int],
-        fallback_key: str,
-    ) -> torch.Tensor | None:
-        if transform_granularity == "param":
-            store = activation_registry.get(fallback_key)
-            if store is None:
-                return None
-            cov = store.get_covariance(center=center_acts)
-            if cov is None:
-                return None
-            if (int(cov.shape[0]), int(cov.shape[1])) != expected_shape:
-                return None
-            return _compute_procrustes_map_from_cov(cov)
-
-        group = _activation_group(module_name, granularity=transform_granularity)
-        return grouped_transforms.get((group, side, expected_shape))
 
     items = _iter_with_progress(
         visual_delta.items(),
         total=len(visual_delta),
-        desc=f"{method_name}.prepare: assign transforms",
+        desc=f"{method_name}.prepare: compute transforms",
         enabled=show_progress,
     )
     for key, delta_source in items:
@@ -773,35 +719,35 @@ def _precompute_transforms(
         if key == "proj":
             in_key = "ln_post.out"
             out_key = ".out"
-            in_module = "ln_post"
-            out_module = ""
         else:
             in_key = f"{module_name}.in"
             out_key = f"{module_name}.out"
-            in_module = module_name
-            out_module = module_name
 
         if delta_source.ndim == 2:
-            target_ref = target_visual_base[key]
-            if key == "proj":
-                expected_in = (int(delta_source.shape[0]), int(target_ref.shape[0]))
-                expected_out = (int(delta_source.shape[1]), int(target_ref.shape[1]))
-            else:
-                expected_in = (int(delta_source.shape[1]), int(target_ref.shape[1]))
-                expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
-
-            t_in = _transform_for(in_module, side="in", expected_shape=expected_in, fallback_key=in_key)
-            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
-            if t_in is not None and t_out is not None:
-
-                transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
-                continue
+            in_store = activation_registry.get(in_key)
+            out_store = activation_registry.get(out_key)
+            if in_store is not None and out_store is not None:
+                t_in = _compute_alignment_map(
+                    in_store,
+                    center=center_acts,
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+                t_out = _compute_alignment_map(
+                    out_store,
+                    center=center_acts,
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+                if t_in is not None and t_out is not None:
+                    transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+                    continue
             transforms_by_key[key] = _LayerTransform(kind="weight")
             continue
 
         if delta_source.ndim == 1:
             if key.endswith(".bias"):
-                weight_key = f"{key[:-len('.bias')]}.weight"
+                weight_key = f"{key[: -len('.bias')]}.weight"
                 weight_transform = transforms_by_key.get(weight_key)
                 if weight_transform is not None and weight_transform.t_out is not None:
                     transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
@@ -814,24 +760,100 @@ def _precompute_transforms(
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=cached_t_out)
                 continue
 
-            target_ref = target_visual_base[key]
-            expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
-            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
-            if t_out is not None:
-                t_out_cache[out_key] = t_out
-                transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
-                continue
+            out_store = activation_registry.get(out_key)
+            if out_store is not None:
+                t_out = _compute_alignment_map(
+                    out_store,
+                    center=center_acts,
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+                if t_out is not None:
+                    t_out_cache[out_key] = t_out
+                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+                    continue
             transforms_by_key[key] = _LayerTransform(kind="bias")
             continue
 
         transforms_by_key[key] = _LayerTransform(kind="unsupported")
 
-    diagnostics = _PrecomputeDiagnostics(
-        assigned_keys=len(transforms_by_key),
-        shared_transform_count=(len(grouped_transforms) if transform_granularity != "param" else 0),
-        shared_group_count=(len(grouped_covariances) if transform_granularity != "param" else 0),
+    return transforms_by_key
+
+
+def _precompute_transforms_data_free(
+    *,
+    source_visual_base: Mapping[str, torch.Tensor],
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    whiten_power: float,
+    whiten_eps: float,
+    show_progress: bool,
+    method_name: str,
+) -> dict[str, _LayerTransform]:
+    transforms_by_key: dict[str, _LayerTransform] = {}
+
+    items = _iter_with_progress(
+        visual_delta.items(),
+        total=len(visual_delta),
+        desc=f"{method_name}.prepare: compute data-free transforms",
+        enabled=show_progress,
     )
-    return transforms_by_key, diagnostics
+    for key, delta_source in items:
+        if key not in target_visual_base:
+            print(f"Theseus align: skipping task vector key:{key} as it is not in target visual base.")
+            continue
+        if key not in source_visual_base:
+            transforms_by_key[key] = _LayerTransform(kind="unsupported")
+            continue
+
+        source_ref = source_visual_base[key]
+        target_ref = target_visual_base[key]
+
+        if key in _ZERO_KEYS:
+            transforms_by_key[key] = _LayerTransform(kind="zero")
+            continue
+
+        if delta_source.ndim == 2 and source_ref.ndim == 2 and target_ref.ndim == 2:
+            # CLIP stores `visual.proj` as [hidden, embed], so its axes are
+            # flipped relative to nn.Linear([out, in]) weights.
+            t_in = _compute_alignment_map_from_matrix_proxies(
+                source_ref,
+                target_ref,
+                side="output" if key == "proj" else "input",
+                whiten_power=whiten_power,
+                whiten_eps=whiten_eps,
+            )
+            t_out = _compute_alignment_map_from_matrix_proxies(
+                source_ref,
+                target_ref,
+                side="input" if key == "proj" else "output",
+                whiten_power=whiten_power,
+                whiten_eps=whiten_eps,
+            )
+            transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+            continue
+
+        if delta_source.ndim == 1 and source_ref.ndim == 1 and target_ref.ndim == 1:
+            if key.endswith(".bias"):
+                weight_key = f"{key[: -len('.bias')]}.weight"
+                weight_transform = transforms_by_key.get(weight_key)
+                if weight_transform is not None and weight_transform.t_out is not None:
+                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
+                    continue
+
+            t_out = _compute_alignment_map_from_matrix_proxies(
+                source_ref.unsqueeze(0),
+                target_ref.unsqueeze(0),
+                side="input",
+                whiten_power=whiten_power,
+                whiten_eps=whiten_eps,
+            )
+            transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+            continue
+
+        transforms_by_key[key] = _LayerTransform(kind="unsupported")
+
+    return transforms_by_key
 
 
 def _apply_transforms_to_visual_delta(
@@ -841,16 +863,8 @@ def _apply_transforms_to_visual_delta(
     transforms_by_key: Mapping[str, _LayerTransform],
     show_progress: bool,
     method_name: str,
-) -> tuple[TensorDict, _ApplyDiagnostics]:
+) -> TensorDict:
     aligned: TensorDict = {}
-    transformed_weight = 0
-    transformed_bias = 0
-    zero_passthrough = 0
-    missing_transform = 0
-    transport_failures = 0
-    wrong_shape = 0
-    wrong_shape_examples: list[str] = []
-    skipped_not_in_target_visual = 0
 
     items = _iter_with_progress(
         visual_delta.items(),
@@ -861,37 +875,30 @@ def _apply_transforms_to_visual_delta(
     for key, delta_source in items:
         if key not in target_visual_base:
             print(f"Theseus align: skipping task vector key:{key} as it is not in target visual base.")
-            skipped_not_in_target_visual += 1
             continue
 
         target_ref = target_visual_base[key]
         transported = torch.zeros_like(target_ref, dtype=torch.float32, device="cpu")
 
         transform = transforms_by_key.get(key)
-        applied = False
         if transform is not None:
-            if transform.kind == "zero":
-                zero_passthrough += 1
-                applied = True
-            if transform.kind == "weight" and delta_source.ndim == 2 and transform.t_in is not None and transform.t_out is not None:
+            if (
+                transform.kind == "weight"
+                and delta_source.ndim == 2
+                and transform.t_in is not None
+                and transform.t_out is not None
+            ):
                 try:
-                    transported = _transport_weight(delta_source.float().cpu(), transform.t_in, transform.t_out, key=key)
-                    transformed_weight += 1
-                    applied = True
+                    transported = _transport_weight(
+                        delta_source.float().cpu(), transform.t_in, transform.t_out, key=key
+                    )
                 except RuntimeError as exc:
                     logger.warning("Theseus transport failed for %s: %s", key, exc)
-                    transport_failures += 1
             elif transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None:
                 try:
                     transported = _transport_bias(delta_source.float().cpu(), transform.t_out)
-                    transformed_bias += 1
-                    applied = True
                 except ValueError as exc:
                     logger.warning("Theseus vector transport failed for %s: %s", key, exc)
-                    transport_failures += 1
-
-        if not applied and key in target_visual_base:
-            missing_transform += 1
 
         if transported.shape != target_ref.shape:
             logger.warning(
@@ -900,24 +907,11 @@ def _apply_transforms_to_visual_delta(
                 tuple(transported.shape),
                 tuple(target_ref.shape),
             )
-            wrong_shape += 1
-            if len(wrong_shape_examples) < 5:
-                wrong_shape_examples.append(key)
             transported = torch.zeros_like(target_ref, dtype=torch.float32, device="cpu")
 
         aligned[key] = transported.to(dtype=target_ref.dtype, device=target_ref.device)
 
-    diagnostics = _ApplyDiagnostics(
-        transformed_weight=transformed_weight,
-        transformed_bias=transformed_bias,
-        zero_passthrough=zero_passthrough,
-        missing_transform=missing_transform,
-        transport_failures=transport_failures,
-        wrong_shape=wrong_shape,
-        wrong_shape_examples=tuple(wrong_shape_examples),
-        skipped_not_in_target_visual=skipped_not_in_target_visual,
-    )
-    return aligned, diagnostics
+    return aligned
 
 
 @dataclass(frozen=True)
@@ -929,13 +923,16 @@ class TheseusRebase:
         *,
         source_model: torch.nn.Module,
         target_model: torch.nn.Module,
-        source_dataloader: Iterable[Any],
-        target_dataloader: Iterable[Any],
+        source_dataloader: Iterable[Any] | None = None,
+        target_dataloader: Iterable[Any] | None = None,
         target_base: Mapping[str, torch.Tensor] | None = None,
         delta: Mapping[str, torch.Tensor] | None = None,
         device: str = "cuda",
         seq_align: str = "interpolate2d",
         center_acts: bool = False,
+        covariance_mode: str = "activations",
+        whiten_power: float = 0.0,
+        whiten_eps: float = 1e-6,
         n_batches: int | None = None,
         num_batches: int | None = None,
         seed: int = 0,
@@ -948,20 +945,25 @@ class TheseusRebase:
         split_qkv = kwargs.pop("split_qkv", None)
         if split_qkv is not None:
             patch_qkv = bool(split_qkv)
-        transform_granularity = str(kwargs.pop("transform_granularity", "param")).strip().lower()
-        if transform_granularity not in {"param", "module_type", "block", "global"}:
-            raise ValueError("transform_granularity must be one of: param, module_type, block, global")
         del kwargs
-        #Config fallbacks num_batches -> n_batches
+        # Config fallbacks num_batches -> n_batches
         if n_batches is None:
             n_batches = num_batches
         log_prefix = f"[{self.name}]"
+        covariance_mode = _resolve_covariance_mode(covariance_mode)
+        whiten_power = float(whiten_power)
+        whiten_eps = float(whiten_eps)
+        if not (0.0 <= whiten_power <= 0.5):
+            raise ValueError("Theseus whiten_power must be in [0, 0.5].")
+        if whiten_eps <= 0.0:
+            raise ValueError("Theseus whiten_eps must be > 0.")
 
         if verbose:
             print(
                 f"{log_prefix} prepare: start "
-                f"(seq_align={seq_align}, center_acts={bool(center_acts)}, n_batches={n_batches}, "
-                f"seed={int(seed)}, transform_granularity={transform_granularity})"
+                f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
+                f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
+                f"n_batches={n_batches}, seed={int(seed)})"
             )
 
         patched_source = 0
@@ -983,32 +985,42 @@ class TheseusRebase:
 
         activation_registry: dict[str, ActivationStore] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
-        precompute_diag = _PrecomputeDiagnostics(assigned_keys=0, shared_transform_count=0, shared_group_count=0)
         split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
         try:
-            if verbose:
-                print(f"{log_prefix} prepare: collecting activations")
+            if covariance_mode == "activations":
+                if source_dataloader is None or target_dataloader is None:
+                    raise ValueError(
+                        "Theseus activation covariance mode requires both source_dataloader and target_dataloader."
+                    )
+                if verbose:
+                    print(f"{log_prefix} prepare: collecting activations")
 
-            activation_registry = collect_activations(
-                source_model,
-                target_model,
-                source_dataloader,
-                target_dataloader,
-                device=device,
-                seq_align=seq_align,
-                n_batches=n_batches,
-                seed=int(seed),
-                batch_size=batch_size,
-            )
-            if verbose:
-                print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+                activation_registry = collect_activations(
+                    source_model,
+                    target_model,
+                    source_dataloader,
+                    target_dataloader,
+                    device=device,
+                    seq_align=seq_align,
+                    n_batches=n_batches,
+                    seed=int(seed),
+                    batch_size=batch_size,
+                    store_a_gram=whiten_power > 0.0,
+                    store_b_gram=whiten_power > 0.0,
+                )
+                if verbose:
+                    print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+
+            elif verbose:
+                print(f"{log_prefix} prepare: skipping activation collection (data-free covariance mode)")
 
             if target_base is not None and delta is not None:
                 if verbose:
                     print(f"{log_prefix} prepare: precomputing per-layer transforms")
                 visual_key_map = _visual_delta_keys(delta)
+                source_visual_base = _visual_state_dict(source_model.state_dict())
                 target_visual_base = _visual_state_dict(target_base)
                 visual_delta = {
                     stripped_key: delta[original_key]
@@ -1017,27 +1029,34 @@ class TheseusRebase:
                 }
 
                 if split_fused_qkv:
+                    source_visual_base = _split_fused_qkv_state(source_visual_base)
                     target_visual_base = _split_fused_qkv_state(target_visual_base)
                     visual_delta = _split_fused_qkv_state(visual_delta)
 
-                transforms_by_key, precompute_diag = _precompute_transforms(
-                    target_model=target_model,
-                    target_visual_base=target_visual_base,
-                    visual_delta=visual_delta,
-                    activation_registry=activation_registry,
-                    center_acts=bool(center_acts),
-                    transform_granularity=transform_granularity,
-                    show_progress=bool(show_progress),
-                    method_name=self.name,
-                )
+                if covariance_mode == "activations":
+                    transforms_by_key = _precompute_transforms(
+                        target_model=target_model,
+                        target_visual_base=target_visual_base,
+                        visual_delta=visual_delta,
+                        activation_registry=activation_registry,
+                        center_acts=bool(center_acts),
+                        whiten_power=whiten_power,
+                        whiten_eps=whiten_eps,
+                        show_progress=bool(show_progress),
+                        method_name=self.name,
+                    )
+                else:
+                    transforms_by_key = _precompute_transforms_data_free(
+                        source_visual_base=source_visual_base,
+                        target_visual_base=target_visual_base,
+                        visual_delta=visual_delta,
+                        whiten_power=whiten_power,
+                        whiten_eps=whiten_eps,
+                        show_progress=bool(show_progress),
+                        method_name=self.name,
+                    )
                 if verbose:
-                    if transform_granularity == "param":
-                        print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
-                    else:
-                        print(
-                            f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)} "
-                            f"(shared={precompute_diag.shared_transform_count}, groups={precompute_diag.shared_group_count})"
-                        )
+                    print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
             elif verbose:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
         finally:
@@ -1059,18 +1078,13 @@ class TheseusRebase:
         return {
             "activation_registry": activation_registry,
             "transforms_by_key": transforms_by_key,
+            "covariance_mode": covariance_mode,
             "split_fused_qkv": split_fused_qkv,
             "n_batches": n_batches,
             "patched_source_blocks": patched_source,
             "patched_target_blocks": patched_target,
             "unpatched_source_blocks": unpatched_source,
             "unpatched_target_blocks": unpatched_target,
-            "transform_granularity": transform_granularity,
-            "precompute_diagnostics": {
-                "assigned_keys": precompute_diag.assigned_keys,
-                "shared_transform_count": precompute_diag.shared_transform_count,
-                "shared_group_count": precompute_diag.shared_group_count,
-            },
         }
 
     def apply(
@@ -1114,7 +1128,7 @@ class TheseusRebase:
         if strict and not visual_delta_work:
             raise ValueError("Theseus did not find any visual delta keys to transport.")
 
-        aligned_visual, apply_diag = _apply_transforms_to_visual_delta(
+        aligned_visual = _apply_transforms_to_visual_delta(
             target_visual_base=target_visual_base_work,
             visual_delta=visual_delta_work,
             transforms_by_key=transforms_by_key,
@@ -1151,17 +1165,6 @@ class TheseusRebase:
                 raise KeyError(f"Theseus did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
-            if apply_diag.wrong_shape > 0:
-                print(
-                    f"{log_prefix} apply: warnings wrong_shape={apply_diag.wrong_shape} "
-                    f"examples={list(apply_diag.wrong_shape_examples)}"
-                )
-            print(
-                f"{log_prefix} apply: diagnostics "
-                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
-                f"zero={apply_diag.zero_passthrough} "
-                f"missing={apply_diag.missing_transform} failures={apply_diag.transport_failures}"
-            )
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out
@@ -1180,6 +1183,9 @@ class TheseusRebase:
         device: str = "cuda",
         seq_align: str = "interpolate2d",
         center_acts: bool = False,
+        covariance_mode: str = "activations",
+        whiten_power: float = 0.0,
+        whiten_eps: float = 1e-6,
         prepared: Mapping[str, Any] | None = None,
         n_batches: int | None = None,
         num_batches: int | None = None,
@@ -1200,7 +1206,9 @@ class TheseusRebase:
         if prepared is None:
             if source_model is None or target_model is None:
                 raise ValueError("Theseus transport requires both source_model and target_model.")
-            if source_dataloader is None or target_dataloader is None:
+            if _resolve_covariance_mode(covariance_mode) == "activations" and (
+                source_dataloader is None or target_dataloader is None
+            ):
                 raise ValueError("Theseus transport requires both source_dataloader and target_dataloader.")
 
             prepared_payload = self.prepare(
@@ -1213,6 +1221,9 @@ class TheseusRebase:
                 device=device,
                 seq_align=seq_align,
                 center_acts=bool(center_acts),
+                covariance_mode=covariance_mode,
+                whiten_power=float(whiten_power),
+                whiten_eps=float(whiten_eps),
                 n_batches=n_batches,
                 seed=int(seed),
                 batch_size=batch_size,

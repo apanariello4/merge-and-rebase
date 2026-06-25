@@ -7,6 +7,7 @@ import re
 import time
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -27,7 +28,8 @@ from ..data.text_loaders import (
     default_head_class_ids_for_task,
 )
 from ..models.text_lm import TextBuildConfig, TextLM
-from .strategies.full import cosine_lr
+from .forward_mode import apply_training_forward_mode, resolve_training_forward_mode
+from .schedulers import build_lr_scheduler
 
 NLI_SUITES: dict[str, tuple[str, ...]] = {
     "nli6": tuple(NLI_TASKS),
@@ -343,6 +345,7 @@ def _configure_text_strategy(
     lr: float,
     weight_decay: float,
     warmup_length: int,
+    scheduler_name: str = "cosine",
     steps: int,
     device: torch.device,
 ) -> tuple[nn.Module, optim.Optimizer, Any, dict[str, int], dict[str, Any]]:
@@ -420,7 +423,13 @@ def _configure_text_strategy(
         raise RuntimeError(f"Strategy '{name}' produced zero trainable parameters.")
 
     opt = _optimizer_from_name(trainable_params, optimizer_name, lr, weight_decay)
-    scheduler = cosine_lr(opt, lr, warmup_length, steps)
+    scheduler = build_lr_scheduler(
+        opt,
+        name=scheduler_name,
+        base_lrs=lr,
+        warmup_length=warmup_length,
+        steps=steps,
+    )
 
     info: dict[str, int] = {
         "trainable_params": int(sum(p.numel() for p in trainable_params)),
@@ -429,6 +438,7 @@ def _configure_text_strategy(
         info["lora_params"] = int(
             sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and "lora" in n.lower())
         )
+    info["scheduler_name"] = scheduler_name
 
     return model, opt, scheduler, info, peft_cfg_out
 
@@ -503,6 +513,7 @@ def train_task(
     lr: float,
     weight_decay: float,
     warmup_length: int,
+    scheduler_name: str = "cosine",
     optimizer_name: str,
     clip_grad_norm: float,
     accumulate_grad_batches: int,
@@ -527,6 +538,7 @@ def train_task(
 
     dev = _device(device)
     _set_seed(seed, deterministic=deterministic)
+    forward_mode = resolve_training_forward_mode(strategy_cfg)
 
     if build_cfg.model_kind != "sequence_classification":
         raise ValueError("train_text currently supports backbone.model_kind='sequence_classification' only.")
@@ -579,8 +591,20 @@ def train_task(
         lr=lr,
         weight_decay=weight_decay,
         warmup_length=warmup_length,
+        scheduler_name=scheduler_name,
         steps=total_steps,
         device=dev,
+    )
+    trainable_info = dict(trainable_info)
+    trainable_info["forward_mode"] = forward_mode
+    trainable_info.update(
+        apply_training_forward_mode(
+            model=model,
+            forward_mode=forward_mode,
+            device=dev,
+            output_transform=lambda out: out.logits,
+            output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
+        )
     )
 
     best_val = -1.0
@@ -594,7 +618,7 @@ def train_task(
 
     t_start = time.time()
     global_update_step = 0
-    ckpt_stem = str(strategy)
+    ckpt_stem = str(strategy) if forward_mode == "standard" else f"{strategy}__{forward_mode}"
 
     def _build_checkpoint_payload(
         *,
@@ -606,6 +630,7 @@ def train_task(
         payload: dict[str, Any] = {
             "task": task,
             "strategy": strategy,
+            "forward_mode": forward_mode,
             "backbone": {
                 "kind": "hf_text",
                 "model_name_or_path": build_cfg.model_name_or_path,
@@ -798,6 +823,7 @@ def train_task(
     summary = {
         "task": task,
         "strategy": strategy,
+        "forward_mode": forward_mode,
         "save_format": save_format,
         "save_last_epoch": bool(save_last_epoch),
         "ckpt_path": str(best_ckpt_path),
@@ -824,7 +850,7 @@ def train_task(
             "seed": int(seed),
         },
     }
-    _save_json(task_dir / f"{strategy}.json", summary)
+    _save_json(task_dir / f"{ckpt_stem}.json", summary)
 
     print(f"[{task}] saved best: {best_ckpt_path}")
     if last_ckpt_path is not None:
@@ -922,6 +948,27 @@ def main() -> None:
             default_parent=out_dir / model_tag,
             timestamp=run_ts,
         )
+        startup_cfg = deepcopy(common)
+        startup_cfg["config"] = args.text_config
+        startup_cfg["tasks"] = list(tasks)
+        startup_cfg["device"] = device
+        startup_cfg["dtype"] = dtype
+        startup_cfg["deterministic"] = deterministic
+        startup_cfg["logging"] = logging_cfg
+        startup_cfg["summary"] = str(run_path)
+        startup_cfg.setdefault("backbone", {})
+        startup_cfg["backbone"]["name"] = backbone_name
+        startup_cfg["backbone"]["model_name_or_path"] = model_name_or_path
+        startup_cfg["backbone"]["model_arch"] = model_arch
+        startup_cfg["backbone"]["model_kind"] = model_kind
+        startup_cfg["backbone"]["trust_remote_code"] = trust_remote_code
+        startup_cfg["backbone"]["use_fast_tokenizer"] = use_fast_tokenizer
+        startup_cfg.setdefault("output", {})
+        startup_cfg["output"]["out_dir"] = str(out_dir)
+        startup_cfg["output"]["save_format"] = save_format_default
+        startup_cfg["output"]["save_last_epoch"] = save_last_epoch_default
+        startup_cfg["output"]["extract_heads"] = extract_heads_default
+        startup_cfg["output"]["heads_path"] = heads_path_default
 
         all_summaries: dict[str, Any] = {
             "config_path": args.text_config,
@@ -952,9 +999,8 @@ def main() -> None:
             summary_path=run_path,
             metadata={
                 "config_path": args.text_config,
-                "cli": all_summaries["cli"],
-                "resolved": all_summaries["resolved"],
-                "logging": logging_cfg,
+                "summary_path": str(run_path),
+                "resolved_config": startup_cfg,
             },
         )
 
@@ -977,6 +1023,7 @@ def main() -> None:
             strategy_cfg = _get(task_cfg, "strategy", {})
             if not isinstance(strategy_cfg, dict):
                 raise ValueError(f"[{task}] strategy must be a dict.")
+            resolve_training_forward_mode(strategy_cfg)
             strategy = str(_get(task_cfg, "strategy.name", "full"))
             if strategy not in {"full", "linear_probe", "peft_lora"}:
                 raise ValueError(f"[{task}] Unsupported strategy '{strategy}'. Use one of: full, linear_probe, peft_lora")
@@ -985,6 +1032,7 @@ def main() -> None:
             lr = float(_get(task_cfg, "train.lr", 1e-4))
             weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
             warmup_length = int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500))
+            scheduler_name = str(_get(task_cfg, "train.lr_scheduler.name", "cosine"))
             clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
             accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
             if accumulate_grad_batches <= 0:
@@ -1038,6 +1086,7 @@ def main() -> None:
                 lr=lr,
                 weight_decay=weight_decay,
                 warmup_length=warmup_length,
+                scheduler_name=scheduler_name,
                 optimizer_name=optimizer_name,
                 clip_grad_norm=clip_grad_norm,
                 accumulate_grad_batches=accumulate_grad_batches,

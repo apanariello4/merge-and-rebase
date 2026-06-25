@@ -12,7 +12,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from merge_and_rebase.io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
+from merge_and_rebase.io.peft_helpers import (
+    is_peft_adapter_dir_ckpt,
+    load_peft_adapter_dir_components,
+    normalize_peft_adapter_dir_checkpoint,
+)
 from merge_and_rebase.io.utils import atomic_write_json
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
@@ -32,23 +36,33 @@ from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
     TaskAttentionMeta,
     assert_qkv_patched_before_linearizing,
+    build_dense_delta_branch,
     ensure_peft_cfg_map,
     extract_checkpoint_attn_patch_info,
     extract_peft_components,
     get_peft_cfg,
     humanize,
     is_peft_checkpoint,
+    load_vision_checkpoint_reference,
     materialize_peft_sd_from_adapter,
     maybe_patch_base_for_task_attn,
     to_cpu_fp32,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ..merge.base import PreparedMergeMethod
+from ..merge.methods._common import resolve_merge_weights
 from ..merge.registry import get_method, list_methods
 from ..merge.runtime import build_merged_state_for_alpha
 from ..merge.subspaces.registry import get_subspace, list_subspaces
-from ..models.forward_modes import get_forward_mode, list_forward_modes
+from ..models.forward_modes import (
+    get_forward_mode,
+    list_forward_modes,
+    normalize_forward_mode_params,
+    resolve_auto_forward_mode,
+    resolve_shared_forward_mode_params,
+)
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ..run_logging import print_config_args
 from .datasets.vision8_14_20 import SUITES
 
 
@@ -75,6 +89,8 @@ class TaskCheckpointPayload:
     path: str
     obj: Any
     strategy: str | None
+    forward_mode: str | None
+    forward_mode_params: dict[str, Any] | None
     attn_meta: TaskAttentionMeta
     tuned_text_features: torch.Tensor | None
 
@@ -170,14 +186,26 @@ def _normalize_tuned_ckpts(raw: Any, tasks: list[str]) -> dict[str, str]:
 
 
 def _load_checkpoint_payload(path: str) -> TaskCheckpointPayload:
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    resolved_path, obj = load_vision_checkpoint_reference(ckpt_ref=path)
+    obj = normalize_peft_adapter_dir_checkpoint(obj, checkpoint_path=resolved_path)
     strategy = obj.get("strategy", None) if isinstance(obj, dict) else None
-    attn_meta = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=path)
-    tuned_text_features = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(obj=obj, ckpt_path=path)
+    forward_mode = obj.get("forward_mode", None) if isinstance(obj, dict) else None
+    forward_mode_params = (
+        normalize_forward_mode_params(str(forward_mode), obj.get("forward_mode_params", None))
+        if isinstance(obj, dict) and forward_mode is not None
+        else None
+    )
+    attn_meta = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=resolved_path)
+    tuned_text_features = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(
+        obj=obj,
+        ckpt_path=resolved_path,
+    )
     return TaskCheckpointPayload(
-        path=str(path),
+        path=str(resolved_path),
         obj=obj,
         strategy=strategy,
+        forward_mode=forward_mode,
+        forward_mode_params=forward_mode_params,
         attn_meta=attn_meta,
         tuned_text_features=tuned_text_features,
     )
@@ -196,7 +224,7 @@ def _load_full_checkpoint_state(
     is_peft = False
 
     if is_peft_adapter_dir_ckpt(obj):
-        peft_state, peft_cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"])
+        peft_state, peft_cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"], checkpoint_path=payload.path)
         is_peft = True
     elif is_peft_checkpoint(obj) and isinstance(obj, dict):
         peft_state, peft_cfg_map = extract_peft_components(obj)
@@ -209,6 +237,7 @@ def _load_full_checkpoint_state(
             base_sd=base_sd,
             build_cfg=build_cfg,
             peft_cfg=get_peft_cfg(peft_cfg_map),
+            peft_dense_state=dict(obj.get("peft_dense_state", {})) if isinstance(obj, dict) and isinstance(obj.get("peft_dense_state", {}), dict) else None,
             strict_load=strict_load,
             patched_attn=payload.attn_meta.patched_attn,
             attn_patch_cfg=payload.attn_meta.attn_patch_cfg,
@@ -673,6 +702,7 @@ def _json_safe(value: Any) -> Any:
 
 def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_path: Path) -> dict[str, Any]:
     t0 = time.time()
+    subspace_artifact_dir = output_path.parent / f"{output_path.stem}.artifacts"
     suite_name = str(cfg.get("suite", "vision8"))
     tasks = _resolve_tasks(cfg=cfg, suite_name=suite_name)
     tuned_ckpt_by_task = _normalize_tuned_ckpts(cfg.get("tuned_ckpts", None), tasks)
@@ -760,19 +790,56 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
     subspace = None
     subspace_prepared = None
     peft_cfg: dict[str, Any] | None = None
+    dense_tuned_sds_list: list[dict[str, torch.Tensor]] = []
+    dense_base_sd_for_merge: dict[str, torch.Tensor] = {}
+    merge_base_sd = to_cpu_fp32(base_sd)
     if peft_subspace != "full" and merged_ckpt_path is None:
+        resolved_merge_weights = resolve_merge_weights(len(tasks), cfg.get("weights", None))
         if peft_cfg_map is None:
             raise ValueError(f"peft_subspace='{peft_subspace}' requires peft_config in checkpoints.")
         peft_cfg = get_peft_cfg(peft_cfg_map)
         subspace = get_subspace(peft_subspace)
-        subspace_prepared = subspace.prepare(lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
+        subspace_prepared = subspace.prepare(
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+            method_params=candidate.method_params,
+            weights=resolved_merge_weights,
+            artifact_dir=subspace_artifact_dir,
+        )
+        if getattr(subspace_prepared, "merge_weight_override", None) is not None:
+            cfg["weights"] = list(subspace_prepared.merge_weight_override)
         projected_by_task = subspace.project(subspace_prepared, lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
         tuned_sds_list = [projected_by_task[t] for t in tasks]
         base_sd_for_merge = {k: torch.zeros_like(v) for k, v in tuned_sds_list[0].items()}
+        lora_only_sds_by_task: dict[str, dict[str, torch.Tensor]] = {}
+        for task in tasks:
+            payload = tuned_payload_by_task[task]
+            lora_only_sd = materialize_peft_sd_from_adapter(
+                peft_state=peft_state_by_task[task],
+                base_sd=base_sd,
+                build_cfg=build_cfg,
+                peft_cfg=peft_cfg,
+                peft_dense_state=None,
+                strict_load=strict_load,
+                patched_attn=payload.attn_meta.patched_attn,
+                attn_patch_cfg=payload.attn_meta.attn_patch_cfg,
+            )
+            lora_only_aligned = align_to_base_keys(lora_only_sd, base_sd)
+            if not lora_only_aligned:
+                raise ValueError(
+                    f"No tensors from LoRA-only checkpoint aligned to base keys: {payload.path}. "
+                    "Check checkpoint key prefixes and model compatibility."
+                )
+            lora_only_sds_by_task[task] = to_cpu_fp32(lora_only_aligned)
+        dense_base_sd_for_merge, dense_tuned_sds_list = build_dense_delta_branch(
+            tasks=tasks,
+            full_tuned_by_task=tuned_sds_by_task,
+            lora_only_tuned_by_task=lora_only_sds_by_task,
+            base_sd=merge_base_sd,
+        )
     else:
         tuned_sds_list = [tuned_sds_by_task[t] for t in tasks]
         base_sd_for_merge = to_cpu_fp32(base_sd)
-    merge_base_sd = to_cpu_fp32(base_sd)
 
     needs_linear_attention = any(payload.attn_meta.linearized_attn for payload in tuned_payload_by_task.values())
     assert_qkv_patched_before_linearizing(
@@ -783,12 +850,24 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
 
     requested_forward_mode = str(cfg.get("forward_mode", "auto"))
     if requested_forward_mode == "auto":
-        all_ntk = bool(tasks) and all(tuned_payload_by_task[t].strategy == "ntk" for t in tasks)
-        resolved_forward_mode = "linearized_ntk" if all_ntk else "standard"
+        resolved_forward_mode = resolve_auto_forward_mode([tuned_payload_by_task[t].forward_mode for t in tasks])
     else:
         resolved_forward_mode = requested_forward_mode
-    get_forward_mode(resolved_forward_mode).bind(clf=clf, base_sd=merge_base_sd, strict_load=strict_load)
-    print(f"Using forward mode: {resolved_forward_mode}")
+    resolved_forward_mode_params = resolve_shared_forward_mode_params(
+        resolved_forward_mode,
+        [
+            tuned_payload_by_task[t].forward_mode_params
+            for t in tasks
+            if tuned_payload_by_task[t].forward_mode == "linearized_ntk"
+        ],
+    )
+    get_forward_mode(resolved_forward_mode).bind(
+        clf=clf,
+        base_sd=merge_base_sd,
+        strict_load=strict_load,
+        params=resolved_forward_mode_params,
+    )
+    print(f"Using forward mode: {resolved_forward_mode} params={resolved_forward_mode_params}")
 
     per_task = _build_task_contexts(
         clf=clf,
@@ -808,6 +887,7 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
         method = get_method(method_name)
         merge_weights = cfg.get("weights", None)
         prepared = None
+        dense_prepared = None
         if isinstance(method, PreparedMergeMethod):
             prepared = method.prepare(
                 base=base_sd_for_merge,
@@ -830,6 +910,22 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
                 },
                 method_params=candidate.method_params,
             )
+            if dense_tuned_sds_list and dense_base_sd_for_merge:
+                dense_prepared = method.prepare(
+                    base=dense_base_sd_for_merge,
+                    tuned=dense_tuned_sds_list,
+                    weights=merge_weights,
+                    strict=strict_load,
+                    tasks=tasks,
+                    merge_context={
+                        "kind": "vision_logit_kl_dense_delta",
+                        "cfg": cfg,
+                        "tasks": tasks,
+                        "suite_name": suite_name,
+                        "peft_subspace": peft_subspace,
+                    },
+                    method_params=candidate.method_params,
+                )
 
         merged_sd = build_merged_state_for_alpha(
             method=method,
@@ -846,6 +942,9 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
             peft_state_by_task=peft_state_by_task,
             tasks=tasks,
             merge_base_sd=merge_base_sd,
+            dense_prepared=dense_prepared,
+            dense_base_sd_for_merge=dense_base_sd_for_merge,
+            dense_tuned_sds_list=dense_tuned_sds_list,
         )
 
     reference_logits_by_task: dict[str, list[torch.Tensor]] = {}
@@ -974,6 +1073,7 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
         "merged_checkpoint": merged_ckpt_path,
         "peft_subspace": peft_subspace,
         "forward_mode": resolved_forward_mode,
+        "forward_mode_params": dict(resolved_forward_mode_params),
         "resolved_config": _json_safe(cfg),
         "per_task": per_task_result,
         "avg_kl": float(avg_kl),
@@ -982,6 +1082,11 @@ def run_vision_logit_kl(cfg: dict[str, Any], *, candidate: KlCandidate, output_p
         "logit_cache": logit_cache_info,
         "total_samples": int(total_samples),
         "runtime_seconds": float(time.time() - t0),
+        "subspace_artifacts": (
+            {"similarity_artifact_path": getattr(subspace_prepared, "similarity_artifact_path", None)}
+            if subspace_prepared is not None
+            else {}
+        ),
     }
     atomic_write_json(str(output_path), result)
     print(f"\nSaved KL analysis to {output_path}")
@@ -1088,6 +1193,15 @@ def main() -> None:
     elif "alpha" in cfg:
         del cfg["alpha"]
     cfg["method_params"] = dict(candidate.method_params)
+    print_config_args(
+        {
+            **cfg,
+            "config": args.config,
+            "output": str(Path(args.output)),
+            "candidate_source": candidate.source,
+        },
+        title="Run config (eval.vision_logit_kl)",
+    )
 
     run_vision_logit_kl(cfg, candidate=candidate, output_path=Path(args.output))
 

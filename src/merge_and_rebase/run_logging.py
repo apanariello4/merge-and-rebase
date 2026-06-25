@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 import traceback
 from dataclasses import dataclass
@@ -41,6 +42,71 @@ def _json_safe(value: Any) -> Any:
         except Exception:
             pass
     return repr(value)
+
+
+def _stringify_arg_value(value: Any) -> str | None:
+    safe_value = _json_safe(value)
+    if safe_value is None:
+        return None
+    if isinstance(safe_value, bool):
+        return "true" if safe_value else "false"
+    if isinstance(safe_value, str):
+        return safe_value.replace("\n", "\\n")
+    if isinstance(safe_value, list):
+        if all(not isinstance(item, (dict, list)) for item in safe_value):
+            return ",".join(
+                "true" if item is True else "false" if item is False else str(item)
+                for item in safe_value
+            )
+        return json.dumps(safe_value, sort_keys=True, separators=(",", ":"))
+    return str(safe_value)
+
+
+def _flatten_config_items(
+    value: Any,
+    *,
+    parent_key: str = "",
+) -> list[tuple[str, str]]:
+    if isinstance(value, dict):
+        items: list[tuple[str, str]] = []
+        for key in sorted(value.keys(), key=str):
+            current_key = f"{parent_key}.{key}" if parent_key else str(key)
+            items.extend(_flatten_config_items(value[key], parent_key=current_key))
+        return items
+    rendered = _stringify_arg_value(value)
+    if rendered is None:
+        return []
+    return [(parent_key or "value", rendered)]
+
+
+def render_config_args(
+    config: dict[str, Any] | None,
+    *,
+    title: str | None = None,
+) -> str:
+    parts = [f"{key}={shlex.quote(value)}" for key, value in _flatten_config_items(config or {})]
+    body = " ".join(parts) if parts else "<empty>"
+    return f"{title}: {body}" if title else body
+
+
+def _config_for_display(metadata: dict[str, Any]) -> dict[str, Any]:
+    cfg = metadata.get("resolved_config", metadata)
+    if not isinstance(cfg, dict):
+        cfg = {"value": cfg}
+    out = dict(cfg)
+    if metadata.get("config_path") is not None and "config" not in out:
+        out["config"] = metadata["config_path"]
+    if metadata.get("summary_path") is not None and "summary" not in out:
+        out["summary"] = metadata["summary_path"]
+    return out
+
+
+def print_config_args(
+    config: dict[str, Any] | None,
+    *,
+    title: str | None = None,
+) -> None:
+    print(render_config_args(config, title=title))
 
 
 def merge_logging_config(
@@ -159,12 +225,15 @@ class LocalRunLogger(RunLogger):
         step: int | None = None,
         context: dict[str, Any] | None = None,
     ) -> None:
+        resolved_context = dict(_json_safe(context or {}))
+        if bool(resolved_context.pop("_wandb_only", False)):
+            return
         payload = {
             "ts": time.time(),
             "event_type": event_type,
             "step": step,
             "metrics": _json_safe(metrics or {}),
-            "context": _json_safe(context or {}),
+            "context": resolved_context,
         }
         _append_jsonl(self.events_path, payload)
 
@@ -218,7 +287,9 @@ class WandbRunLogger(RunLogger):
     ) -> None:
         payload = dict(_json_safe(metrics or {}))
         payload["event/type"] = event_type
-        for key, value in dict(_json_safe(context or {})).items():
+        resolved_context = dict(_json_safe(context or {}))
+        resolved_context.pop("_wandb_only", None)
+        for key, value in resolved_context.items():
             payload[f"context/{key}"] = value
         self._wandb.log(payload, step=step)
 
@@ -265,6 +336,10 @@ def start_run(
         Path(summary_path)
         if summary_path is not None
         else default_summary_path(entrypoint=entrypoint, logging_cfg=logging_cfg)
+    )
+    print_config_args(
+        _config_for_display(metadata),
+        title=f"Run config ({entrypoint})",
     )
     loggers: list[RunLogger] = [
         LocalRunLogger(

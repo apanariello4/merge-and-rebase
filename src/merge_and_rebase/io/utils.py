@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +19,7 @@ def read_json_silent(path: str) -> dict[str, Any]:
 def atomic_write_json(path: str, obj: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{time.time_ns()}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
         f.write("\n")

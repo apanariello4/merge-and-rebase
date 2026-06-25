@@ -1,9 +1,11 @@
 import inspect
+import json
 import math
 import random
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -22,15 +24,19 @@ except ImportError:
     get_peft_model = None
     set_peft_model_state_dict = None
 
-from merge_and_rebase.io.ckpt import load_ckpt, load_into_model
+from merge_and_rebase.io.ckpt import load_ckpt, load_into_model, resolve_ckpt_path
 from merge_and_rebase.io.peft_helpers import (
     get_attn_patch_cfg,
     get_patched_attn_flag,
     is_peft_adapter_dir_ckpt,
+    is_peft_adapter_reference,
     normalize_attn_patch_cfg,
+    normalize_peft_visual_state_dict_keys,
+    resolve_peft_adapter_dir,
     state_dict_looks_patched_attn,
 )
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from merge_and_rebase.models.patch_openclip_projection import patch_openclip_visual_proj, restore_openclip_proj_keyspace
 
 from ..merge import runtime as _merge_utils
 
@@ -41,6 +47,7 @@ apply_delta = _merge_utils.apply_delta
 to_cpu_fp32 = _merge_utils.to_cpu_fp32
 ensure_peft_cfg_map = _merge_utils.ensure_peft_cfg_map
 build_merged_state_for_alpha = _merge_utils.build_merged_state_for_alpha
+build_dense_delta_branch = _merge_utils.build_dense_delta_branch
 compose_weighted_deltas = _merge_utils.compose_weighted_deltas
 
 
@@ -49,8 +56,22 @@ def _require_peft() -> None:
         raise ImportError("PEFT-dependent evaluation paths require `peft` with its runtime dependencies installed.")
 
 
+def stable_method_params_cache_key(value: Any) -> str:
+    def _json_safe(x: Any) -> Any:
+        if x is None or isinstance(x, (bool, int, float, str)):
+            return x
+        if isinstance(x, Mapping):
+            return {str(k): _json_safe(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple, set)):
+            return [_json_safe(v) for v in x]
+        return repr(x)
+
+    return json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
+
+
 def build_cpu_cfg(cfg: OpenClipBuildConfig) -> OpenClipBuildConfig:
     return OpenClipBuildConfig(
+        loader=cfg.loader,
         model_name=cfg.model_name,
         pretrained=cfg.pretrained,
         device="cpu",
@@ -175,6 +196,17 @@ def extract_dataset_labels(dataset: Any) -> list[int]:
             "Expected .labels/.targets, split[label_key], dict['labels'], or tuple(item, label)."
         )
     return out
+
+
+def load_vision_checkpoint_reference(
+    *,
+    ckpt_ref: str,
+) -> tuple[str, Any]:
+    resolved_ref = resolve_ckpt_path(str(ckpt_ref))
+    if is_peft_adapter_reference(resolved_ref):
+        adapter_dir = resolve_peft_adapter_dir(resolved_ref)
+        return str(ckpt_ref), {"format": "peft", "peft_adapter_dir": str(Path(adapter_dir))}
+    return resolved_ref, torch.load(resolved_ref, map_location="cpu", weights_only=False)
 
 
 def proportional_sample_indices(
@@ -320,13 +352,15 @@ def acc_cache_key(
     chk_path: str,
     baseline_mode: str,
     forward_mode: str,
+    forward_mode_params: Mapping[str, Any] | None,
     classnames_mode: str,
     text_features_mode: str = "zero_shot",
 ) -> str:
     # Include baseline mode/checkpoint/forward/classname mode to avoid stale cache collisions.
+    forward_mode_params_key = json.dumps(dict(forward_mode_params or {}), sort_keys=True, separators=(",", ":"))
     return (
         f"{clip_model}::{clip_pretrained}::{dataset}::{baseline_mode}::"
-        f"{chk_path}::{forward_mode}::{classnames_mode}::{text_features_mode}"
+        f"{chk_path}::{forward_mode}::{forward_mode_params_key}::{classnames_mode}::{text_features_mode}"
     )
 
 
@@ -496,6 +530,7 @@ def eval_norm_accs_for_split(
 ) -> tuple[list[float], list[float]]:
     merged_accs: list[float] = []
     norm_accs: list[float] = []
+    task_width = max((len(str(item["task"])) for item in per_task), default=0)
     pbar = tqdm(per_task, desc=f"Evaluating {split} accuracies", unit="task", disable=not split == "test")
 
     for item in pbar:
@@ -514,7 +549,7 @@ def eval_norm_accs_for_split(
         merged_accs.append(acc)
         norm_accs.append(norm)
         if print_per_task:
-            print(f"{task}: {result_label}={acc:.6f} {baseline_label}={single_acc:.6f} norm={norm:.6f}")
+            print(f"{task:<{task_width}}  {baseline_label}={single_acc:.6f}  {result_label}={acc:.6f}  norm={norm:.6f}")
     return merged_accs, norm_accs
 
 
@@ -524,6 +559,7 @@ def materialize_peft_sd_from_adapter(
     base_sd: dict[str, torch.Tensor],
     build_cfg: OpenClipBuildConfig,
     peft_cfg: dict[str, Any],
+    peft_dense_state: dict[str, torch.Tensor] | None = None,
     strict_load: bool,
     patched_attn: bool,
     attn_patch_cfg: dict[str, Any] | None = None,
@@ -570,8 +606,15 @@ def materialize_peft_sd_from_adapter(
     # base_sd must match this model's keys (patched keyspace if patched_attn=True)
     load_into_model(model, base_sd, strict=strict_load)
 
-    if peft_cfg.get("target_modules", None) is None:
+    target_modules = peft_cfg.get("target_modules", None)
+    if target_modules is None:
         raise ValueError("peft_cfg_map must include target_modules to reconstruct the adapter.")
+    if not isinstance(target_modules, list):
+        raise ValueError("peft_cfg.target_modules must be a list when reconstructing PEFT adapters.")
+    if "lin_proj" in target_modules:
+        patched_proj = patch_openclip_visual_proj(model.visual)
+        if patched_proj == 0 and not hasattr(model.visual, "lin_proj"):
+            raise RuntimeError("target_modules requested 'lin_proj' but the visual projection surface was not patched.")
 
     # 5) Wrap ONLY visual with PEFT
     peft_visual = get_peft_model(model.visual, build_lora_config(peft_cfg))
@@ -580,6 +623,7 @@ def materialize_peft_sd_from_adapter(
     # 6) Load adapter weights
     # Ensure tensors are on the same device/dtype as the PEFT module expects
     dev = next(model.parameters()).device
+    peft_state = normalize_peft_visual_state_dict_keys(peft_state)
     peft_state = {k: v.to(device=dev) for k, v in peft_state.items()}
 
     # Adapter-only state dict load. Missing base-model keys are expected here.
@@ -598,10 +642,15 @@ def materialize_peft_sd_from_adapter(
                 raise RuntimeError(msg + f"\nunexpected[:20]={unexpected[:20]}")
             print("[warn]", msg)
 
+    if peft_dense_state:
+        dense_state = {k: v.to(device=dev) for k, v in peft_dense_state.items()}
+        model.visual.load_state_dict(dense_state, strict=False)
+
     # Important: unwrap PEFT visual so state_dict keys match OpenCLIP base keyspace.
     if hasattr(model.visual, "merge_and_unload"):
         model.visual = model.visual.merge_and_unload()
 
     # 7) Export full weights on CPU
     full_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    full_sd = restore_openclip_proj_keyspace(full_sd)
     return full_sd

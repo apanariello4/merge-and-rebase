@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
+import urllib.request
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -10,27 +12,10 @@ import torch
 from datasets import ClassLabel, DatasetDict, Features
 from datasets import Dataset as HFDataset
 from datasets import load_dataset as hf_load_dataset
-from PIL import ExifTags, Image, ImageFile
+from PIL import ImageFile
 from torch.utils.data import DataLoader, Dataset
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-
-def _ensure_pillow_exif_compat() -> None:
-    # datasets may access PIL.Image.ExifTags.Base.Orientation, which is missing
-    # in older Pillow versions. Provide a minimal compatibility shim.
-    if not hasattr(Image, "ExifTags"):
-        Image.ExifTags = ExifTags
-    if not hasattr(Image.ExifTags, "Base"):
-        orientation = 274
-        for tag, name in getattr(ExifTags, "TAGS", {}).items():
-            if name == "Orientation":
-                orientation = int(tag)
-                break
-        Image.ExifTags.Base = SimpleNamespace(Orientation=orientation)
-
-
-_ensure_pillow_exif_compat()
 
 LabelRemap = dict[int, int] | Sequence[int] | np.ndarray | Callable[[int], int] | None
 
@@ -96,6 +81,12 @@ KMNIST_CLASSNAMES = [
     "hiragana re",
     "hiragana wo",
 ]
+
+IMAGENET21KP_TREE_URL = (
+    "https://miil-public-eu.oss-eu-central-1.aliyuncs.com/model-zoo/"
+    "ImageNet_21K_P/resources/winter21/imagenet21k_miil_tree.pth"
+)
+IMAGENET21KP_TREE_FILENAME = "imagenet21k_miil_tree.pth"
 
 
 def batch_to_dict(batch, x_key: str = "x", y_key: str = "y") -> dict[str, Any]:
@@ -209,6 +200,68 @@ class HFVisionDataset(Dataset):
 _ALLOWED_SPLITS = ("train", "test", "val", "validation")
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _load_torch_object(path: str) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _resolve_imagenet21kp_tree_path() -> str:
+    repo_root = _repo_root()
+    cache_dir = repo_root / "src" / ".cache" / "imagenet21k"
+    candidates = [
+        os.environ.get("IMAGENET21K_MIIL_TREE_PATH"),
+        os.environ.get("IMAGENET21K_TREE_PATH"),
+        str(Path.cwd() / IMAGENET21KP_TREE_FILENAME),
+        str(repo_root / IMAGENET21KP_TREE_FILENAME),
+        str(cache_dir / IMAGENET21KP_TREE_FILENAME),
+    ]
+    checked: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        checked.append(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    download_target = cache_dir / IMAGENET21KP_TREE_FILENAME
+    try:
+        urllib.request.urlretrieve(IMAGENET21KP_TREE_URL, download_target)
+        return str(download_target)
+    except Exception as exc:
+        checked.append(str(download_target))
+        raise FileNotFoundError(
+            "Could not resolve ImageNet-21K MIIL tree metadata. "
+            f"Checked {checked} and failed to download from {IMAGENET21KP_TREE_URL}: {exc}. "
+            "Set IMAGENET21K_TREE_PATH or IMAGENET21K_MIIL_TREE_PATH to a local copy of "
+            f"{IMAGENET21KP_TREE_FILENAME}."
+        ) from exc
+
+
+def _imagenet21kp_classnames_from_tree() -> list[str]:
+    tree = _load_torch_object(_resolve_imagenet21kp_tree_path())
+    required_keys = {"class_list", "class_description"}
+    missing = required_keys - set(tree.keys())
+    if missing:
+        raise KeyError(f"ImageNet-21K tree metadata is missing keys: {sorted(missing)}")
+
+    descriptions = dict(tree["class_description"])
+    classnames: list[str] = []
+    for class_id in list(tree["class_list"]):
+        raw_name = descriptions.get(class_id, class_id)
+        safe_name = str(raw_name).replace("_", " ").strip() or str(class_id)
+        classnames.append(safe_name)
+    if not classnames:
+        raise ValueError("ImageNet-21K tree metadata produced no classnames.")
+    return classnames
+
+
 def _fix_special_dataset_columns(path: str, splits: dict[str, HFDataset]) -> dict[str, HFDataset]:
     if path != "clip-benchmark/wds_fer2013":
         return splits
@@ -233,6 +286,10 @@ def load_hf_splits(
 ) -> DatasetDict:
     """
     Loads only the requested HF splits.
+
+    This loader expects Hugging Face map-style datasets and currently does not
+    support ``streaming=True`` or chunked shard eviction for very large vision
+    datasets. Large datasets rely on the normal Hugging Face on-disk cache.
 
     When ``requested_splits`` is omitted, the loader falls back to the common
     vision split names in ``allowed_splits``. This avoids resolving unrelated
@@ -326,6 +383,7 @@ def build_vision_loaders(
     hf_path: str | None = None,
     *,
     preprocess: Callable[[Any], torch.Tensor],
+    train_preprocess: Transform = None,
     ft_epochs: int,
     split_map: dict[str, str] | None = None,
     batch_size: int = 128,
@@ -366,27 +424,30 @@ def build_vision_loaders(
     val_split = split["train"]
     test_split = split["test"]
 
+    eval_preprocess = preprocess
+    train_transform = train_preprocess if train_preprocess is not None else eval_preprocess
     if hf_path == "tanganke/emnist_mnist":
-        preprocess = emnist_fix_transform(preprocess)
+        eval_preprocess = emnist_fix_transform(eval_preprocess)
+        train_transform = emnist_fix_transform(train_transform)
 
     # Wrap with torch datasets
     train_ds = HFVisionDataset(
         hf_ds[train_key],
-        transform=preprocess,
+        transform=train_transform,
         image_key=image_key,
         label_key=label_key,
         label_remap=label_remap,
     )
     val_ds = HFVisionDataset(
         val_split,
-        transform=preprocess,
+        transform=eval_preprocess,
         image_key=image_key,
         label_key=label_key,
         label_remap=label_remap,
     )
     test_ds = HFVisionDataset(
         test_split,
-        transform=preprocess,
+        transform=eval_preprocess,
         image_key=image_key,
         label_key=label_key,
         label_remap=label_remap,
@@ -398,6 +459,13 @@ def build_vision_loaders(
             classnames_overrides = ["lymph node", "lymph node containing metastatic tumor tissue"]
         elif hf_path == "clip-benchmark/wds_fer2013":
             classnames_overrides = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"]
+        elif hf_path == "timm/imagenet-w21-p":
+            try:
+                classnames_overrides = _imagenet21kp_classnames_from_tree()
+            except Exception:
+                if strict_classnames:
+                    raise
+                classnames_overrides = None
         # elif hf_path == "tanganke/kmnist":
         #     classnames_overrides = KMNIST_CLASSNAMES
         else:

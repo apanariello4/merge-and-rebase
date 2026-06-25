@@ -154,7 +154,8 @@ datasets:
   # Example of strategy override on one dataset (if you ever need it)
   # SomeDataset:
   #   strategy:
-  #     name: ntk
+  #     name: peft_lora
+  #     forward_mode: linearized_ntk
   #     params:
   #       freeze_backbone: true
   #   train:

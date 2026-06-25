@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
+from merge_and_rebase.eval.vision_connectivity import _load_checkpoint_payload
+from merge_and_rebase.models.forward_modes import resolve_shared_forward_mode_params
 from merge_and_rebase.eval.vision_merge import (
     _acc_cache_key,
     _assert_qkv_patched_before_linearizing,
@@ -104,6 +107,7 @@ def test_acc_cache_key_differs_by_baseline_mode() -> None:
         chk_path="task_a.pt",
         baseline_mode="tuned",
         forward_mode="standard",
+        forward_mode_params={},
         classnames_mode="raw",
     )
     zero_shot_key = _acc_cache_key(
@@ -113,6 +117,7 @@ def test_acc_cache_key_differs_by_baseline_mode() -> None:
         chk_path="open_clip_pretrained",
         baseline_mode="zero_shot",
         forward_mode="standard",
+        forward_mode_params={},
         classnames_mode="raw",
     )
     assert tuned_key != zero_shot_key
@@ -126,6 +131,7 @@ def test_acc_cache_key_differs_by_text_features_mode() -> None:
         chk_path="task_a.pt",
         baseline_mode="tuned",
         forward_mode="standard",
+        forward_mode_params={},
         classnames_mode="raw",
         text_features_mode="zero_shot",
     )
@@ -136,10 +142,64 @@ def test_acc_cache_key_differs_by_text_features_mode() -> None:
         chk_path="task_a.pt",
         baseline_mode="tuned",
         forward_mode="standard",
+        forward_mode_params={},
         classnames_mode="raw",
         text_features_mode="tuned_ckpt",
     )
     assert zs_key != tuned_key
+
+
+def test_acc_cache_key_differs_by_forward_mode_params() -> None:
+    key_true = _acc_cache_key(
+        "ViT-B-32",
+        "openai",
+        "cifar10",
+        chk_path="task_a.pt",
+        baseline_mode="tuned",
+        forward_mode="linearized_ntk",
+        forward_mode_params={"linearized_feature_normalization": True},
+        classnames_mode="raw",
+    )
+    key_false = _acc_cache_key(
+        "ViT-B-32",
+        "openai",
+        "cifar10",
+        chk_path="task_a.pt",
+        baseline_mode="tuned",
+        forward_mode="linearized_ntk",
+        forward_mode_params={"linearized_feature_normalization": False},
+        classnames_mode="raw",
+    )
+    assert key_true != key_false
+
+
+def test_resolve_shared_forward_mode_params_rejects_conflicts() -> None:
+    with pytest.raises(ValueError, match="Inconsistent forward_mode_params"):
+        resolve_shared_forward_mode_params(
+            "linearized_ntk",
+            [
+                {"linearized_feature_normalization": True},
+                {"linearized_feature_normalization": False},
+            ],
+        )
+
+
+def test_checkpoint_payload_loads_forward_mode_params(tmp_path) -> None:
+    path = tmp_path / "linearized.pt"
+    torch.save(
+        {
+            "strategy": "full",
+            "forward_mode": "linearized_ntk",
+            "forward_mode_params": {"linearized_feature_normalization": False},
+            "patched_attn": False,
+            "tuned_text_features": torch.eye(2),
+        },
+        path,
+    )
+
+    payload = _load_checkpoint_payload(str(path))
+    assert payload.forward_mode == "linearized_ntk"
+    assert payload.forward_mode_params == {"linearized_feature_normalization": False}
 
 
 def test_resolve_zero_shot_only_defaults_true_without_tuned_ckpts() -> None:

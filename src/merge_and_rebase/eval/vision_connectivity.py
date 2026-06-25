@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from merge_and_rebase.io.peft_helpers import (
     is_peft_adapter_dir_ckpt,
     load_peft_adapter_dir_components,
+    normalize_peft_adapter_dir_checkpoint,
 )
 from merge_and_rebase.io.utils import atomic_write_json
 from merge_and_rebase.utils.helpers import load_json, parse_csv
@@ -39,12 +40,19 @@ from ..eval.utils import (
     get_peft_cfg,
     humanize,
     is_peft_checkpoint,
+    load_vision_checkpoint_reference,
     materialize_peft_sd_from_adapter,
     maybe_patch_base_for_task_attn,
     to_cpu_fp32,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ..models.forward_modes import get_forward_mode, list_forward_modes
+from ..models.forward_modes import (
+    get_forward_mode,
+    list_forward_modes,
+    normalize_forward_mode_params,
+    resolve_auto_forward_mode,
+    resolve_shared_forward_mode_params,
+)
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .datasets.vision8_14_20 import SUITES
@@ -55,6 +63,8 @@ class _CheckpointPayload:
     path: str
     obj: Any
     strategy: str | None
+    forward_mode: str | None
+    forward_mode_params: dict[str, Any] | None
     attn_meta: TaskAttentionMeta
     tuned_text_features: torch.Tensor | None
 
@@ -128,14 +138,26 @@ def _find_alpha_index(alphas: list[float], target: float, *, tol: float = 1e-8) 
 
 
 def _load_checkpoint_payload(path: str) -> _CheckpointPayload:
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    resolved_path, obj = load_vision_checkpoint_reference(ckpt_ref=path)
+    obj = normalize_peft_adapter_dir_checkpoint(obj, checkpoint_path=resolved_path)
     strategy = obj.get("strategy", None) if isinstance(obj, dict) else None
-    attn_meta = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=path)
-    tuned_text_features = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(obj=obj, ckpt_path=path)
+    forward_mode = obj.get("forward_mode", None) if isinstance(obj, dict) else None
+    forward_mode_params = (
+        normalize_forward_mode_params(str(forward_mode), obj.get("forward_mode_params", None))
+        if isinstance(obj, dict) and forward_mode is not None
+        else None
+    )
+    attn_meta = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=resolved_path)
+    tuned_text_features = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(
+        obj=obj,
+        ckpt_path=resolved_path,
+    )
     return _CheckpointPayload(
-        path=path,
+        path=resolved_path,
         obj=obj,
         strategy=strategy,
+        forward_mode=forward_mode,
+        forward_mode_params=forward_mode_params,
         attn_meta=attn_meta,
         tuned_text_features=tuned_text_features,
     )
@@ -166,7 +188,7 @@ def _load_full_checkpoint_state(
 
     obj = ckpt.obj
     if is_peft_adapter_dir_ckpt(obj):
-        peft_state, peft_cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"])
+        peft_state, peft_cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"], checkpoint_path=ckpt.path)
         is_peft = True
     elif is_peft_checkpoint(obj) and isinstance(obj, dict):
         peft_state, peft_cfg_map = extract_peft_components(obj)
@@ -179,6 +201,7 @@ def _load_full_checkpoint_state(
             base_sd=base_sd,
             build_cfg=build_cfg,
             peft_cfg=get_peft_cfg(peft_cfg_map),
+            peft_dense_state=dict(obj.get("peft_dense_state", {})) if isinstance(obj, dict) and isinstance(obj.get("peft_dense_state", {}), dict) else None,
             strict_load=strict_load,
             patched_attn=ckpt.attn_meta.patched_attn,
             attn_patch_cfg=ckpt.attn_meta.attn_patch_cfg,
@@ -792,13 +815,20 @@ def _run_pair_analysis(
         print("Verified q/k/v attention patch is active before linearized attention evaluation.")
 
     if requested_forward_mode == "auto":
-        all_ntk = (payload_a.strategy == "ntk") and (payload_b.strategy == "ntk")
-        resolved_forward_mode = "linearized_ntk" if all_ntk else "standard"
+        resolved_forward_mode = resolve_auto_forward_mode([payload_a.forward_mode, payload_b.forward_mode])
     else:
         resolved_forward_mode = requested_forward_mode
+    resolved_forward_mode_params = resolve_shared_forward_mode_params(
+        resolved_forward_mode,
+        [
+            payload.forward_mode_params
+            for payload in (payload_a, payload_b)
+            if payload.forward_mode == "linearized_ntk"
+        ],
+    )
     forward_mode = get_forward_mode(resolved_forward_mode)
-    forward_mode.bind(clf=clf, base_sd=base_sd, strict_load=strict_load)
-    print(f"Using forward mode: {resolved_forward_mode}")
+    forward_mode.bind(clf=clf, base_sd=base_sd, strict_load=strict_load, params=resolved_forward_mode_params)
+    print(f"Using forward mode: {resolved_forward_mode} params={resolved_forward_mode_params}")
 
     if text_features_checkpoint == "pair_task":
         if task_a not in pair_ckpt_by_task or task_b not in pair_ckpt_by_task:
@@ -1056,6 +1086,7 @@ def _run_pair_analysis(
             "text_features_source": text_features_source,
             "text_features_checkpoint": text_features_checkpoint,
             "forward_mode": resolved_forward_mode,
+            "forward_mode_params": dict(resolved_forward_mode_params),
             "classnames_mode": classnames_mode,
         },
         "line": {

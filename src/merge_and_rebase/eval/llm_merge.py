@@ -45,11 +45,15 @@ from ..data.text_loaders import (
     default_head_class_ids_for_task,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ..io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
+from ..io.peft_helpers import (
+    is_peft_adapter_dir_ckpt,
+    load_peft_adapter_dir_components,
+    normalize_peft_adapter_dir_checkpoint,
+)
 from ..merge import runtime as _merge_utils
 from ..merge import subspaces as _subspaces  # noqa: F401
 from ..merge.base import PreparedMergeMethod
-from ..merge.methods._common import default_weights, get_method_params
+from ..merge.methods._common import get_method_params, resolve_merge_weights
 from ..merge.registry import get_method, list_methods
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..merge.task_vectors import default_key_filter
@@ -58,6 +62,7 @@ from ..postmerge import PostMergeContext, get_postmerge_method
 from ..postmerge.methods.adamerging import prediction_entropy
 from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .print_utils import pretty_print_task_accuracies
+from .utils import stable_method_params_cache_key
 
 _build_merged_state_for_alpha = _merge_utils.build_merged_state_for_alpha
 _ensure_peft_cfg_map = _merge_utils.ensure_peft_cfg_map
@@ -88,10 +93,6 @@ def _resolve_tuned_ckpts(tuned_cfg: Any, *, tasks: list[str] | None = None) -> l
             raise ValueError(f"tuned_ckpts list length ({len(out)}) must match number of tasks ({len(tasks)}): {tasks}")
         return out
     raise ValueError("tuned_ckpts must be a list/tuple of checkpoint paths (or a task->path dict).")
-
-
-def _resolve_merge_weights(n: int, weights: Any) -> list[float]:
-    return [float(w) for w in default_weights(int(n), weights).tolist()]
 
 
 @dataclass(frozen=True)
@@ -180,13 +181,14 @@ def _load_peft_components_for_subspace(
     p = Path(resolved_ref)
     if p.exists() and p.is_file():
         obj = torch.load(str(p), map_location="cpu", weights_only=False)
+        obj = normalize_peft_adapter_dir_checkpoint(obj, checkpoint_path=str(p))
         if is_peft_adapter_dir_ckpt(obj):
             adapter_dir = str(obj["peft_adapter_dir"])
-            state, cfg_map = load_peft_adapter_dir_components(adapter_dir)
+            state, cfg_map = load_peft_adapter_dir_components(adapter_dir, checkpoint_path=str(p))
             return state, cfg_map, adapter_dir
         if isinstance(obj, dict) and isinstance(obj.get("peft_adapter_dir"), str):
             adapter_dir = str(obj["peft_adapter_dir"])
-            state, cfg_map = load_peft_adapter_dir_components(adapter_dir)
+            state, cfg_map = load_peft_adapter_dir_components(adapter_dir, checkpoint_path=str(p))
             return state, cfg_map, adapter_dir
         if _is_peft_checkpoint(obj):
             state, cfg_map = _extract_peft_components(obj)
@@ -441,6 +443,7 @@ def _resolve_checkpoint_reference(ckpt_ref: str) -> str:
     if p.exists() and p.is_file():
         try:
             obj = torch.load(str(p), map_location="cpu", weights_only=False)
+            obj = normalize_peft_adapter_dir_checkpoint(obj, checkpoint_path=str(p))
             if is_peft_adapter_dir_ckpt(obj):
                 adapter_dir = str(obj["peft_adapter_dir"])
                 print(f"Resolved PEFT adapter checkpoint metadata {resolved_ref} -> {adapter_dir}")
@@ -1166,7 +1169,7 @@ def _prepare_task_arithmetic_streaming(
     if not tuned_refs:
         raise ValueError("No tuned checkpoints provided for streaming task_arithmetic.")
 
-    w = _resolve_merge_weights(len(tuned_refs), weights)
+    w = resolve_merge_weights(len(tuned_refs), weights)
     active_keys: set[str] | None = None
     direction: dict[str, torch.Tensor] = {}
     expected_base_keys = {k for k, v in base_sd.items() if default_key_filter(k, v)}
@@ -1493,6 +1496,7 @@ def main() -> None:
 
     strict_load = bool(cfg.get("strict_load", False))
     merge_weights = cfg.get("weights", None)
+    merge_weights_raw = merge_weights
     peft_subspace = str(cfg.get("peft_subspace", "full"))
     task_heads_path = cfg.get("task_heads", None)
     if task_heads_path is not None:
@@ -1534,6 +1538,7 @@ def main() -> None:
             "summary_path": str(run_summary_path),
         },
     )
+    subspace_artifact_dir = run_summary_path.with_name(f"{run_summary_path.stem}.artifacts")
     llm = TextLM.build(build_cfg)
     print(f"Using eval mode: {eval_mode}")
     print(f"Using model arch: {model_arch}")
@@ -1618,7 +1623,12 @@ def main() -> None:
         subspace_prepared = subspace.prepare(
             lora_by_task=peft_state_by_task,
             peft_cfg=peft_cfg,
+            method_params=method_params,
+            weights=resolve_merge_weights(len(tasks), merge_weights),
+            artifact_dir=subspace_artifact_dir,
         )
+        if getattr(subspace_prepared, "merge_weight_override", None) is not None:
+            merge_weights = list(subspace_prepared.merge_weight_override)
         projected_by_task = subspace.project(
             subspace_prepared,
             lora_by_task=peft_state_by_task,
@@ -1906,6 +1916,7 @@ def main() -> None:
     alpha_to_task_norm_accs: dict[float, list[float]] = {}
     search_results: list[SearchEvaluation] = []
     best_result: SearchEvaluation | None = None
+    subspace_state_cache: dict[str, dict[str, Any]] = {}
     prepared_cache: dict[str, Any] = {}
 
     if method is None:
@@ -1926,19 +1937,82 @@ def main() -> None:
         merge_base_sd=merge_base_sd,
     )
 
+    def _subspace_state_for(candidate_method_params: dict[str, Any]) -> dict[str, Any]:
+        if peft_subspace == "full" or subspace is None or peft_cfg is None:
+            return {
+                "subspace_prepared": subspace_prepared,
+                "tuned_sds_list": tuned_sds_list,
+                "base_sd_for_merge": base_sd_for_merge,
+                "weights": merge_weights,
+            }
+
+        cache_key = stable_method_params_cache_key(candidate_method_params)
+        if cache_key in subspace_state_cache:
+            return subspace_state_cache[cache_key]
+
+        print(f"\nPreparing PEFT subspace: {peft_subspace} ({candidate_method_params})")
+        candidate_subspace_prepared = subspace.prepare(
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+            method_params=candidate_method_params,
+            weights=resolve_merge_weights(len(tasks), merge_weights),
+            artifact_dir=subspace_artifact_dir,
+        )
+        candidate_weights = (
+            list(candidate_subspace_prepared.merge_weight_override)
+            if getattr(candidate_subspace_prepared, "merge_weight_override", None) is not None
+            else merge_weights_raw
+        )
+        projected_by_task = subspace.project(
+            candidate_subspace_prepared,
+            lora_by_task=peft_state_by_task,
+            peft_cfg=peft_cfg,
+        )
+        missing_projected = [t for t in tasks if t not in projected_by_task]
+        if missing_projected:
+            raise ValueError(f"Subspace projection missing task outputs: {missing_projected}")
+        candidate_tuned_sds_list = [projected_by_task[t] for t in tasks]
+        if not candidate_tuned_sds_list or not candidate_tuned_sds_list[0]:
+            raise ValueError("Subspace projection returned no mergeable tensors.")
+        candidate_base_sd_for_merge = _to_cpu_fp32({k: torch.zeros_like(v) for k, v in candidate_tuned_sds_list[0].items()})
+        state = {
+            "subspace_prepared": candidate_subspace_prepared,
+            "tuned_sds_list": candidate_tuned_sds_list,
+            "base_sd_for_merge": candidate_base_sd_for_merge,
+            "weights": candidate_weights,
+        }
+        subspace_state_cache[cache_key] = state
+        return state
+
     def _prepared_for(candidate_method_params: dict[str, Any]) -> Any:
         if not isinstance(method, PreparedMergeMethod):
             return None
-        cache_key = str(sorted(candidate_method_params.items()))
+        candidate_subspace_state = _subspace_state_for(candidate_method_params)
+        cache_key = stable_method_params_cache_key(candidate_method_params)
         if cache_key in prepared_cache:
             return prepared_cache[cache_key]
         print(f"\nPreparing merge directions with method: {method.name} ({candidate_method_params})")
+        candidate_merge_context = _AlphaMergeContext(
+            method=method,
+            prepared=prepared,
+            base_sd_for_merge=candidate_subspace_state["base_sd_for_merge"],
+            tuned_sds_list=candidate_subspace_state["tuned_sds_list"],
+            weights=candidate_subspace_state["weights"],
+            method_params=candidate_method_params,
+            peft_subspace=peft_subspace,
+            subspace=subspace,
+            subspace_prepared=candidate_subspace_state["subspace_prepared"],
+            peft_cfg=peft_cfg,
+            peft_state_by_task=peft_state_by_task,
+            tasks=tasks,
+            merge_base_sd=merge_base_sd,
+        )
         prepared_value = method.prepare(
-            base=base_sd_for_merge,
-            tuned=tuned_sds_list,
-            weights=merge_weights,
+            base=candidate_subspace_state["base_sd_for_merge"],
+            tuned=candidate_subspace_state["tuned_sds_list"],
+            weights=candidate_subspace_state["weights"],
             strict=strict_load,
-            merge_context=merge_context,
+            merge_context=candidate_merge_context,
             method_params=candidate_method_params,
         )
         prepared_cache[cache_key] = prepared_value
@@ -2114,18 +2188,19 @@ def main() -> None:
         prev_avg_norm_acc: float | None = None
         for candidate in batch:
             t0 = time.time()
+            candidate_subspace_state = _subspace_state_for(candidate.method_params)
             candidate_prepared = prepared if prepared is not None else _prepared_for(candidate.method_params)
             candidate_prepared_base_direction = _prepared_base_direction(candidate_prepared)
             candidate_context = _AlphaMergeContext(
                 method=method,
                 prepared=candidate_prepared,
-                base_sd_for_merge=base_sd_for_merge,
-                tuned_sds_list=tuned_sds_list,
-                weights=merge_weights,
+                base_sd_for_merge=candidate_subspace_state["base_sd_for_merge"],
+                tuned_sds_list=candidate_subspace_state["tuned_sds_list"],
+                weights=candidate_subspace_state["weights"],
                 method_params=candidate.method_params,
                 peft_subspace=peft_subspace,
                 subspace=subspace,
-                subspace_prepared=subspace_prepared,
+                subspace_prepared=candidate_subspace_state["subspace_prepared"],
                 peft_cfg=peft_cfg,
                 peft_state_by_task=peft_state_by_task,
                 tasks=tasks,
@@ -2307,17 +2382,21 @@ def main() -> None:
             single_accs=single_accs,
         )
 
+    if peft_subspace != "full":
+        subspace_prepared = _subspace_state_for(best_method_params)["subspace_prepared"]
+
     if cfg.get("save_merged", None) is not None:
+        best_subspace_state = _subspace_state_for(best_method_params)
         best_context = _AlphaMergeContext(
             method=method,
             prepared=(prepared if prepared is not None else _prepared_for(best_method_params)),
-            base_sd_for_merge=base_sd_for_merge,
-            tuned_sds_list=tuned_sds_list,
-            weights=merge_weights,
+            base_sd_for_merge=best_subspace_state["base_sd_for_merge"],
+            tuned_sds_list=best_subspace_state["tuned_sds_list"],
+            weights=best_subspace_state["weights"],
             method_params=best_method_params,
             peft_subspace=peft_subspace,
             subspace=subspace,
-            subspace_prepared=subspace_prepared,
+            subspace_prepared=best_subspace_state["subspace_prepared"],
             peft_cfg=peft_cfg,
             peft_state_by_task=peft_state_by_task,
             tasks=tasks,
@@ -2347,6 +2426,11 @@ def main() -> None:
                     td.task: float(best_norm_vals[i]) for i, td in enumerate(task_data[: len(best_norm_vals)])
                 },
                 "saved_merged_path": cfg.get("save_merged"),
+                "subspace_artifacts": (
+                    {"similarity_artifact_path": getattr(subspace_prepared, "similarity_artifact_path", None)}
+                    if subspace_prepared is not None
+                    else {}
+                ),
             }
         )
         run_logger.finish("success")
