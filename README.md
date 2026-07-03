@@ -15,6 +15,7 @@
 - Config-driven OpenCLIP fine-tuning across multiple datasets
 - Vision checkpoint merging with `weighted_average`, `task_arithmetic`, `ties_merge`, `dare_merge`, `tsv_merge`, `isoc_merge`, `isocts_merge`, `cart_merge`, and `pcb`/`pcb_merge`
 - Zero-shot and merged evaluation on full benchmark test sets
+- Advanced task-vector fine-tuning techniques such as TAK and DELTA
 - Task-vector transport utilities under `merge_and_rebase.rebase`
 - GradFix-based rebasing for cross-base transfer in vision models
 - Text fine-tuning and merge evaluation for NLI-style LLM setups
@@ -188,6 +189,27 @@ To add a new strategy:
 3. Register the strategy in `registry.py`.
 
 Schedulers and optimizers are owned by the strategy implementation.
+
+### Available Regularizers
+
+Regularizers live in `src/merge_and_rebase/finetune/regularizers/`.
+
+Currently available:
+- `distillation`: teacher-student knowledge distillation
+- `kfac_ggn`: curvature regularization that caches second-order statistics of reference tasks and penalizes updates that interfere with those tasks
+- `ekfac_ggn`: a variant of the `kfac_ggn` penalty that applies a more fine-grained approximation of the Hessian
+
+### Extending Regularizers
+
+To add a new regularizer:
+
+1. Create a new file in `src/merge_and_rebase/finetune/regularizers/`.
+2. Implement `prepare(...)` to build any cached state and return the prepared regularizer plus an info dict.
+3. Implement `apply(...)` to return the regularization loss for each training step.
+4. Optionally implement `finalize_model(...)` if the regularizer needs to patch or prepare the model before training starts.
+5. Register the regularizer in `registry.py`.
+
+Prepared regularizers can also expose auxiliary optimizer bundles, batch overrides, checkpoint payloads, and cleanup hooks when needed.
 
 ---
 
