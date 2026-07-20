@@ -430,8 +430,8 @@ If you use this repository in your work, please cite it as:
 
 ```bibtex
 @software{panariello2026merge_and_rebase,
-  author = {Panariello, Aniello and Rinaldi, Filippo},
-  title = {merge-and-rebase},
+  author = {Panariello, Aniello and Rinaldi, Filippo and Porrello, Angelo and van de Weijer, Joost and Calderara, Simone},
+  title = {Merge-and-Rebase: A Unified Framework and Evaluation Benchmark for Fine-Tuning, Model Merging, and Rebasin},
   year = {2026},
   url = {https://github.com/apanariello4/merge-and-rebase},
   version = {0.1.0}
