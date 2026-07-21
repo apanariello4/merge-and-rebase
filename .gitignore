@@ -249,3 +249,5 @@ src/merge_and_rebase/finetune/configs/vision-delta-*
 src/merge_and_rebase/finetune/configs/vision-nonlinear-kfac-vitb32-8vision-clip-*
 src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
+out
+sbatch*
