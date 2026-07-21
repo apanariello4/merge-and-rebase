@@ -39,4 +39,12 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         max_iter = int(method_params.get("max_iter", 100))
         intra_head = bool(method_params.get("intra_head", True))
         return f"transfusion(iter={max_iter}, intra_head={intra_head})"
+    if method_name == "bico":
+        batches = int(method_params.get("num_batches", 1))
+        seq_align = str(method_params.get("seq_align", "interpolate2d"))
+        return f"bico(batches={batches}, align={seq_align})"
+    if method_name == "bico_gradin":
+        batches = int(method_params.get("num_batches", 1))
+        seq_align = str(method_params.get("seq_align", "interpolate2d"))
+        return f"bico_gradin(batches={batches}, align={seq_align}, in=grad)"
     return method_name

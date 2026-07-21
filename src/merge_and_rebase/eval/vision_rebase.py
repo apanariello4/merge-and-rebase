@@ -284,10 +284,12 @@ def main() -> None:
         method_label = format_rebase_method_label(method_name, method_params)
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
         theseus_like_method = method_name in {"theseus", "theseus_reference"}
+        blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
         transfusion_mode = method_name == "transfusion"
+        bico_mode = method_name in ("bico", "bico_gradin")
         eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
         block_extension_eval_requested = bool(eval_before_rebase)
-        block_extension_eval_enabled = bool(block_extension_eval_requested and theseus_like_method)
+        block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
         block_extension_eval_split = str(cfg.get("block_extension_eval_split", "test")).strip().lower()
         if block_extension_eval_split not in {"val", "test"}:
             raise ValueError("block_extension_eval_split must be one of: val, test")
@@ -295,10 +297,10 @@ def main() -> None:
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
-        if block_extension_eval_requested and not theseus_like_method:
+        if block_extension_eval_requested and not blockext_like_method:
             print(
                 "Block-extension target-dataset eval: requested but skipped "
-                f"(method='{method_name}' is not Theseus-like)."
+                f"(method='{method_name}' does not support block-extension)."
             )
 
         grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
@@ -396,14 +398,14 @@ def main() -> None:
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
         run_block_extension_prestep = bool(
-            theseus_like_method and block_extension_enabled and source_depth < target_depth
+            blockext_like_method and block_extension_enabled and source_depth < target_depth
         )
-        if theseus_like_method and block_extension_enabled and source_depth > target_depth:
+        if blockext_like_method and block_extension_enabled and source_depth > target_depth:
             raise ValueError(
                 "Block extension preprocess only supports growing the smaller source network. "
                 f"Got source depth {source_depth} > target depth {target_depth}."
             )
-        if theseus_like_method:
+        if blockext_like_method:
             if run_block_extension_prestep:
                 print(
                     "Block extension preprocess: enabled "
@@ -512,7 +514,7 @@ def main() -> None:
             )
 
             source_loaders = None
-            if theseus_like_method or transfusion_mode:
+            if theseus_like_method or transfusion_mode or bico_mode:
                 source_loaders = build_vision_loaders(
                     hf_ds=hf_ds,
                     hf_path=hf_path,
@@ -530,7 +532,7 @@ def main() -> None:
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
-            if theseus_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
+            if blockext_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
                 load_into_model(source_base_model_task, source_base_sd, strict=False)
@@ -798,6 +800,43 @@ def main() -> None:
                     device=device,
                     **method_params,
                 )
+            elif bico_mode:
+                from ..models.grad_recipes import clip_contrastive_recipe
+
+                if run_block_extension_prestep and source_base_model_task is not None:
+                    source_model_for_bico = source_base_model_task
+                else:
+                    source_model_for_bico = deepcopy(clf_source.model)
+                    load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
+                target_model_for_bico = deepcopy(clf_target.model)
+                load_into_model(target_model_for_bico, target_base_sd, strict=False)
+
+                source_recipe = clip_contrastive_recipe(
+                    clf_source,
+                    classnames,
+                    source_build_cfg_task,
+                    device=device,
+                )
+                target_recipe = clip_contrastive_recipe(
+                    clf_target,
+                    classnames,
+                    build_cfg_task,
+                    device=device,
+                )
+
+                prepared = method.prepare(
+                    source_model=source_model_for_bico,
+                    target_model=target_model_for_bico,
+                    source_dataloader=source_loaders.train,
+                    target_dataloader=loaders.train,
+                    source_recipe=source_recipe,
+                    target_recipe=target_recipe,
+                    target_base=target_base_sd,
+                    delta=task_delta,
+                    device=device,
+                    **method_params,
+                )
+                del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
             else:
                 prepared = transfusion_prepared
 
