@@ -1592,17 +1592,19 @@ def main() -> None:
                 if save_transport_dir:
                     os.makedirs(save_transport_dir, exist_ok=True)
                     native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
-                    legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
-                    legacy_no_conv1_path = os.path.join(
-                        save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
-                    )
                     torch.save(to_cpu_fp32(transported_delta), native_path)
-                    torch.save(_legacy_visual_delta(transported_delta), legacy_path)
-                    torch.save(_legacy_visual_delta(transported_delta, drop_conv1=True), legacy_no_conv1_path)
                     print(f"  {task}: saved transported TV -> {native_path}")
-                    print(f"  {task}: saved legacy visual TV -> {legacy_path}")
-                    print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
-                    transported_artifacts[task] = [native_path, legacy_path, legacy_no_conv1_path]
+                    transported_artifacts[task] = [native_path]
+                    if bool(cfg.get("save_transported_tvs_legacy", True)):
+                        legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
+                        legacy_no_conv1_path = os.path.join(
+                            save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
+                        )
+                        torch.save(_legacy_visual_delta(transported_delta), legacy_path)
+                        torch.save(_legacy_visual_delta(transported_delta, drop_conv1=True), legacy_no_conv1_path)
+                        print(f"  {task}: saved legacy visual TV -> {legacy_path}")
+                        print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
+                        transported_artifacts[task] += [legacy_path, legacy_no_conv1_path]
             else:
                 original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
