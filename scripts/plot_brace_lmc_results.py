@@ -90,6 +90,33 @@ def main() -> None:
         fig.savefig(OUT / ("cross_task_lmc_comparison.png" if pair == "eurosat_gtsrb" else f"{pair}_cross_task_lmc_comparison.png"), dpi=180)
         plt.close(fig)
 
+    barrier_rows = []
+    for pair, tasks in (("eurosat_gtsrb", ("EuroSAT", "GTSRB")), ("dtd_svhn", ("DTD", "SVHN"))):
+        for mode in ("shared", "independent"):
+            values = load(f"{pair}_{mode}")["cross_task_source_lmc"][0]
+            barriers = []
+            for task in tasks:
+                loss = values["per_task_loss"][task]
+                chord = [(1 - alpha) * loss[0] + alpha * loss[-1] for alpha in values["alphas"]]
+                barriers.append(max(0.0, max(value - reference for value, reference in zip(loss, chord, strict=True))))
+            barrier_rows.append((f"{pair.replace('_', '+')}\n{mode}", max(barriers)))
+    residual = json.loads((ROOT / "residual_metrics_dtd_svhn.json").read_text())
+    residual_rows = [("DTD", residual["per_task"]["DTD"]), ("SVHN", residual["per_task"]["SVHN"]), ("DTD+SVHN\nmerge", residual["equal_weight_task_arithmetic_merge"])]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
+    labels, barriers = zip(*barrier_rows, strict=True)
+    bars = axes[0].bar(labels, barriers, color=["C0", "C1", "C0", "C1"])
+    axes[0].set(title=r"Worst-task source barrier $B_{\max}=\max_k B_k$", ylabel="Positive loss chord gap")
+    axes[0].bar_label(bars, fmt="%.4f", padding=2, fontsize=8)
+    x = list(range(len(residual_rows)))
+    width = 0.25
+    for offset, key, label in ((-width, "shared_norm", "shared delta"), (0, "independent_norm", "independent delta"), (width, "residual_norm", "residual")):
+        axes[1].bar([value + offset for value in x], [row[key] for _, row in residual_rows], width=width, label=label)
+    axes[1].set(xticks=x, xticklabels=[label for label, _ in residual_rows], yscale="log", title="Transported target-vector norms", ylabel=r"$\ell_2$ norm (log scale)")
+    axes[1].legend(fontsize=8)
+    fig.suptitle("Cross-task LMC barrier and shared-versus-independent coordinate mismatch")
+    fig.savefig(OUT / "cross_task_barrier_and_residuals.png", dpi=180)
+    plt.close(fig)
+
     lambda_runs = (
         ("λ=0 independent", "gtsrb_independent_lambda0"),
         ("λ=0 shared", "gtsrb_shared_lambda0"),
