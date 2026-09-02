@@ -154,6 +154,17 @@ def main() -> None:
         fig.savefig(OUT / "vision8_all_task_simplex_barrier.png", dpi=180)
         plt.close(fig)
 
+        angles = [2 * 3.141592653589793 * index / len(tasks) for index in range(len(tasks))]
+        fig, axis = plt.subplots(figsize=(5.4, 5.4), subplot_kw={"projection": "polar"}, constrained_layout=True)
+        for mode, values in all_task.items():
+            radii = [values["per_task_max_loss_barrier"][task] for task in tasks]
+            axis.plot(angles + angles[:1], radii + radii[:1], marker="o", label=mode)
+            axis.fill(angles + angles[:1], radii + radii[:1], alpha=0.12)
+        axis.set(xticks=angles, xticklabels=tasks, ylim=(0, 0.36), title=r"Vision8 task-wise all-task barrier $B_k$")
+        axis.legend(loc="upper right", bbox_to_anchor=(1.25, 1.16))
+        fig.savefig(OUT / "vision8_all_task_simplex_barrier_radar.png", dpi=180)
+        plt.close(fig)
+
     functional = {
         "raw": json.loads((ROOT / "functional_overlap_dtd_svhn.json").read_text()),
         "unit parameter norm": json.loads((ROOT / "functional_overlap_dtd_svhn_unit_norm.json").read_text()),
