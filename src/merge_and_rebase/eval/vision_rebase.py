@@ -397,6 +397,64 @@ def _evaluate_cross_task_source_lmc(
     }
 
 
+@torch.no_grad()
+def _evaluate_all_task_star_lmc(
+    *,
+    model: torch.nn.Module,
+    restore_sd: dict[str, torch.Tensor],
+    endpoint_states: dict[str, dict[str, torch.Tensor]],
+    clf_source: OpenClipClassifier,
+    task_contexts: list[dict[str, Any]],
+    split: str,
+    first_n_batches: int | None,
+    alphas: list[float],
+    device: str,
+) -> dict[str, Any]:
+    """Sample every endpoint-to-uniform-barycenter ray of a task simplex."""
+    tasks = list(endpoint_states)
+    if len(tasks) < 2:
+        raise ValueError("All-task simplex LMC requires at least two task endpoints.")
+    keyspace = set(endpoint_states[tasks[0]])
+    if any(set(endpoint_states[task]) != keyspace for task in tasks[1:]):
+        raise ValueError("All-task simplex LMC endpoint keyspaces differ.")
+    barycenter = {
+        key: sum((endpoint_states[task][key].float() for task in tasks), start=torch.zeros_like(endpoint_states[tasks[0]][key], dtype=torch.float32))
+        / len(tasks)
+        if torch.is_floating_point(endpoint_states[tasks[0]][key])
+        else endpoint_states[tasks[0]][key]
+        for key in endpoint_states[tasks[0]]
+    }
+    rays = {
+        task: _evaluate_cross_task_source_lmc(
+            model=model,
+            restore_sd=restore_sd,
+            endpoint_a_sd=endpoint_states[task],
+            endpoint_b_sd=barycenter,
+            clf_source=clf_source,
+            task_contexts=task_contexts,
+            split=split,
+            first_n_batches=first_n_batches,
+            alphas=alphas,
+            device=device,
+        )
+        for task in tasks
+    }
+    per_task = {
+        task: max(ray["per_task_max_loss_barrier"][task] for ray in rays.values())
+        for task in tasks
+    }
+    return {
+        "tasks": tasks,
+        "geometry": "all endpoint-to-uniform-barycenter simplex rays",
+        "rays": rays,
+        "per_task_max_loss_barrier": per_task,
+        "max_per_task_loss_barrier": max(per_task.values()),
+        "max_joint_loss_barrier": max(ray["max_loss_barrier"] for ray in rays.values()),
+        "split": split,
+        "first_n_batches": first_n_batches,
+    }
+
+
 def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
     w = float(weight)
     if w == 1.0:
@@ -960,6 +1018,22 @@ def main() -> None:
         cross_task_lmc_first_n_batches = (
             int(cross_task_lmc_first_n_batches_raw) if cross_task_lmc_first_n_batches_raw is not None else None
         )
+        all_task_lmc_tasks_raw = cfg.get("all_task_lmc_tasks", [])
+        if all_task_lmc_tasks_raw is None:
+            all_task_lmc_tasks_raw = []
+        if not isinstance(all_task_lmc_tasks_raw, (list, tuple)):
+            raise ValueError("all_task_lmc_tasks must be a list of task names.")
+        all_task_lmc_tasks = [str(task) for task in all_task_lmc_tasks_raw]
+        if all_task_lmc_tasks and (len(all_task_lmc_tasks) < 2 or len(set(all_task_lmc_tasks)) != len(all_task_lmc_tasks)):
+            raise ValueError("all_task_lmc_tasks must contain at least two distinct task names.")
+        all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
+        if all_task_lmc_split not in {"val", "test"}:
+            raise ValueError("all_task_lmc_eval_split must be one of: val, test")
+        all_task_lmc_first_n_batches_raw = cfg.get("all_task_lmc_first_n_batches", cross_task_lmc_first_n_batches)
+        all_task_lmc_first_n_batches = (
+            int(all_task_lmc_first_n_batches_raw) if all_task_lmc_first_n_batches_raw is not None else None
+        )
+        source_only = bool(cfg.get("source_only", False))
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
@@ -1187,6 +1261,7 @@ def main() -> None:
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
         cross_task_lmc_rows: list[dict[str, Any]] = []
+        all_task_lmc_rows: list[dict[str, Any]] = []
         corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
         corrected_ft_templates: dict[str, torch.nn.Module] = {}
 
@@ -1366,7 +1441,7 @@ def main() -> None:
                     key_filter=_visual_only_filter,
                 ).delta
 
-                if cross_task_lmc_pairs:
+                if cross_task_lmc_pairs or all_task_lmc_tasks:
                     corrected_ft_states[task] = task_source_ft_sd
                     corrected_ft_templates[task] = deepcopy(source_ft_model_task).cpu()
 
@@ -1463,6 +1538,9 @@ def main() -> None:
                     },
                     context=last_row,
                 )
+
+            if source_only:
+                continue
 
             if not run_block_extension_prestep:
                 if transfusion_mode:
@@ -1648,6 +1726,48 @@ def main() -> None:
                     },
                     context={"tasks": [task_a, task_b], "lmc_mode": block_extension_cfg.lmc_mode},
                 )
+
+        if all_task_lmc_tasks:
+            contexts_by_task = {str(item["task"]): item for item in per_task}
+            if any(task not in contexts_by_task or task not in corrected_ft_states for task in all_task_lmc_tasks):
+                raise ValueError("all_task_lmc_tasks must be selected tasks with BRACE-corrected source endpoints.")
+            print(f"\n--- All-task source LMC simplex: {', '.join(all_task_lmc_tasks)} ---")
+            metrics = _evaluate_all_task_star_lmc(
+                model=deepcopy(corrected_ft_templates[all_task_lmc_tasks[0]]),
+                restore_sd=corrected_ft_states[all_task_lmc_tasks[0]],
+                endpoint_states={task: corrected_ft_states[task] for task in all_task_lmc_tasks},
+                clf_source=clf_source,
+                task_contexts=[contexts_by_task[task] for task in all_task_lmc_tasks],
+                split=all_task_lmc_split,
+                first_n_batches=all_task_lmc_first_n_batches,
+                alphas=source_lmc_alphas,
+                device=device,
+            )
+            row = {"lmc_mode": block_extension_cfg.lmc_mode, **metrics}
+            all_task_lmc_rows.append(row)
+            run_logger.log_event(
+                "all_task_source_lmc",
+                metrics={
+                    "all_task_lmc/max_joint_loss_barrier": row["max_joint_loss_barrier"],
+                    "all_task_lmc/max_per_task_loss_barrier": row["max_per_task_loss_barrier"],
+                },
+                context={"tasks": all_task_lmc_tasks, "lmc_mode": block_extension_cfg.lmc_mode},
+            )
+
+        if source_only:
+            final_summary = {
+                "suite": suite_name,
+                "tasks": tasks,
+                "method": method.name,
+                "method_label": method_label,
+                "source_only": True,
+                "source_lmc": source_lmc_rows,
+                "cross_task_source_lmc": cross_task_lmc_rows,
+                "all_task_source_lmc": all_task_lmc_rows,
+            }
+            run_logger.log_summary(final_summary)
+            run_logger.finish("success")
+            return
 
         can_eval_untransported_by_task: list[bool] = []
         if merge_mode == "none":
@@ -2380,6 +2500,7 @@ def main() -> None:
             "block_extension_target_dataset_eval": block_extension_eval_rows,
             "source_lmc": source_lmc_rows,
             "cross_task_source_lmc": cross_task_lmc_rows,
+            "all_task_source_lmc": all_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
             "saved_merged_path": saved_merged_path,

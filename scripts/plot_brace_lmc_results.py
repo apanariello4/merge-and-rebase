@@ -117,6 +117,43 @@ def main() -> None:
     fig.savefig(OUT / "cross_task_barrier_and_residuals.png", dpi=180)
     plt.close(fig)
 
+    all_task = {}
+    for mode in ("shared", "independent"):
+        path = ROOT / f"vision8_all_task_lmc_{mode}.json"
+        if path.exists():
+            all_task[mode] = json.loads(path.read_text())["all_task_source_lmc"][0]
+    if all_task:
+        tasks = next(iter(all_task.values()))["tasks"]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
+        x = list(range(len(tasks)))
+        width = 0.7 / len(all_task)
+        for index, (mode, values) in enumerate(all_task.items()):
+            offset = (index - (len(all_task) - 1) / 2) * width
+            axes[0].bar(
+                [value + offset for value in x],
+                [values["per_task_max_loss_barrier"][task] for task in tasks],
+                width=width,
+                label=mode,
+            )
+        axes[0].set(xticks=x, xticklabels=tasks, title=r"All-task star-simplex $B_k$", ylabel="Positive loss chord gap")
+        axes[0].tick_params(axis="x", rotation=35)
+        axes[0].legend(fontsize=8)
+        labels = ["joint average", "worst task"]
+        for index, (mode, values) in enumerate(all_task.items()):
+            offset = (index - (len(all_task) - 1) / 2) * width
+            bars = axes[1].bar(
+                [value + offset for value in range(2)],
+                [values["max_joint_loss_barrier"], values["max_per_task_loss_barrier"]],
+                width=width,
+                label=mode,
+            )
+            axes[1].bar_label(bars, fmt="%.4f", padding=2, fontsize=8)
+        axes[1].set(xticks=range(2), xticklabels=labels, title=r"$B_{\mathrm{joint}}$ versus $B_{\mathrm{worst}}$", ylabel="Positive loss chord gap")
+        axes[1].legend(fontsize=8)
+        fig.suptitle("Vision8 all-task source LMC: endpoint-to-uniform-barycenter rays")
+        fig.savefig(OUT / "vision8_all_task_simplex_barrier.png", dpi=180)
+        plt.close(fig)
+
     functional = {
         "raw": json.loads((ROOT / "functional_overlap_dtd_svhn.json").read_text()),
         "unit parameter norm": json.loads((ROOT / "functional_overlap_dtd_svhn_unit_norm.json").read_text()),
