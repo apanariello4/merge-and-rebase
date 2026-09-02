@@ -40,6 +40,17 @@ def _metrics(shared: dict[str, torch.Tensor], independent: dict[str, torch.Tenso
     }
 
 
+def _cross_task_metrics(first: dict[str, torch.Tensor], second: dict[str, torch.Tensor]) -> dict[str, float | int]:
+    metrics = _metrics(first, second)
+    return {
+        "key_count": metrics["key_count"],
+        "first_task_norm": metrics["shared_norm"],
+        "second_task_norm": metrics["independent_norm"],
+        "difference_norm": metrics["residual_norm"],
+        "cosine_similarity": metrics["cosine_similarity"],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shared-dir", type=Path, required=True)
@@ -63,6 +74,13 @@ def main() -> None:
         "per_task": per_task,
         "equal_weight_task_arithmetic_merge": _metrics(merged_shared, merged_independent),
     }
+    if len(args.tasks) == 2:
+        first, second = args.tasks
+        output["cross_task_similarity"] = {
+            "definition": f"cosine between the {first} and {second} target deltas within each strategy.",
+            "shared": _cross_task_metrics(_load(args.shared_dir, first), _load(args.shared_dir, second)),
+            "independent": _cross_task_metrics(_load(args.independent_dir, first), _load(args.independent_dir, second)),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2) + "\n")
     print(json.dumps(output, indent=2))
