@@ -117,6 +117,27 @@ def main() -> None:
     fig.savefig(OUT / "cross_task_barrier_and_residuals.png", dpi=180)
     plt.close(fig)
 
+    functional = {
+        "raw": json.loads((ROOT / "functional_overlap_dtd_svhn.json").read_text()),
+        "unit parameter norm": json.loads((ROOT / "functional_overlap_dtd_svhn_unit_norm.json").read_text()),
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), constrained_layout=True)
+    x = list(range(len(functional)))
+    width = 0.35
+    for offset, mode in ((-width / 2, "shared"), (width / 2, "independent")):
+        pooled = [values["strategies"][mode]["pooled"] for values in functional.values()]
+        axes[0].bar([value + offset for value in x], [row["feature_delta_cosine"] for row in pooled], width=width, label=mode)
+        axes[1].bar([value + offset for value in x], [row["relative_nonadditivity"] for row in pooled], width=width, label=mode)
+    for axis, title, ylabel in (
+        (axes[0], "Feature-change cosine", "cosine"),
+        (axes[1], "Feature non-additivity", "interaction / additive norm"),
+    ):
+        axis.set(xticks=x, xticklabels=list(functional), title=title, ylabel=ylabel)
+        axis.legend(fontsize=8)
+    fig.suptitle("DTD--SVHN pooled target-feature probe")
+    fig.savefig(OUT / "functional_overlap_dtd_svhn.png", dpi=180)
+    plt.close(fig)
+
     lambda_runs = (
         ("λ=0 independent", "gtsrb_independent_lambda0"),
         ("λ=0 shared", "gtsrb_shared_lambda0"),
