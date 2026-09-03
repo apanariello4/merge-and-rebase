@@ -27,7 +27,11 @@ from ..cli_args import (
     parse_json_object_arg,
 )
 from ..data.templates import get_templates
-from ..data.vision_loaders import build_vision_loaders, load_hf_splits
+from ..data.vision_loaders import (
+    build_vision_calibration_loader,
+    build_vision_loaders,
+    load_hf_splits,
+)
 from ..eval.utils import (
     eval_task_top1,
     humanize,
@@ -50,7 +54,12 @@ from ..rebase.runtime import (
 )
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
-from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
+from .block_extension import (
+    calibration_dataset_spec,
+    resolve_block_extension_config,
+    run_block_extension,
+    select_loader,
+)
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
@@ -1150,11 +1159,13 @@ def main() -> None:
                 "Use merge_mode='rebase_then_merge' for depth-mismatch pairs."
             )
         if blockext_like_method:
+            calibration_dataset = calibration_dataset_spec(block_extension_cfg)
             if run_block_extension_prestep:
                 print(
                     "Block extension preprocess: enabled "
                     f"(source_depth={source_depth} -> target_depth={target_depth}, "
                     f"split={block_extension_cfg.calibration_split}, "
+                    f"dataset={calibration_dataset!r}, "
                     f"n_batches_act={block_extension_cfg.n_batches_act})."
                 )
             else:
@@ -1167,6 +1178,25 @@ def main() -> None:
                     "Block extension preprocess: skipped "
                     f"({reason}, source_depth={source_depth}, target_depth={target_depth})."
                 )
+
+        block_extension_calibration_loader = None
+        calibration_dataset = calibration_dataset_spec(block_extension_cfg)
+        if run_block_extension_prestep and calibration_dataset is not None:
+            block_extension_calibration_loader = build_vision_calibration_loader(
+                calibration_dataset,
+                resolver=suite.resolver,
+                preprocess=clf_source.preprocess,
+                calibration_split=block_extension_cfg.calibration_split,
+                batch_size=int(cfg.get("batch_size", 128)),
+                num_workers=int(cfg.get("num_workers", 6)),
+                pin_memory=True,
+                val_fraction=float(cfg.get("val_fraction", 0.1)),
+                seed=int(cfg.get("seed", 42)),
+            )
+            print(
+                "Block extension preprocess: using one task-independent calibration loader "
+                f"from {calibration_dataset!r}."
+            )
 
         attn_patch_cfg_raw = cfg.get("attn_patch_cfg", None)
         if attn_patch_cfg_raw is not None and not isinstance(attn_patch_cfg_raw, dict):
@@ -1412,12 +1442,14 @@ def main() -> None:
                 if source_base_model_task is None or source_ft_model_task is None:
                     raise RuntimeError("Block extension preprocess expected initialized source task models.")
 
-                calibration_loader = select_loader(
-                    block_extension_cfg.calibration_split,
-                    train_loader=source_loaders.train,
-                    test_loader=source_loaders.test,
-                    val_loader=source_loaders.val,
-                )
+                calibration_loader = block_extension_calibration_loader
+                if calibration_loader is None:
+                    calibration_loader = select_loader(
+                        block_extension_cfg.calibration_split,
+                        train_loader=source_loaders.train,
+                        test_loader=source_loaders.test,
+                        val_loader=source_loaders.val,
+                    )
                 final_depth = run_block_extension(
                     source_base_model=source_base_model_task,
                     source_ft_model=source_ft_model_task,

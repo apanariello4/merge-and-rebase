@@ -21,12 +21,21 @@ from ..cli_args import (
     parse_json_object_arg,
 )
 from ..data.templates import get_templates
-from ..data.vision_loaders import build_vision_loaders, load_hf_splits
+from ..data.vision_loaders import (
+    build_vision_calibration_loader,
+    build_vision_loaders,
+    load_hf_splits,
+)
 from ..eval.utils import humanize, resolve_eval_split_loader, to_cpu_fp32
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..run_logging import default_summary_path, merge_logging_config, start_run
-from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
+from .block_extension import (
+    calibration_dataset_spec,
+    resolve_block_extension_config,
+    run_block_extension,
+    select_loader,
+)
 from .datasets.vision8_14_20 import SUITES
 
 
@@ -236,13 +245,33 @@ def main() -> None:
         f"extension_density={block_extension_cfg.extension_density}, "
         f"extension_strategy={block_extension_cfg.extension_strategy}, "
         f"n_batches_act={block_extension_cfg.n_batches_act}, "
-        f"calibration_split={block_extension_cfg.calibration_split}"
+        f"calibration_split={block_extension_cfg.calibration_split}, "
+        f"calibration_dataset={calibration_dataset_spec(block_extension_cfg)}"
     )
 
     use_humanized_classnames = not bool(cfg.get("no_humanize", True))
     show_progress = bool(block_extension_cfg.show_progress)
 
     rows: list[dict[str, Any]] = []
+    task_independent_calibration_loader = None
+    calibration_dataset = calibration_dataset_spec(block_extension_cfg)
+    if calibration_dataset is not None:
+        task_independent_calibration_loader = build_vision_calibration_loader(
+            calibration_dataset,
+            resolver=suite.resolver,
+            preprocess=clf_source.preprocess,
+            calibration_split=block_extension_cfg.calibration_split,
+            batch_size=int(cfg.get("batch_size", 128)),
+            num_workers=int(cfg.get("num_workers", 6)),
+            pin_memory=True,
+            val_fraction=float(cfg.get("val_fraction", 0.1)),
+            seed=int(cfg.get("seed", 42)),
+        )
+        print(
+            "[block_extension.runner] using task-independent calibration dataset "
+            f"{calibration_dataset!r}"
+        )
+
     task_iter: Any = tasks
     if show_progress and tqdm is not None:
         task_iter = tqdm(tasks, total=len(tasks), desc="block_extension.tasks")
@@ -317,12 +346,14 @@ def main() -> None:
             first_n_batches=first_n_eval_batches,
         )
 
-        calibration_loader = select_loader(
-            block_extension_cfg.calibration_split,
-            train_loader=source_loaders.train,
-            test_loader=source_loaders.test,
-            val_loader=source_loaders.val,
-        )
+        calibration_loader = task_independent_calibration_loader
+        if calibration_loader is None:
+            calibration_loader = select_loader(
+                block_extension_cfg.calibration_split,
+                train_loader=source_loaders.train,
+                test_loader=source_loaders.test,
+                val_loader=source_loaders.val,
+            )
         final_depth = run_block_extension(
             source_base_model=source_base_model,
             source_ft_model=source_ft_model,

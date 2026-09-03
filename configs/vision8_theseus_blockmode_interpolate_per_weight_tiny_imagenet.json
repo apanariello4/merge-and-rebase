@@ -7,7 +7,7 @@
   "target_clip_pretrained": "datacomp_xl_s13b_b90k",
   "method": "theseus",
   "method_params": {
-    "num_batches": 5,
+    "num_batches": 10,
     "batch_size": 32,
     "seq_align": "interpolate2d",
     "split_qkv": true,
@@ -17,12 +17,16 @@
   },
   "block_extension_enabled": true,
   "block_extension_params": {
-    "calibration_split": "val",
+    "calibration_dataset": {
+      "path": "zh-plus/tiny-imagenet",
+      "split": "valid",
+      "max_samples": 2048
+    },
     "extension_density": "spread",
     "extension_strategy": "interpolate_per_weight",
     "insertion_order": "bottom-top",
     "dampening_factor": 1.0,
-    "n_batches_act": 1,
+    "n_batches_act": 5,
     "n_cascade_iters": 1,
     "ridge_identity": 100.0,
     "skip_correction": false,

@@ -12,8 +12,16 @@ import torch
 
 from merge_and_rebase.cli_args import add_logging_args, build_logging_overrides
 from merge_and_rebase.data.templates import get_templates
-from merge_and_rebase.data.vision_loaders import build_vision_loaders, load_hf_splits
-from merge_and_rebase.eval.block_extension import resolve_block_extension_config, run_block_extension
+from merge_and_rebase.data.vision_loaders import (
+    build_vision_calibration_loader,
+    build_vision_loaders,
+    load_hf_splits,
+)
+from merge_and_rebase.eval.block_extension import (
+    calibration_dataset_spec,
+    resolve_block_extension_config,
+    run_block_extension,
+)
 from merge_and_rebase.eval.datasets.vision8_14_20 import SUITES
 from merge_and_rebase.eval.utils import to_cpu_fp32
 from merge_and_rebase.io.ckpt import align_to_base_keys, load_ckpt, load_into_model
@@ -74,6 +82,7 @@ def _extend_and_prepare(
     method_name: str,
     method_params: dict[str, Any],
     block_ext_cfg: Any,
+    block_extension_calibration_loader: Any | None,
     source_loaders: Any,
     target_loaders: Any,
     source_classnames: list[str],
@@ -103,7 +112,11 @@ def _extend_and_prepare(
     final_depth = run_block_extension(
         source_base_model=source_base_model,
         source_ft_model=source_ft_model,
-        calibration_loader=source_loaders.train,
+        calibration_loader=(
+            block_extension_calibration_loader
+            if block_extension_calibration_loader is not None
+            else source_loaders.train
+        ),
         target_layers_total=ctx.target_depth,
         config=block_ext_cfg,
         device=device,
@@ -187,6 +200,7 @@ def _transport_source_task(
     method_name: str,
     method_params: dict[str, Any],
     block_ext_cfg: Any,
+    block_extension_calibration_loader: Any | None,
     source_loaders: Any,
     target_loaders: Any,
     source_classnames: list[str],
@@ -204,6 +218,7 @@ def _transport_source_task(
         method_name=method_name,
         method_params=method_params,
         block_ext_cfg=block_ext_cfg,
+        block_extension_calibration_loader=block_extension_calibration_loader,
         source_loaders=source_loaders,
         target_loaders=target_loaders,
         source_classnames=source_classnames,
@@ -307,6 +322,25 @@ def main() -> None:
         base_construction = str(cfg.get("base_construction", "per_task"))
         alpha_mode = str(cfg.get("alpha_mode", "shared"))
 
+        block_extension_calibration_loader = None
+        calibration_dataset = calibration_dataset_spec(block_ext_cfg)
+        if calibration_dataset is not None:
+            block_extension_calibration_loader = build_vision_calibration_loader(
+                calibration_dataset,
+                resolver=suite.resolver,
+                preprocess=clf_source.preprocess,
+                calibration_split=str(block_ext_cfg.calibration_split),
+                batch_size=batch_size,
+                num_workers=num_workers,
+                pin_memory=True,
+                val_fraction=val_fraction,
+                seed=seed,
+            )
+            print(
+                "Using one task-independent block-extension calibration loader "
+                f"from {calibration_dataset!r}."
+            )
+
         save_dir = args.save_transported_dir or cfg.get("save_transported_dir", "results/transported_tvs")
         os.makedirs(save_dir, exist_ok=True)
 
@@ -342,6 +376,7 @@ def main() -> None:
                     method_name=method_name,
                     method_params=method_params,
                     block_ext_cfg=block_ext_cfg,
+                    block_extension_calibration_loader=block_extension_calibration_loader,
                     source_loaders=source_loaders,
                     target_loaders=target_loaders,
                     source_classnames=list(source_loaders.classnames),
@@ -463,6 +498,7 @@ def main() -> None:
                     method_name=method_name,
                     method_params=method_params,
                     block_ext_cfg=block_ext_cfg,
+                    block_extension_calibration_loader=block_extension_calibration_loader,
                     source_loaders=source_loaders,
                     target_loaders=target_loaders,
                     source_classnames=list(source_loaders.classnames),

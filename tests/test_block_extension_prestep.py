@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval.block_extension import (
+    BlockExtender,
     BlockExtensionConfig,
     InputAlignedBlock,
     InputAlignedFinalLayer,
@@ -12,6 +13,46 @@ from merge_and_rebase.eval.block_extension import (
     run_block_extension,
     select_loader,
 )
+
+
+def _assert_shared_lmc_direction(monkeypatch, mode: str) -> None:
+    source_base = _TinyModel(depth=2)
+    source_ft = _TinyModel(depth=2)
+    extender = BlockExtender(source_base, source_ft, "cpu", verbose=False, show_progress=False)
+    correction_calls: list[str] = []
+    apply_calls: list[torch.nn.Module] = []
+
+    monkeypatch.setattr(extender, "capture_reference_inputs", lambda loader, n_batches: None)
+    monkeypatch.setattr(extender, "_capture_component_references", lambda loader, n_batches: None)
+
+    def fake_correct(model_name, model, insert_pos, src_idx, loader, n_batches, **kwargs):
+        correction_calls.append(model_name)
+        kwargs["lmc_store"]["sentinel"] = (torch.eye(8), torch.zeros(8))
+
+    def fake_apply(model, insert_pos, corrections):
+        assert set(corrections) == {"sentinel"}
+        apply_calls.append(model)
+
+    monkeypatch.setattr(extender, "_correct_block_weights_cascade", fake_correct)
+    monkeypatch.setattr(extender, "_apply_block_corrections", fake_apply)
+
+    extender._extend_per_weight(
+        loader=object(),
+        n_batches=1,
+        dampening_factor=1.0,
+        blocks_to_add=1,
+        target_layers_total=None,
+        insertion_order="bottom-top",
+        extension_density="spread",
+        per_weight_mode="duplicate",
+        skip_correction=False,
+        lmc_mode=mode,
+    )
+
+    expected_source = "base" if mode == "shared" else "ft"
+    expected_target = source_ft if mode == "shared" else source_base
+    assert correction_calls == [expected_source]
+    assert apply_calls == [expected_target]
 
 
 class _TinyAttn(nn.Module):
@@ -88,6 +129,27 @@ def test_resolve_block_extension_config_defaults() -> None:
     assert cfg.insertion_order == "bottom-top"
 
 
+def test_resolve_block_extension_config_accepts_task_independent_dataset() -> None:
+    enabled, cfg = resolve_block_extension_config(
+        {
+            "block_extension_params": {
+                "calibration_dataset": {
+                    "path": "zh-plus/tiny-imagenet",
+                    "split": "train",
+                    "max_samples": 8,
+                }
+            }
+        }
+    )
+
+    assert enabled
+    assert cfg.calibration_dataset == {
+        "path": "zh-plus/tiny-imagenet",
+        "split": "train",
+        "max_samples": 8,
+    }
+
+
 def test_select_loader_split_precedence() -> None:
     train = object()
     test = object()
@@ -129,3 +191,57 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
     assert len(source_ft.visual.transformer.resblocks) == 5
     assert isinstance(source_base.visual.transformer.resblocks[0], InputAlignedBlock)
     assert isinstance(source_base.visual.ln_post, InputAlignedFinalLayer)
+
+
+def test_shared_lmc_fits_base_and_applies_to_ft(monkeypatch) -> None:
+    _assert_shared_lmc_direction(monkeypatch, "shared")
+
+
+def test_shared_reverse_lmc_fits_ft_and_applies_to_base(monkeypatch) -> None:
+    _assert_shared_lmc_direction(monkeypatch, "shared_reverse")
+
+
+def test_shared_reverse_lmc_shrink_fits_ft_and_applies_to_base(monkeypatch) -> None:
+    source_base = _TinyModel(depth=2)
+    source_ft = _TinyModel(depth=2)
+    extender = BlockExtender(source_base, source_ft, "cpu", verbose=False, show_progress=False)
+    correction_calls: list[str] = []
+    apply_calls: list[torch.nn.Module] = []
+
+    monkeypatch.setattr(extender, "capture_reference_inputs", lambda loader, n_batches: None)
+    monkeypatch.setattr(extender, "_capture_component_references", lambda loader, n_batches: None)
+
+    def fake_correct(model_name, model, *args, **kwargs):
+        correction_calls.append(model_name)
+        kwargs["lmc_store"]["sentinel"] = (torch.eye(8), torch.zeros(8))
+
+    def fake_apply(model, collapse_pos, corrections):
+        assert set(corrections) == {"sentinel"}
+        apply_calls.append(model)
+
+    monkeypatch.setattr(extender, "_correct_collapsed_block_weights_cascade", fake_correct)
+    monkeypatch.setattr(extender, "_apply_block_corrections", fake_apply)
+
+    extender._shrink_per_weight(
+        loader=object(),
+        n_batches=1,
+        dampening_factor=1.0,
+        blocks_to_add=-1,
+        target_layers_total=None,
+        insertion_order="bottom-top",
+        extension_density="spread",
+        per_weight_mode="duplicate",
+        skip_correction=False,
+        lmc_mode="shared_reverse",
+    )
+
+    assert correction_calls == ["ft"]
+    assert apply_calls == [source_base]
+
+
+def test_resolve_block_extension_config_accepts_shared_reverse() -> None:
+    enabled, cfg = resolve_block_extension_config(
+        {"block_extension_params": {"lmc_mode": "shared_reverse"}}
+    )
+    assert enabled
+    assert cfg.lmc_mode == "shared_reverse"

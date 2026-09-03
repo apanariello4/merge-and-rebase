@@ -9,6 +9,7 @@ from datasets import Dataset, DatasetDict
 from PIL import Image
 
 from merge_and_rebase.data.vision_loaders import (
+    build_vision_calibration_loader,
     build_vision_loaders,
     emnist_fix_transform,
     load_hf_splits,
@@ -44,6 +45,39 @@ def test_load_hf_splits_loads_only_requested_splits(monkeypatch) -> None:
 def test_load_hf_splits_rejects_unsupported_requested_split() -> None:
     with pytest.raises(ValueError, match="Unsupported requested splits"):
         load_hf_splits("tanganke/sun397", requested_splits=("train", "foo"))
+
+
+def test_build_vision_calibration_loader_accepts_direct_hf_dataset_spec(monkeypatch) -> None:
+    calls: list[tuple[str, str | None]] = []
+    datasets_by_split = {
+        "train": Dataset.from_dict({"image": [0, 1, 2, 3], "label": [0, 1, 0, 1]}),
+    }
+
+    def _fake_load_dataset(path, *args, split=None, **kwargs):
+        del kwargs
+        config = args[0] if args else None
+        calls.append((path, config))
+        return datasets_by_split[split]
+
+    monkeypatch.setattr("merge_and_rebase.data.vision_loaders.hf_load_dataset", _fake_load_dataset)
+
+    loader = build_vision_calibration_loader(
+        {
+            "path": "zh-plus/tiny-imagenet",
+            "split": "train",
+            "max_samples": 3,
+        },
+        resolver=lambda task: (_ for _ in ()).throw(ValueError(task)),
+        preprocess=_identity,
+        batch_size=2,
+        num_workers=0,
+    )
+
+    images, labels = next(iter(loader))
+    assert calls == [("zh-plus/tiny-imagenet", None)]
+    assert images.tolist() == [0, 1]
+    assert labels.tolist() == [0, 1]
+    assert len(loader.dataset) == 3
 
 
 def test_emnist_fix_transform_is_picklable() -> None:

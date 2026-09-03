@@ -33,6 +33,34 @@ The smallest useful merge configuration identifies the OpenCLIP base, method, an
 | `strict_load` | boolean | Require strict compatible checkpoint loading. |
 | `postmerge` | object | Optional post-merge adaptation block. |
 
+Block extension calibration is task-local by default: `calibration_split` selects
+the active task's loader. To use one task-independent support set for every
+task, configure `calibration_dataset` inside `block_extension_params`. It can
+name a supported task such as `ImageNet1K`, or point directly to a Hugging Face
+dataset such as Tiny ImageNet:
+
+```json
+{
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "calibration_dataset": {
+      "path": "zh-plus/tiny-imagenet",
+      "split": "train",
+      "max_samples": 2048
+    },
+    "n_batches_act": 5,
+    "calibration_split": "train"
+  }
+}
+```
+
+For a named task, use `"calibration_dataset": "ImageNet1K"` and select
+`train`, `val`, or `test` with `calibration_split`; direct Hugging Face specs
+select their raw split with the spec's `split` field. The alias
+`calibration_task` is also accepted for named datasets. When
+`calibration_dataset`/`calibration_task` is omitted, existing task-dependent
+behavior is unchanged.
+
 Use `hyperparam_search` instead of a fixed alpha for multi-parameter search:
 
 ```json

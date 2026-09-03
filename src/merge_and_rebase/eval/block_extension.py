@@ -30,6 +30,9 @@ class BlockExtensionConfig:
     dampening_factor: float = 1.0
     n_batches_act: int = 2
     calibration_split: str = "test"
+    calibration_dataset: str | dict[str, Any] | None = None
+    # Backward-compatible/ergonomic alias for a named calibration dataset.
+    calibration_task: str | None = None
     skip_correction: bool = False
     skip_final_ln: bool = False
     eval_before_extension: bool = False
@@ -63,6 +66,8 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         dampening_factor=float(params.get("dampening_factor", 1.0)),
         n_batches_act=max(1, int(params.get("n_batches_act", 2))),
         calibration_split=str(params.get("calibration_split", "test")),
+        calibration_dataset=_as_optional_calibration_dataset(params.get("calibration_dataset", None)),
+        calibration_task=_as_optional_str(params.get("calibration_task", None)),
         skip_correction=bool(params.get("skip_correction", False)),
         skip_final_ln=bool(params.get("skip_final_ln", False)),
         eval_before_extension=bool(params.get("eval_before_extension", False)),
@@ -75,6 +80,22 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
     )
+
+
+def calibration_dataset_spec(config: BlockExtensionConfig) -> str | dict[str, Any] | None:
+    """Return the configured task-independent calibration dataset.
+
+    ``calibration_dataset`` is the canonical field. ``calibration_task`` is
+    accepted as a shorthand for named suite tasks such as ``ImageNet1K``.
+    ``None`` preserves the historical task-local calibration behavior.
+    """
+    if config.calibration_dataset is not None and config.calibration_task is not None:
+        raise ValueError("Set only one of block_extension_params.calibration_dataset or calibration_task.")
+    if config.calibration_dataset is not None:
+        return config.calibration_dataset
+    if config.calibration_task is not None:
+        return {"task": config.calibration_task}
+    return None
 
 
 def select_loader(split: str, train_loader: Iterable[Any], test_loader: Iterable[Any], val_loader: Iterable[Any] | None):
@@ -1303,8 +1324,19 @@ class BlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
+                elif lmc_mode == "shared_reverse":
+                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                    self._correct_block_weights_cascade(
+                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
+                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        component_ridge=component_ridge,
+                        lmc_store=ft_corrections,
+                    )
+                    self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
                 else:
-                    raise ValueError(f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', or 'shared'.")
+                    raise ValueError(
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                    )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
         self._vprint(f"per-weight extension completed. final_depth={final_depth}")
@@ -1488,8 +1520,27 @@ class BlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
+                elif lmc_mode == "shared_reverse":
+                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                    self._correct_collapsed_block_weights_cascade(
+                        "ft",
+                        self.model_ft,
+                        collapse_pos,
+                        span_start_idx,
+                        span_end_idx,
+                        output_ref_key,
+                        loader,
+                        n_batches,
+                        ridge_identity=ridge_identity,
+                        n_iters=n_cascade_iters,
+                        component_ridge=component_ridge,
+                        lmc_store=ft_corrections,
+                    )
+                    self._apply_block_corrections(self.model_base, collapse_pos, ft_corrections)
                 else:
-                    raise ValueError(f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', or 'shared'.")
+                    raise ValueError(
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                    )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
         self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
@@ -1537,6 +1588,24 @@ def _as_optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _as_optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    resolved = str(value).strip()
+    return resolved or None
+
+
+def _as_optional_calibration_dataset(value: Any) -> str | dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        resolved = value.strip()
+        return resolved or None
+    if isinstance(value, Mapping):
+        return {str(k): v for k, v in value.items()}
+    raise ValueError("block_extension_params.calibration_dataset must be a string or dict.")
 
 
 def _as_optional_dict_float(value: Any) -> dict[str, float] | None:

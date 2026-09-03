@@ -22,13 +22,13 @@
     "extension_strategy": "interpolate_per_weight",
     "insertion_order": "bottom-top",
     "dampening_factor": 1.0,
-    "n_batches_act": 1,
+    "n_batches_act": 5,
     "n_cascade_iters": 1,
-    "ridge_identity": 100.0,
+    "ridge_identity": 150.0,
     "skip_correction": false,
     "skip_final_ln": false,
     "share_ft_refs": false,
-    "lmc_mode": "shared"
+    "lmc_mode": "shared_reverse"
   },
   "eval_before_rebase": true,
   "block_extension_eval_split": "test",
