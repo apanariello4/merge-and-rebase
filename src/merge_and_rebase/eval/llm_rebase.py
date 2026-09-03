@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,7 @@ from ..merge.runtime import (
 from ..merge.task_vectors import TaskVector, default_key_filter
 from ..models.text_lm import TextBuildConfig, TextLM
 from ..rebase import get_method
-from ..rebase.capabilities import check_pair, needs_depth_upsize
+from ..rebase.capabilities import check_pair
 from ..rebase.model_families import infer_family
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from .block_extension import resolve_block_extension_config
@@ -92,6 +93,53 @@ class _TokenizedPromptDataset(Dataset):
         return feat
 
 
+@dataclass
+class _PreparedTaskDelta:
+    """Delta together with the exact source context it was prepared from."""
+
+    delta: dict[str, torch.Tensor]
+    source_base: dict[str, torch.Tensor]
+    transport_keys: set[str]
+    source_model: torch.nn.Module
+
+
+def _prepare_resized_task_delta(
+    *,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    calibration_loader: Any,
+    target_layers_total: int,
+    config: Any,
+    family_adapter: Any,
+    device: str,
+) -> _PreparedTaskDelta:
+    """Resize one task pair and retain the exact source context for transport."""
+    final_depth = run_block_extension_llm(
+        source_base_model=source_base_model,
+        source_ft_model=source_ft_model,
+        calibration_loader=calibration_loader,
+        target_layers_total=target_layers_total,
+        config=config,
+        family_adapter=family_adapter,
+        device=device,
+    )
+    if final_depth != target_layers_total:
+        raise RuntimeError(
+            "Block extension preprocess failed: "
+            f"final_depth={final_depth}, expected={target_layers_total}."
+        )
+
+    source_base = to_cpu_fp32(source_base_model.state_dict())
+    source_ft = to_cpu_fp32(source_ft_model.state_dict())
+    task_vector = TaskVector.from_checkpoints(source_base, source_ft, strict=False)
+    return _PreparedTaskDelta(
+        delta=task_vector.delta,
+        source_base=source_base,
+        transport_keys=set(family_adapter.transportable_keys(source_base)),
+        source_model=source_base_model,
+    )
+
+
 def _build_text_calibration_loader(
     *,
     tokenizer: Any,
@@ -116,6 +164,8 @@ def _build_text_calibration_loader(
         feats = [{k: v for k, v in row.items() if k != "labels"} for row in batch]
         padded = tokenizer.pad(feats, return_tensors="pt", padding="max_length", max_length=int(max_length))
         padded["labels"] = padded["input_ids"].clone()
+        if "attention_mask" in padded:
+            padded["labels"][padded["attention_mask"] == 0] = -100
         return padded
 
     return DataLoader(
@@ -359,9 +409,6 @@ def main() -> None:
         source_meta = source_family.metadata(source_llm.model) if source_family else None
         target_meta = target_family.metadata(target_llm.model) if target_family else None
 
-        check_pair(method_name, source_meta, target_meta)
-        print(f"Capability check passed for {method_name}")
-
         # Block extension config
         blockext_like_method = method_name in {"theseus", "bico"}
         if "block_extension_enabled" not in cfg:
@@ -370,12 +417,37 @@ def main() -> None:
 
         source_depth = source_meta.num_hidden_layers if source_meta else 0
         target_depth = target_meta.num_hidden_layers if target_meta else 0
+        depth_mismatch = source_depth != target_depth
+        check_pair(
+            method_name,
+            source_meta,
+            target_meta,
+            allow_depth_mismatch=bool(blockext_like_method and block_extension_enabled and depth_mismatch),
+        )
+        print(f"Capability check passed for {method_name}")
+
+        if source_depth > target_depth and blockext_like_method and block_extension_enabled:
+            shrink_strategies = {
+                "per_weight",
+                "per-weight",
+                "shrink",
+                "interpolate_per_weight",
+                "interpolate-per-weight",
+                "duplicate_per_weight",
+                "duplicate-per-weight",
+            }
+            if block_extension_cfg.extension_strategy not in shrink_strategies:
+                raise ValueError(
+                    "LLM depth shrinking requires a per-weight block-extension strategy. "
+                    f"Got '{block_extension_cfg.extension_strategy}'."
+                )
+
         run_block_extension_prestep = bool(
             blockext_like_method
             and block_extension_enabled
             and source_meta is not None
             and target_meta is not None
-            and needs_depth_upsize(source_meta, target_meta)
+            and depth_mismatch
         )
         if blockext_like_method:
             if run_block_extension_prestep:
@@ -447,7 +519,7 @@ def main() -> None:
 
         # Compute per-task source deltas
         print("\nComputing task deltas...")
-        task_deltas: list[dict[str, torch.Tensor]] = []
+        prepared_tasks: list[_PreparedTaskDelta] = []
 
         tp_keys = None
         full_fp_keys = None
@@ -473,7 +545,9 @@ def main() -> None:
 
         for ckpt_ref in tuned_ref_list:
             if run_block_extension_prestep:
-                # Block extension prestep: extend source base + ft models to target depth
+                # Each task starts from an immutable source template, then its
+                # own copy is resized to the target depth before transport.
+                # Keep that depth-matched source model alive below.
                 source_base_model_task = deepcopy(source_llm.model)
                 source_ft_model_task = deepcopy(source_llm.model)
 
@@ -492,40 +566,19 @@ def main() -> None:
                 if family_adapter_for_ext is None:
                     raise ValueError("Block extension requires a family adapter but none was inferred.")
 
-                final_depth = run_block_extension_llm(
+                prepared_task = _prepare_resized_task_delta(
                     source_base_model=source_base_model_task,
                     source_ft_model=source_ft_model_task,
                     calibration_loader=blockext_calib_loader,
-                    target_layers_total=target_depth,
+                    target_layers_total=int(target_depth),
                     config=block_extension_cfg,
                     family_adapter=family_adapter_for_ext,
                     device=device,
                 )
-                if final_depth != target_depth:
-                    raise RuntimeError(
-                        f"Block extension preprocess failed: "
-                        f"final_depth={final_depth}, expected={target_depth}."
-                    )
-                print(f"  block extension completed (source_depth={source_depth} -> {final_depth})")
-
-                # Recompute delta from extended source base/ft
-                task_source_base_sd = to_cpu_fp32(source_base_model_task.state_dict())
-                task_source_ft_sd = to_cpu_fp32(source_ft_model_task.state_dict())
-
-                # Filter to transportable keys
-                if tp_keys is not None:
-                    task_source_base_sd = {k: v for k, v in task_source_base_sd.items() if k in tp_keys or k in source_base_sd}
-                    task_source_ft_sd = {k: v for k, v in task_source_ft_sd.items() if k in tp_keys or k in source_base_sd}
-
-                tv = TaskVector.from_checkpoints(
-                    task_source_base_sd, task_source_ft_sd, strict=False
-                )
-                task_deltas.append(tv.delta)
-
-                # Update source_base_sd so the transport step uses the extended base
-                source_base_sd = to_cpu_fp32(source_base_model_task.state_dict())
-
-                del source_base_model_task, source_ft_model_task
+                print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
+                prepared_tasks.append(prepared_task)
+                source_base_model_task.to("cpu")
+                del source_ft_model_task
             else:
                 aligned = load_aligned_tuned_from_ref(
                     ckpt_ref=ckpt_ref,
@@ -551,7 +604,14 @@ def main() -> None:
                 tv = TaskVector.from_checkpoints(
                     source_base_sd, tuned_cpu, strict=False
                 )
-                task_deltas.append(tv.delta)
+                prepared_tasks.append(
+                    _PreparedTaskDelta(
+                        delta=tv.delta,
+                        source_base=source_base_sd,
+                        transport_keys=set(tp_keys or ()),
+                        source_model=source_llm.model,
+                    )
+                )
 
         weights_raw = cfg.get("weights", None)
         if weights_raw is None:
@@ -566,15 +626,19 @@ def main() -> None:
         print(f"\n=== Transporting {len(tasks) if tasks else 1} task vectors with {method_name} ===")
         transported_deltas: list[dict[str, torch.Tensor]] = []
 
-        transport_keys = tp_keys or set()
         family_adapter = target_family or source_family
-        for idx, delta in enumerate(task_deltas):
+        for idx, prepared_task in enumerate(prepared_tasks):
+            delta = prepared_task.delta
+            transport_keys = prepared_task.transport_keys
             if tasks:
                 label = tasks[idx]
             else:
                 label = f"task_{idx}"
-            print(f"\n--- '{label}' ({idx + 1}/{len(task_deltas)}) ---")
+            print(f"\n--- '{label}' ({idx + 1}/{len(prepared_tasks)}) ---")
             t0 = time.time()
+
+            if run_block_extension_prestep:
+                prepared_task.source_model.to(device)
 
             if method_name in ("theseus", "bico") and transport_keys:
                 # Hybrid: transport body keys, identity-pass the rest
@@ -599,11 +663,11 @@ def main() -> None:
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     transport_kwargs.setdefault("n_batches", 2)
                     transported_body = method.transport(
-                        source_base=source_base_sd,
+                        source_base=prepared_task.source_base,
                         target_base=target_base_sd,
                         delta=body_delta,
                         strict=False,
-                        source_model=source_llm.model,
+                        source_model=prepared_task.source_model,
                         target_model=target_llm.model,
                         source_dataloader=source_calib,
                         target_dataloader=target_calib,
@@ -617,11 +681,11 @@ def main() -> None:
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     transport_kwargs.setdefault("n_batches", 2)
                     transported_body = method.transport(
-                        source_base=source_base_sd,
+                        source_base=prepared_task.source_base,
                         target_base=target_base_sd,
                         delta=body_delta,
                         strict=False,
-                        source_model=source_llm.model,
+                        source_model=prepared_task.source_model,
                         target_model=target_llm.model,
                         source_dataloader=source_calib,
                         target_dataloader=target_calib,
@@ -647,7 +711,7 @@ def main() -> None:
                     )
             else:
                 transported = method.transport(
-                    source_base=source_base_sd,
+                    source_base=prepared_task.source_base,
                     target_base=target_base_sd,
                     delta=delta,
                     strict=False,
@@ -656,6 +720,11 @@ def main() -> None:
             elapsed = time.time() - t0
             print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
             transported_deltas.append(transported)
+            if run_block_extension_prestep:
+                # Release each task-local resized model immediately after its
+                # matching transport completes.
+                prepared_task.source_model.to("cpu")
+                del prepared_task.source_model
 
         # Merge transported deltas
         merged_delta = compose_weighted_deltas(transported_deltas, weights)

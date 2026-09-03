@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -245,3 +248,16 @@ def test_resolve_block_extension_config_accepts_shared_reverse() -> None:
     )
     assert enabled
     assert cfg.lmc_mode == "shared_reverse"
+
+
+def test_vision8_shared_configs_differ_only_by_lmc_direction() -> None:
+    root = Path(__file__).resolve().parents[1]
+    shared_path = root / "configs/vision8_theseus_blockmode_interpolate_per_weight.json"
+    reverse_path = root / "configs/vision8_theseus_blockmode_interpolate_per_weight_shared_reverse.json"
+    shared = json.loads(shared_path.read_text())
+    reverse = json.loads(reverse_path.read_text())
+
+    assert shared["block_extension_params"]["lmc_mode"] == "shared"
+    assert reverse["block_extension_params"]["lmc_mode"] == "shared_reverse"
+    shared["block_extension_params"]["lmc_mode"] = "shared_reverse"
+    assert shared == reverse

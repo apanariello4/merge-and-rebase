@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.registry import get_method, list_methods
+from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
 
 
 class _TinyVisual(nn.Module):
@@ -42,6 +43,51 @@ def _make_loader(n_samples: int = 16, in_dim: int = 6, batch_size: int = 4) -> D
     x = torch.randn(n_samples, in_dim)
     y = torch.randint(0, 5, (n_samples,))
     return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+
+class _TinyTextModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(32, 6)
+        self.model = nn.Linear(6, 8)
+
+    def forward(self, input_ids, attention_mask=None):
+        del attention_mask
+        return self.model(self.embed(input_ids))
+
+
+class _TinyTextFamily:
+    def transport_scope(self, model):
+        return model.model
+
+    def extract_calibration_batch(self, batch):
+        return {key: batch[key] for key in ("input_ids", "attention_mask", "labels") if key in batch}
+
+
+def _text_recipe(model, batch):
+    output = model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
+    return output.square().mean(), []
+
+
+def test_bico_collects_standard_text_batches() -> None:
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+        "labels": torch.tensor([[1, 2, 3], [4, 5, -100]]),
+    }
+    stats = collect_bilinear_statistics(
+        _TinyTextModel(),
+        _TinyTextModel(),
+        [batch],
+        [batch],
+        _text_recipe,
+        _text_recipe,
+        device="cpu",
+        seq_align="mean",
+        n_batches=1,
+        family_adapter=_TinyTextFamily(),
+    )
+    assert stats
 
 
 def test_bico_registered() -> None:

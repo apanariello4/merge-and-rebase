@@ -825,9 +825,18 @@ class DecoderBlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
+                elif lmc_mode == "shared_reverse":
+                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                    self._correct_block_weights_cascade(
+                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
+                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        component_ridge=component_ridge,
+                        lmc_store=ft_corrections,
+                    )
+                    self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', or 'shared'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
@@ -962,9 +971,19 @@ class DecoderBlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
+                elif lmc_mode == "shared_reverse":
+                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                    self._correct_collapsed_block_weights_cascade(
+                        "ft", self.model_ft, collapse_pos, span_start, span_end,
+                        output_ref_key, loader, n_batches,
+                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        component_ridge=component_ridge,
+                        lmc_store=ft_corrections,
+                    )
+                    self._apply_block_corrections(self.model_base, collapse_pos, ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', or 'shared'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
@@ -1124,8 +1143,13 @@ class DecoderBlockExtender:
                 extension_density=extension_density,
                 skip_final_ln=skip_final_ln,
             )
-        if strategy in ("per_weight", "per-weight"):
-            return self._extend_per_weight(
+        if strategy in ("per_weight", "per-weight", "interpolate_per_weight", "interpolate-per-weight", "duplicate_per_weight", "duplicate-per-weight"):
+            per_weight_mode = "duplicate" if strategy in ("duplicate_per_weight", "duplicate-per-weight") else "cascade"
+            n_needed = self._resolve_depth_delta(
+                len(_get_layers(self.model_base, self.family_adapter)), blocks_to_add, target_layers_total
+            )
+            per_weight_fn = self._shrink_per_weight if n_needed < 0 else self._extend_per_weight
+            return per_weight_fn(
                 loader=loader,
                 n_batches=n_batches,
                 dampening_factor=dampening_factor,
@@ -1134,7 +1158,7 @@ class DecoderBlockExtender:
                 insertion_order=insertion_order,
                 extension_density=extension_density,
                 ridge_identity=ridge_identity,
-                per_weight_mode="cascade",
+                per_weight_mode=per_weight_mode,
                 n_cascade_iters=n_cascade_iters,
                 share_ft_refs=share_ft_refs,
                 skip_correction=skip_correction,
@@ -1159,7 +1183,8 @@ class DecoderBlockExtender:
                 lmc_mode=lmc_mode,
             )
         raise ValueError(
-            f"Unsupported extension_strategy '{strategy}'. Expected: interpolate, per_weight, shrink."
+            "Unsupported extension_strategy "
+            f"'{strategy}'. Expected: interpolate, per_weight, shrink, interpolate_per_weight, duplicate_per_weight."
         )
 
 

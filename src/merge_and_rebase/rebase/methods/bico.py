@@ -75,6 +75,21 @@ class _BiCoHook:
             handle.remove()
 
 
+def _calibration_primary_input(batch: Any, family_adapter: Any = None) -> torch.Tensor:
+    """Return a tensor only for calibration shape checks/input gradients.
+
+    Decoder-family batches carry token IDs instead of the image tensor expected
+    by Theseus' legacy visual helper.
+    """
+    if family_adapter is not None:
+        inputs = family_adapter.extract_calibration_batch(batch)
+        input_ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
+        if not torch.is_tensor(input_ids):
+            raise TypeError("Family-adapter calibration batches must provide tensor 'input_ids'.")
+        return input_ids
+    return _t._extract_model_inputs(batch)
+
+
 def _collect_batch(
     model: torch.nn.Module,
     recipe,
@@ -83,15 +98,16 @@ def _collect_batch(
     *,
     device: torch.device,
     mark_inputs_grad: bool = False,
+    family_adapter: Any = None,
 ) -> None:
     """Run forward + backward on one model/batch and populate hook."""
     model.to(device)
     model.zero_grad(set_to_none=True)
     with torch.set_grad_enabled(True):
         if mark_inputs_grad:
-            imgs = _t._extract_model_inputs(batch)
-            if torch.is_tensor(imgs):
-                imgs.requires_grad_(True)
+            inputs = _calibration_primary_input(batch, family_adapter)
+            if inputs.is_floating_point():
+                inputs.requires_grad_(True)
         loss, _ = recipe(model, batch)
         if loss.dim() > 0:
             loss = loss.sum()
@@ -158,24 +174,30 @@ def collect_bilinear_statistics(
             if n_batches is not None and idx >= n_batches:
                 break
 
-            source_imgs = _t._extract_model_inputs(source_batch).to(dev)
-            target_imgs = _t._extract_model_inputs(target_batch).to(dev)
-            if source_imgs.shape[0] != target_imgs.shape[0]:
+            source_inputs = _calibration_primary_input(source_batch, family_adapter)
+            target_inputs = _calibration_primary_input(target_batch, family_adapter)
+            if source_inputs.shape[0] != target_inputs.shape[0]:
                 raise ValueError(
                     "BiCo calibration expects aligned batch sizes. "
-                    f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
+                    f"Got {source_inputs.shape[0]} and {target_inputs.shape[0]}."
                 )
-            del source_imgs, target_imgs
+            del source_inputs, target_inputs
 
             # Source: forward + backward on GPU
             source_hook.clear()
-            _collect_batch(source_model, source_recipe, source_batch, source_hook, device=dev)
+            _collect_batch(
+                source_model, source_recipe, source_batch, source_hook,
+                device=dev, family_adapter=family_adapter,
+            )
             source_model.to(cpu_device)
             torch.cuda.empty_cache()
 
             # Target: forward + backward on GPU
             target_hook.clear()
-            _collect_batch(target_model, target_recipe, target_batch, target_hook, device=dev)
+            _collect_batch(
+                target_model, target_recipe, target_batch, target_hook,
+                device=dev, family_adapter=family_adapter,
+            )
             target_model.to(cpu_device)
             torch.cuda.empty_cache()
 
@@ -272,24 +294,30 @@ def collect_gradin_statistics(
             if n_batches is not None and idx >= n_batches:
                 break
 
-            source_imgs = _t._extract_model_inputs(source_batch).to(dev)
-            target_imgs = _t._extract_model_inputs(target_batch).to(dev)
-            if source_imgs.shape[0] != target_imgs.shape[0]:
+            source_inputs = _calibration_primary_input(source_batch, family_adapter)
+            target_inputs = _calibration_primary_input(target_batch, family_adapter)
+            if source_inputs.shape[0] != target_inputs.shape[0]:
                 raise ValueError(
                     "BiCo gradin calibration expects aligned batch sizes. "
-                    f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
+                    f"Got {source_inputs.shape[0]} and {target_inputs.shape[0]}."
                 )
-            del source_imgs, target_imgs
+            del source_inputs, target_inputs
 
             # Source: forward + backward on GPU with inputs marked grad
             source_hook.clear()
-            _collect_batch(source_model, source_recipe, source_batch, source_hook, device=dev, mark_inputs_grad=True)
+            _collect_batch(
+                source_model, source_recipe, source_batch, source_hook,
+                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
+            )
             source_model.to(cpu_device)
             torch.cuda.empty_cache()
 
             # Target: forward + backward on GPU with inputs marked grad
             target_hook.clear()
-            _collect_batch(target_model, target_recipe, target_batch, target_hook, device=dev, mark_inputs_grad=True)
+            _collect_batch(
+                target_model, target_recipe, target_batch, target_hook,
+                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
+            )
             target_model.to(cpu_device)
             torch.cuda.empty_cache()
 

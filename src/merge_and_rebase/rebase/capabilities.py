@@ -30,6 +30,7 @@ def check_pair(
     target_meta: ModelFamilyMetadata | None,
     source_state_dict: Mapping[str, torch.Tensor] | None = None,
     target_state_dict: Mapping[str, torch.Tensor] | None = None,
+    allow_depth_mismatch: bool = False,
 ) -> None:
     support = _METHOD_SUPPORT.get(method_name)
     if support is None:
@@ -56,7 +57,7 @@ def check_pair(
     source_depth = source_meta.num_hidden_layers
     target_depth = target_meta.num_hidden_layers
 
-    if source_depth > target_depth:
+    if source_depth > target_depth and not allow_depth_mismatch:
         raise ValueError(
             f"Source has more layers than target ({source_depth} > {target_depth}). "
             "Downsizing preprocess is not implemented in v1."
@@ -75,7 +76,7 @@ def check_pair(
             "Cross-size support: theseus, bico"
         )
 
-    if same_size and source_depth != target_depth:
+    if same_size and source_depth != target_depth and not allow_depth_mismatch:
         raise ValueError(
             f"Same-size models have different depths ({source_depth} vs {target_depth}). "
             "Depth mismatch requires block-extension prealign."

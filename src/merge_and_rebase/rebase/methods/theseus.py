@@ -1093,7 +1093,27 @@ def _precompute_transforms_data_free(
                 )
             transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
         elif w_delta.ndim == 1:
-            transforms_by_key[key] = _LayerTransform(kind="bias")
+            if key in _ZERO_KEYS:
+                transforms_by_key[key] = _LayerTransform(kind="zero")
+                continue
+
+            if key.endswith(".bias"):
+                weight_key = f"{key[:-len('.bias')]}.weight"
+                weight_transform = transforms_by_key.get(weight_key)
+                if weight_transform is not None and weight_transform.t_out is not None:
+                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
+                    continue
+
+            # Fall back to a one-row weight-space alignment for uncommon
+            # standalone vectors whose parent weight transform is unavailable.
+            t_out = _compute_alignment_map_from_matrix_proxies(
+                w_src_base.unsqueeze(0),
+                w_tgt_base.unsqueeze(0),
+                side="input",
+                whiten_power=whiten_power,
+                whiten_eps=whiten_eps,
+            )
+            transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
         else:
             transforms_by_key[key] = _LayerTransform(kind="unsupported")
 
@@ -1321,6 +1341,8 @@ class TheseusRebase:
                         n_batches=n_batches,
                         seed=int(seed),
                         batch_size=batch_size,
+                        store_a_gram=whiten_power > 0.0,
+                        store_b_gram=whiten_power > 0.0,
                         family_adapter=family_adapter,
                     )
                     if cache_path is not None:

@@ -175,6 +175,67 @@ def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
         assert tensor.dtype == target_base[key].dtype
 
 
+def test_data_free_transforms_handle_biases_and_zero_keys() -> None:
+    source_weight = torch.eye(4)
+    target_weight = torch.eye(6)
+    transforms = theseus_mod._precompute_transforms_data_free(
+        source_visual_base={
+            "class_embedding": torch.ones(4),
+            "transformer.resblocks.0.mlp.c_fc.weight": source_weight,
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(4),
+        },
+        target_visual_base={
+            "class_embedding": torch.ones(6),
+            "transformer.resblocks.0.mlp.c_fc.weight": target_weight,
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(6),
+        },
+        visual_delta={
+            "class_embedding": torch.ones(4),
+            "transformer.resblocks.0.mlp.c_fc.weight": torch.ones_like(source_weight),
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(4),
+        },
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+        show_progress=False,
+        method_name="theseus",
+    )
+
+    assert transforms["class_embedding"].kind == "zero"
+    bias_transform = transforms["transformer.resblocks.0.mlp.c_fc.bias"]
+    assert bias_transform.kind == "bias"
+    assert bias_transform.t_out is not None
+
+
+def test_prepare_collects_grams_when_whitening_is_enabled(monkeypatch) -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
+    delta = {"visual.fc1.weight": torch.ones_like(source_base["visual.fc1.weight"])}
+    seen: dict[str, object] = {}
+
+    def fake_collect(*args, **kwargs):
+        seen["store_a_gram"] = kwargs["store_a_gram"]
+        seen["store_b_gram"] = kwargs["store_b_gram"]
+        return {}
+
+    monkeypatch.setattr(theseus_mod, "collect_activations", fake_collect)
+    theseus_mod.TheseusRebase().prepare(
+        source_model=source_model,
+        target_model=target_model,
+        source_dataloader=[],
+        target_dataloader=[],
+        target_base={k: v.detach().clone() for k, v in target_model.state_dict().items()},
+        delta=delta,
+        device="cpu",
+        patch_qkv=False,
+        whiten_power=0.25,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert seen == {"store_a_gram": True, "store_b_gram": True}
+
+
 def test_data_free_covariance_map_uses_weight_proxies() -> None:
     source = torch.tensor([[2.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
     rotation = torch.tensor([[0.0, -1.0], [1.0, 0.0]], dtype=torch.float32)

@@ -67,6 +67,12 @@ def test_source_deeper_than_target_rejected() -> None:
         check_pair("theseus", src, tgt)
 
 
+def test_source_deeper_than_target_allowed_for_block_extension() -> None:
+    src = _meta(layers=40)
+    tgt = _meta(layers=32)
+    check_pair("theseus", src, tgt, allow_depth_mismatch=True)
+
+
 def test_transfusion_not_available() -> None:
     src = _meta()
     tgt = _meta()

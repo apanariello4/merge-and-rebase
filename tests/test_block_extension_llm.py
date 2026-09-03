@@ -238,6 +238,31 @@ class TestDecoderBlockExtender:
         )
         assert final_depth == 4
 
+    @pytest.mark.parametrize(
+        ("strategy", "expected_mode"),
+        [
+            ("interpolate_per_weight", "cascade"),
+            ("duplicate_per_weight", "duplicate"),
+        ],
+    )
+    def test_vision_per_weight_strategy_aliases_extend(
+        self, small_model, family_adapter, calib_loader, strategy, expected_mode
+    ):
+        model_base = small_model
+        model_ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+        extender = DecoderBlockExtender(
+            model_base, model_ft, family_adapter, device="cpu", verbose=False, show_progress=False
+        )
+        final_depth = extender.extend_and_calibrate(
+            loader=calib_loader,
+            n_batches=1,
+            strategy=strategy,
+            target_layers_total=4,
+            skip_correction=True,
+        )
+        assert final_depth == 4
+        assert expected_mode in {"cascade", "duplicate"}
+
     def test_extend_per_weight_with_correction(self, small_model, family_adapter, calib_loader):
         model_base = small_model
         model_ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
@@ -273,6 +298,22 @@ class TestDecoderBlockExtender:
         )
         assert final_depth == 3
 
+    @pytest.mark.parametrize("strategy", ["interpolate_per_weight", "duplicate_per_weight"])
+    def test_vision_per_weight_strategy_aliases_shrink(self, family_adapter, calib_loader, strategy):
+        model_base = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
+        model_ft = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
+        extender = DecoderBlockExtender(
+            model_base, model_ft, family_adapter, device="cpu", verbose=False, show_progress=False
+        )
+        final_depth = extender.extend_and_calibrate(
+            loader=calib_loader,
+            n_batches=1,
+            strategy=strategy,
+            target_layers_total=4,
+            skip_correction=True,
+        )
+        assert final_depth == 4
+
     def test_no_extension_needed(self, small_model, family_adapter, calib_loader):
         model_base = small_model
         model_ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
@@ -286,6 +327,58 @@ class TestDecoderBlockExtender:
             target_layers_total=3,
         )
         assert final_depth == 3
+
+
+@pytest.mark.parametrize("strategy", ["interpolate_per_weight", "duplicate_per_weight"])
+def test_shared_reverse_fits_ft_and_applies_to_base_for_extension(monkeypatch, strategy):
+    base = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+    ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+    adapter = DummyFamilyAdapter()
+    extender = DecoderBlockExtender(base, ft, adapter, device="cpu", verbose=False, show_progress=False)
+    correction_calls: list[str] = []
+    apply_calls: list[nn.Module] = []
+
+    monkeypatch.setattr(extender, "capture_reference_inputs", lambda loader, n_batches: None)
+    monkeypatch.setattr(extender, "_capture_component_references", lambda loader, n_batches: None)
+
+    def fake_correct(model_name, model, *args, **kwargs):
+        correction_calls.append(model_name)
+        kwargs["lmc_store"]["sentinel"] = (torch.eye(16), torch.zeros(16))
+
+    monkeypatch.setattr(extender, "_correct_block_weights_cascade", fake_correct)
+    monkeypatch.setattr(extender, "_apply_block_corrections", lambda model, *_: apply_calls.append(model))
+    extender.extend_and_calibrate(
+        loader=object(), n_batches=1, strategy=strategy, target_layers_total=4,
+        skip_correction=False, lmc_mode="shared_reverse",
+    )
+    assert correction_calls == ["ft"]
+    assert apply_calls == [base]
+
+
+@pytest.mark.parametrize("strategy", ["interpolate_per_weight", "duplicate_per_weight"])
+def test_shared_reverse_fits_ft_and_applies_to_base_for_shrink(monkeypatch, strategy):
+    base = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
+    ft = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
+    adapter = DummyFamilyAdapter()
+    extender = DecoderBlockExtender(base, ft, adapter, device="cpu", verbose=False, show_progress=False)
+    correction_calls: list[str] = []
+    apply_calls: list[nn.Module] = []
+
+    monkeypatch.setattr(extender, "capture_reference_inputs", lambda loader, n_batches: None)
+    monkeypatch.setattr(extender, "_capture_component_references", lambda loader, n_batches: None)
+
+    def fake_correct(model_name, model, *args, **kwargs):
+        correction_calls.append(model_name)
+        kwargs["lmc_store"]["sentinel"] = (torch.eye(16), torch.zeros(16))
+
+    monkeypatch.setattr(extender, "_correct_collapsed_block_weights_cascade", fake_correct)
+    monkeypatch.setattr(extender, "_apply_block_corrections", lambda model, *_: apply_calls.append(model))
+    extender.extend_and_calibrate(
+        loader=object(), n_batches=1, strategy=strategy, target_layers_total=4,
+        skip_correction=False, lmc_mode="shared_reverse",
+    )
+    assert correction_calls == ["ft"]
+    assert apply_calls == [base]
 
 
 class TestRunBlockExtensionLLM:
