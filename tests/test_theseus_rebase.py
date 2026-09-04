@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -40,6 +41,27 @@ def _make_loader(n_samples: int = 16, in_dim: int = 6, batch_size: int = 4) -> D
 def test_theseus_registered() -> None:
     assert "theseus" in list_methods()
     assert get_method("theseus").name == "theseus"
+
+
+@pytest.mark.parametrize(
+    ("whiten_power", "whiten_eps"),
+    [(-0.01, 1e-5), (0.51, 1e-5), (0.0, 0.0)],
+)
+def test_theseus_rejects_invalid_whitening_parameters(whiten_power, whiten_eps):
+    method = theseus_mod.TheseusRebase()
+    with pytest.raises(ValueError):
+        method.prepare(
+            source_model=nn.Linear(2, 2),
+            target_model=nn.Linear(2, 2),
+            source_dataloader=[],
+            target_dataloader=[],
+            device="cpu",
+            patch_qkv=False,
+            whiten_power=whiten_power,
+            whiten_eps=whiten_eps,
+            show_progress=False,
+            verbose=False,
+        )
 
 
 def test_theseus_transport_smoke() -> None:

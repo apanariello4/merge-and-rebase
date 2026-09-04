@@ -5,12 +5,14 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 try:
     from tqdm.auto import tqdm
@@ -18,6 +20,39 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 logger = logging.getLogger(__name__)
+
+
+def _deterministic_calibration_loader(loader, n_batches: int):
+    """Freeze a randomized DataLoader for the extender's repeated passes.
+
+    Correction/reference fitting makes several passes over the same calibration
+    examples. A RandomSampler would produce different rows on each pass and
+    pair unrelated activations. Preserve the sampler's first calibration
+    window, then replay it sequentially.
+    """
+
+    if not isinstance(loader, DataLoader) or loader.batch_size is None:
+        return loader
+    if isinstance(loader.sampler, SequentialSampler):
+        return loader
+
+    n_items = max(0, int(n_batches)) * int(loader.batch_size)
+    indices = list(islice(iter(loader.sampler), n_items))
+    frozen_dataset = Subset(loader.dataset, indices)
+    return DataLoader(
+        frozen_dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        collate_fn=loader.collate_fn,
+        pin_memory=loader.pin_memory,
+        drop_last=loader.drop_last,
+        timeout=loader.timeout,
+        worker_init_fn=loader.worker_init_fn,
+        persistent_workers=bool(
+            getattr(loader, "persistent_workers", False) and loader.num_workers > 0
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1097,8 @@ class BlockExtender:
         lmc_mode: str = "independent",
     ) -> int:
         curr_layers = len(self.model_base.visual.transformer.resblocks)
+        if not skip_correction:
+            loader = _deterministic_calibration_loader(loader, n_batches)
         n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
 
         common_kwargs = dict(
@@ -1097,7 +1134,8 @@ class BlockExtender:
         self._vprint("starting extension and calibration")
         self.wrap_with_aligners()
         self._vprint("wrapping with aligners completed")
-        self.capture_reference_inputs(loader, n_batches)
+        if not skip_correction:
+            self.capture_reference_inputs(loader, n_batches)
         self._vprint("reference activation capture completed")
 
         if n_needed <= 0:

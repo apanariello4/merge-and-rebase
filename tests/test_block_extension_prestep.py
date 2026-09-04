@@ -12,6 +12,7 @@ from merge_and_rebase.eval.block_extension import (
     BlockExtensionConfig,
     InputAlignedBlock,
     InputAlignedFinalLayer,
+    _deterministic_calibration_loader,
     resolve_block_extension_config,
     run_block_extension,
     select_loader,
@@ -194,6 +195,19 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
     assert len(source_ft.visual.transformer.resblocks) == 5
     assert isinstance(source_base.visual.transformer.resblocks[0], InputAlignedBlock)
     assert isinstance(source_base.visual.ln_post, InputAlignedFinalLayer)
+
+
+def test_calibration_loader_replays_the_same_randomized_window():
+    values = torch.arange(12, dtype=torch.float32).unsqueeze(1)
+    dataset = TensorDataset(values, torch.zeros(len(values), dtype=torch.long))
+    loader = DataLoader(dataset, batch_size=3, shuffle=True)
+
+    frozen = _deterministic_calibration_loader(loader, n_batches=2)
+    first = torch.cat([batch[0].flatten() for batch in frozen]).tolist()
+    second = torch.cat([batch[0].flatten() for batch in frozen]).tolist()
+
+    assert first == second
+    assert len(first) == 6
 
 
 def test_shared_lmc_fits_base_and_applies_to_ft(monkeypatch) -> None:

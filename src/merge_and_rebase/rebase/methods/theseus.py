@@ -383,6 +383,38 @@ class ActivationStore:
         return gram
 
 
+def _cache_dataset_identity(dataset: Any) -> tuple[Any, ...]:
+    """Return stable metadata that distinguishes common dataset wrappers/splits."""
+
+    if dataset is None:
+        return ("none",)
+
+    identity: list[Any] = [
+        type(dataset).__module__,
+        type(dataset).__qualname__,
+    ]
+    for attr in ("_fingerprint", "fingerprint", "image_key", "label_key"):
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            identity.append((attr, str(value)))
+
+    # Hugging Face datasets expose a split fingerprint; torch Subset exposes
+    # its parent dataset and selected indices. Include both when available.
+    for attr in ("split", "dataset"):
+        nested = getattr(dataset, attr, None)
+        if nested is not None and nested is not dataset:
+            identity.append((attr, _cache_dataset_identity(nested)))
+
+    indices = getattr(dataset, "indices", None)
+    if indices is not None:
+        try:
+            indices = tuple(int(index) for index in indices)
+        except (TypeError, ValueError):
+            indices = repr(indices)
+        identity.append(("indices", indices))
+    return tuple(identity)
+
+
 def _activation_cache_fingerprint(
     *,
     source_model: nn.Module,
@@ -394,10 +426,20 @@ def _activation_cache_fingerprint(
     seed: int,
     batch_size: int | None,
     cache_key: str | None,
+    whiten_power: float,
+    whiten_eps: float,
 ) -> str:
     """Fingerprint every input that affects streamed activation statistics."""
     digest = sha256()
-    for value in (seq_align, n_batches, seed, batch_size, cache_key):
+    for value in (
+        seq_align,
+        n_batches,
+        seed,
+        batch_size,
+        cache_key,
+        float(whiten_power),
+        float(whiten_eps),
+    ):
         digest.update(repr(value).encode())
     for model in (source_model, target_model):
         for name, tensor in sorted(model.state_dict().items()):
@@ -413,6 +455,15 @@ def _activation_cache_fingerprint(
                 digest.update(str(len(value)).encode())
             except TypeError:
                 digest.update(b"unknown-length")
+        digest.update(
+            repr(
+                (
+                    getattr(loader, "batch_size", None),
+                    getattr(loader, "drop_last", None),
+                    _cache_dataset_identity(dataset),
+                )
+            ).encode()
+        )
     return digest.hexdigest()
 
 
@@ -1270,6 +1321,10 @@ class TheseusRebase:
         covariance_mode = _resolve_covariance_mode(covariance_mode)
         whiten_power = float(whiten_power)
         whiten_eps = float(whiten_eps)
+        if not 0.0 <= whiten_power <= 0.5:
+            raise ValueError("Theseus whiten_power must be in [0, 0.5].")
+        if whiten_eps <= 0.0:
+            raise ValueError("Theseus whiten_eps must be > 0.")
 
         if verbose:
             print(
@@ -1317,6 +1372,8 @@ class TheseusRebase:
                         seed=int(seed),
                         batch_size=batch_size,
                         cache_key=activation_cache_key,
+                        whiten_power=whiten_power,
+                        whiten_eps=whiten_eps,
                     )
                     cache_path = Path(activation_cache_dir) / f"theseus_activations_{fingerprint}.pt"
                     if activation_cache_mode != "refresh" and cache_path.exists():

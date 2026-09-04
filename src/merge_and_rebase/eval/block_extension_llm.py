@@ -15,7 +15,7 @@ try:
 except Exception:
     tqdm = None
 
-from .block_extension import BlockExtensionConfig
+from .block_extension import BlockExtensionConfig, _deterministic_calibration_loader
 
 logger = logging.getLogger(__name__)
 
@@ -1132,6 +1132,8 @@ class DecoderBlockExtender:
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
     ) -> int:
+        if not skip_correction:
+            loader = _deterministic_calibration_loader(loader, n_batches)
         if strategy == "interpolate":
             return self._extend_interpolate(
                 loader=loader,
