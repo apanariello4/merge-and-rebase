@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch.nn as nn
 
+from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.eval.vision_rebase import _build_rebase_prepared
 
 
@@ -142,3 +145,29 @@ def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source
     assert len(method.source_model.visual.transformer.resblocks) == target_depth
     assert len(method.target_model.visual.transformer.resblocks) == target_depth
     assert method.source_model is not corrected_source
+
+
+def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> None:
+    tree = ast.parse(inspect.getsource(vision_rebase.main))
+    main_fn = tree.body[0]
+    assert isinstance(main_fn, ast.FunctionDef)
+    try_block = next(node for node in main_fn.body if isinstance(node, ast.Try))
+    task_loop_index = next(
+        index
+        for index, node in enumerate(try_block.body)
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "task"
+    )
+    initialized = {
+        node.target.id
+        for node in try_block.body[:task_loop_index]
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert {
+        "source_lmc_rows",
+        "cross_task_lmc_rows",
+        "all_task_lmc_rows",
+        "corrected_ft_states",
+        "corrected_ft_templates",
+        "independent_base_by_task",
+        "independent_ft_by_task",
+    } <= initialized

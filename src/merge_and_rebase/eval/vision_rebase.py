@@ -1392,6 +1392,23 @@ def main() -> None:
         transport_timings: dict[str, dict[str, float]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
+        source_lmc_rows: list[dict[str, Any]] = []
+        cross_task_lmc_rows: list[dict[str, Any]] = []
+        all_task_lmc_rows: list[dict[str, Any]] = []
+        corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
+        corrected_ft_templates: dict[str, torch.nn.Module] = {}
+
+        # These collectors are populated for optional independent-endpoint
+        # diagnostics.  They must exist for every BRACE run because corrected
+        # source endpoints are recorded before that optional branch is chosen.
+        independent_base_by_task: dict[str, dict[str, torch.Tensor]] = {}
+        independent_ft_by_task: dict[str, dict[str, torch.Tensor]] = {}
+        independent_base_average: dict[str, torch.Tensor] | None = None
+        independent_base_distance_by_task: dict[str, float] = {}
+        independent_base_dispersion: float | None = None
+        independent_base_diagnostics_path: str | None = None
+        independent_source_merge_param_count: int | None = None
+        independent_direct_delta_key_count: dict[str, int] = {}
 
         transfusion_prepared: dict[str, Any] | None = None
 
