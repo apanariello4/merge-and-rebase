@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch.nn as nn
+
+from merge_and_rebase.eval.vision_rebase import _build_rebase_prepared
+
+
+def _model(depth: int) -> nn.Module:
+    model = nn.Module()
+    model.visual = SimpleNamespace(transformer=SimpleNamespace(resblocks=nn.ModuleList()))
+    model.visual.transformer.resblocks.extend(nn.Linear(1, 1) for _ in range(depth))
+    return model
+
+
+class _PreparedTheseusStub:
+    def __init__(self) -> None:
+        self.source_model = None
+        self.target_model = None
+
+    def prepare(self, **kwargs):
+        self.source_model = kwargs["source_model"]
+        self.target_model = kwargs["target_model"]
+        return kwargs
+
+
+class _PreparedBiCoStub(_PreparedTheseusStub):
+    pass
+
+
+@pytest.mark.parametrize("source_depth", [12, 24])
+def test_theseus_uses_depth_matched_source_after_block_extension(source_depth: int) -> None:
+    target_depth = 24 if source_depth == 12 else 12
+    source_base_model_task = _model(target_depth)
+    clf_source = SimpleNamespace(model=_model(source_depth))
+    clf_target = SimpleNamespace(model=_model(target_depth))
+    method = _PreparedTheseusStub()
+
+    prepared = _build_rebase_prepared(
+        method_name="theseus",
+        method=method,
+        method_params={},
+        cfg={},
+        device="cpu",
+        grad_batch_size=None,
+        grad_imgs_per_class=None,
+        grad_num_batches=None,
+        theseus_like_method=True,
+        bico_mode=False,
+        run_block_extension_prestep=True,
+        clf_source=clf_source,
+        clf_target=clf_target,
+        classnames=[],
+        loaders=SimpleNamespace(train=None),
+        source_loaders=SimpleNamespace(train=None),
+        build_cfg_task=None,
+        source_build_cfg_task=None,
+        task_source_base_sd={},
+        target_base_sd={},
+        task_delta={},
+        source_base_model_task=source_base_model_task,
+        transfusion_prepared=None,
+    )
+
+    assert prepared["source_model"] is method.source_model
+    assert len(method.source_model.visual.transformer.resblocks) == target_depth
+    assert len(method.target_model.visual.transformer.resblocks) == target_depth
+    assert len(method.source_model.visual.transformer.resblocks) != source_depth
+    assert method.source_model is not source_base_model_task
+
+
+def test_theseus_keeps_raw_source_fallback_without_block_extension() -> None:
+    source_model = _model(12)
+    target_model = _model(12)
+    method = _PreparedTheseusStub()
+
+    _build_rebase_prepared(
+        method_name="theseus",
+        method=method,
+        method_params={},
+        cfg={},
+        device="cpu",
+        grad_batch_size=None,
+        grad_imgs_per_class=None,
+        grad_num_batches=None,
+        theseus_like_method=True,
+        bico_mode=False,
+        run_block_extension_prestep=False,
+        clf_source=SimpleNamespace(model=source_model),
+        clf_target=SimpleNamespace(model=target_model),
+        classnames=[],
+        loaders=SimpleNamespace(train=None),
+        source_loaders=SimpleNamespace(train=None),
+        build_cfg_task=None,
+        source_build_cfg_task=None,
+        task_source_base_sd={},
+        target_base_sd={},
+        task_delta={},
+        source_base_model_task=None,
+        transfusion_prepared=None,
+    )
+
+    assert len(method.source_model.visual.transformer.resblocks) == 12
+    assert len(method.target_model.visual.transformer.resblocks) == 12
+
+
+@pytest.mark.parametrize("source_depth", [12, 24])
+def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source_depth: int) -> None:
+    target_depth = 24 if source_depth == 12 else 12
+    corrected_source = _model(target_depth)
+    method = _PreparedBiCoStub()
+
+    prepared = _build_rebase_prepared(
+        method_name="bico",
+        method=method,
+        method_params={},
+        cfg={},
+        device="cpu",
+        grad_batch_size=None,
+        grad_imgs_per_class=None,
+        grad_num_batches=None,
+        theseus_like_method=False,
+        bico_mode=True,
+        run_block_extension_prestep=True,
+        clf_source=SimpleNamespace(model=_model(source_depth), normalize=True),
+        clf_target=SimpleNamespace(model=_model(target_depth), normalize=True),
+        classnames=[],
+        loaders=SimpleNamespace(train=None),
+        source_loaders=SimpleNamespace(train=None),
+        build_cfg_task=None,
+        source_build_cfg_task=None,
+        task_source_base_sd={},
+        target_base_sd={},
+        task_delta={},
+        source_base_model_task=corrected_source,
+        transfusion_prepared=None,
+    )
+
+    assert prepared["source_model"] is method.source_model
+    assert len(method.source_model.visual.transformer.resblocks) == target_depth
+    assert len(method.target_model.visual.transformer.resblocks) == target_depth
+    assert method.source_model is not corrected_source

@@ -1,0 +1,86 @@
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: fp32
+
+  backbone:
+    name: openclip
+    clip_model: ViT-H-14
+    clip_pretrained: laion2b_s32b_b79k
+
+  data:
+    batch_size: 4
+    num_workers: 6
+    val_fraction: 0.1
+    pin_memory: true
+
+  train:
+    epochs: null
+    optimizer:
+      name: adamw
+    lr: 1.0e-5
+    weight_decay: 0.1
+    accumulate_grad_batches: 32
+    lr_scheduler:
+      name: cosine
+    grad_clip_norm: 1.0
+    early_stopping: false
+    early_stopping_patience: 5
+
+  strategy:
+    name: full
+    forward_mode: standard
+    params: {}
+
+  output:
+    out_dir: /leonardo_scratch/large/userexternal/frinaldi/finetuning/finetune
+    save_format: full
+    save_last_epoch: true
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: [vith14, laion2b, vision8, full-ft]
+    mode: disabled
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
+datasets_order:
+  - Cars
+  - DTD
+  - EuroSAT
+  - GTSRB
+  - MNIST
+  - RESISC45
+  - SUN397
+  - SVHN
+
+datasets:
+  Cars:
+    train:
+      epochs: 35
+  DTD:
+    train:
+      epochs: 76
+  EuroSAT:
+    train:
+      epochs: 12
+  GTSRB:
+    train:
+      epochs: 11
+  MNIST:
+    train:
+      epochs: 5
+  RESISC45:
+    train:
+      epochs: 15
+  SUN397:
+    train:
+      epochs: 14
+  SVHN:
+    train:
+      epochs: 4

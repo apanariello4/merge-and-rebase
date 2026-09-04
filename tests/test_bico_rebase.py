@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from merge_and_rebase.rebase.methods import bico as bico_method
 from merge_and_rebase.rebase.registry import get_method, list_methods
 from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
 
@@ -133,6 +134,40 @@ def test_bico_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+
+
+def test_bico_split_qkv_apply_unpacks_transform_diagnostics(monkeypatch) -> None:
+    target_base = {
+        "visual.block.attn.in_proj_weight": torch.zeros(6, 2),
+    }
+    delta = {
+        "visual.block.attn.in_proj_weight": torch.ones(6, 2),
+    }
+
+    def fake_apply_transforms(**kwargs):
+        return kwargs["visual_delta"], object()
+
+    monkeypatch.setattr(
+        bico_method._t,
+        "_apply_transforms_to_visual_delta",
+        fake_apply_transforms,
+    )
+
+    transported = bico_method.BiCoRebase().apply(
+        {
+            "transforms_by_key": {},
+            "split_fused_qkv": True,
+            "compute_device": torch.device("cpu"),
+        },
+        target_base=target_base,
+        delta=delta,
+        strict=True,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert set(transported) == set(delta)
+    assert torch.equal(transported["visual.block.attn.in_proj_weight"], delta["visual.block.attn.in_proj_weight"])
 
 
 def test_bico_deterministic() -> None:

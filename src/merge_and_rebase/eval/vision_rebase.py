@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -495,6 +496,65 @@ def _average_defined(values: list[float]) -> float:
     return average_scores(defined) if defined else float("nan")
 
 
+_BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
+
+
+def _average_visual_state_dicts(
+    states_by_task: Mapping[str, Mapping[str, torch.Tensor]],
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Average independently transformed visual endpoint bases.
+
+    Only floating-point visual tensors present with identical shapes in every
+    task endpoint participate. This is deliberately separate from task-vector
+    construction: callers must form each ``ft_ind_t - base_ind_t`` first.
+    """
+    if not states_by_task:
+        raise ValueError("Cannot average independent endpoint bases for an empty task set.")
+
+    task_items = list(states_by_task.items())
+    common_keys = set(task_items[0][1])
+    for _, state in task_items[1:]:
+        common_keys &= set(state)
+
+    usable_keys: list[str] = []
+    for key in sorted(common_keys):
+        values = [state[key] for _, state in task_items]
+        if not key.startswith("visual.") or any(not value.is_floating_point() for value in values):
+            continue
+        shape = tuple(values[0].shape)
+        if any(tuple(value.shape) != shape for value in values[1:]):
+            continue
+        usable_keys.append(key)
+
+    if not usable_keys:
+        raise ValueError("Independent endpoint bases have no common floating-point visual tensors to average.")
+
+    average: dict[str, torch.Tensor] = {}
+    for key in usable_keys:
+        values = [state[key].detach().to(device="cpu", dtype=torch.float32) for _, state in task_items]
+        average[key] = torch.stack(values, dim=0).mean(dim=0)
+    return average, usable_keys
+
+
+def _relative_visual_state_distance(
+    state: Mapping[str, torch.Tensor],
+    reference: Mapping[str, torch.Tensor],
+    keys: Sequence[str],
+) -> float:
+    """Return ||state-reference||_2 / ||reference||_2 over selected tensors."""
+    distance_sq = torch.zeros((), dtype=torch.float64)
+    reference_sq = torch.zeros((), dtype=torch.float64)
+    for key in keys:
+        value = state[key].detach().to(device="cpu", dtype=torch.float64)
+        ref = reference[key].detach().to(device="cpu", dtype=torch.float64)
+        distance_sq += torch.sum((value - ref) ** 2)
+        reference_sq += torch.sum(ref ** 2)
+    denominator = float(torch.sqrt(reference_sq))
+    if denominator == 0.0:
+        return 0.0 if float(torch.sqrt(distance_sq)) == 0.0 else float("inf")
+    return float(torch.sqrt(distance_sq)) / denominator
+
+
 @dataclass(frozen=True)
 class _TaskContext:
     loaders: Any
@@ -770,10 +830,8 @@ def _build_rebase_prepared(
         if run_block_extension_prestep:
             if source_base_model_task is None:
                 raise RuntimeError("Theseus block-extension preprocess requires the corrected source base model.")
-            # ``task_source_base_sd`` contains the expanded/shrunk BRACE state.
-            # Starting from the original source architecture here and loading
-            # non-strictly would silently discard added blocks, causing Theseus
-            # to collect activations from the wrong computation graph.
+            # BRACE changes the source depth.  Loading this state into the raw
+            # source architecture non-strictly drops every inserted block.
             source_model_for_theseus = deepcopy(source_base_model_task)
             load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
         else:
@@ -781,6 +839,14 @@ def _build_rebase_prepared(
             load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
         target_model_for_theseus = deepcopy(clf_target.model)
         load_into_model(target_model_for_theseus, target_base_sd, strict=False)
+
+        source_depth = len(source_model_for_theseus.visual.transformer.resblocks)
+        target_depth = len(target_model_for_theseus.visual.transformer.resblocks)
+        if source_depth != target_depth:
+            raise ValueError(
+                "Theseus calibration models must be depth-matched: "
+                f"source_depth={source_depth}, target_depth={target_depth}"
+            )
 
         return method.prepare(
             source_model=source_model_for_theseus,
@@ -796,13 +862,27 @@ def _build_rebase_prepared(
     if bico_mode:
         from ..models.grad_recipes import clip_contrastive_recipe
 
-        if run_block_extension_prestep and source_base_model_task is not None:
-            source_model_for_bico = source_base_model_task
+        if run_block_extension_prestep:
+            if source_base_model_task is None:
+                raise RuntimeError("BiCo block-extension preprocess requires the corrected source base model.")
+            # BiCo moves models across devices and performs backward passes
+            # while collecting statistics; use a strict-loaded copy so the
+            # task's corrected endpoint remains immutable for later steps.
+            source_model_for_bico = deepcopy(source_base_model_task)
+            load_into_model(source_model_for_bico, task_source_base_sd, strict=True)
         else:
             source_model_for_bico = deepcopy(clf_source.model)
             load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
         target_model_for_bico = deepcopy(clf_target.model)
         load_into_model(target_model_for_bico, target_base_sd, strict=False)
+
+        source_depth = len(source_model_for_bico.visual.transformer.resblocks)
+        target_depth = len(target_model_for_bico.visual.transformer.resblocks)
+        if source_depth != target_depth:
+            raise ValueError(
+                "BiCo calibration models must be depth-matched: "
+                f"source_depth={source_depth}, target_depth={target_depth}"
+            )
 
         source_recipe = clip_contrastive_recipe(
             clf_source,
@@ -1080,6 +1160,12 @@ def main() -> None:
 
         merge_mode, merge_method_name, merge_params, global_alpha_search = _resolve_merge_mode_config(cfg, alpha_selection)
 
+        base_construction = str(cfg.get("base_construction", "per_task")).strip().lower()
+        if base_construction not in _BASE_CONSTRUCTION_MODES:
+            raise ValueError(
+                "base_construction must be one of: " + ", ".join(_BASE_CONSTRUCTION_MODES)
+            )
+
         positive_alphas = [float(alpha) for alpha in alphas if float(alpha) > 0.0]
         if alpha_search and not positive_alphas:
             raise ValueError("alpha_search requires at least one alpha > 0.")
@@ -1283,17 +1369,29 @@ def main() -> None:
                     "prepare step swaps the target keyspace. Use a theseus/bico transport method."
                 )
 
+        if base_construction == "independent_endpoint_average":
+            if merge_mode != "rebase_then_merge":
+                raise ValueError(
+                    "base_construction='independent_endpoint_average' requires "
+                    "merge_mode='rebase_then_merge'."
+                )
+            if alpha_selection != "shared":
+                raise ValueError(
+                    "base_construction='independent_endpoint_average' requires "
+                    "alpha_selection='shared'; per-task alpha search is not part of this baseline."
+                )
+            if native_tasks:
+                raise ValueError(
+                    "base_construction='independent_endpoint_average' requires every task to be "
+                    "an independently transformed source endpoint; native target tasks are not allowed."
+                )
+
         per_task: list[dict[str, Any]] = []
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
         transport_timings: dict[str, dict[str, float]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
-        source_lmc_rows: list[dict[str, Any]] = []
-        cross_task_lmc_rows: list[dict[str, Any]] = []
-        all_task_lmc_rows: list[dict[str, Any]] = []
-        corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
-        corrected_ft_templates: dict[str, torch.nn.Module] = {}
 
         transfusion_prepared: dict[str, Any] | None = None
 
@@ -1472,6 +1570,8 @@ def main() -> None:
                     strict=False,
                     key_filter=_visual_only_filter,
                 ).delta
+                independent_base_by_task[task] = task_source_base_sd
+                independent_ft_by_task[task] = task_source_ft_sd
 
                 if cross_task_lmc_pairs or all_task_lmc_tasks:
                     corrected_ft_states[task] = task_source_ft_sd
@@ -1630,6 +1730,8 @@ def main() -> None:
                         strict=False,
                         key_filter=_visual_only_filter,
                     ).delta
+                    independent_base_by_task[task] = task_source_base_sd
+                    independent_ft_by_task[task] = tuned_sd
 
                 n_keys = len(tuned_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
@@ -1719,89 +1821,8 @@ def main() -> None:
                 original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
 
-        if cross_task_lmc_pairs:
-            contexts_by_task = {str(item["task"]): item for item in per_task}
-            for task_a, task_b in cross_task_lmc_pairs:
-                if task_a not in contexts_by_task or task_b not in contexts_by_task:
-                    raise ValueError(
-                        f"cross-task LMC pair ({task_a}, {task_b}) must be selected in tasks={tasks}."
-                    )
-                if task_a not in corrected_ft_states or task_b not in corrected_ft_states:
-                    raise RuntimeError(
-                        f"cross-task LMC pair ({task_a}, {task_b}) requires BRACE-corrected source endpoints."
-                    )
-                if set(corrected_ft_states[task_a]) != set(corrected_ft_states[task_b]):
-                    raise RuntimeError(
-                        f"cross-task LMC pair ({task_a}, {task_b}) has incompatible corrected endpoint keyspaces."
-                    )
-                print(f"\n--- Cross-task source LMC: {task_a} -> {task_b} ---")
-                metrics = _evaluate_cross_task_source_lmc(
-                    model=deepcopy(corrected_ft_templates[task_a]),
-                    restore_sd=corrected_ft_states[task_a],
-                    endpoint_a_sd=corrected_ft_states[task_a],
-                    endpoint_b_sd=corrected_ft_states[task_b],
-                    clf_source=clf_source,
-                    task_contexts=[contexts_by_task[task_a], contexts_by_task[task_b]],
-                    split=cross_task_lmc_split,
-                    first_n_batches=cross_task_lmc_first_n_batches,
-                    alphas=source_lmc_alphas,
-                    device=device,
-                )
-                row = {"tasks": [task_a, task_b], "lmc_mode": block_extension_cfg.lmc_mode, **metrics}
-                cross_task_lmc_rows.append(row)
-                run_logger.log_event(
-                    "cross_task_source_lmc",
-                    metrics={
-                        f"cross_task_lmc/{task_a}__{task_b}/max_loss_barrier": row["max_loss_barrier"],
-                        f"cross_task_lmc/{task_a}__{task_b}/min_loss_chord_gap": row["min_loss_chord_gap"],
-                        f"cross_task_lmc/{task_a}__{task_b}/area_below_loss_chord": row["area_below_loss_chord"],
-                    },
-                    context={"tasks": [task_a, task_b], "lmc_mode": block_extension_cfg.lmc_mode},
-                )
-
-        if all_task_lmc_tasks:
-            contexts_by_task = {str(item["task"]): item for item in per_task}
-            if any(task not in contexts_by_task or task not in corrected_ft_states for task in all_task_lmc_tasks):
-                raise ValueError("all_task_lmc_tasks must be selected tasks with BRACE-corrected source endpoints.")
-            print(f"\n--- All-task source LMC simplex: {', '.join(all_task_lmc_tasks)} ---")
-            metrics = _evaluate_all_task_star_lmc(
-                model=deepcopy(corrected_ft_templates[all_task_lmc_tasks[0]]),
-                restore_sd=corrected_ft_states[all_task_lmc_tasks[0]],
-                endpoint_states={task: corrected_ft_states[task] for task in all_task_lmc_tasks},
-                clf_source=clf_source,
-                task_contexts=[contexts_by_task[task] for task in all_task_lmc_tasks],
-                split=all_task_lmc_split,
-                first_n_batches=all_task_lmc_first_n_batches,
-                alphas=source_lmc_alphas,
-                device=device,
-            )
-            row = {"lmc_mode": block_extension_cfg.lmc_mode, **metrics}
-            all_task_lmc_rows.append(row)
-            run_logger.log_event(
-                "all_task_source_lmc",
-                metrics={
-                    "all_task_lmc/max_joint_loss_barrier": row["max_joint_loss_barrier"],
-                    "all_task_lmc/max_per_task_loss_barrier": row["max_per_task_loss_barrier"],
-                },
-                context={"tasks": all_task_lmc_tasks, "lmc_mode": block_extension_cfg.lmc_mode},
-            )
-
-        if source_only:
-            final_summary = {
-                "suite": suite_name,
-                "tasks": tasks,
-                "method": method.name,
-                "method_label": method_label,
-                "source_only": True,
-                "source_lmc": source_lmc_rows,
-                "cross_task_source_lmc": cross_task_lmc_rows,
-                "all_task_source_lmc": all_task_lmc_rows,
-            }
-            run_logger.log_summary(final_summary)
-            run_logger.finish("success")
-            return
-
         can_eval_untransported_by_task: list[bool] = []
+        single_tv_deltas_for_diagnostic: list[dict[str, torch.Tensor]] | None = None
         if merge_mode == "none":
             rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
             untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
@@ -1851,6 +1872,7 @@ def main() -> None:
                     merge_input_deltas.append(native_delta_by_task[t])
                 else:
                     merge_input_deltas.append(next(transported_iter))
+            single_tv_deltas_for_diagnostic = list(merge_input_deltas)
 
             if alpha_selection == "per_task":
                 # Hierarchical: per-task alphas are searched on the individual
@@ -2024,12 +2046,40 @@ def main() -> None:
                 out[idx] = _eval_task(per_task[idx], split)
             return out
 
+        def _eval_single_tv_task_indices(split: str, indices: list[int], alpha: float) -> dict[int, float]:
+            if single_tv_deltas_for_diagnostic is None:
+                raise RuntimeError("Single-TV diagnostic requires merge_mode='rebase_then_merge'.")
+            out: dict[int, float] = {}
+            for idx in indices:
+                single_sd = axpy_state_dict(
+                    target_base_sd,
+                    single_tv_deltas_for_diagnostic[idx],
+                    alpha=float(alpha),
+                )
+                _load_into_target_model(single_sd)
+                del single_sd
+                out[idx] = _eval_task(per_task[idx], split)
+            return out
+
         hierarchical = bool(merge_mode == "rebase_then_merge" and alpha_selection == "per_task")
+        single_tv_diagnostic_enabled = single_tv_deltas_for_diagnostic is not None
+        single_tv_val_best_acc: list[float] | None = (
+            [float("-inf")] * len(per_task) if single_tv_diagnostic_enabled else None
+        )
+        single_tv_val_best_alpha: list[float] | None = (
+            [float(alphas[0])] * len(per_task) if single_tv_diagnostic_enabled else None
+        )
+        single_tv_alpha_protocol = (
+            "per_task_premerge_alpha" if hierarchical else "single_tv_validation_oracle"
+        )
         per_task_premerge_alphas: list[float] | None = None
+        hierarchical_premerge_alpha_curve: list[dict[str, Any]] | None = None
+        global_alpha_curve: list[dict[str, Any]] | None = None
 
         if alpha_selection == "shared" or hierarchical:
             if hierarchical:
                 # ---------------- PASS 1: per-task alpha on individual deltas ----------------
+                hierarchical_premerge_alpha_curve = []
                 tracker = PerTaskAlphaTracker(
                     task_names=[str(item["task"]) for item in per_task],
                     initial_alpha=float(positive_alphas[0] if positive_alphas else alphas[0]),
@@ -2079,6 +2129,25 @@ def main() -> None:
                             f"per-task={display_rebase:.6f}  norm={norm:.6f}"
                         )
 
+                    hierarchical_premerge_alpha_curve.append(
+                        {
+                            "alpha": float(alpha),
+                            "per_task_rebased": {
+                                per_task[idx]["task"]: float(rebase_by_idx[idx])
+                                for idx in rebase_eval_indices
+                            },
+                            "per_task_baseline": {
+                                per_task[idx]["task"]: float(baseline_by_idx[idx])
+                                for idx in eval_indices
+                            },
+                        }
+                    )
+                    run_logger.log_event(
+                        "hierarchical_premerge_alpha_eval_end",
+                        metrics={"alpha/value": float(alpha)},
+                        context=hierarchical_premerge_alpha_curve[-1],
+                    )
+
                     stopped_primary: list[int] = []
                     if float(alpha) > 0.0:
                         stopped_primary, _ = tracker.update(
@@ -2092,6 +2161,8 @@ def main() -> None:
                             print(f"  Early-stopping per-task alphas at alpha={alpha:.3f}: {stopped_names}")
 
                 per_task_premerge_alphas = [float(tracker.best_primary_alpha[idx]) for idx in range(len(per_task))]
+                single_tv_val_best_acc = [float(tracker.best_primary_acc[idx]) for idx in range(len(per_task))]
+                single_tv_val_best_alpha = list(per_task_premerge_alphas)
                 print("\n=== Hierarchical pass-1 summary (per-task alphas) ===")
                 for item, a in zip(per_task, per_task_premerge_alphas, strict=True):
                     print(f"  {item['task']}: premerge_alpha={a:.3f}")
@@ -2165,6 +2236,16 @@ def main() -> None:
                 idxs = list(range(len(per_task)))
                 baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, idxs, float(alpha))
                 rebase_by_idx = _eval_rebased_task_indices(alpha_search_split, idxs, float(alpha))
+                if (
+                    single_tv_diagnostic_enabled
+                    and single_tv_val_best_acc is not None
+                    and single_tv_val_best_alpha is not None
+                ):
+                    single_tv_by_idx = _eval_single_tv_task_indices(alpha_search_split, idxs, float(alpha))
+                    for idx in idxs:
+                        if single_tv_by_idx[idx] > single_tv_val_best_acc[idx]:
+                            single_tv_val_best_acc[idx] = float(single_tv_by_idx[idx])
+                            single_tv_val_best_alpha[idx] = float(alpha)
                 baseline_accs = [baseline_by_idx[i] for i in idxs]
                 rebase_accs = [rebase_by_idx[i] for i in idxs]
 
@@ -2245,6 +2326,20 @@ def main() -> None:
                 avg_r = average_scores(r["rebase_accs"])
                 avg_b = _average_defined(r["baseline_accs"])
                 print(f"  alpha={a:.3f}  {baseline_label}={avg_b:.6f}  {result_label}={avg_r:.6f}")
+            global_alpha_curve = [
+                {
+                    "alpha": float(row["alpha"]),
+                    "avg_rebased": float(average_scores(row["rebase_accs"])),
+                    "avg_baseline": float(_average_defined(row["baseline_accs"])),
+                    "per_task_rebased": {
+                        item["task"]: float(row["rebase_accs"][idx]) for idx, item in enumerate(per_task)
+                    },
+                    "per_task_baseline": {
+                        item["task"]: float(row["baseline_accs"][idx]) for idx, item in enumerate(per_task)
+                    },
+                }
+                for row in sweep_results
+            ]
             print(
                 f"\nBest alpha: rebase={best_alpha:.3f} (avg rebased val acc={best_rebase_avg:.6f}) | "
                 f"baseline={best_baseline_alpha:.3f} (avg baseline val acc={best_baseline_avg:.6f})"
@@ -2435,6 +2530,43 @@ def main() -> None:
 
         norm_accs = [_norm_acc(r, b) for r, b in zip(rebase_test_accs, baseline_test_accs, strict=True)]
 
+        single_tv_test_accs: list[float] | None = None
+        single_tv_test_alpha_by_task: list[float] | None = None
+        if single_tv_diagnostic_enabled and single_tv_val_best_alpha is not None:
+            single_tv_test_alpha_by_task = [float(a) for a in single_tv_val_best_alpha]
+            single_tv_test_accs = []
+            print("\nSingle transported task-vector test diagnostic:")
+            for idx, item in enumerate(per_task):
+                alpha = single_tv_test_alpha_by_task[idx]
+                single_acc = _eval_single_tv_task_indices("test", [idx], alpha)[idx]
+                single_tv_test_accs.append(float(single_acc))
+                print(f"  {item['task']}: alpha={alpha:.3f}  single_tv_test={single_acc:.6f}")
+            single_avg = sum(single_tv_test_accs) / len(single_tv_test_accs)
+            merged_avg = sum(rebase_test_accs) / len(rebase_test_accs)
+            print(
+                f"  avg single_tv_test={single_avg:.6f}  merged_test={merged_avg:.6f} "
+                f"merge_gap={single_avg - merged_avg:+.6f}"
+            )
+            run_logger.log_event(
+                "single_tv_test_diagnostic_end",
+                metrics={
+                    "single_tv/avg_test_accuracy": float(single_avg),
+                    "single_tv/merged_test_accuracy": float(merged_avg),
+                    "single_tv/merge_gap": float(single_avg - merged_avg),
+                },
+                context={
+                    "alpha_protocol": single_tv_alpha_protocol,
+                    "per_task_alpha": {
+                        item["task"]: float(single_tv_test_alpha_by_task[i])
+                        for i, item in enumerate(per_task)
+                    },
+                    "per_task_test_accuracy": {
+                        item["task"]: float(single_tv_test_accs[i])
+                        for i, item in enumerate(per_task)
+                    },
+                },
+            )
+
         alpha_display_label = "hierarchical(per_task+global)" if hierarchical else alpha_selection
         pretty_print_task_accuracies(
             suite_name,
@@ -2485,6 +2617,23 @@ def main() -> None:
             "merge_mode": merge_mode,
             "merge_method": merge_method_name if merge_mode != "none" else None,
             "merge_params": merge_params if merge_mode != "none" else None,
+            "base_construction": base_construction,
+            "independent_endpoint_baseline": (
+                {
+                    "task_vector_definition": "tau_ind_t = ft_ind_t - base_ind_t",
+                    "base_average_definition": "base_ind_avg = mean_t(base_ind_t)",
+                    "base_average_key_scope": "common floating-point visual tensors",
+                    "n_common_visual_keys": len(independent_base_average) if independent_base_average is not None else None,
+                    "base_dispersion_ind": independent_base_dispersion,
+                    "per_task_distance_to_mean_base": independent_base_distance_by_task,
+                    "source_merge_direction_param_count": independent_source_merge_param_count,
+                    "diagnostics_path": independent_base_diagnostics_path,
+                    "direct_delta_key_count": independent_direct_delta_key_count,
+                    "direct_endpoint_difference_used": base_construction == "independent_endpoint_average",
+                }
+                if base_construction == "independent_endpoint_average"
+                else None
+            ),
             "native_target_tasks": sorted(native_tasks) if native_tasks else [],
             "global_alpha_search": global_alpha_search if hierarchical else None,
             "per_task_premerge_alphas": (
@@ -2492,6 +2641,8 @@ def main() -> None:
                 if hierarchical and per_task_premerge_alphas is not None
                 else None
             ),
+            "hierarchical_premerge_alpha_curve": hierarchical_premerge_alpha_curve,
+            "global_alpha_curve": global_alpha_curve,
             "alpha_selection": alpha_selection,
             "best_alpha": float(best_alpha),
             "best_baseline_alpha": float(best_baseline_alpha),
@@ -2525,6 +2676,35 @@ def main() -> None:
                 "avg_rebased": float(sum(rebase_test_accs) / len(rebase_test_accs)),
                 "avg_norm": float(sum(norm_accs) / len(norm_accs)),
             },
+            "single_tv_diagnostic": (
+                {
+                    "definition": (
+                        "For each task t, evaluate target_base + alpha_t * transported/native task_vector_t "
+                        "on task t's test set; alpha_t is selected on validation only."
+                    ),
+                    "alpha_protocol": single_tv_alpha_protocol,
+                    "per_task_validation_alpha": {
+                        item["task"]: float(single_tv_val_best_alpha[i])
+                        for i, item in enumerate(per_task)
+                    },
+                    "per_task_validation_accuracy": {
+                        item["task"]: float(single_tv_val_best_acc[i])
+                        for i, item in enumerate(per_task)
+                    },
+                    "per_task_test_accuracy": {
+                        item["task"]: float(single_tv_test_accs[i])
+                        for i, item in enumerate(per_task)
+                    },
+                    "avg_test_accuracy": float(sum(single_tv_test_accs) / len(single_tv_test_accs)),
+                    "merged_avg_test_accuracy": float(sum(rebase_test_accs) / len(rebase_test_accs)),
+                    "merge_gap_single_minus_merged": float(
+                        sum(single_tv_test_accs) / len(single_tv_test_accs)
+                        - sum(rebase_test_accs) / len(rebase_test_accs)
+                    ),
+                }
+                if single_tv_test_accs is not None
+                else None
+            ),
             "selected_alpha_by_task": {item["task"]: float(selected_alpha_by_task[i]) for i, item in enumerate(per_task)},
             "selected_baseline_alpha_by_task": {
                 item["task"]: float(selected_baseline_alpha_by_task[i]) for i, item in enumerate(per_task)

@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
-import torch.nn as nn
 
 from merge_and_rebase.eval.vision_rebase import (
-    _build_rebase_prepared,
+    _average_visual_state_dicts,
     _ckpt_visual_base_coverage,
     _infer_ckpt_base,
     _merge_direction,
     _pseudo_tuned,
+    _relative_visual_state_distance,
     _resolve_merge_mode_config,
     _scale_deltas_by,
 )
@@ -38,62 +36,6 @@ def _approx(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> bool:
     return set(a) == set(b) and all(torch.allclose(a[k], b[k]) for k in a)
 
 
-class _ToyVisionModel(nn.Module):
-    def __init__(self, depth: int) -> None:
-        super().__init__()
-        self.visual = nn.Module()
-        self.visual.transformer = nn.Module()
-        self.visual.transformer.resblocks = nn.ModuleList([nn.Linear(1, 1) for _ in range(depth)])
-
-
-class _CapturePrepare:
-    def __init__(self) -> None:
-        self.source_model: nn.Module | None = None
-
-    def prepare(self, **kwargs):
-        self.source_model = kwargs["source_model"]
-        return {"prepared": True}
-
-
-def test_theseus_uses_expanded_brace_source_model_for_activations() -> None:
-    original_source = _ToyVisionModel(depth=1)
-    corrected_source = _ToyVisionModel(depth=2)
-    target = _ToyVisionModel(depth=3)
-    method = _CapturePrepare()
-
-    prepared = _build_rebase_prepared(
-        method_name="theseus",
-        method=method,
-        method_params={},
-        cfg={},
-        device="cpu",
-        grad_batch_size=None,
-        grad_imgs_per_class=None,
-        grad_num_batches=None,
-        theseus_like_method=True,
-        bico_mode=False,
-        run_block_extension_prestep=True,
-        clf_source=SimpleNamespace(model=original_source),
-        clf_target=SimpleNamespace(model=target),
-        classnames=[],
-        loaders=SimpleNamespace(train=[]),
-        source_loaders=SimpleNamespace(train=[]),
-        build_cfg_task=None,
-        source_build_cfg_task=None,
-        task_source_base_sd={k: v.detach().clone() for k, v in corrected_source.state_dict().items()},
-        target_base_sd={k: v.detach().clone() for k, v in target.state_dict().items()},
-        task_delta={},
-        source_base_model_task=corrected_source,
-        transfusion_prepared=None,
-    )
-
-    assert prepared == {"prepared": True}
-    assert method.source_model is not None
-    assert method.source_model is not corrected_source
-    assert len(method.source_model.visual.transformer.resblocks) == 2
-    assert set(method.source_model.state_dict()) == set(corrected_source.state_dict())
-
-
 def test_pseudo_tuned_adds_each_delta_to_base() -> None:
     base = _sd(1.0, 2.0, 3.0)
     deltas = [
@@ -104,6 +46,31 @@ def test_pseudo_tuned_adds_each_delta_to_base() -> None:
     assert len(tuned) == 2
     assert torch.allclose(tuned[0]["w"], torch.tensor([2.0, 3.0, 4.0]))
     assert torch.allclose(tuned[1]["w"], torch.tensor([-1.0, 2.0, 5.0]))
+
+
+def test_independent_endpoint_average_uses_common_visual_float_tensors() -> None:
+    bases, keys = _average_visual_state_dicts(
+        {
+            "Cars": {
+                "visual.w": torch.tensor([1.0, 3.0]),
+                "visual.counter": torch.tensor(1, dtype=torch.int64),
+                "text.w": torch.tensor([100.0]),
+            },
+            "DTD": {
+                "visual.w": torch.tensor([3.0, 5.0]),
+                "visual.counter": torch.tensor(2, dtype=torch.int64),
+                "text.w": torch.tensor([200.0]),
+            },
+        }
+    )
+    assert keys == ["visual.w"]
+    assert torch.allclose(bases["visual.w"], torch.tensor([2.0, 4.0]))
+
+    assert _relative_visual_state_distance(
+        {"visual.w": torch.tensor([1.0, 3.0])},
+        bases,
+        keys,
+    ) == pytest.approx(((1.0**2 + 1.0**2) / (2.0**2 + 4.0**2)) ** 0.5)
 
 
 def test_merge_direction_matches_manual_weighted_sum() -> None:

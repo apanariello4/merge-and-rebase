@@ -76,6 +76,8 @@ class BlockExtensionConfig:
     n_cascade_iters: int = 1
     share_ft_refs: bool = False
     component_ridge: dict[str, float] | None = None
+    # ``shared`` fits the correction at the pretrained/base endpoint and
+    # applies it to FT; ``shared_ft`` does the converse.
     lmc_mode: str = "independent"
     verbose: bool = True
     show_progress: bool = True
@@ -222,6 +224,8 @@ class BlockExtender:
         *,
         verbose: bool = True,
         show_progress: bool = True,
+        diagnostic_collector: Any | None = None,
+        diagnostic_mode: str = "independent",
     ):
         self.model_base = model_base
         self.model_ft = model_ft
@@ -229,10 +233,34 @@ class BlockExtender:
         self.reference_inputs: dict[str, dict[str, torch.Tensor]] = {"base": {}, "ft": {}}
         self.verbose = bool(verbose)
         self.show_progress = bool(show_progress)
+        # Diagnostics are an optional side channel and are off by default.
+        self.diagnostic_collector = diagnostic_collector
+        self.diagnostic_mode = str(diagnostic_mode)
+        self._diagnostic_context: dict[str, Any] | None = None
 
     def _vprint(self, message: str) -> None:
         if self.verbose:
             print(f"[block_extension] {message}")
+
+    def _record_correction(self, endpoint: str, component: str, W: torch.Tensor, b: torch.Tensor) -> None:
+        collector = self.diagnostic_collector
+        context = self._diagnostic_context
+        if collector is None or context is None:
+            return
+        collector.record_map(
+            mode=self.diagnostic_mode,
+            endpoint=endpoint,
+            structural_step=context["structural_step"],
+            final_block=context["final_block"],
+            source_block=context["source_block"],
+            component=component,
+            W=W,
+            b=b,
+        )
+
+    def _record_corrections(self, endpoint: str, corrections: Mapping[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
+        for component, (W, b) in corrections.items():
+            self._record_correction(endpoint, component, W, b)
 
     @staticmethod
     def _inner_block(block: nn.Module) -> nn.Module:
@@ -554,6 +582,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_1", ridge_identity), ridge_target=_ridge_target("ln_1"))
                     if lmc_store is not None:
                         lmc_store["ln_1"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "ln_1", W, b)
                     d = torch.diag(W).to(inner.ln_1.weight.device, dtype=inner.ln_1.weight.dtype)
                     b = b.to(inner.ln_1.bias.device, dtype=inner.ln_1.bias.dtype)
                     inner.ln_1.weight.mul_(d)
@@ -568,6 +597,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("q", ridge_identity), ridge_target=_ridge_target("q"))
                     if lmc_store is not None:
                         lmc_store["q"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "q", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[:dim_qkv].clone()
@@ -584,6 +614,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("k", ridge_identity), ridge_target=_ridge_target("k"))
                     if lmc_store is not None:
                         lmc_store["k"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "k", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv].clone()
@@ -600,6 +631,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("v", ridge_identity), ridge_target=_ridge_target("v"))
                     if lmc_store is not None:
                         lmc_store["v"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "v", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv].clone()
@@ -616,6 +648,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
                     if lmc_store is not None:
                         lmc_store["out_proj"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "out_proj", W, b)
                     W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
                     b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
                     inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
@@ -630,6 +663,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_2", ridge_identity), ridge_target=_ridge_target("ln_2"))
                     if lmc_store is not None:
                         lmc_store["ln_2"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "ln_2", W, b)
                     d = torch.diag(W).to(inner.ln_2.weight.device, dtype=inner.ln_2.weight.dtype)
                     b = b.to(inner.ln_2.bias.device, dtype=inner.ln_2.bias.dtype)
                     inner.ln_2.weight.mul_(d)
@@ -644,6 +678,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_fc", ridge_identity), ridge_target=_ridge_target("c_fc"))
                     if lmc_store is not None:
                         lmc_store["c_fc"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "c_fc", W, b)
                     W = W.to(inner.mlp.c_fc.weight.device, dtype=inner.mlp.c_fc.weight.dtype)
                     b = b.to(inner.mlp.c_fc.bias.device, dtype=inner.mlp.c_fc.bias.dtype)
                     inner.mlp.c_fc.weight.copy_(W @ inner.mlp.c_fc.weight)
@@ -658,6 +693,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
                     if lmc_store is not None:
                         lmc_store["c_proj"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "c_proj", W, b)
                     W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
                     b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
                     inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
@@ -706,6 +742,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_1", ridge_identity), ridge_target=_ridge_target("ln_1"))
                     if lmc_store is not None:
                         lmc_store["ln_1"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "ln_1", W, b)
                     d = torch.diag(W).to(inner.ln_1.weight.device, dtype=inner.ln_1.weight.dtype)
                     b = b.to(inner.ln_1.bias.device, dtype=inner.ln_1.bias.dtype)
                     inner.ln_1.weight.mul_(d)
@@ -720,6 +757,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("q", ridge_identity), ridge_target=_ridge_target("q"))
                     if lmc_store is not None:
                         lmc_store["q"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "q", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[:dim_qkv].clone()
@@ -736,6 +774,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("k", ridge_identity), ridge_target=_ridge_target("k"))
                     if lmc_store is not None:
                         lmc_store["k"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "k", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv].clone()
@@ -752,6 +791,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("v", ridge_identity), ridge_target=_ridge_target("v"))
                     if lmc_store is not None:
                         lmc_store["v"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "v", W, b)
                     W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
                     b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
                     w_slice = inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv].clone()
@@ -772,6 +812,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
                     if lmc_store is not None:
                         lmc_store["out_proj"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "out_proj", W, b)
                     W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
                     b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
                     inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
@@ -786,6 +827,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_2", ridge_identity), ridge_target=_ridge_target("ln_2"))
                     if lmc_store is not None:
                         lmc_store["ln_2"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "ln_2", W, b)
                     d = torch.diag(W).to(inner.ln_2.weight.device, dtype=inner.ln_2.weight.dtype)
                     b = b.to(inner.ln_2.bias.device, dtype=inner.ln_2.bias.dtype)
                     inner.ln_2.weight.mul_(d)
@@ -800,6 +842,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_fc", ridge_identity), ridge_target=_ridge_target("c_fc"))
                     if lmc_store is not None:
                         lmc_store["c_fc"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "c_fc", W, b)
                     W = W.to(inner.mlp.c_fc.weight.device, dtype=inner.mlp.c_fc.weight.dtype)
                     b = b.to(inner.mlp.c_fc.bias.device, dtype=inner.mlp.c_fc.bias.dtype)
                     inner.mlp.c_fc.weight.copy_(W @ inner.mlp.c_fc.weight)
@@ -818,6 +861,7 @@ class BlockExtender:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
                     if lmc_store is not None:
                         lmc_store["c_proj"] = (W.clone(), b.clone())
+                    self._record_correction(model_name, "c_proj", W, b)
                     W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
                     b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
                     inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
@@ -1200,6 +1244,12 @@ class BlockExtender:
             self.model_base.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_base])
             self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
 
+            self._diagnostic_context = {
+                "structural_step": step,
+                "final_block": insert_pos,
+                "source_block": src_idx,
+            }
+
             if skip_correction:
                 self._vprint("skip_correction enabled, skipping aligner fit for this step")
                 continue
@@ -1362,7 +1412,8 @@ class BlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
-                elif lmc_mode == "shared_reverse":
+                    self._record_corrections("ft", base_corrections)
+                elif lmc_mode in {"shared_reverse", "shared_ft"}:
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
@@ -1371,9 +1422,11 @@ class BlockExtender:
                         lmc_store=ft_corrections,
                     )
                     self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
+                    self._record_corrections("base", ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. "
+                        "Expected 'independent', 'steer', 'shared', 'shared_reverse', or 'shared_ft'."
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
@@ -1480,6 +1533,11 @@ class BlockExtender:
                 span_start_idx = merged_orig_idxs[0]
                 span_end_idx = merged_orig_idxs[-1]
                 output_ref_key = "final.input" if span_end_idx + 1 >= orig_depth else f"{span_end_idx + 1}.input"
+                self._diagnostic_context = {
+                    "structural_step": step,
+                    "final_block": collapse_pos,
+                    "source_block": span_start_idx,
+                }
                 base_ref = "ft" if share_ft_refs else None
                 if lmc_mode == "independent":
                     self._correct_collapsed_block_weights_cascade(
@@ -1558,7 +1616,8 @@ class BlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
-                elif lmc_mode == "shared_reverse":
+                    self._record_corrections("ft", base_corrections)
+                elif lmc_mode in {"shared_reverse", "shared_ft"}:
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_collapsed_block_weights_cascade(
                         "ft",
@@ -1575,9 +1634,11 @@ class BlockExtender:
                         lmc_store=ft_corrections,
                     )
                     self._apply_block_corrections(self.model_base, collapse_pos, ft_corrections)
+                    self._record_corrections("base", ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. "
+                        "Expected 'independent', 'steer', 'shared', 'shared_reverse', or 'shared_ft'."
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
@@ -1594,6 +1655,7 @@ def run_block_extension(
     target_layers_total: int | None,
     config: BlockExtensionConfig,
     device: str | torch.device,
+    diagnostic_collector: Any | None = None,
 ) -> int:
     extender = BlockExtender(
         source_base_model,
@@ -1601,6 +1663,8 @@ def run_block_extension(
         device,
         verbose=bool(config.verbose),
         show_progress=bool(config.show_progress),
+        diagnostic_collector=diagnostic_collector,
+        diagnostic_mode=str(config.lmc_mode),
     )
     resolved_target_layers_total = target_layers_total if target_layers_total is not None else config.target_layers_total
     return extender.extend_and_calibrate(

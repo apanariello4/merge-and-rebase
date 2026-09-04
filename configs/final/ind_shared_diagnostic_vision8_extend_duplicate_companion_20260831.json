@@ -1,0 +1,15 @@
+{
+  "experiment": "ind_shared_diagnostic",
+  "model": "ViT-B-16",
+  "pretrained": "datacomp_xl_s13b_b90k",
+  "source_depth": 12,
+  "target_depth": 24,
+  "initialization": "duplicate_per_weight",
+  "tasks": ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"],
+  "calibration": {"num_batches": 10, "batch_size": 16, "split": "validation", "seed": 89},
+  "ridge_identity": [150.0],
+  "modes": ["independent", "shared"],
+  "source_checkpoint_root": "/leonardo_scratch/large/userexternal/frinaldi/finetuning/finetune/extension_ckpts/ft_vitb16_native/ViT-B-16/datacomp_xl_s13b_b90k",
+  "diagnostic_root": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/final_brace/ind_shared_diagnostic_20260831/duplicate_per_weight_lambda150_companion",
+  "provenance": {"do_not_overwrite": true, "save_activation_banks": false, "matched_historical_lambda": 150.0}
+}
