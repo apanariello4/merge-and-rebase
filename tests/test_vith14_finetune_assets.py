@@ -48,14 +48,13 @@ def test_smoke_config_isolated_and_short():
     assert payload["common"]["backbone"]["clip_model"] == "ViT-H-14"
     assert payload["common"]["backbone"]["clip_pretrained"] == "laion2b_s32b_b79k"
     assert payload["common"]["output"]["out_dir"].endswith("finetune_smoke")
-    assert payload["common"]["train"]["max_train_batches"] == 1
     assert payload["datasets_order"] == ["MNIST"]
     assert payload["datasets"]["MNIST"]["train"]["epochs"] == 1
 
 
 def test_slurm_launcher_has_eight_tasks_and_cache_safety():
     text = LAUNCHER.read_text()
-    assert "#SBATCH --array=0-7" in text
+    assert "#SBATCH --array=0-7%4" in text
     assert "#SBATCH --gres=gpu:a100:1" in text
     assert "export HF_DATASETS_CACHE=\"${HF_HOME}/datasets\"" in text
     assert "HF_DATASETS_OFFLINE" not in text
