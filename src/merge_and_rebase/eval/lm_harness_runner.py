@@ -29,7 +29,9 @@ def run(
 
     Returns
     -------
-    dict[str, float] : Per-task accuracy dict.
+    dict[str, float] : Flat "{task}_{metric}" -> value dict, for every
+        non-stderr metric lm-eval reports for each task (e.g. "acc", "acc_norm",
+        "exact_match", "math_verify" ...), whichever apply to the given tasks.
     """
     try:
         from lm_eval import simple_evaluate
@@ -72,11 +74,11 @@ def run(
         return out
 
     for task_name, task_results in results.get("results", {}).items():
-        acc = task_results.get("acc,none")
-        if acc is not None:
-            out[task_name] = float(acc)
-        acc_norm = task_results.get("acc_norm,none")
-        if acc_norm is not None:
-            out[f"{task_name}_norm"] = float(acc_norm)
+        for key, value in task_results.items():
+            # keys look like "exact_match,none", "acc_norm,none", "exact_match_stderr,none", ...
+            metric, _, _filter_name = str(key).partition(",")
+            if metric.endswith("_stderr") or not isinstance(value, int | float):
+                continue
+            out[f"{task_name}_{metric}"] = float(value)
 
     return out

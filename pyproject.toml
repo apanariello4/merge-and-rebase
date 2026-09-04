@@ -57,6 +57,10 @@ docs = [
 
 harness = [
   "lm-eval>=0.4.0",
+  # needed for the minerva_math* tasks' math_verify (sympy-equivalence) grader
+  "sympy>=1.12",
+  "antlr4-python3-runtime==4.11",
+  "math_verify[antlr4_11_0]",
 ]
 
 [tool.uv]
