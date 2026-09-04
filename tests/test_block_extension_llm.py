@@ -330,7 +330,7 @@ class TestDecoderBlockExtender:
 
 
 @pytest.mark.parametrize("strategy", ["interpolate_per_weight", "duplicate_per_weight"])
-def test_shared_reverse_fits_ft_and_applies_to_base_for_extension(monkeypatch, strategy):
+def test_shared_ft_fits_ft_and_applies_to_base_for_extension(monkeypatch, strategy):
     base = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
     ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
     adapter = DummyFamilyAdapter()
@@ -349,14 +349,14 @@ def test_shared_reverse_fits_ft_and_applies_to_base_for_extension(monkeypatch, s
     monkeypatch.setattr(extender, "_apply_block_corrections", lambda model, *_: apply_calls.append(model))
     extender.extend_and_calibrate(
         loader=object(), n_batches=1, strategy=strategy, target_layers_total=4,
-        skip_correction=False, lmc_mode="shared_reverse",
+        skip_correction=False, lmc_mode="shared_ft",
     )
     assert correction_calls == ["ft"]
     assert apply_calls == [base]
 
 
 @pytest.mark.parametrize("strategy", ["interpolate_per_weight", "duplicate_per_weight"])
-def test_shared_reverse_fits_ft_and_applies_to_base_for_shrink(monkeypatch, strategy):
+def test_shared_ft_fits_ft_and_applies_to_base_for_shrink(monkeypatch, strategy):
     base = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
     ft = DummyDecoderModel(n_layers=5, dim=16, intermediate=32)
     adapter = DummyFamilyAdapter()
@@ -375,10 +375,27 @@ def test_shared_reverse_fits_ft_and_applies_to_base_for_shrink(monkeypatch, stra
     monkeypatch.setattr(extender, "_apply_block_corrections", lambda model, *_: apply_calls.append(model))
     extender.extend_and_calibrate(
         loader=object(), n_batches=1, strategy=strategy, target_layers_total=4,
-        skip_correction=False, lmc_mode="shared_reverse",
+        skip_correction=False, lmc_mode="shared_ft",
     )
     assert correction_calls == ["ft"]
     assert apply_calls == [base]
+
+
+def test_legacy_reverse_mode_is_rejected(monkeypatch):
+    base = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+    ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+    adapter = DummyFamilyAdapter()
+    extender = DecoderBlockExtender(base, ft, adapter, device="cpu", verbose=False, show_progress=False)
+
+    monkeypatch.setattr(extender, "capture_reference_inputs", lambda loader, n_batches: None)
+    monkeypatch.setattr(extender, "_capture_component_references", lambda loader, n_batches: None)
+
+    legacy_mode = "shared_" + "reverse"
+    with pytest.raises(ValueError, match="Unsupported lmc_mode"):
+        extender.extend_and_calibrate(
+            loader=object(), n_batches=1, strategy="duplicate_per_weight", target_layers_total=4,
+            skip_correction=False, lmc_mode=legacy_mode,
+        )
 
 
 class TestRunBlockExtensionLLM:

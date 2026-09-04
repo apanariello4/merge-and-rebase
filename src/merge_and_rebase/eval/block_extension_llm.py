@@ -825,7 +825,7 @@ class DecoderBlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
-                elif lmc_mode == "shared_reverse":
+                elif lmc_mode == "shared_ft":
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
@@ -836,7 +836,7 @@ class DecoderBlockExtender:
                     self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_ft'."
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
@@ -971,7 +971,7 @@ class DecoderBlockExtender:
                         lmc_store=base_corrections,
                     )
                     self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
-                elif lmc_mode == "shared_reverse":
+                elif lmc_mode == "shared_ft":
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_collapsed_block_weights_cascade(
                         "ft", self.model_ft, collapse_pos, span_start, span_end,
@@ -983,7 +983,7 @@ class DecoderBlockExtender:
                     self._apply_block_corrections(self.model_base, collapse_pos, ft_corrections)
                 else:
                     raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_reverse'."
+                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_ft'."
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))

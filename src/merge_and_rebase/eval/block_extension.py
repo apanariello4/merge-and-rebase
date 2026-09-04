@@ -1413,7 +1413,7 @@ class BlockExtender:
                     )
                     self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
                     self._record_corrections("ft", base_corrections)
-                elif lmc_mode in {"shared_reverse", "shared_ft"}:
+                elif lmc_mode == "shared_ft":
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
@@ -1426,7 +1426,7 @@ class BlockExtender:
                 else:
                     raise ValueError(
                         f"Unsupported lmc_mode '{lmc_mode}'. "
-                        "Expected 'independent', 'steer', 'shared', 'shared_reverse', or 'shared_ft'."
+                        "Expected 'independent', 'steer', 'shared', or 'shared_ft'."
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
@@ -1617,7 +1617,7 @@ class BlockExtender:
                     )
                     self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
                     self._record_corrections("ft", base_corrections)
-                elif lmc_mode in {"shared_reverse", "shared_ft"}:
+                elif lmc_mode == "shared_ft":
                     ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
                     self._correct_collapsed_block_weights_cascade(
                         "ft",
@@ -1638,7 +1638,7 @@ class BlockExtender:
                 else:
                     raise ValueError(
                         f"Unsupported lmc_mode '{lmc_mode}'. "
-                        "Expected 'independent', 'steer', 'shared', 'shared_reverse', or 'shared_ft'."
+                        "Expected 'independent', 'steer', 'shared', or 'shared_ft'."
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)

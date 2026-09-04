@@ -28,7 +28,7 @@
     "skip_correction": false,
     "skip_final_ln": false,
     "share_ft_refs": false,
-    "lmc_mode": "shared_reverse"
+    "lmc_mode": "shared_ft"
   },
   "eval_before_rebase": true,
   "block_extension_eval_split": "test",
