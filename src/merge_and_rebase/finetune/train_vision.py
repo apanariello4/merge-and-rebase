@@ -465,6 +465,7 @@ def train_task(
     dense_lr: float | None = None,
     warmup_length: int,
     scheduler_name: str = "cosine",
+    max_train_batches: int | None = None,
     clip_grad_norm: float,
     accumulate_grad_batches: int,
     batch_size: int,
@@ -497,6 +498,8 @@ def train_task(
     _set_seed(seed)
     if accumulate_grad_batches <= 0:
         raise ValueError("accumulate_grad_batches must be >= 1.")
+    if max_train_batches is not None and max_train_batches < 1:
+        raise ValueError("max_train_batches must be >= 1 when provided.")
     strategy_cfg = dict(strategy_cfg or {})
     forward_mode = resolve_training_forward_mode(strategy_cfg)
     forward_mode_params = normalize_forward_mode_params(forward_mode, strategy_cfg.get("forward_mode_params", None))
@@ -809,7 +812,10 @@ def train_task(
         return summary
 
     loss_fn = nn.CrossEntropyLoss()
-    steps_per_epoch = math.ceil(len(loaders.train) / accumulate_grad_batches)
+    train_batches = len(loaders.train)
+    if max_train_batches is not None:
+        train_batches = min(train_batches, int(max_train_batches))
+    steps_per_epoch = math.ceil(train_batches / accumulate_grad_batches)
     total_steps = epochs * steps_per_epoch
 
     # For non-PEFT strategies, optional strategy.attention patching is applied here.
@@ -1098,10 +1104,12 @@ def train_task(
         window_batch_count = 0
         window_size = 1
 
-        with tqdm(total=len(loaders.train), desc=f"[{task}] Epoch {epoch}/{epochs}", unit="batch") as pbar:
+        with tqdm(total=train_batches, desc=f"[{task}] Epoch {epoch}/{epochs}", unit="batch") as pbar:
             for i, (x, y) in enumerate(loaders.train):
+                if i >= train_batches:
+                    break
                 if window_batch_count == 0:
-                    remaining = len(loaders.train) - i
+                    remaining = train_batches - i
                     window_size = min(accumulate_grad_batches, remaining)
                 x = x.to(dev, non_blocking=True)
                 y = y.to(dev, non_blocking=True)
@@ -1860,6 +1868,8 @@ def main() -> None:
             dense_lr = _resolve_dense_lr(task_cfg, default_lr=lr)
             optimizer_name = str(_get(task_cfg, "train.optimizer.name", "adamw"))
             weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
+            max_train_batches_raw = _get(task_cfg, "train.max_train_batches", None)
+            max_train_batches = None if max_train_batches_raw is None else int(max_train_batches_raw)
             clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
             accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
             if accumulate_grad_batches <= 0:
@@ -1923,6 +1933,7 @@ def main() -> None:
                     "epochs": epochs,
                     "lr": lr,
                     "dense_lr": dense_lr,
+                    "max_train_batches": max_train_batches,
                     "optimizer_name": optimizer_name,
                     "weight_decay": weight_decay,
                     "warmup_length": int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500)),

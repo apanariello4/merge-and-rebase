@@ -23,6 +23,7 @@ common:
     lr: 1.0e-5
     weight_decay: 0.1
     accumulate_grad_batches: 32
+    max_train_batches: 1
     lr_scheduler:
       name: cosine
     grad_clip_norm: 1.0
