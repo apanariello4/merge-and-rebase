@@ -77,6 +77,30 @@ _DEFAULT_CALIBRATION_PROMPTS = [
     "Write a polite email asking for a meeting.",
     "List two differences between cats and dogs.",
     "Solve: 17 plus 26.",
+    "What is the derivative of x^3 + 2x with respect to x?",
+    "Simplify the fraction 24/36.",
+    "Solve for x: 3x - 7 = 14.",
+    "What is the area of a circle with radius 5?",
+    "Factor the polynomial x^2 - 9.",
+    "What is the least common multiple of 8 and 12?",
+    "Convert 0.75 into a fraction in lowest terms.",
+    "Explain the Pythagorean theorem in one sentence.",
+    "What is the sum of the first 10 positive integers?",
+    "Solve the inequality 2x + 3 > 11.",
+    "What is 15% of 240?",
+    "Find the slope of the line passing through (2, 3) and (4, 9).",
+    "Explain what a prime number is.",
+    "What is the value of 7! (7 factorial)?",
+    "Solve the system: x + y = 10, x - y = 2.",
+    "What is the perimeter of a rectangle with sides 4 and 9?",
+    "Write a short poem about autumn.",
+    "Summarize the plot of Romeo and Juliet in two sentences.",
+    "What are the main causes of the French Revolution?",
+    "Explain how photosynthesis works.",
+    "Describe the water cycle briefly.",
+    "What is the boiling point of water at sea level?",
+    "Give a brief definition of inflation in economics.",
+    "Name three renewable energy sources.",
 ]
 
 
@@ -532,6 +556,17 @@ def main() -> None:
             if tp_keys:
                 print(f"Transportable body keys: {len(tp_keys)} / {len(full_fp_keys)} total FP keys")
 
+        calibration_prompts_cfg = cfg.get("calibration_prompts", None)
+        if isinstance(calibration_prompts_cfg, str):
+            # Allow pointing at a JSON file shaped {"prompts": [...]}, so a large
+            # domain-specific calibration bank doesn't have to be inlined into
+            # (and duplicated across) every config.
+            calibration_prompts_cfg = load_json(calibration_prompts_cfg).get("prompts", None)
+        if calibration_prompts_cfg is not None and not isinstance(calibration_prompts_cfg, list):
+            raise ValueError(
+                "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one."
+            )
+
         # Block extension: build calibration loader once if needed
         blockext_calib_loader = None
         if run_block_extension_prestep:
@@ -539,6 +574,7 @@ def main() -> None:
             calib_max_length = int(cfg.get("calibration_max_length", 128))
             blockext_calib_loader = _build_text_calibration_loader(
                 tokenizer=source_llm.tokenizer,
+                prompts=calibration_prompts_cfg,
                 batch_size=calib_batch_size,
                 max_length=calib_max_length,
             )
@@ -650,11 +686,13 @@ def main() -> None:
                 calib_max_length = int(cfg.get("calibration_max_length", 128))
                 source_calib = _build_text_calibration_loader(
                     tokenizer=source_llm.tokenizer,
+                    prompts=calibration_prompts_cfg,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
                 target_calib = _build_text_calibration_loader(
                     tokenizer=target_llm.tokenizer,
+                    prompts=calibration_prompts_cfg,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
