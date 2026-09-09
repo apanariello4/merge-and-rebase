@@ -781,25 +781,90 @@ def main() -> None:
             harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
             harness_limit = cfg.get("harness_limit", None)
 
-            best_alpha = float(cfg.get("alpha", 1.0))
-            best_sd = apply_delta(target_base_sd, {k: v * best_alpha for k, v in merged_delta.items()})
+            best_harness_eval: SearchEvaluation | None = None
+            harness_results_by_alpha: dict[float, dict[str, float]] = {}
+            harness_search_results: list[SearchEvaluation] = []
 
-            load_into_model(target_llm.model, best_sd, strict=False)
-            print(f"\nEvaluating with lm-harness (alpha={best_alpha:.2f})...")
-            harness_results = run_harness(
-                tasks=list(harness_tasks_resolved),
-                model=target_llm.model,
-                tokenizer=target_llm.tokenizer,
-                device=device,
-                num_fewshot=harness_num_fewshot,
-                batch_size=harness_batch_size,
-                limit=harness_limit,
-            )
-            print("\n=== Harness results ===")
-            for task_name, acc in harness_results.items():
+            baseline_harness_results: dict[str, float] | None = None
+            if bool(cfg.get("eval_before_rebase", False)):
+                load_into_model(target_llm.model, target_base_sd, strict=False)
+                print("\nEvaluating untransported target with lm-harness (before rebase)...")
+                baseline_harness_results = run_harness(
+                    tasks=list(harness_tasks_resolved),
+                    model=target_llm.model,
+                    tokenizer=target_llm.tokenizer,
+                    device=device,
+                    num_fewshot=harness_num_fewshot,
+                    batch_size=harness_batch_size,
+                    limit=harness_limit,
+                )
+                for task_name, acc in baseline_harness_results.items():
+                    print(f"  [before rebase] {task_name}: {acc:.4f}")
+
+            while True:
+                batch = search_planner.next_batch()
+                if batch is None:
+                    break
+                batch_results: list[SearchEvaluation] = []
+
+                for candidate in batch:
+                    alpha = float(candidate.alpha)
+                    scaled = {k: v * alpha for k, v in merged_delta.items()}
+                    merged_sd = apply_delta(target_base_sd, scaled)
+                    load_into_model(target_llm.model, merged_sd, strict=False)
+
+                    print(f"\nEvaluating with lm-harness (alpha={alpha:.3f})...")
+                    harness_results = run_harness(
+                        tasks=list(harness_tasks_resolved),
+                        model=target_llm.model,
+                        tokenizer=target_llm.tokenizer,
+                        device=device,
+                        num_fewshot=harness_num_fewshot,
+                        batch_size=harness_batch_size,
+                        limit=harness_limit,
+                    )
+                    for task_name, acc in harness_results.items():
+                        print(f"  {task_name}: {acc:.4f}")
+
+                    score = sum(harness_results.values()) / max(1, len(harness_results))
+                    result = SearchEvaluation(
+                        candidate=candidate,
+                        score=float(score),
+                        avg_acc=float(score),
+                        avg_norm_acc=0.0,
+                        per_task_acc=[float(v) for v in harness_results.values()],
+                        per_task_norm_acc=[],
+                    )
+                    batch_results.append(result)
+                    harness_search_results.append(result)
+                    harness_results_by_alpha[alpha] = harness_results
+
+                    if best_harness_eval is None or result.score > best_harness_eval.score:
+                        best_harness_eval = result
+
+                    print(f"  alpha={alpha:.3f}  avg_score={score:.6f}")
+                    del merged_sd
+
+                search_planner.observe(batch_results)
+
+            if best_harness_eval is None:
+                raise RuntimeError("Harness alpha search produced no results.")
+
+            if len(harness_search_results) > 1:
+                print("\n=== Harness alpha search summary ===")
+                for r in harness_search_results:
+                    print(f"{describe_candidate(r.candidate)}  avg_score={r.avg_acc:.6f}")
+
+            best_alpha = float(best_harness_eval.candidate.alpha)
+            best_harness_results = harness_results_by_alpha[best_alpha]
+            print(f"\nBest alpha={best_alpha:.3f} -> avg_score={best_harness_eval.avg_acc:.6f}")
+            print("\n=== Harness results (best alpha) ===")
+            for task_name, acc in best_harness_results.items():
                 print(f"  {task_name}: {acc:.4f}")
 
             if cfg.get("save_merged", None) is not None:
+                scaled = {k: v * best_alpha for k, v in merged_delta.items()}
+                best_sd = apply_delta(target_base_sd, scaled)
                 outp = Path(str(cfg["save_merged"]))
                 outp.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(to_cpu_fp32(best_sd), str(outp))
@@ -810,7 +875,10 @@ def main() -> None:
                     "method": method_name,
                     "best_alpha": best_alpha,
                     "backend": "lm_harness",
-                    "harness_results": harness_results,
+                    "harness_results": best_harness_results,
+                    "harness_results_before_rebase": baseline_harness_results,
+                    "search_strategy": search_planner.search_summary(),
+                    "search_results": summarize_search_results(harness_search_results),
                     "saved_merged_path": cfg.get("save_merged"),
                 })
                 run_logger.finish("success")
