@@ -290,6 +290,51 @@ def _align_features(
     return source_tokens.reshape(-1, source_tokens.shape[-1]), target_tokens.reshape(-1, target_tokens.shape[-1])
 
 
+def _content_row_mask(
+    source_attention_mask: torch.Tensor | None,
+    target_attention_mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Flat (batch*tokens,) bool mask selecting the non-padding activation rows.
+
+    Text calibration batches are padded to a fixed length, so most positions in
+    a short prompt are pad tokens. Their activations carry no signal about how
+    the two models represent content, and folding them into the cross-covariance
+    lets padding dominate the fitted Procrustes maps. Returns None whenever a
+    trustworthy mask can't be built, in which case callers keep every row.
+    """
+    masks = [
+        m.detach().to(device="cpu").reshape(-1).bool()
+        for m in (source_attention_mask, target_attention_mask)
+        if isinstance(m, torch.Tensor) and m.ndim == 2
+    ]
+    if not masks:
+        return None
+    if len({int(m.numel()) for m in masks}) != 1:
+        # Source and target tokenized to different lengths, so rows no longer
+        # correspond one-to-one after sequence alignment; don't guess.
+        return None
+    mask = masks[0]
+    for extra in masks[1:]:
+        mask = mask & extra
+    if bool(mask.all()) or not bool(mask.any()):
+        return None
+    return mask
+
+
+def _drop_padding_rows(
+    source_rows: torch.Tensor,
+    target_rows: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mask is None:
+        return source_rows, target_rows
+    n = int(mask.numel())
+    if int(source_rows.shape[0]) != n or int(target_rows.shape[0]) != n:
+        # Not one row per input token (pooled/head-split features); leave as-is.
+        return source_rows, target_rows
+    return source_rows[mask], target_rows[mask]
+
+
 class ActivationStore:
     """Streaming activation statistics with optional Gram and raw storage."""
 
@@ -601,6 +646,7 @@ def collect_activations(
 
                 source_model(**({"input_ids": s_inp, "attention_mask": s_attn} if s_attn is not None else {"input_ids": s_inp}))
                 target_model(**({"input_ids": t_inp, "attention_mask": t_attn} if t_attn is not None else {"input_ids": t_inp}))
+                row_mask = _content_row_mask(s_attn, t_attn)
             else:
                 source_imgs = _extract_model_inputs(source_batch).to(dev)
                 target_imgs = _extract_model_inputs(target_batch).to(dev)
@@ -611,12 +657,14 @@ def collect_activations(
                     )
                 _encode_image(source_model, source_imgs)
                 _encode_image(target_model, target_imgs)
+                row_mask = None
 
             common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
             common_outputs = set(source_hook.outputs.keys()) & set(target_hook.outputs.keys())
 
             for key in common_inputs:
                 src_rows, tgt_rows = _align_features(source_hook.inputs[key], target_hook.inputs[key], mode=seq_align)
+                src_rows, tgt_rows = _drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.in"
                 registry.setdefault(
                     reg_key,
@@ -629,6 +677,7 @@ def collect_activations(
 
             for key in common_outputs:
                 src_rows, tgt_rows = _align_features(source_hook.outputs[key], target_hook.outputs[key], mode=seq_align)
+                src_rows, tgt_rows = _drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.out"
                 registry.setdefault(
                     reg_key,

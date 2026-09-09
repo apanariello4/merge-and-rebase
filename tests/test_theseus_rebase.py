@@ -357,3 +357,46 @@ def test_random_dataset_subsampling_uses_randperm_seed() -> None:
     g2.manual_seed(124)
     expected_other_seed = torch.randperm(20, generator=g2)[:12].tolist()
     assert seen != expected_other_seed
+
+
+def test_content_row_mask_and_padding_drop():
+    """Padded calibration positions must not reach the cross-covariance.
+
+    Text calibration batches are padded to a fixed length, so on short prompts
+    most positions are pad tokens. Folding them into the Procrustes covariance
+    lets padding dominate the fitted alignment.
+    """
+    import torch
+
+    from merge_and_rebase.rebase.methods.theseus import _content_row_mask, _drop_padding_rows
+
+    # batch=2, tokens=4, with 3 real tokens then 1 pad in each row.
+    attn = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 0]])
+    mask = _content_row_mask(attn, attn)
+    assert mask is not None
+    assert mask.tolist() == [True, True, True, False, True, True, True, False]
+
+    src = torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
+    tgt = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
+    src_kept, tgt_kept = _drop_padding_rows(src, tgt, mask)
+    assert src_kept.shape == (6, 3)
+    assert tgt_kept.shape == (6, 5)
+    assert torch.equal(src_kept, src[mask])
+    assert torch.equal(tgt_kept, tgt[mask])
+
+    # No mask, an all-real mask, and an all-pad mask all leave rows untouched.
+    assert _content_row_mask(None, None) is None
+    assert _content_row_mask(torch.ones(2, 4, dtype=torch.long), None) is None
+    assert _content_row_mask(torch.zeros(2, 4, dtype=torch.long), None) is None
+
+    # Source and target tokenized to different lengths -> rows no longer
+    # correspond one-to-one, so don't guess.
+    assert _content_row_mask(attn, torch.ones(2, 6, dtype=torch.long)) is None
+
+    # Activations that aren't one row per input token (pooled/head-split) are
+    # passed through rather than mis-sliced.
+    pooled_src = torch.zeros(2, 3)
+    pooled_tgt = torch.zeros(2, 5)
+    out_src, out_tgt = _drop_padding_rows(pooled_src, pooled_tgt, mask)
+    assert out_src.shape == (2, 3)
+    assert out_tgt.shape == (2, 5)
