@@ -410,7 +410,7 @@ def main() -> None:
         target_meta = target_family.metadata(target_llm.model) if target_family else None
 
         # Block extension config
-        blockext_like_method = method_name in {"theseus", "bico"}
+        blockext_like_method = method_name in {"theseus", "theseus_gqa", "bico"}
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
@@ -640,7 +640,7 @@ def main() -> None:
             if run_block_extension_prestep:
                 prepared_task.source_model.to(device)
 
-            if method_name in ("theseus", "bico") and transport_keys:
+            if method_name in ("theseus", "theseus_gqa", "bico") and transport_keys:
                 # Hybrid: transport body keys, identity-pass the rest
                 body_delta = {k: v for k, v in delta.items() if k in transport_keys}
                 passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
@@ -659,7 +659,7 @@ def main() -> None:
                     max_length=calib_max_length,
                 )
 
-                if method_name == "theseus":
+                if method_name in ("theseus", "theseus_gqa"):
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     transport_kwargs.setdefault("n_batches", 2)
                     transported_body = method.transport(
