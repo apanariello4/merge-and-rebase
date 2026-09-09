@@ -69,6 +69,11 @@ def run(
             limit=limit,
         )
 
+    # Fixed bookkeeping keys lm-eval attaches to every task's result dict
+    # (see lm_eval.result_schema._TaskMetrics) that are not accuracy metrics
+    # and must never be averaged in with real scores.
+    _NON_METRIC_KEYS = frozenset({"name", "alias", "sample_len", "sample_count"})
+
     out: dict[str, float] = {}
     if results is None:
         return out
@@ -77,7 +82,7 @@ def run(
         for key, value in task_results.items():
             # keys look like "exact_match,none", "acc_norm,none", "exact_match_stderr,none", ...
             metric, _, _filter_name = str(key).partition(",")
-            if metric.endswith("_stderr") or not isinstance(value, int | float):
+            if metric in _NON_METRIC_KEYS or metric.endswith("_stderr") or not isinstance(value, int | float):
                 continue
             out[f"{task_name}_{metric}"] = float(value)
 
