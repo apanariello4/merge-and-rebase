@@ -1111,6 +1111,25 @@ class DecoderBlockExtender:
     def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
         scope = self.family_adapter.transport_scope(model)
         scope.layers = nn.ModuleList(new_layers)
+        self._reindex_layers(model, scope.layers)
+
+    @staticmethod
+    def _reindex_layers(model: nn.Module, layers: nn.ModuleList) -> None:
+        # Each decoder layer's attention module caches its own `layer_idx`
+        # (set at construction) to key into the shared KV cache during a
+        # forward pass. Duplicating/reordering layers without updating it
+        # leaves two layers pointing at the same cache slot: the second one
+        # to run has its `update()` call concatenate onto the first's
+        # leftover keys/values, silently doubling the sequence length the
+        # rest of that layer's attention sees (crashes as a seq-length
+        # mismatch against the attention mask, or worse, doesn't crash).
+        layer_types = getattr(getattr(model, "config", None), "layer_types", None)
+        for new_idx, layer in enumerate(layers):
+            for holder in (layer, getattr(layer, "self_attn", None)):
+                if holder is not None and hasattr(holder, "layer_idx"):
+                    holder.layer_idx = new_idx
+            if layer_types is not None and hasattr(layer, "attention_type") and new_idx < len(layer_types):
+                layer.attention_type = layer_types[new_idx]
 
     @torch.no_grad()
     def extend_and_calibrate(
