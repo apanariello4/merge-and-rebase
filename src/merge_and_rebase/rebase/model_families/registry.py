@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import ModelFamilyAdapter
-from .hf_decoder import LlamaDecoderAdapter, Qwen2DecoderAdapter
+from .hf_decoder import LlamaDecoderAdapter, Qwen2DecoderAdapter, Qwen3DecoderAdapter
 
 _FAMILIES: dict[str, ModelFamilyAdapter] = {}
 
@@ -39,3 +39,4 @@ def infer_family(model_or_config: Any) -> ModelFamilyAdapter | None:
 
 register(LlamaDecoderAdapter())
 register(Qwen2DecoderAdapter())
+register(Qwen3DecoderAdapter())

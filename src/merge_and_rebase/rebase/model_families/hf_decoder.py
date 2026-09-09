@@ -53,13 +53,19 @@ class HfDecoderAdapter:
 
     def metadata(self, model: nn.Module) -> ModelFamilyMetadata:
         cfg = getattr(model, "config", model)
+        num_attention_heads = int(getattr(cfg, "num_attention_heads", 0))
+        hidden_size = int(getattr(cfg, "hidden_size", 0))
+        head_dim = getattr(cfg, "head_dim", None)
+        if head_dim is None and num_attention_heads:
+            head_dim = hidden_size // num_attention_heads
         return ModelFamilyMetadata(
             family=self.name,
-            hidden_size=int(getattr(cfg, "hidden_size", 0)),
+            hidden_size=hidden_size,
             intermediate_size=int(getattr(cfg, "intermediate_size", 0)),
             num_hidden_layers=int(getattr(cfg, "num_hidden_layers", 0)),
-            num_attention_heads=int(getattr(cfg, "num_attention_heads", 0)),
+            num_attention_heads=num_attention_heads,
             num_key_value_heads=getattr(cfg, "num_key_value_heads", None),
+            head_dim=int(head_dim) if head_dim is not None else None,
         )
 
     def transport_scope(self, model: nn.Module) -> nn.Module:
@@ -150,3 +156,12 @@ class LlamaDecoderAdapter(HfDecoderAdapter):
 class Qwen2DecoderAdapter(HfDecoderAdapter):
     name: str = "qwen2"
     _MODEL_TYPES = frozenset({"qwen2", "qwen2_moe"})
+
+
+class Qwen3DecoderAdapter(HfDecoderAdapter):
+    name: str = "qwen3"
+    _MODEL_TYPES = frozenset({"qwen3", "qwen3_moe"})
+    # Qwen3 adds per-head QK-RMSNorm ("self_attn.q_norm.weight" / "k_norm.weight"),
+    # which have no Qwen2 counterpart. They're intentionally excluded from
+    # _DECODER_TRANSPORTABLE_SUFFIXES, so they're simply left untouched (passthrough)
+    # rather than transported.

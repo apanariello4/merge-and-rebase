@@ -16,6 +16,7 @@ class ModelFamilyMetadata:
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int | None = None
+    head_dim: int | None = None
 
 
 @runtime_checkable

@@ -1,5 +1,5 @@
 from .base import ModelFamilyAdapter, ModelFamilyMetadata
-from .hf_decoder import HfDecoderAdapter, LlamaDecoderAdapter, Qwen2DecoderAdapter
+from .hf_decoder import HfDecoderAdapter, LlamaDecoderAdapter, Qwen2DecoderAdapter, Qwen3DecoderAdapter
 from .registry import get_family, infer_family, list_families
 
 __all__ = [
@@ -11,4 +11,5 @@ __all__ = [
     "HfDecoderAdapter",
     "LlamaDecoderAdapter",
     "Qwen2DecoderAdapter",
+    "Qwen3DecoderAdapter",
 ]
