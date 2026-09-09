@@ -537,7 +537,16 @@ def load_aligned_tuned_from_ref(
     resolved_ref = resolve_checkpoint_reference(str(ckpt_ref))
     used_adapter = False
 
-    if is_adapter_reference(resolved_ref):
+    # A local directory that isn't a raw checkpoint *file* can never be loaded
+    # via torch.load (that's an IsADirectoryError waiting to happen). If it's
+    # not a PEFT adapter dir either (is_adapter_reference already covers that,
+    # plus HF-hub-id-shaped strings), it's presumably a plain dense HF model
+    # dir -- let _is_hf_dense_ref below confirm and route it accordingly
+    # instead of falling through to the raw-checkpoint-file branch.
+    resolved_path = Path(resolved_ref)
+    is_dense_local_dir = resolved_path.is_dir() and not is_adapter_reference(resolved_ref)
+
+    if is_adapter_reference(resolved_ref) or is_dense_local_dir:
         if _is_hf_dense_ref(resolved_ref):
             print(f"Loading dense HF model ref: {resolved_ref}")
             sd = _load_dense_hf_state_dict(resolved_ref, build_cfg)
