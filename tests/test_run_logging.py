@@ -57,6 +57,12 @@ def test_local_logger_writes_summary_and_events(tmp_path: Path):
     assert payload["run_logging"]["status"] == "success"
     assert any(item["event_type"] == "metric" for item in event_lines)
     assert any(item["event_type"] == "run_finished" for item in event_lines)
+    # Every run summary should be stamped with the code state that produced
+    # it, so two nominally-identical configs that disagree can be checked
+    # for a code-version mismatch directly instead of by mtime archaeology.
+    fingerprint = payload["run_logging"]["metadata"]["code_fingerprint"]
+    assert "git_commit" in fingerprint
+    assert "git_dirty" in fingerprint
 
 
 def test_local_logger_skips_wandb_only_events(tmp_path: Path):
