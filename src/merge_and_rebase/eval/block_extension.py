@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import islice
@@ -73,6 +73,8 @@ class BlockExtensionConfig:
     eval_before_extension: bool = False
     first_n_eval_batches: int | None = None
     ridge_identity: float = 0.0
+    # Paper Eq. (9): coefficient for the stabilizing ||W||_F^2 penalty.
+    ridge_weight: float = 1e-6
     n_cascade_iters: int = 1
     share_ft_refs: bool = False
     component_ridge: dict[str, float] | None = None
@@ -94,6 +96,16 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
     enabled_raw = cfg.get("block_extension_enabled", None)
     enabled = bool(enabled_raw) if enabled_raw is not None else bool(params)
 
+    n_batches_act = int(params.get("n_batches_act", 2))
+    if n_batches_act <= 0:
+        raise ValueError("block_extension_params.n_batches_act must be > 0.")
+    ridge_identity = float(params.get("ridge_identity", 0.0))
+    ridge_weight = float(params.get("ridge_weight", 1e-6))
+    if ridge_identity < 0.0:
+        raise ValueError("block_extension_params.ridge_identity must be >= 0.")
+    if ridge_weight < 0.0:
+        raise ValueError("block_extension_params.ridge_weight must be >= 0.")
+
     return enabled, BlockExtensionConfig(
         blocks_to_add=_as_optional_int(params.get("blocks_to_add", None)),
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
@@ -101,7 +113,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         extension_density=str(params.get("extension_density", "spread")),
         extension_strategy=str(params.get("extension_strategy", "interpolate")),
         dampening_factor=float(params.get("dampening_factor", 1.0)),
-        n_batches_act=max(1, int(params.get("n_batches_act", 2))),
+        n_batches_act=n_batches_act,
         calibration_split=str(params.get("calibration_split", "test")),
         calibration_dataset=_as_optional_calibration_dataset(params.get("calibration_dataset", None)),
         calibration_task=_as_optional_str(params.get("calibration_task", None)),
@@ -109,7 +121,8 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         skip_final_ln=bool(params.get("skip_final_ln", False)),
         eval_before_extension=bool(params.get("eval_before_extension", False)),
         first_n_eval_batches=_as_optional_int(params.get("first_n_eval_batches", None)),
-        ridge_identity=float(params.get("ridge_identity", 0.0)),
+        ridge_identity=ridge_identity,
+        ridge_weight=ridge_weight,
         n_cascade_iters=max(1, int(params.get("n_cascade_iters", 1))),
         share_ft_refs=bool(params.get("share_ft_refs", False)),
         component_ridge=_as_optional_dict_float(params.get("component_ridge", None)),
@@ -208,7 +221,10 @@ class _InProjCapture:
     def _patched_forward(self, query, key=None, value=None, **kwargs):
         qkv = F.linear(query, self.attn.in_proj_weight, self.attn.in_proj_bias)
         q, k, v = qkv.chunk(3, dim=-1)
-        self.outputs.append((q.detach(), k.detach(), v.detach()))
+        # Q/K/V captures can dominate GPU memory at larger calibration
+        # budgets.  They are regression inputs, not tensors for subsequent
+        # GPU computation, so transfer them immediately.
+        self.outputs.append((q.detach().cpu(), k.detach().cpu(), v.detach().cpu()))
         return self._orig_forward(query, key=key, value=value, **kwargs)
 
     def restore(self):
@@ -233,6 +249,7 @@ class BlockExtender:
         self.reference_inputs: dict[str, dict[str, torch.Tensor]] = {"base": {}, "ft": {}}
         self.verbose = bool(verbose)
         self.show_progress = bool(show_progress)
+        self._ridge_weight = 1e-6
         # Diagnostics are an optional side channel and are off by default.
         self.diagnostic_collector = diagnostic_collector
         self.diagnostic_mode = str(diagnostic_mode)
@@ -283,8 +300,14 @@ class BlockExtender:
 
         return hook
 
-    @staticmethod
-    def _fit_ridge(A: torch.Tensor, T: torch.Tensor, lambda_reg: float = 1e-6, ridge_id: float = 0.0, ridge_target: torch.Tensor | None = None):
+    def _fit_ridge(
+        self,
+        A: torch.Tensor,
+        T: torch.Tensor,
+        lambda_reg: float | None = None,
+        ridge_id: float = 0.0,
+        ridge_target: torch.Tensor | None = None,
+    ):
         A = A.float()
         T = T.float()
 
@@ -295,7 +318,8 @@ class BlockExtender:
         T_c = T - mu_T
 
         dim_in = A.shape[1]
-        reg = lambda_reg + ridge_id
+        resolved_lambda_reg = self._ridge_weight if lambda_reg is None else float(lambda_reg)
+        reg = resolved_lambda_reg + ridge_id
         cov = A_c.T @ A_c
         cov = cov + reg * torch.eye(dim_in, device=A.device, dtype=A.dtype)
         if ridge_target is not None:
@@ -365,6 +389,7 @@ class BlockExtender:
             hooks.append(model.visual.ln_post.register_forward_hook(self._store_input_hook(store, "final.input")))
 
             it = iter(loader)
+            consumed = 0
             for _ in _iter_with_progress(
                 range(n_batches),
                 total=n_batches,
@@ -374,8 +399,13 @@ class BlockExtender:
                 try:
                     images, _ = next(it)
                 except StopIteration:
-                    break
+                    for hook in hooks:
+                        hook.remove()
+                    raise ValueError(
+                        f"BRACE calibration loader exhausted after {consumed} batches; requested {n_batches}."
+                    ) from None
                 _encode_image(model, images.to(self.device))
+                consumed += 1
 
             for h in hooks:
                 h.remove()
@@ -386,50 +416,107 @@ class BlockExtender:
             self.reference_inputs[name] = refs
 
     @torch.no_grad()
-    def _capture_component_references(self, loader: Iterable[Any], n_batches: int):
-        for name, model in [("base", self.model_base), ("ft", self.model_ft)]:
-            self._vprint(f"capture component references ({name}) with n_batches={n_batches}")
+    def _capture_per_weight_reference_subset(
+        self,
+        reference_models: Mapping[str, nn.Module],
+        *,
+        endpoints: Sequence[str],
+        block_indices: Sequence[int],
+        input_indices: Sequence[int | str],
+        loader: Iterable[Any],
+        n_batches: int,
+    ) -> None:
+        """Capture only references needed by the current structural step.
+
+        The former eager path retained every component from every block for
+        both endpoints.  At 40 calibration batches that scales to hundreds of
+        gigabytes.  This lazy path is mathematically equivalent: pristine
+        endpoint copies provide the same references, while tensors from the
+        previous structural step are released before the next capture.
+        """
+        # Drop the previous step before allocating the next reference window.
+        self.reference_inputs = {"base": {}, "ft": {}}
+        unique_blocks = tuple(dict.fromkeys(int(index) for index in block_indices))
+        unique_inputs = tuple(dict.fromkeys(input_indices))
+        for name in endpoints:
+            model = reference_models[name]
+            model.to(self.device)
             model.eval()
             store: dict[str, list[torch.Tensor]] = defaultdict(list)
-            hooks = []
-            caps: list[_InProjCapture] = []
+            hooks: list[Any] = []
+            caps: list[tuple[int, _InProjCapture]] = []
+            try:
+                for index in unique_blocks:
+                    inner = self._inner_block(model.visual.transformer.resblocks[index])
+                    hooks.append(
+                        inner.ln_1.register_forward_hook(
+                            self._store_output_hook(store, f"{index}.ln_1_output")
+                        )
+                    )
+                    hooks.append(
+                        inner.attn.register_forward_hook(
+                            self._store_output_hook(store, f"{index}.attn_output")
+                        )
+                    )
+                    hooks.append(
+                        inner.ln_2.register_forward_hook(
+                            self._store_output_hook(store, f"{index}.ln_2_output")
+                        )
+                    )
+                    hooks.append(
+                        inner.mlp.c_fc.register_forward_hook(
+                            self._store_output_hook(store, f"{index}.c_fc_output")
+                        )
+                    )
+                    hooks.append(
+                        inner.mlp.c_proj.register_forward_hook(
+                            self._store_output_hook(store, f"{index}.c_proj_output")
+                        )
+                    )
+                    caps.append((index, _InProjCapture(inner.attn)))
 
-            for i, block in enumerate(model.visual.transformer.resblocks):
-                inner = self._inner_block(block)
-                hooks.append(inner.ln_1.register_forward_hook(self._store_output_hook(store, f"{i}.ln_1_output")))
-                hooks.append(inner.attn.register_forward_hook(self._store_output_hook(store, f"{i}.attn_output")))
-                hooks.append(inner.ln_2.register_forward_hook(self._store_output_hook(store, f"{i}.ln_2_output")))
-                hooks.append(inner.mlp.c_fc.register_forward_hook(self._store_output_hook(store, f"{i}.c_fc_output")))
-                hooks.append(inner.mlp.c_proj.register_forward_hook(self._store_output_hook(store, f"{i}.c_proj_output")))
-                caps.append(_InProjCapture(inner.attn))
+                for index in unique_inputs:
+                    if index == "final":
+                        module = model.visual.ln_post
+                        key = "final.input"
+                    else:
+                        module = model.visual.transformer.resblocks[int(index)]
+                        key = f"{int(index)}.input"
+                    hooks.append(module.register_forward_hook(self._store_input_hook(store, key)))
 
-            it = iter(loader)
-            for _ in _iter_with_progress(
-                range(n_batches),
-                total=n_batches,
-                desc=f"block_extension.capture_components.{name}",
-                enabled=self.show_progress,
-            ):
-                try:
-                    images, _ = next(it)
-                except StopIteration:
-                    break
-                _encode_image(model, images.to(self.device))
+                iterator = iter(loader)
+                consumed = 0
+                for _ in range(n_batches):
+                    try:
+                        images, _ = next(iterator)
+                    except StopIteration:
+                        raise ValueError(
+                            f"BRACE calibration loader exhausted after {consumed} batches; "
+                            f"requested {n_batches}."
+                        ) from None
+                    _encode_image(model, images.to(self.device))
+                    consumed += 1
+            finally:
+                for hook in hooks:
+                    hook.remove()
+                for _, cap in caps:
+                    cap.restore()
+                model.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            for h in hooks:
-                h.remove()
-            for cap in caps:
-                cap.restore()
-            for i, cap in enumerate(caps):
+            for index, cap in caps:
                 for q, k, v in cap.outputs:
-                    store[f"{i}.q_output"].append(q.cpu())
-                    store[f"{i}.k_output"].append(k.cpu())
-                    store[f"{i}.v_output"].append(v.cpu())
+                    store[f"{index}.q_output"].append(q)
+                    store[f"{index}.k_output"].append(k)
+                    store[f"{index}.v_output"].append(v)
 
             refs: dict[str, torch.Tensor] = {}
-            for key, tensors in store.items():
+            for key in list(store):
+                tensors = store.pop(key)
                 refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
-            self.reference_inputs[name].update(refs)
+                del tensors
+            self.reference_inputs[name] = refs
 
     @torch.no_grad()
     def _capture_single_input(self, model: nn.Module, target: int | str, loader: Iterable[Any], n_batches: int):
@@ -540,6 +627,14 @@ class BlockExtender:
         if cr is None:
             return default
         return float(cr.get(component, default))
+
+    @staticmethod
+    def _reference_endpoint_names(lmc_mode: str, share_ft_refs: bool) -> tuple[str, ...]:
+        if lmc_mode == "shared":
+            return ("ft",) if share_ft_refs else ("base",)
+        if lmc_mode == "shared_ft" or share_ft_refs:
+            return ("ft",)
+        return ("base", "ft")
 
     @torch.no_grad()
     def _correct_block_weights_cascade(
@@ -1135,11 +1230,15 @@ class BlockExtender:
         skip_correction: bool,
         skip_final_ln: bool,
         ridge_identity: float = 0.0,
+        ridge_weight: float = 1e-6,
         n_cascade_iters: int = 1,
         share_ft_refs: bool = False,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
     ) -> int:
+        self._ridge_weight = float(ridge_weight)
+        if self._ridge_weight < 0.0:
+            raise ValueError("ridge_weight must be >= 0.")
         curr_layers = len(self.model_base.visual.transformer.resblocks)
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
@@ -1312,10 +1411,13 @@ class BlockExtender:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
         if not skip_correction:
-            self.capture_reference_inputs(loader, n_batches)
-            self._capture_component_references(loader, n_batches)
-            self._vprint("reference activation and component capture completed")
+            reference_models = {
+                "base": deepcopy(self.model_base).cpu(),
+                "ft": deepcopy(self.model_ft).cpu(),
+            }
+            self._vprint("created pristine CPU reference endpoints for lazy capture")
         else:
+            reference_models = {}
             self._vprint("skip_correction enabled: skipping reference capture")
 
         curr_layers = len(self.model_base.visual.transformer.resblocks)
@@ -1377,6 +1479,14 @@ class BlockExtender:
             self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
 
             if not skip_correction:
+                self._capture_per_weight_reference_subset(
+                    reference_models,
+                    endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
+                    block_indices=(src_idx,),
+                    input_indices=(),
+                    loader=loader,
+                    n_batches=n_batches,
+                )
                 base_ref = "ft" if share_ft_refs else None
                 if lmc_mode == "independent":
                     self._correct_block_weights_cascade(
@@ -1430,6 +1540,10 @@ class BlockExtender:
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
+        self.reference_inputs = {"base": {}, "ft": {}}
+        reference_models.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._vprint(f"per-weight extension completed. final_depth={final_depth}")
         return final_depth
 
@@ -1456,10 +1570,13 @@ class BlockExtender:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
         if not skip_correction:
-            self.capture_reference_inputs(loader, n_batches)
-            self._capture_component_references(loader, n_batches)
-            self._vprint("reference activation and component capture completed")
+            reference_models = {
+                "base": deepcopy(self.model_base).cpu(),
+                "ft": deepcopy(self.model_ft).cpu(),
+            }
+            self._vprint("created pristine CPU reference endpoints for lazy capture")
         else:
+            reference_models = {}
             self._vprint("skip_correction enabled: skipping reference capture")
 
         curr_layers = len(self.model_base.visual.transformer.resblocks)
@@ -1533,6 +1650,17 @@ class BlockExtender:
                 span_start_idx = merged_orig_idxs[0]
                 span_end_idx = merged_orig_idxs[-1]
                 output_ref_key = "final.input" if span_end_idx + 1 >= orig_depth else f"{span_end_idx + 1}.input"
+                output_input_index: int | str = (
+                    "final" if span_end_idx + 1 >= orig_depth else span_end_idx + 1
+                )
+                self._capture_per_weight_reference_subset(
+                    reference_models,
+                    endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
+                    block_indices=(span_start_idx, span_end_idx),
+                    input_indices=(span_end_idx, output_input_index),
+                    loader=loader,
+                    n_batches=n_batches,
+                )
                 self._diagnostic_context = {
                     "structural_step": step,
                     "final_block": collapse_pos,
@@ -1642,6 +1770,10 @@ class BlockExtender:
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
+        self.reference_inputs = {"base": {}, "ft": {}}
+        reference_models.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
         return final_depth
 
@@ -1679,6 +1811,7 @@ def run_block_extension(
         skip_correction=bool(config.skip_correction),
         skip_final_ln=bool(config.skip_final_ln),
         ridge_identity=float(config.ridge_identity),
+        ridge_weight=float(config.ridge_weight),
         n_cascade_iters=int(config.n_cascade_iters),
         share_ft_refs=bool(config.share_ft_refs),
         component_ridge=config.component_ridge,
