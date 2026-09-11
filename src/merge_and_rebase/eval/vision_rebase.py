@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
-import json
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -27,10 +27,15 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ..data.balanced_calibration import (
+    Vision8TaskContext,
+    build_balanced_vision8_calibration_loaders,
+)
 from ..data.templates import get_templates
 from ..data.vision_loaders import (
     build_vision_calibration_loader,
     build_vision_loaders,
+    extract_classnames,
     load_hf_splits,
 )
 from ..eval.utils import (
@@ -64,6 +69,32 @@ from .block_extension import (
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
+
+
+def _set_deterministic_seed(seed: int) -> None:
+    """Seed torch/cuda and force deterministic kernels for this run.
+
+    BRACE's per-weight reference capture forwards the same pristine model
+    through the same frozen calibration batches once per structural step
+    (rather than once, globally) to bound memory. Without
+    `cudnn.deterministic`/`use_deterministic_algorithms`, repeated forward
+    passes over identical weights and inputs are not guaranteed bit-identical
+    on GPU, and with a small ridge_weight the resulting ridge fit can amplify
+    that noise into visible downstream accuracy drift between otherwise
+    identical runs.
+    """
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _legacy_visual_key(key: str) -> str | None:
@@ -562,6 +593,169 @@ class _TaskContext:
     classnames: list[str]
     build_cfg_task: OpenClipBuildConfig
     source_build_cfg_task: OpenClipBuildConfig
+    target_text_features: torch.Tensor | None = None
+    source_text_features: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class _CalibrationLoaders:
+    """Minimal loader bundle accepted by the transport preparation helpers."""
+
+    train: Any
+    val: Any | None = None
+    test: Any | None = None
+
+
+def _select_dedicated_brace_loader(
+    *,
+    brace_loader: Any | None,
+    transport_loader: Any,
+    correction_enabled: bool,
+) -> Any | None:
+    """Validate that BRACE does not consume the transport calibration loader."""
+    if correction_enabled and brace_loader is None:
+        raise RuntimeError(
+            "merge_then_brace_then_transport requires a dedicated BRACE "
+            "calibration loader when correction is enabled."
+        )
+    if brace_loader is transport_loader:
+        raise RuntimeError("BRACE and transport calibration must use separate loader instances.")
+    return brace_loader
+
+
+def _build_direct_paired_calibration_context(
+    dataset_spec: Mapping[str, Any],
+    *,
+    suite: Any,
+    cfg: dict[str, Any],
+    clf_source: OpenClipClassifier,
+    clf_target: OpenClipClassifier,
+    source_cfg: OpenClipBuildConfig,
+    target_cfg: OpenClipBuildConfig,
+) -> _TaskContext:
+    """Build label-aligned source/target views of one direct HF dataset."""
+    source_loader = build_vision_calibration_loader(
+        dataset_spec,
+        resolver=suite.resolver,
+        preprocess=clf_source.preprocess,
+        calibration_split=str(dataset_spec.get("split", "valid")),
+        batch_size=int(cfg.get("batch_size", 128)),
+        num_workers=int(cfg.get("num_workers", 6)),
+        pin_memory=True,
+        val_fraction=float(cfg.get("val_fraction", 0.1)),
+        seed=int(cfg.get("seed", 42)),
+    )
+    target_loader = build_vision_calibration_loader(
+        dataset_spec,
+        resolver=suite.resolver,
+        preprocess=clf_target.preprocess,
+        calibration_split=str(dataset_spec.get("split", "valid")),
+        batch_size=int(cfg.get("batch_size", 128)),
+        num_workers=int(cfg.get("num_workers", 6)),
+        pin_memory=True,
+        val_fraction=float(cfg.get("val_fraction", 0.1)),
+        seed=int(cfg.get("seed", 42)),
+    )
+    path = str(dataset_spec.get("path", dataset_spec.get("hf_path", dataset_spec.get("dataset", ""))))
+    split = str(dataset_spec.get("split", "valid"))
+    hf_ds = load_hf_splits(
+        path,
+        config=(str(dataset_spec["config"]) if dataset_spec.get("config") is not None else None),
+        requested_splits=(split,),
+    )
+    classnames = list(
+        extract_classnames(
+            hf_ds,
+            label_key=str(dataset_spec.get("label_key", "label")),
+            strict=False,
+        )
+    )
+    templates = get_templates("ImageNet1K")
+
+    def _with_templates(build: OpenClipBuildConfig) -> OpenClipBuildConfig:
+        return OpenClipBuildConfig(
+            model_name=build.model_name,
+            pretrained=build.pretrained,
+            device=build.device,
+            dtype=build.dtype,
+            prompt_templates=templates,
+        )
+
+    return _TaskContext(
+        loaders=_CalibrationLoaders(train=target_loader),
+        source_loaders=_CalibrationLoaders(train=source_loader),
+        classnames=classnames,
+        build_cfg_task=_with_templates(target_cfg),
+        source_build_cfg_task=_with_templates(source_cfg),
+    )
+
+
+def _build_balanced_calibration_context(
+    per_task: Sequence[Mapping[str, Any]],
+    *,
+    cfg: dict[str, Any],
+    clf_source: OpenClipClassifier,
+    clf_target: OpenClipClassifier,
+    n_batches: int,
+    split: str = "val",
+) -> tuple[_TaskContext, dict[str, Any]]:
+    """Build the paired, exactly balanced Vision8 transport context."""
+    contexts: dict[str, Vision8TaskContext] = {}
+    by_task = {str(item["task"]): item for item in per_task}
+    for task, item in by_task.items():
+        source_loaders = item["source_loaders"]
+        if source_loaders is None:
+            raise RuntimeError(f"Balanced transport calibration requires source loaders for {task}.")
+        source_loader = select_loader(
+            split,
+            train_loader=source_loaders.train,
+            val_loader=source_loaders.val,
+            test_loader=source_loaders.test,
+        )
+        target_loader = select_loader(
+            split,
+            train_loader=item["loaders"].train,
+            val_loader=item["loaders"].val,
+            test_loader=item["loaders"].test,
+        )
+        contexts[task] = Vision8TaskContext(
+            source_dataset=source_loader.dataset,
+            target_dataset=target_loader.dataset,
+            classnames=list(item["classnames"]),
+        )
+
+    balanced = build_balanced_vision8_calibration_loaders(
+        contexts,
+        n_batches=int(n_batches),
+        batch_size=int(cfg.get("batch_size", 128)),
+        seed=int(cfg.get("seed", 42)),
+        num_workers=int(cfg.get("num_workers", 6)),
+        pin_memory=True,
+    )
+
+    source_features: list[torch.Tensor] = []
+    target_features: list[torch.Tensor] = []
+    for task in sorted(by_task):
+        item = by_task[task]
+        names = list(item["classnames"])
+        source_features.append(
+            clf_source._compute_zeroshot_text_features(names, item["source_build_cfg_task"]).detach().cpu()
+        )
+        target_features.append(
+            clf_target._compute_zeroshot_text_features(names, item["build_cfg_task"]).detach().cpu()
+        )
+
+    first = by_task[sorted(by_task)[0]]
+    context = _TaskContext(
+        loaders=_CalibrationLoaders(train=balanced.target_loaders),
+        source_loaders=_CalibrationLoaders(train=balanced.source_loaders),
+        classnames=list(balanced.union_classnames),
+        build_cfg_task=first["build_cfg_task"],
+        source_build_cfg_task=first["source_build_cfg_task"],
+        target_text_features=torch.cat(target_features, dim=0),
+        source_text_features=torch.cat(source_features, dim=0),
+    )
+    return context, {"plan": balanced.plan, "fingerprint": balanced.fingerprint}
 
 
 def _build_task_context(
@@ -622,7 +816,20 @@ def _build_task_context(
     )
 
 
-_VALID_MERGE_MODES = ("none", "rebase_then_merge", "merge_then_rebase")
+_VALID_MERGE_MODES = (
+    "none",
+    "rebase_then_merge",
+    "merge_then_rebase",
+    "brace_transport_then_merge",
+    "brace_merge_then_transport",
+    "merge_then_brace_then_transport",
+)
+_TRANSPORT_THEN_MERGE_MODES = {"rebase_then_merge", "brace_transport_then_merge"}
+_SINGLE_TRANSPORT_MODES = {
+    "merge_then_rebase",
+    "brace_merge_then_transport",
+    "merge_then_brace_then_transport",
+}
 
 
 def _resolve_merge_mode_config(
@@ -633,18 +840,19 @@ def _resolve_merge_mode_config(
 
     Returns (merge_mode, merge_method_name, merge_params, global_alpha_search).
     ``merge_mode="none"`` keeps the historical per-task transfer evaluation;
-    ``rebase_then_merge`` supports hierarchical search (per-task alphas followed
-    by a global merge alpha) when ``alpha_selection="per_task"``.
+    ``rebase_then_merge`` and its explicit campaign alias
+    ``brace_transport_then_merge`` support hierarchical search (per-task alphas
+    followed by a global merge alpha) when ``alpha_selection="per_task"``.
     """
     merge_mode = str(cfg.get("merge_mode", "none")).strip().lower()
     if merge_mode not in _VALID_MERGE_MODES:
         raise ValueError(f"merge_mode must be one of: {', '.join(_VALID_MERGE_MODES)}")
 
-    if merge_mode == "merge_then_rebase" and alpha_selection == "per_task":
+    if merge_mode not in _TRANSPORT_THEN_MERGE_MODES and merge_mode != "none" and alpha_selection == "per_task":
         raise ValueError(
-            "merge_then_rebase requires alpha_selection='shared': per-task alpha search "
+            f"{merge_mode} requires alpha_selection='shared': per-task alpha search "
             "is only defined for individually transported deltas on the target base. "
-            "Use merge_mode='rebase_then_merge' for hierarchical per-task alphas."
+            "Use merge_mode='brace_transport_then_merge' for hierarchical per-task alphas."
         )
 
     merge_method_name = str(cfg.get("merge_method", "task_arithmetic"))
@@ -696,6 +904,18 @@ def _visual_key_fingerprint(sd: Mapping[str, torch.Tensor]) -> dict[str, Any]:
         "n_blocks": len(block_ids),
         "visual_out_dims_sample": visual_widths[:4],
     }
+
+
+def _state_dict_sha256(sd: Mapping[str, torch.Tensor]) -> str:
+    """Stable CPU hash used to prove that the native target base was not mutated."""
+    digest = hashlib.sha256()
+    for key in sorted(sd):
+        value = sd[key].detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(memoryview(value.numpy()))
+    return digest.hexdigest()
 
 
 def _ckpt_visual_base_coverage(
@@ -790,6 +1010,8 @@ def _build_rebase_prepared(
     task_delta: dict[str, torch.Tensor],
     source_base_model_task: torch.nn.Module | None,
     transfusion_prepared: dict[str, Any] | None,
+    source_text_features: torch.Tensor | None = None,
+    target_text_features: torch.Tensor | None = None,
 ) -> Any:
     """Compute the rebase method's prepared state for one task context.
 
@@ -797,6 +1019,12 @@ def _build_rebase_prepared(
     post-composition transport. Note that theseus/bico use ``task_delta`` for
     key filtering and shape handling only — values never affect the prepared
     transforms.
+
+    For Theseus and BiCo, ``seed`` controls the deterministic sampling of
+    calibration batches used to fit the transport maps.  Default it to the
+    run-level seed so a seed sweep actually changes those maps, while allowing
+    ``method_params.seed`` to override it when map sampling must be decoupled
+    from the validation/test split seed.
     """
     if method_name == "gradfix":
         from ..eval.utils import build_grad_dataloader
@@ -827,6 +1055,8 @@ def _build_rebase_prepared(
         )
 
     if theseus_like_method:
+        theseus_params = dict(method_params)
+        transport_seed = int(theseus_params.pop("seed", cfg.get("seed", 42)))
         if run_block_extension_prestep:
             if source_base_model_task is None:
                 raise RuntimeError("Theseus block-extension preprocess requires the corrected source base model.")
@@ -836,9 +1066,9 @@ def _build_rebase_prepared(
             load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
         else:
             source_model_for_theseus = deepcopy(clf_source.model)
-            load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
+            load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
         target_model_for_theseus = deepcopy(clf_target.model)
-        load_into_model(target_model_for_theseus, target_base_sd, strict=False)
+        load_into_model(target_model_for_theseus, target_base_sd, strict=True)
 
         source_depth = len(source_model_for_theseus.visual.transformer.resblocks)
         target_depth = len(target_model_for_theseus.visual.transformer.resblocks)
@@ -848,6 +1078,14 @@ def _build_rebase_prepared(
                 f"source_depth={source_depth}, target_depth={target_depth}"
             )
 
+        # Corrected BRACE templates are intentionally retained on CPU to keep
+        # the multi-task campaign's resident memory bounded.  Theseus sends
+        # calibration inputs to ``device`` but does not own model placement,
+        # so place only these isolated working copies immediately before
+        # activation collection.
+        source_model_for_theseus.to(device).eval()
+        target_model_for_theseus.to(device).eval()
+
         return method.prepare(
             source_model=source_model_for_theseus,
             target_model=target_model_for_theseus,
@@ -856,11 +1094,15 @@ def _build_rebase_prepared(
             target_base=target_base_sd,
             delta=task_delta,
             device=device,
-            **method_params,
+            seed=transport_seed,
+            **theseus_params,
         )
 
     if bico_mode:
         from ..models.grad_recipes import clip_contrastive_recipe
+
+        bico_params = dict(method_params)
+        transport_seed = int(bico_params.pop("seed", cfg.get("seed", 42)))
 
         if run_block_extension_prestep:
             if source_base_model_task is None:
@@ -872,9 +1114,9 @@ def _build_rebase_prepared(
             load_into_model(source_model_for_bico, task_source_base_sd, strict=True)
         else:
             source_model_for_bico = deepcopy(clf_source.model)
-            load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
+            load_into_model(source_model_for_bico, task_source_base_sd, strict=True)
         target_model_for_bico = deepcopy(clf_target.model)
-        load_into_model(target_model_for_bico, target_base_sd, strict=False)
+        load_into_model(target_model_for_bico, target_base_sd, strict=True)
 
         source_depth = len(source_model_for_bico.visual.transformer.resblocks)
         target_depth = len(target_model_for_bico.visual.transformer.resblocks)
@@ -889,12 +1131,14 @@ def _build_rebase_prepared(
             classnames,
             source_build_cfg_task,
             device=device,
+            text_features=source_text_features,
         )
         target_recipe = clip_contrastive_recipe(
             clf_target,
             classnames,
             build_cfg_task,
             device=device,
+            text_features=target_text_features,
         )
 
         prepared = method.prepare(
@@ -907,7 +1151,8 @@ def _build_rebase_prepared(
             target_base=target_base_sd,
             delta=task_delta,
             device=device,
-            **method_params,
+            seed=transport_seed,
+            **bico_params,
         )
         del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
         return prepared
@@ -945,7 +1190,7 @@ def main() -> None:
         p.add_argument(
             "--merge-mode",
             type=str,
-            choices=["none", "rebase_then_merge", "merge_then_rebase"],
+            choices=list(_VALID_MERGE_MODES),
             default=None,
             help="Compose task deltas into one merged model instead of (or after) per-task transport.",
         )
@@ -1048,6 +1293,7 @@ def main() -> None:
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
         cfg["logging"] = logging_cfg
+        _set_deterministic_seed(int(cfg.get("seed", 42)))
 
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
@@ -1101,12 +1347,6 @@ def main() -> None:
         cross_task_lmc_split = str(cfg.get("cross_task_lmc_eval_split", source_lmc_eval_split)).strip().lower()
         if cross_task_lmc_split not in {"val", "test"}:
             raise ValueError("cross_task_lmc_eval_split must be one of: val, test")
-        cross_task_lmc_first_n_batches_raw = cfg.get(
-            "cross_task_lmc_first_n_batches", source_lmc_first_n_batches
-        )
-        cross_task_lmc_first_n_batches = (
-            int(cross_task_lmc_first_n_batches_raw) if cross_task_lmc_first_n_batches_raw is not None else None
-        )
         all_task_lmc_tasks_raw = cfg.get("all_task_lmc_tasks", [])
         if all_task_lmc_tasks_raw is None:
             all_task_lmc_tasks_raw = []
@@ -1118,10 +1358,6 @@ def main() -> None:
         all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
         if all_task_lmc_split not in {"val", "test"}:
             raise ValueError("all_task_lmc_eval_split must be one of: val, test")
-        all_task_lmc_first_n_batches_raw = cfg.get("all_task_lmc_first_n_batches", cross_task_lmc_first_n_batches)
-        all_task_lmc_first_n_batches = (
-            int(all_task_lmc_first_n_batches_raw) if all_task_lmc_first_n_batches_raw is not None else None
-        )
         source_only = bool(cfg.get("source_only", False))
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
@@ -1150,6 +1386,10 @@ def main() -> None:
             a_min = float(cfg.get("alpha_min", 0.0))
             a_max = float(cfg.get("alpha_max", 2.0))
             a_step = float(cfg.get("alpha_step", 0.1))
+            if a_step <= 0.0:
+                raise ValueError("alpha_step must be > 0")
+            if a_max < a_min:
+                raise ValueError("alpha_max must be >= alpha_min")
             alphas = torch.arange(a_min, a_max + 1e-9, a_step).tolist()
         else:
             alphas = [float(cfg.get("alpha", 1.0))]
@@ -1267,7 +1507,11 @@ def main() -> None:
 
         block_extension_calibration_loader = None
         calibration_dataset = calibration_dataset_spec(block_extension_cfg)
-        if run_block_extension_prestep and calibration_dataset is not None:
+        if (
+            run_block_extension_prestep
+            and not block_extension_cfg.skip_correction
+            and calibration_dataset is not None
+        ):
             block_extension_calibration_loader = build_vision_calibration_loader(
                 calibration_dataset,
                 resolver=suite.resolver,
@@ -1311,6 +1555,7 @@ def main() -> None:
         else:
             source_base_sd = to_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
             target_base_sd = to_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
+        target_hash_before = _state_dict_sha256(target_base_sd)
 
         use_humanized_classnames = not bool(cfg.get("no_humanize", True))
         print(f"Classname mode: {'humanized' if use_humanized_classnames else 'raw'}")
@@ -1349,6 +1594,13 @@ def main() -> None:
                     native_tasks.add(task)
                     print(f"  {task}: native target checkpoint (auto-detected)")
                 else:
+                    if strict_load:
+                        coverage = _ckpt_visual_base_coverage(raw_sd, source_base_sd)
+                        if coverage != 1.0:
+                            raise ValueError(
+                                f"Strict visual checkpoint coverage failed for task '{task}': "
+                                f"coverage={coverage:.6f}, expected=1.0 ({tuned_by_task[task]})."
+                            )
                     print(f"  {task}: source checkpoint (transport required)")
                 del raw_sd
 
@@ -1358,7 +1610,7 @@ def main() -> None:
                     "Native target checkpoints require a merge mode; merge_mode='none' evaluates "
                     "per-task transported deltas only. Use merge_mode='rebase_then_merge'."
                 )
-            if merge_mode == "merge_then_rebase":
+            if merge_mode in _SINGLE_TRANSPORT_MODES:
                 raise ValueError(
                     "Native target checkpoints cannot participate in merge_then_rebase: the merge "
                     "happens on the source base, where native target deltas do not exist."
@@ -1370,10 +1622,10 @@ def main() -> None:
                 )
 
         if base_construction == "independent_endpoint_average":
-            if merge_mode != "rebase_then_merge":
+            if merge_mode not in _TRANSPORT_THEN_MERGE_MODES:
                 raise ValueError(
                     "base_construction='independent_endpoint_average' requires "
-                    "merge_mode='rebase_then_merge'."
+                    "merge_mode='brace_transport_then_merge'."
                 )
             if alpha_selection != "shared":
                 raise ValueError(
@@ -1386,6 +1638,7 @@ def main() -> None:
                     "an independently transformed source endpoint; native target tasks are not allowed."
                 )
 
+        task_context_by_name: dict[str, _TaskContext] = {}
         per_task: list[dict[str, Any]] = []
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
@@ -1397,10 +1650,6 @@ def main() -> None:
         all_task_lmc_rows: list[dict[str, Any]] = []
         corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
         corrected_ft_templates: dict[str, torch.nn.Module] = {}
-
-        # These collectors are populated for optional independent-endpoint
-        # diagnostics.  They must exist for every BRACE run because corrected
-        # source endpoints are recorded before that optional branch is chosen.
         independent_base_by_task: dict[str, dict[str, torch.Tensor]] = {}
         independent_ft_by_task: dict[str, dict[str, torch.Tensor]] = {}
         independent_base_average: dict[str, torch.Tensor] | None = None
@@ -1409,8 +1658,8 @@ def main() -> None:
         independent_base_diagnostics_path: str | None = None
         independent_source_merge_param_count: int | None = None
         independent_direct_delta_key_count: dict[str, int] = {}
-
-        transfusion_prepared: dict[str, Any] | None = None
+        corrected_source_template: torch.nn.Module | None = None
+        brace_calibration_metadata: dict[str, Any] | None = None
 
         for task in tasks:
             task_ctx = _build_task_context(
@@ -1426,22 +1675,49 @@ def main() -> None:
                     (theseus_like_method or transfusion_mode or bico_mode) and task not in native_tasks
                 ),
             )
+            task_context_by_name[task] = task_ctx
+            per_task.append(
+                {
+                    "task": task,
+                    "loaders": task_ctx.loaders,
+                    "classnames": task_ctx.classnames,
+                    "build_cfg_task": task_ctx.build_cfg_task,
+                    "source_loaders": task_ctx.source_loaders,
+                    "source_build_cfg_task": task_ctx.source_build_cfg_task,
+                }
+            )
+
+        brace_protocol = str(
+            (cfg.get("block_extension_params", {}) or {}).get("calibration_protocol", "task_local")
+        ).lower()
+        if (
+            run_block_extension_prestep
+            and not block_extension_cfg.skip_correction
+            and brace_protocol.startswith("vision8_mix")
+        ):
+            brace_mix_context, brace_mix_metadata = _build_balanced_calibration_context(
+                per_task,
+                cfg=cfg,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                n_batches=block_extension_cfg.n_batches_act,
+                split=block_extension_cfg.calibration_split,
+            )
+            block_extension_calibration_loader = brace_mix_context.source_loaders.train
+            brace_calibration_metadata = brace_mix_metadata
+            run_logger.log_event("brace_calibration_plan", context=brace_mix_metadata)
+        transfusion_prepared: dict[str, Any] | None = None
+        task_block_extension_prestep = bool(
+            run_block_extension_prestep and merge_mode != "merge_then_brace_then_transport"
+        )
+
+        for task in tasks:
+            task_ctx = task_context_by_name[task]
             loaders = task_ctx.loaders
             classnames = task_ctx.classnames
             build_cfg_task = task_ctx.build_cfg_task
             source_build_cfg_task = task_ctx.source_build_cfg_task
             source_loaders = task_ctx.source_loaders
-
-            per_task.append(
-                {
-                    "task": task,
-                    "loaders": loaders,
-                    "classnames": classnames,
-                    "build_cfg_task": build_cfg_task,
-                    "source_loaders": source_loaders,
-                    "source_build_cfg_task": source_build_cfg_task,
-                }
-            )
 
             if task in native_tasks:
                 print(f"  {task}: native target checkpoint — skipping transport")
@@ -1451,11 +1727,11 @@ def main() -> None:
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
-            if blockext_like_method and (run_block_extension_prestep or block_extension_eval_enabled):
+            if blockext_like_method and (task_block_extension_prestep or block_extension_eval_enabled):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
-                load_into_model(source_base_model_task, source_base_sd, strict=False)
-                load_into_model(source_ft_model_task, source_base_sd, strict=False)
+                load_into_model(source_base_model_task, source_base_sd, strict=True)
+                load_into_model(source_ft_model_task, source_base_sd, strict=True)
                 load_into_model(source_ft_model_task, load_ckpt(str(tuned_by_task[task])), strict=False)
 
             if block_extension_eval_enabled and source_loaders is not None:
@@ -1467,12 +1743,12 @@ def main() -> None:
                         if block_extension_eval_first_n_batches is not None
                         else None
                     ),
-                    "extension_applied": bool(run_block_extension_prestep),
+                    "extension_applied": bool(task_block_extension_prestep),
                 }
                 if source_base_model_task is None or source_ft_model_task is None:
                     raise RuntimeError("Block-extension eval requested but source task models were not initialized.")
 
-                if run_block_extension_prestep:
+                if task_block_extension_prestep:
                     zero_pre = _evaluate_source_model_top1(
                         model=source_base_model_task,
                         clf_source=clf_source,
@@ -1522,7 +1798,7 @@ def main() -> None:
                 block_extension_eval_rows.append(eval_row)
 
             source_lmc_row: dict[str, Any] | None = None
-            if source_lmc_eval and run_block_extension_prestep:
+            if source_lmc_eval and task_block_extension_prestep:
                 if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
                     raise RuntimeError("Source LMC evaluation requires initialized source models and loaders.")
                 source_lmc_row = {
@@ -1551,7 +1827,7 @@ def main() -> None:
                     device=device,
                 )
 
-            if run_block_extension_prestep:
+            if task_block_extension_prestep:
                 if source_loaders is None:
                     raise ValueError("Block extension preprocess requires source_loaders for calibration.")
                 if source_base_model_task is None or source_ft_model_task is None:
@@ -1584,11 +1860,15 @@ def main() -> None:
                 task_delta = TaskVector.from_checkpoints(
                     task_source_base_sd,
                     task_source_ft_sd,
-                    strict=False,
+                    strict=True,
                     key_filter=_visual_only_filter,
                 ).delta
-                independent_base_by_task[task] = task_source_base_sd
-                independent_ft_by_task[task] = task_source_ft_sd
+                if merge_mode == "brace_merge_then_transport" or base_construction == "independent_endpoint_average":
+                    independent_base_by_task[task] = task_source_base_sd
+                if base_construction == "independent_endpoint_average":
+                    independent_ft_by_task[task] = task_source_ft_sd
+                if merge_mode == "brace_merge_then_transport" and corrected_source_template is None:
+                    corrected_source_template = deepcopy(source_base_model_task).cpu()
 
                 if cross_task_lmc_pairs or all_task_lmc_tasks:
                     corrected_ft_states[task] = task_source_ft_sd
@@ -1691,7 +1971,7 @@ def main() -> None:
             if source_only:
                 continue
 
-            if not run_block_extension_prestep:
+            if not task_block_extension_prestep:
                 if transfusion_mode:
                     if transfusion_prepared is None:
                         transfusion_prepared = method.prepare(
@@ -1706,6 +1986,7 @@ def main() -> None:
                         )
                         source_base_sd = transfusion_prepared["source_base_sd"]
                         target_base_sd = transfusion_prepared["target_base_sd"]
+                        target_hash_before = _state_dict_sha256(target_base_sd)
                         clf_target.model = transfusion_prepared["target_model_patched"]
                         if transfusion_prepared.get("sanity_check_pre") is not None:
                             print(
@@ -1747,14 +2028,15 @@ def main() -> None:
                         strict=False,
                         key_filter=_visual_only_filter,
                     ).delta
-                    independent_base_by_task[task] = task_source_base_sd
-                    independent_ft_by_task[task] = tuned_sd
+                    if base_construction == "independent_endpoint_average":
+                        independent_base_by_task[task] = task_source_base_sd
+                        independent_ft_by_task[task] = tuned_sd
 
                 n_keys = len(tuned_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
-            if merge_mode != "merge_then_rebase":
+            if merge_mode not in _SINGLE_TRANSPORT_MODES:
                 if torch.cuda.is_available() and device != "cpu":
                     torch.cuda.reset_peak_memory_stats()
                 prepare_started = time.perf_counter()
@@ -1770,7 +2052,7 @@ def main() -> None:
                     grad_num_batches=grad_num_batches,
                     theseus_like_method=theseus_like_method,
                     bico_mode=bico_mode,
-                    run_block_extension_prestep=run_block_extension_prestep,
+                    run_block_extension_prestep=task_block_extension_prestep,
                     clf_source=clf_source,
                     clf_target=clf_target,
                     classnames=classnames,
@@ -1818,13 +2100,16 @@ def main() -> None:
                 )
 
                 save_transport_dir = cfg.get("save_transported_tvs_dir", None)
-                if save_transport_dir:
+                save_transported_artifacts = bool(cfg.get("save_transported_artifacts", bool(save_transport_dir)))
+                if save_transported_artifacts and not save_transport_dir:
+                    raise ValueError("save_transported_artifacts=true requires save_transported_tvs_dir.")
+                if save_transported_artifacts and save_transport_dir:
                     os.makedirs(save_transport_dir, exist_ok=True)
                     native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
                     torch.save(to_cpu_fp32(transported_delta), native_path)
                     print(f"  {task}: saved transported TV -> {native_path}")
                     transported_artifacts[task] = [native_path]
-                    if bool(cfg.get("save_transported_tvs_legacy", True)):
+                    if bool(cfg.get("save_transported_tvs_legacy", False)):
                         legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
                         legacy_no_conv1_path = os.path.join(
                             save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
@@ -1840,6 +2125,7 @@ def main() -> None:
 
         can_eval_untransported_by_task: list[bool] = []
         single_tv_deltas_for_diagnostic: list[dict[str, torch.Tensor]] | None = None
+        single_transport_calibration_metadata: dict[str, Any] | None = None
         if merge_mode == "none":
             rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
             untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
@@ -1856,7 +2142,7 @@ def main() -> None:
                         print(f"  - {msg}")
                     if len(issues) > 3:
                         print(f"  - ... and {len(issues) - 3} more incompatibilities")
-        elif merge_mode == "rebase_then_merge":
+        elif merge_mode in _TRANSPORT_THEN_MERGE_MODES:
             native_delta_by_task: dict[str, dict[str, torch.Tensor]] = {}
             for task in sorted(native_tasks):
                 path = str(tuned_by_task[task])
@@ -1926,15 +2212,138 @@ def main() -> None:
                 # One shared merged model: every task evaluates the same direction at alpha.
                 rebased_deltas = [merged_direction] * len(tasks)
                 untransported_deltas = original_deltas
-        else:  # merge_then_rebase
-            merged_source_direction = _merge_direction(
-                base_sd=source_base_sd,
-                deltas=original_deltas,
-                merge_method_name=merge_method_name,
-                weights=merge_weights,
-                merge_params=merge_params,
-            )
+        else:
             first_item = per_task[0]
+            transport_protocol = str(cfg.get("transport_calibration_protocol", "task_local")).lower()
+            calibration_metadata: dict[str, Any] = {"protocol": transport_protocol}
+            single_transport_calibration_metadata = calibration_metadata
+            if transport_protocol.startswith("tiny"):
+                direct_spec = {
+                    "path": "zh-plus/tiny-imagenet",
+                    "split": "valid",
+                    "max_samples": int(cfg.get("transport_calibration_max_samples", 2048)),
+                }
+                transport_ctx = _build_direct_paired_calibration_context(
+                    direct_spec,
+                    suite=suite,
+                    cfg=cfg,
+                    clf_source=clf_source,
+                    clf_target=clf_target,
+                    source_cfg=source_cfg,
+                    target_cfg=target_cfg,
+                )
+            elif transport_protocol in {"vision8_mix", "vision8_mix_10", "task_local", "task_local_10"}:
+                transport_ctx, balanced_meta = _build_balanced_calibration_context(
+                    per_task,
+                    cfg=cfg,
+                    clf_source=clf_source,
+                    clf_target=clf_target,
+                    n_batches=int(cfg.get("transport_calibration_batches", 10)),
+                    split=str(cfg.get("transport_calibration_split", "val")),
+                )
+                calibration_metadata.update(balanced_meta)
+            else:
+                raise ValueError(f"Unsupported transport_calibration_protocol: {transport_protocol!r}")
+
+            if merge_mode == "merge_then_rebase":
+                # Historical same-depth behavior is intentionally unchanged.
+                transport_ctx = _TaskContext(
+                    loaders=first_item["loaders"],
+                    source_loaders=first_item["source_loaders"],
+                    classnames=list(first_item["classnames"]),
+                    build_cfg_task=first_item["build_cfg_task"],
+                    source_build_cfg_task=first_item["source_build_cfg_task"],
+                )
+                merged_source_base = source_base_sd
+                merged_source_direction = _merge_direction(
+                    base_sd=source_base_sd,
+                    deltas=original_deltas,
+                    merge_method_name=merge_method_name,
+                    weights=merge_weights,
+                    merge_params=merge_params,
+                )
+                source_template_once = None
+                prepared_has_brace = False
+            elif merge_mode == "brace_merge_then_transport":
+                if corrected_source_template is None or not independent_base_by_task:
+                    raise RuntimeError("BRACE-then-merge requires corrected source endpoints for every task.")
+                average_visual, average_keys = _average_visual_state_dicts(independent_base_by_task)
+                first_base = independent_base_by_task[sorted(independent_base_by_task)[0]]
+                merged_source_base = dict(first_base)
+                merged_source_base.update(average_visual)
+                merged_source_direction = _merge_direction(
+                    base_sd=merged_source_base,
+                    deltas=original_deltas,
+                    merge_method_name=merge_method_name,
+                    weights=merge_weights,
+                    merge_params=merge_params,
+                )
+                distances = {
+                    task: _relative_visual_state_distance(state, average_visual, average_keys)
+                    for task, state in independent_base_by_task.items()
+                }
+                calibration_metadata.update(
+                    {
+                        "consensus_source_base": "mean_corrected_source_base",
+                        "consensus_visual_key_count": len(average_keys),
+                        "source_base_relative_distance_by_task": distances,
+                        "source_base_max_relative_distance": max(distances.values()),
+                    }
+                )
+                source_template_once = corrected_source_template
+                prepared_has_brace = True
+            elif merge_mode == "merge_then_brace_then_transport":
+                native_merged_direction = _merge_direction(
+                    base_sd=source_base_sd,
+                    deltas=original_deltas,
+                    merge_method_name=merge_method_name,
+                    weights=merge_weights,
+                    merge_params=merge_params,
+                )
+                source_base_model_once = deepcopy(clf_source.model)
+                source_ft_model_once = deepcopy(clf_source.model)
+                load_into_model(source_base_model_once, source_base_sd, strict=True)
+                load_into_model(
+                    source_ft_model_once,
+                    axpy_state_dict(source_base_sd, native_merged_direction, alpha=1.0),
+                    strict=True,
+                )
+                # BRACE and transport have distinct calibration contracts and
+                # must not share a bounded loader.  In particular, campaign
+                # rows may request 40 BRACE batches but only 10 transport
+                # batches.  The dedicated BRACE loader was constructed above
+                # from block_extension_cfg; transport_ctx remains exclusively
+                # owned by the subsequent transport preparation.
+                brace_loader = _select_dedicated_brace_loader(
+                    brace_loader=block_extension_calibration_loader,
+                    transport_loader=transport_ctx.source_loaders.train,
+                    correction_enabled=not block_extension_cfg.skip_correction,
+                )
+                final_depth = run_block_extension(
+                    source_base_model=source_base_model_once,
+                    source_ft_model=source_ft_model_once,
+                    calibration_loader=brace_loader,
+                    target_layers_total=target_depth,
+                    config=block_extension_cfg,
+                    device=device,
+                )
+                if final_depth != target_depth:
+                    raise RuntimeError(
+                        f"Merged-pair BRACE depth mismatch: final_depth={final_depth}, target_depth={target_depth}."
+                    )
+                merged_source_base = to_cpu_fp32(dict(source_base_model_once.state_dict()))
+                merged_source_ft = to_cpu_fp32(dict(source_ft_model_once.state_dict()))
+                merged_source_direction = TaskVector.from_checkpoints(
+                    merged_source_base,
+                    merged_source_ft,
+                    strict=True,
+                    key_filter=_visual_only_filter,
+                ).delta
+                source_template_once = deepcopy(source_base_model_once).cpu()
+                prepared_has_brace = True
+            else:  # pragma: no cover - validated by _resolve_merge_mode_config
+                raise AssertionError(f"Unhandled merge mode: {merge_mode}")
+
             prepared_once = _build_rebase_prepared(
                 method_name=method_name,
                 method=method,
@@ -1946,23 +2355,25 @@ def main() -> None:
                 grad_num_batches=grad_num_batches,
                 theseus_like_method=theseus_like_method,
                 bico_mode=bico_mode,
-                run_block_extension_prestep=run_block_extension_prestep,
+                run_block_extension_prestep=prepared_has_brace,
                 clf_source=clf_source,
                 clf_target=clf_target,
-                classnames=list(first_item["classnames"]),
-                loaders=first_item["loaders"],
-                source_loaders=first_item["source_loaders"],
-                build_cfg_task=first_item["build_cfg_task"],
-                source_build_cfg_task=first_item["source_build_cfg_task"],
-                task_source_base_sd=source_base_sd,
+                classnames=list(transport_ctx.classnames),
+                loaders=transport_ctx.loaders,
+                source_loaders=transport_ctx.source_loaders,
+                build_cfg_task=transport_ctx.build_cfg_task,
+                source_build_cfg_task=transport_ctx.source_build_cfg_task,
+                task_source_base_sd=merged_source_base,
                 target_base_sd=target_base_sd,
                 task_delta=merged_source_direction,
-                source_base_model_task=None,
+                source_base_model_task=source_template_once,
                 transfusion_prepared=transfusion_prepared,
+                source_text_features=transport_ctx.source_text_features,
+                target_text_features=transport_ctx.target_text_features,
             )
             transport_started = time.perf_counter()
             transported_merged_delta = method.transport(
-                source_base=source_base_sd,
+                source_base=merged_source_base,
                 target_base=target_base_sd,
                 delta=merged_source_direction,
                 strict=strict_load,
@@ -1985,7 +2396,7 @@ def main() -> None:
                     "merge_method": merge_method_name,
                     "merge_params": merge_params,
                     "n_tasks": len(original_deltas),
-                    "calibration_task": str(first_item["task"]),
+                    "calibration": calibration_metadata,
                 },
             )
             rebased_deltas = [transported_merged_delta] * len(tasks)
@@ -2078,7 +2489,7 @@ def main() -> None:
                 out[idx] = _eval_task(per_task[idx], split)
             return out
 
-        hierarchical = bool(merge_mode == "rebase_then_merge" and alpha_selection == "per_task")
+        hierarchical = bool(merge_mode in _TRANSPORT_THEN_MERGE_MODES and alpha_selection == "per_task")
         single_tv_diagnostic_enabled = single_tv_deltas_for_diagnostic is not None
         single_tv_val_best_acc: list[float] | None = (
             [float("-inf")] * len(per_task) if single_tv_diagnostic_enabled else None
@@ -2099,7 +2510,7 @@ def main() -> None:
                 hierarchical_premerge_alpha_curve = []
                 tracker = PerTaskAlphaTracker(
                     task_names=[str(item["task"]) for item in per_task],
-                    initial_alpha=float(positive_alphas[0] if positive_alphas else alphas[0]),
+                    initial_alpha=float(alphas[0]),
                     patience=alpha_patience,
                 )
                 # Merge-mode baselines are the alpha-independent target zero-shot:
@@ -2165,17 +2576,15 @@ def main() -> None:
                         context=hierarchical_premerge_alpha_curve[-1],
                     )
 
-                    stopped_primary: list[int] = []
-                    if float(alpha) > 0.0:
-                        stopped_primary, _ = tracker.update(
-                            alpha=float(alpha),
-                            indices=eval_indices,
-                            primary_accs=rebase_accs,
-                            secondary_accs=baseline_accs,
-                        )
-                        if stopped_primary:
-                            stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
-                            print(f"  Early-stopping per-task alphas at alpha={alpha:.3f}: {stopped_names}")
+                    stopped_primary, _ = tracker.update(
+                        alpha=float(alpha),
+                        indices=eval_indices,
+                        primary_accs=rebase_accs,
+                        secondary_accs=baseline_accs,
+                    )
+                    if stopped_primary:
+                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
+                        print(f"  Early-stopping per-task alphas at alpha={alpha:.3f}: {stopped_names}")
 
                 per_task_premerge_alphas = [float(tracker.best_primary_alpha[idx]) for idx in range(len(per_task))]
                 single_tv_val_best_acc = [float(tracker.best_primary_acc[idx]) for idx in range(len(per_task))]
@@ -2234,7 +2643,7 @@ def main() -> None:
 
             best_rebase_avg = float("-inf")
             best_baseline_avg = float("-inf")
-            best_alpha = float(sweep_positive_alphas[0] if sweep_positive_alphas else sweep_alphas[0])
+            best_alpha = float(sweep_alphas[0])
             # When every task's baseline is target_zeroshot (untransported infeasible),
             # the baseline is alpha-independent — keep best_baseline_alpha at 0.0 so
             # the summary does not report a spurious non-zero value.
@@ -2308,34 +2717,33 @@ def main() -> None:
                     },
                 )
 
-                if float(alpha) > 0.0:
-                    eps = 1e-12
-                    # Track baseline best alpha independently of rebased best alpha,
-                    # but only when there is at least one untransported baseline task
-                    # (otherwise the baseline is target_zeroshot and alpha-independent).
-                    if has_untransported:
-                        if avg_baseline != avg_baseline:  # NaN guard
-                            avg_baseline_for_track = float("-inf")
-                        else:
-                            avg_baseline_for_track = float(avg_baseline)
-                        if avg_baseline_for_track > best_baseline_avg + eps:
-                            best_baseline_avg = avg_baseline_for_track
-                            best_baseline_alpha = float(alpha)
+                eps = 1e-12
+                # Track baseline best alpha independently of rebased best alpha,
+                # but only when there is at least one untransported baseline task
+                # (otherwise the baseline is target_zeroshot and alpha-independent).
+                if has_untransported:
+                    if avg_baseline != avg_baseline:  # NaN guard
+                        avg_baseline_for_track = float("-inf")
+                    else:
+                        avg_baseline_for_track = float(avg_baseline)
+                    if avg_baseline_for_track > best_baseline_avg + eps:
+                        best_baseline_avg = avg_baseline_for_track
+                        best_baseline_alpha = float(alpha)
 
-                    if avg_rebase > best_rebase_avg + eps:
-                        best_rebase_avg = avg_rebase
-                        best_alpha = float(alpha)
-                        shared_bad_steps = 0
-                    elif avg_rebase + eps >= best_rebase_avg:
-                        shared_bad_steps = 0
-                    elif len(sweep_positive_alphas) > 1:
-                        shared_bad_steps += 1
-                        print(
-                            f"  (alpha={alpha:.3f} fell below best shared avg {best_rebase_avg:.6f}; "
-                            f"bad_steps={shared_bad_steps}/{alpha_patience + 1})"
-                        )
-                        if shared_bad_steps > alpha_patience:
-                            break
+                if avg_rebase > best_rebase_avg + eps:
+                    best_rebase_avg = avg_rebase
+                    best_alpha = float(alpha)
+                    shared_bad_steps = 0
+                elif avg_rebase + eps >= best_rebase_avg:
+                    shared_bad_steps = 0
+                elif len(sweep_alphas) > 1:
+                    shared_bad_steps += 1
+                    print(
+                        f"  (alpha={alpha:.3f} fell below best shared avg {best_rebase_avg:.6f}; "
+                        f"bad_steps={shared_bad_steps}/{alpha_patience + 1})"
+                    )
+                    if shared_bad_steps > alpha_patience:
+                        break
 
             print("\n=== Alpha search summary (shared) ===")
             for r in sweep_results:
@@ -2376,7 +2784,7 @@ def main() -> None:
         else:
             tracker = PerTaskAlphaTracker(
                 task_names=[str(item["task"]) for item in per_task],
-                initial_alpha=float(positive_alphas[0] if positive_alphas else alphas[0]),
+                initial_alpha=float(alphas[0]),
                 patience=alpha_patience,
             )
             # For tasks where the untransported baseline is infeasible (different
@@ -2471,19 +2879,18 @@ def main() -> None:
 
                 stopped_primary: list[int] = []
                 stopped_secondary: list[int] = []
-                if float(alpha) > 0.0:
-                    stopped_primary, stopped_secondary = tracker.update(
-                        alpha=float(alpha),
-                        indices=eval_indices,
-                        primary_accs=rebase_accs,
-                        secondary_accs=baseline_accs,
-                    )
-                    if stopped_primary:
-                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
-                        print(f"  Early-stopping REBASED tasks at alpha={alpha:.3f}: {stopped_names}")
-                    if stopped_secondary:
-                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_secondary)
-                        print(f"  Early-stopping BASELINE tasks at alpha={alpha:.3f}: {stopped_names}")
+                stopped_primary, stopped_secondary = tracker.update(
+                    alpha=float(alpha),
+                    indices=eval_indices,
+                    primary_accs=rebase_accs,
+                    secondary_accs=baseline_accs,
+                )
+                if stopped_primary:
+                    stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
+                    print(f"  Early-stopping REBASED tasks at alpha={alpha:.3f}: {stopped_names}")
+                if stopped_secondary:
+                    stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_secondary)
+                    print(f"  Early-stopping BASELINE tasks at alpha={alpha:.3f}: {stopped_names}")
 
                 run_logger.log_event(
                     "alpha_eval_end",
@@ -2626,6 +3033,13 @@ def main() -> None:
                 saved_merged_path = out_path
                 print(f"Saved merged model (alpha={best_alpha:.3f}) -> {out_path}")
 
+        target_hash_after = _state_dict_sha256(target_base_sd)
+        if target_hash_after != target_hash_before:
+            raise RuntimeError(
+                "Native target base was mutated during merge/transport preparation: "
+                f"before={target_hash_before}, after={target_hash_after}."
+            )
+
         final_summary = {
             "suite": suite_name,
             "tasks": tasks,
@@ -2634,6 +3048,11 @@ def main() -> None:
             "merge_mode": merge_mode,
             "merge_method": merge_method_name if merge_mode != "none" else None,
             "merge_params": merge_params if merge_mode != "none" else None,
+            "target_hash_before": target_hash_before,
+            "target_hash_after": target_hash_after,
+            "strict_diagnostics": {"missing": 0, "failures": 0, "wrong_shape": 0},
+            "single_transport_calibration": single_transport_calibration_metadata,
+            "brace_calibration": brace_calibration_metadata,
             "base_construction": base_construction,
             "independent_endpoint_baseline": (
                 {

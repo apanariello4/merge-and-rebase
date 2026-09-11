@@ -12,6 +12,8 @@ from merge_and_rebase.eval.vision_rebase import (
     _relative_visual_state_distance,
     _resolve_merge_mode_config,
     _scale_deltas_by,
+    _select_dedicated_brace_loader,
+    _state_dict_sha256,
 )
 
 
@@ -234,6 +236,54 @@ def test_resolve_merge_mode_config_allows_hierarchical_per_task() -> None:
     mode, _, _, global_search = _resolve_merge_mode_config({"merge_mode": "rebase_then_merge"}, "per_task")
     assert mode == "rebase_then_merge"
     assert global_search is True
+
+
+def test_explicit_transport_then_merge_alias_allows_hierarchical_alpha() -> None:
+    mode, _, _, _ = _resolve_merge_mode_config(
+        {"merge_mode": "brace_transport_then_merge"}, "per_task"
+    )
+    assert mode == "brace_transport_then_merge"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["brace_merge_then_transport", "merge_then_brace_then_transport"],
+)
+def test_single_transport_campaign_modes_require_shared_alpha(mode: str) -> None:
+    with pytest.raises(ValueError, match="requires alpha_selection='shared'"):
+        _resolve_merge_mode_config({"merge_mode": mode}, "per_task")
+
+
+def test_brace_and_transport_calibration_loaders_are_distinct() -> None:
+    brace_loader = object()
+    transport_loader = object()
+    assert (
+        _select_dedicated_brace_loader(
+            brace_loader=brace_loader,
+            transport_loader=transport_loader,
+            correction_enabled=True,
+        )
+        is brace_loader
+    )
+
+
+def test_shared_brace_transport_calibration_loader_is_rejected() -> None:
+    shared_loader = object()
+    with pytest.raises(RuntimeError, match="separate loader instances"):
+        _select_dedicated_brace_loader(
+            brace_loader=shared_loader,
+            transport_loader=shared_loader,
+            correction_enabled=True,
+        )
+
+
+def test_state_dict_hash_detects_mutation_and_ignores_mapping_order() -> None:
+    left = {"visual.b": torch.tensor([2.0]), "visual.a": torch.tensor([1.0])}
+    right = {"visual.a": left["visual.a"].clone(), "visual.b": left["visual.b"].clone()}
+    before = _state_dict_sha256(left)
+    assert before == _state_dict_sha256(right)
+    right["visual.a"].add_(1.0)
+    assert before != _state_dict_sha256(right)
 
 
 @pytest.mark.parametrize("bad_mode", ["merge", "rebase_then", "", "bogus"])

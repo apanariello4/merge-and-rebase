@@ -11,8 +11,18 @@ from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.eval.vision_rebase import _build_rebase_prepared
 
 
+class _DeviceTrackingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_to_device = None
+
+    def to(self, device):
+        self.last_to_device = str(device)
+        return super().to(device)
+
+
 def _model(depth: int) -> nn.Module:
-    model = nn.Module()
+    model = _DeviceTrackingModel()
     model.visual = SimpleNamespace(transformer=SimpleNamespace(resblocks=nn.ModuleList()))
     model.visual.transformer.resblocks.extend(nn.Linear(1, 1) for _ in range(depth))
     return model
@@ -45,7 +55,7 @@ def test_theseus_uses_depth_matched_source_after_block_extension(source_depth: i
         method_name="theseus",
         method=method,
         method_params={},
-        cfg={},
+        cfg={"seed": 33},
         device="cpu",
         grad_batch_size=None,
         grad_imgs_per_class=None,
@@ -72,6 +82,7 @@ def test_theseus_uses_depth_matched_source_after_block_extension(source_depth: i
     assert len(method.target_model.visual.transformer.resblocks) == target_depth
     assert len(method.source_model.visual.transformer.resblocks) != source_depth
     assert method.source_model is not source_base_model_task
+    assert prepared["seed"] == 33
 
 
 def test_theseus_keeps_raw_source_fallback_without_block_extension() -> None:
@@ -79,11 +90,11 @@ def test_theseus_keeps_raw_source_fallback_without_block_extension() -> None:
     target_model = _model(12)
     method = _PreparedTheseusStub()
 
-    _build_rebase_prepared(
+    prepared = _build_rebase_prepared(
         method_name="theseus",
         method=method,
-        method_params={},
-        cfg={},
+        method_params={"seed": 17},
+        cfg={"seed": 33},
         device="cpu",
         grad_batch_size=None,
         grad_imgs_per_class=None,
@@ -107,6 +118,40 @@ def test_theseus_keeps_raw_source_fallback_without_block_extension() -> None:
 
     assert len(method.source_model.visual.transformer.resblocks) == 12
     assert len(method.target_model.visual.transformer.resblocks) == 12
+    assert prepared["seed"] == 17
+
+
+def test_theseus_places_isolated_calibration_models_on_requested_device() -> None:
+    method = _PreparedTheseusStub()
+
+    _build_rebase_prepared(
+        method_name="theseus",
+        method=method,
+        method_params={},
+        cfg={"seed": 33},
+        device="meta",
+        grad_batch_size=None,
+        grad_imgs_per_class=None,
+        grad_num_batches=None,
+        theseus_like_method=True,
+        bico_mode=False,
+        run_block_extension_prestep=True,
+        clf_source=SimpleNamespace(model=_model(1)),
+        clf_target=SimpleNamespace(model=_model(1)),
+        classnames=[],
+        loaders=SimpleNamespace(train=None),
+        source_loaders=SimpleNamespace(train=None),
+        build_cfg_task=None,
+        source_build_cfg_task=None,
+        task_source_base_sd={},
+        target_base_sd={},
+        task_delta={},
+        source_base_model_task=_model(1),
+        transfusion_prepared=None,
+    )
+
+    assert method.source_model.last_to_device == "meta"
+    assert method.target_model.last_to_device == "meta"
 
 
 @pytest.mark.parametrize("source_depth", [12, 24])
@@ -119,7 +164,7 @@ def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source
         method_name="bico",
         method=method,
         method_params={},
-        cfg={},
+        cfg={"seed": 33},
         device="cpu",
         grad_batch_size=None,
         grad_imgs_per_class=None,
@@ -145,6 +190,7 @@ def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source
     assert len(method.source_model.visual.transformer.resblocks) == target_depth
     assert len(method.target_model.visual.transformer.resblocks) == target_depth
     assert method.source_model is not corrected_source
+    assert prepared["seed"] == 33
 
 
 def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> None:
