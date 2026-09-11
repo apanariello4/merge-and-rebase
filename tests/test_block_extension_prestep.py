@@ -304,6 +304,65 @@ def test_lazy_reference_capture_matches_eager_capture_extend(lmc_mode, monkeypat
     _assert_state_dicts_match(lazy_ft, eager_ft)
 
 
+def test_skip_correction_interpolate_matches_interpolate_per_weight() -> None:
+    """With skip_correction=True, ``interpolate`` and ``interpolate_per_weight``
+    should compute the same model.
+
+    ``interpolate`` wraps every block (and the final LN) in an
+    identity-initialized `InputAlignedBlock`/`InputAlignedFinalLayer`, then
+    only fits those aligners when correction is active
+    (`extend_and_calibrate`'s per-step ``if skip_correction: continue``).
+    ``interpolate_per_weight`` never wraps blocks at all. When correction is
+    skipped in both, the aligners in the former are permanent identity
+    passthroughs, so the two strategies should be functionally identical --
+    verified here by comparing forward outputs rather than state_dicts, since
+    the wrapped and unwrapped models have different module structures.
+    """
+    torch.manual_seed(0)
+    base0 = _TinyModel(depth=3)
+    ft0 = _TinyModel(depth=3)
+    with torch.no_grad():
+        for p in ft0.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    loader = _make_loader(n_samples=16, batch_size=4)
+
+    def _run(strategy: str):
+        import copy
+
+        base = copy.deepcopy(base0)
+        ft = copy.deepcopy(ft0)
+        cfg = BlockExtensionConfig(
+            blocks_to_add=2,
+            insertion_order="bottom-top",
+            extension_density="spread",
+            extension_strategy=strategy,
+            dampening_factor=1.0,
+            n_batches_act=2,
+            skip_correction=True,
+            skip_final_ln=False,
+            verbose=False,
+            show_progress=False,
+        )
+        run_block_extension(
+            source_base_model=base,
+            source_ft_model=ft,
+            calibration_loader=loader,
+            target_layers_total=None,
+            config=cfg,
+            device="cpu",
+        )
+        return base, ft
+
+    base_a, ft_a = _run("interpolate")
+    base_b, ft_b = _run("interpolate_per_weight")
+
+    torch.manual_seed(123)
+    x = torch.randn(5, 6)
+    with torch.no_grad():
+        assert torch.allclose(base_a.encode_image(x), base_b.encode_image(x), atol=1e-6, rtol=1e-6)
+        assert torch.allclose(ft_a.encode_image(x), ft_b.encode_image(x), atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize("lmc_mode", ["independent", "shared"])
 def test_lazy_reference_capture_matches_eager_capture_shrink(lmc_mode, monkeypatch) -> None:
     """Regression test for the lazy per-step reference-capture rewrite (shrink).
