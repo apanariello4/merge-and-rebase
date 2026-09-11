@@ -44,7 +44,7 @@ def test_theseus_registered() -> None:
 
 
 def test_theseus_strict_apply_rejects_missing_transform() -> None:
-    with pytest.raises(RuntimeError, match="missing_transform=1"):
+    with pytest.raises(RuntimeError, match="missing_transform_zero=1"):
         theseus_mod._apply_transforms_to_visual_delta(
             target_visual_base={"weight": torch.zeros(2, 2)},
             visual_delta={"weight": torch.ones(2, 2)},
@@ -54,6 +54,92 @@ def test_theseus_strict_apply_rejects_missing_transform() -> None:
             device="cpu",
             strict=True,
         )
+
+
+def test_transport_diagnostics_partition_zero_and_active_paths(caplog, capsys) -> None:
+    identity = torch.eye(2)
+    target = {
+        "active": torch.zeros(2, 2),
+        "class_embedding": torch.zeros(2),
+        "missing": torch.zeros(2, 2),
+        "unsupported": torch.zeros(1, 1, 1),
+        "failure": torch.zeros(2, 2),
+        "wrong_shape": torch.zeros(3, 3),
+    }
+    delta = {key: torch.ones_like(value) for key, value in target.items()}
+    delta["wrong_shape"] = torch.ones(2, 2)
+    transforms = {
+        "active": theseus_mod._LayerTransform(kind="weight", t_in=identity, t_out=identity),
+        "class_embedding": theseus_mod._LayerTransform(kind="zero"),
+        "unsupported": theseus_mod._LayerTransform(kind="unsupported"),
+        "failure": theseus_mod._LayerTransform(kind="weight", t_in=torch.eye(3), t_out=identity),
+        "wrong_shape": theseus_mod._LayerTransform(kind="weight", t_in=identity, t_out=identity),
+    }
+
+    with caplog.at_level("WARNING"):
+        aligned, diagnostics = theseus_mod._apply_transforms_to_visual_delta(
+            target_visual_base=target,
+            visual_delta=delta,
+            transforms_by_key=transforms,
+            show_progress=False,
+            method_name="theseus",
+            device="cpu",
+            out_of_scope_keys=("out_scope",),
+            skipped_not_in_target_keys=("not_in_target",),
+        )
+
+    assert diagnostics.actively_transported == 1
+    assert diagnostics.intentional_zero == 1
+    assert diagnostics.missing_transform_zero == 1
+    assert diagnostics.unsupported_zero == 1
+    assert diagnostics.transport_failure_zero == 1
+    assert diagnostics.wrong_shape_zero == 1
+    assert diagnostics.out_of_scope_zero == 1
+    assert diagnostics.skipped_not_in_target == 1
+    assert set(aligned) == set(target)
+    assert any("theseus transport diagnostics" in record.message for record in caplog.records)
+
+    theseus_mod._report_apply_diagnostics(
+        method_name="theseus", diagnostics=diagnostics, verbose=True
+    )
+    report = capsys.readouterr().out
+    assert "active=1 matrices=1 vectors=0" in report
+    assert "missing_transform_zero=1" in report
+    assert "intentional_zero=1" in report
+
+
+def test_strict_allows_intentional_and_out_of_scope_zero() -> None:
+    _, diagnostics = theseus_mod._apply_transforms_to_visual_delta(
+        target_visual_base={"class_embedding": torch.zeros(2)},
+        visual_delta={"class_embedding": torch.ones(2)},
+        transforms_by_key={"class_embedding": theseus_mod._LayerTransform(kind="zero")},
+        show_progress=False,
+        method_name="theseus",
+        device="cpu",
+        strict=True,
+        out_of_scope_keys=("text_projection",),
+    )
+    assert diagnostics.intentional_zero == 1
+    assert diagnostics.out_of_scope_zero == 1
+
+
+def test_data_free_precompute_marks_every_structural_exclusion_as_intentional_zero() -> None:
+    tensors = {
+        "class_embedding": torch.ones(2),
+        "positional_embedding": torch.ones(3, 2),
+        "conv1.weight": torch.ones(2, 2, 1, 1),
+    }
+    transforms = theseus_mod._precompute_transforms_data_free(
+        source_visual_base=tensors,
+        target_visual_base=tensors,
+        visual_delta=tensors,
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+        show_progress=False,
+        method_name="theseus",
+    )
+    assert set(transforms) == set(tensors)
+    assert all(transform.kind == "zero" for transform in transforms.values())
 
 
 def test_theseus_rejects_misaligned_calibration_labels() -> None:

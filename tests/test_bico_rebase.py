@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from merge_and_rebase.eval.block_extension import BlockExtensionConfig, run_block_extension
 from merge_and_rebase.rebase.methods import bico as bico_method
 from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
 from merge_and_rebase.rebase.registry import get_method, list_methods
@@ -28,6 +29,45 @@ class _TinyModel(nn.Module):
         super().__init__()
         self.visual = _TinyVisual(in_dim=in_dim, hid_dim=hid_dim, out_dim=out_dim)
         self.logit_scale = nn.Parameter(torch.ones(1))
+
+    def encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        return self.visual(x)
+
+
+class _TinyAttentionBlock(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(width)
+        self.attn = nn.MultiheadAttention(width, num_heads=2, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = self.ln_1(x)
+        attended, _ = self.attn(normalized, normalized, normalized, need_weights=False)
+        return x + attended
+
+
+class _TinyAttentionVisual(nn.Module):
+    def __init__(self, depth: int, in_dim: int = 6, width: int = 4, out_dim: int = 5) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(in_dim, width)
+        self.transformer = nn.Module()
+        self.transformer.resblocks = nn.ModuleList(
+            [_TinyAttentionBlock(width) for _ in range(depth)]
+        )
+        self.ln_post = nn.LayerNorm(width)
+        self.proj = nn.Linear(width, out_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x).unsqueeze(1).repeat(1, 3, 1)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return self.proj(self.ln_post(x).mean(dim=1))
+
+
+class _TinyAttentionModel(nn.Module):
+    def __init__(self, depth: int) -> None:
+        super().__init__()
+        self.visual = _TinyAttentionVisual(depth)
 
     def encode_image(self, x: torch.Tensor) -> torch.Tensor:
         return self.visual(x)
@@ -156,6 +196,74 @@ def test_bico_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+
+
+def test_bico_split_qkv_after_per_weight_extension_has_full_transport_coverage() -> None:
+    torch.manual_seed(7)
+    source_base_model = _TinyAttentionModel(depth=1)
+    source_ft_model = _TinyAttentionModel(depth=1)
+    target_model = _TinyAttentionModel(depth=2)
+    loader = _make_loader(n_samples=8, batch_size=4)
+
+    run_block_extension(
+        source_base_model=source_base_model,
+        source_ft_model=source_ft_model,
+        calibration_loader=loader,
+        target_layers_total=2,
+        config=BlockExtensionConfig(
+            extension_strategy="interpolate_per_weight",
+            skip_correction=True,
+            n_batches_act=1,
+            verbose=False,
+            show_progress=False,
+        ),
+        device="cpu",
+    )
+
+    source_base = {
+        key: value.detach().clone() for key, value in source_base_model.state_dict().items()
+    }
+    source_ft = source_ft_model.state_dict()
+    target_base = {
+        key: value.detach().clone() for key, value in target_model.state_dict().items()
+    }
+    delta = {
+        key: source_ft[key].detach().clone() - value
+        for key, value in source_base.items()
+        if key.startswith("visual.") and value.is_floating_point()
+    }
+
+    method = bico_method.BiCoRebase()
+    prepared = method.prepare(
+        source_model=source_ft_model,
+        target_model=target_model,
+        source_dataloader=loader,
+        target_dataloader=loader,
+        source_recipe=_simple_recipe,
+        target_recipe=_simple_recipe,
+        target_base=target_base,
+        delta=delta,
+        device="cpu",
+        seq_align="mean",
+        num_batches=1,
+        verbose=False,
+        show_progress=False,
+    )
+
+    diagnostics = prepared["precompute_diagnostics"]
+    assert diagnostics["incomplete"] == 0
+    assert diagnostics["unsupported"] == 0
+    assert diagnostics["usable"] == diagnostics["slots"]
+
+    transported = method.apply(
+        prepared,
+        target_base=target_base,
+        delta=delta,
+        strict=True,
+        verbose=False,
+        show_progress=False,
+    )
+    assert set(transported) == set(delta)
 
 
 def test_bico_split_qkv_apply_unpacks_transform_diagnostics(monkeypatch) -> None:

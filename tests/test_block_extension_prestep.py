@@ -9,8 +9,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.eval.block_extension import (
     BlockExtender,
     BlockExtensionConfig,
-    InputAlignedBlock,
-    InputAlignedFinalLayer,
     resolve_block_extension_config,
     run_block_extension,
     select_loader,
@@ -102,7 +100,7 @@ def test_resolve_block_extension_config_defaults() -> None:
     enabled, cfg = resolve_block_extension_config({})
     assert not enabled
     assert isinstance(cfg, BlockExtensionConfig)
-    assert cfg.extension_strategy == "interpolate"
+    assert cfg.extension_strategy == "interpolate_per_weight"
     assert cfg.insertion_order == "bottom-top"
     assert cfg.ridge_weight == 1e-6
 
@@ -134,12 +132,6 @@ def test_resolve_block_extension_config_rejects_invalid_calibration(params) -> N
         )
 
 
-def test_reference_capture_requires_requested_batch_count() -> None:
-    extender = BlockExtender(_TinyModel(), _TinyModel(), "cpu", verbose=False, show_progress=False)
-    with pytest.raises(ValueError, match="exhausted after 1 batches; requested 2"):
-        extender.capture_reference_inputs(_make_loader(n_samples=4), n_batches=2)
-
-
 def test_select_loader_split_precedence() -> None:
     train = object()
     test = object()
@@ -151,7 +143,7 @@ def test_select_loader_split_precedence() -> None:
     assert select_loader("test", train, test, val) is test
 
 
-def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
+def test_run_block_extension_increases_depth_without_wrappers() -> None:
     source_base = _TinyModel(depth=3)
     source_ft = _TinyModel(depth=3)
     loader = _make_loader()
@@ -160,7 +152,7 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
         blocks_to_add=2,
         insertion_order="bottom-top",
         extension_density="spread",
-        extension_strategy="duplicate",
+        extension_strategy="duplicate_per_weight",
         dampening_factor=1.0,
         n_batches_act=1,
         skip_correction=True,
@@ -179,8 +171,8 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
     assert final_depth == 5
     assert len(source_base.visual.transformer.resblocks) == 5
     assert len(source_ft.visual.transformer.resblocks) == 5
-    assert isinstance(source_base.visual.transformer.resblocks[0], InputAlignedBlock)
-    assert isinstance(source_base.visual.ln_post, InputAlignedFinalLayer)
+    assert all(not hasattr(block, "aligner") for block in source_base.visual.transformer.resblocks)
+    assert not hasattr(source_base.visual.ln_post, "aligner")
 
 
 def test_resolve_block_extension_config_accepts_shared_ft_mode() -> None:
@@ -304,63 +296,27 @@ def test_lazy_reference_capture_matches_eager_capture_extend(lmc_mode, monkeypat
     _assert_state_dicts_match(lazy_ft, eager_ft)
 
 
-def test_skip_correction_interpolate_matches_interpolate_per_weight() -> None:
-    """With skip_correction=True, ``interpolate`` and ``interpolate_per_weight``
-    should compute the same model.
-
-    ``interpolate`` wraps every block (and the final LN) in an
-    identity-initialized `InputAlignedBlock`/`InputAlignedFinalLayer`, then
-    only fits those aligners when correction is active
-    (`extend_and_calibrate`'s per-step ``if skip_correction: continue``).
-    ``interpolate_per_weight`` never wraps blocks at all. When correction is
-    skipped in both, the aligners in the former are permanent identity
-    passthroughs, so the two strategies should be functionally identical --
-    verified here by comparing forward outputs rather than state_dicts, since
-    the wrapped and unwrapped models have different module structures.
-    """
-    torch.manual_seed(0)
-    base0 = _TinyModel(depth=3)
-    ft0 = _TinyModel(depth=3)
-    with torch.no_grad():
-        for p in ft0.parameters():
-            p.add_(0.05 * torch.randn_like(p))
-    loader = _make_loader(n_samples=16, batch_size=4)
-
-    def _run(strategy: str):
-        import copy
-
-        base = copy.deepcopy(base0)
-        ft = copy.deepcopy(ft0)
-        cfg = BlockExtensionConfig(
-            blocks_to_add=2,
-            insertion_order="bottom-top",
-            extension_density="spread",
-            extension_strategy=strategy,
-            dampening_factor=1.0,
-            n_batches_act=2,
-            skip_correction=True,
-            skip_final_ln=False,
-            verbose=False,
-            show_progress=False,
-        )
+@pytest.mark.parametrize(
+    ("strategy", "replacement"),
+    [("interpolate", "interpolate_per_weight"), ("duplicate", "duplicate_per_weight")],
+)
+def test_legacy_vision_strategies_raise_migration_error(strategy: str, replacement: str) -> None:
+    cfg = BlockExtensionConfig(
+        blocks_to_add=1,
+        extension_strategy=strategy,
+        skip_correction=True,
+        verbose=False,
+        show_progress=False,
+    )
+    with pytest.raises(ValueError, match=replacement):
         run_block_extension(
-            source_base_model=base,
-            source_ft_model=ft,
-            calibration_loader=loader,
+            source_base_model=_TinyModel(),
+            source_ft_model=_TinyModel(),
+            calibration_loader=_make_loader(),
             target_layers_total=None,
             config=cfg,
             device="cpu",
         )
-        return base, ft
-
-    base_a, ft_a = _run("interpolate")
-    base_b, ft_b = _run("interpolate_per_weight")
-
-    torch.manual_seed(123)
-    x = torch.randn(5, 6)
-    with torch.no_grad():
-        assert torch.allclose(base_a.encode_image(x), base_b.encode_image(x), atol=1e-6, rtol=1e-6)
-        assert torch.allclose(ft_a.encode_image(x), ft_b.encode_image(x), atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize("lmc_mode", ["independent", "shared"])

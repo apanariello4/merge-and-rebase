@@ -61,7 +61,7 @@ class BlockExtensionConfig:
     target_layers_total: int | None = None
     insertion_order: str = "bottom-top"
     extension_density: str = "spread"
-    extension_strategy: str = "interpolate"
+    extension_strategy: str = "interpolate_per_weight"
     dampening_factor: float = 1.0
     n_batches_act: int = 2
     calibration_split: str = "test"
@@ -111,7 +111,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
         insertion_order=str(params.get("insertion_order", "bottom-top")),
         extension_density=str(params.get("extension_density", "spread")),
-        extension_strategy=str(params.get("extension_strategy", "interpolate")),
+        extension_strategy=str(params.get("extension_strategy", "interpolate_per_weight")),
         dampening_factor=float(params.get("dampening_factor", 1.0)),
         n_batches_act=n_batches_act,
         calibration_split=str(params.get("calibration_split", "test")),
@@ -154,61 +154,6 @@ def select_loader(split: str, train_loader: Iterable[Any], test_loader: Iterable
     if split == "val" and val_loader is not None:
         return val_loader
     return test_loader
-
-
-class InputAlignedBlock(nn.Module):
-    def __init__(self, original_block: nn.Module, dim: int):
-        super().__init__()
-        ref_weight = _extract_ln_weight(original_block)
-        self.aligner = nn.Linear(dim, dim, bias=True).to(ref_weight.device)
-        self.reset_aligner()
-
-        object.__setattr__(self, "_orig_block", original_block)
-
-        for name, module in original_block.named_children():
-            setattr(self, name, module)
-
-        for name, param in original_block.named_parameters(recurse=False):
-            self.register_parameter(name, param)
-        for name, buf in original_block.named_buffers(recurse=False):
-            self.register_buffer(name, buf)
-
-    @torch.no_grad()
-    def reset_aligner(self):
-        eye = torch.eye(self.aligner.weight.shape[0], device=self.aligner.weight.device, dtype=self.aligner.weight.dtype)
-        self.aligner.weight.copy_(eye)
-        self.aligner.bias.zero_()
-
-    def forward(self, x, attn_mask=None, **kwargs):
-        x = self.aligner(x)
-        self._orig_block.train(self.training)
-        return self._orig_block(x, attn_mask=attn_mask, **kwargs)
-
-
-class InputAlignedFinalLayer(nn.Module):
-    def __init__(self, original_ln: nn.Module, dim: int):
-        super().__init__()
-        self.aligner = nn.Linear(dim, dim, bias=True).to(original_ln.weight.device)
-        self.reset_aligner()
-
-        self.normalized_shape = original_ln.normalized_shape
-        self.eps = original_ln.eps
-        self.elementwise_affine = original_ln.elementwise_affine
-        if self.elementwise_affine:
-            self.weight = original_ln.weight
-            self.bias = original_ln.bias
-
-    @torch.no_grad()
-    def reset_aligner(self):
-        eye = torch.eye(self.aligner.weight.shape[0], device=self.aligner.weight.device, dtype=self.aligner.weight.dtype)
-        self.aligner.weight.copy_(eye)
-        self.aligner.bias.zero_()
-
-    def forward(self, x):
-        x = self.aligner(x)
-        if self.elementwise_affine:
-            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        return F.layer_norm(x, self.normalized_shape, None, None, self.eps)
 
 
 class _InProjCapture:
@@ -357,63 +302,6 @@ class BlockExtender:
         if final_depth < 1:
             raise ValueError(f"Requested final depth must be >= 1. Got: {final_depth}")
         return n_needed
-
-    @torch.no_grad()
-    def wrap_with_aligners(self):
-        for model in [self.model_base, self.model_ft]:
-            wrapped_blocks: list[nn.Module] = []
-            for block in model.visual.transformer.resblocks:
-                if isinstance(block, InputAlignedBlock):
-                    wrapped_blocks.append(block)
-                    continue
-                inner = self._inner_block(block)
-                dim = _extract_ln_weight(inner).shape[0]
-                wrapped_blocks.append(InputAlignedBlock(block, dim))
-            model.visual.transformer.resblocks = nn.ModuleList(wrapped_blocks)
-
-            if not isinstance(model.visual.ln_post, InputAlignedFinalLayer):
-                ln = model.visual.ln_post
-                dim = ln.weight.shape[0]
-                model.visual.ln_post = InputAlignedFinalLayer(ln, dim)
-
-    @torch.no_grad()
-    def capture_reference_inputs(self, loader: Iterable[Any], n_batches: int):
-        for name, model in [("base", self.model_base), ("ft", self.model_ft)]:
-            self._vprint(f"capture reference inputs ({name}) with n_batches={n_batches}")
-            model.eval()
-            store: dict[str, list[torch.Tensor]] = defaultdict(list)
-            hooks = []
-
-            for i, block in enumerate(model.visual.transformer.resblocks):
-                hooks.append(block.register_forward_hook(self._store_input_hook(store, f"{i}.input")))
-            hooks.append(model.visual.ln_post.register_forward_hook(self._store_input_hook(store, "final.input")))
-
-            it = iter(loader)
-            consumed = 0
-            for _ in _iter_with_progress(
-                range(n_batches),
-                total=n_batches,
-                desc=f"block_extension.capture.{name}",
-                enabled=self.show_progress,
-            ):
-                try:
-                    images, _ = next(it)
-                except StopIteration:
-                    for hook in hooks:
-                        hook.remove()
-                    raise ValueError(
-                        f"BRACE calibration loader exhausted after {consumed} batches; requested {n_batches}."
-                    ) from None
-                _encode_image(model, images.to(self.device))
-                consumed += 1
-
-            for h in hooks:
-                h.remove()
-
-            refs: dict[str, torch.Tensor] = {}
-            for key, tensors in store.items():
-                refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
-            self.reference_inputs[name] = refs
 
     @torch.no_grad()
     def _capture_per_weight_reference_subset(
@@ -1149,73 +1037,6 @@ class BlockExtender:
         raise ValueError(f"Could not locate collapse anchor {anchor_orig_idx} in the current block chain.")
 
     @torch.no_grad()
-    def _collect_inner_means(
-        self,
-        model: nn.Module,
-        targets: list[tuple[int | str, int | str]],
-        loader: Iterable[Any],
-        n_batches: int,
-    ):
-        model.eval()
-        store: dict[str, list[torch.Tensor]] = defaultdict(list)
-        hooks = []
-
-        for tgt, _ in targets:
-            if tgt == "final":
-                hooks.append(model.visual.ln_post.register_forward_hook(self._store_input_hook(store, "final_inner")))
-            else:
-                block = model.visual.transformer.resblocks[tgt]
-                hooks.append(self._inner_block(block).register_forward_hook(self._store_input_hook(store, f"{tgt}_inner")))
-
-        it = iter(loader)
-        for _ in range(n_batches):
-            try:
-                images, _ = next(it)
-            except StopIteration:
-                break
-            _encode_image(model, images.to(self.device))
-
-        for h in hooks:
-            h.remove()
-
-        means = {}
-        for key, tensors in store.items():
-            if tensors:
-                means[key] = torch.cat(tensors, dim=0).mean().item()
-        return means
-
-    def _debug_log_alignment_stats(
-        self,
-        model_name: str,
-        model: nn.Module,
-        targets: list[tuple[int | str, int | str]],
-        loader: Iterable[Any],
-        n_batches: int,
-    ):
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-
-        means = self._collect_inner_means(model, targets, loader, n_batches)
-        logger.debug("%s stats (act vs ref):", model_name)
-        logger.debug("%-10s | %-10s | %-12s | %-12s", "Target", "Ref", "Mean(Act)", "Mean(Ref)")
-
-        refs = self.reference_inputs[model_name]
-        for tgt, src_ref in targets:
-            act_key = "final_inner" if tgt == "final" else f"{tgt}_inner"
-            ref_key = "final.input" if src_ref == "final" else f"{src_ref}.input"
-
-            if act_key not in means or ref_key not in refs:
-                continue
-
-            logger.debug(
-                "%-10s | %-10s | %-12.6f | %-12.6f",
-                str(tgt),
-                str(src_ref),
-                means[act_key],
-                refs[ref_key].mean().item(),
-            )
-
-    @torch.no_grad()
     def extend_and_calibrate(
         self,
         *,
@@ -1268,125 +1089,25 @@ class BlockExtender:
                 return self._shrink_per_weight(per_weight_mode="duplicate", **common_kwargs)
             return self._extend_per_weight(per_weight_mode="duplicate", **common_kwargs)
 
+        if strategy == "interpolate":
+            raise ValueError(
+                "Vision extension_strategy='interpolate' is no longer supported; "
+                "use 'interpolate_per_weight'."
+            )
+        if strategy == "duplicate":
+            raise ValueError(
+                "Vision extension_strategy='duplicate' is no longer supported; "
+                "use 'duplicate_per_weight'."
+            )
         if n_needed < 0:
             raise ValueError(
                 "Block shrink is currently supported only for duplicate_per_weight and interpolate_per_weight strategies. "
                 f"Got: {strategy}"
             )
-
-        self._vprint("starting extension and calibration")
-        self.wrap_with_aligners()
-        self._vprint("wrapping with aligners completed")
-        if not skip_correction:
-            self.capture_reference_inputs(loader, n_batches)
-        self._vprint("reference activation capture completed")
-
-        if n_needed <= 0:
-            logger.info("Block extension: no extension needed.")
-            self._vprint("no extension needed")
-            return curr_layers
-
-        schedule = self._build_duplication_schedule(
-            curr_layers=curr_layers,
-            n_needed=n_needed,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
+        raise ValueError(
+            "Unsupported vision extension_strategy. Expected 'interpolate_per_weight' or "
+            f"'duplicate_per_weight'. Got: {strategy}"
         )
-
-        logger.info("Block extension planned duplications: %s", schedule)
-        self._vprint(f"planned duplications: {schedule}")
-
-        orig_base = list(self.model_base.visual.transformer.resblocks)
-        orig_ft = list(self.model_ft.visual.transformer.resblocks)
-
-        chain_base = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_base)]
-        chain_ft = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_ft)]
-
-        step_iter = _iter_with_progress(
-            enumerate(schedule, start=1),
-            total=len(schedule),
-            desc="block_extension.extend",
-            enabled=self.show_progress,
-        )
-        for step, src_idx in step_iter:
-            logger.info("Block extension step %d/%d. Source block: %d", step, len(schedule), src_idx)
-            self._vprint(f"step {step}/{len(schedule)} source_block={src_idx}")
-
-            dup_base = deepcopy(orig_base[src_idx])
-            dup_ft = deepcopy(orig_ft[src_idx])
-            dup_base.reset_aligner()
-            dup_ft.reset_aligner()
-
-            if strategy == "interpolate":
-                src_next = min(src_idx + 1, len(orig_base) - 1)
-                self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
-                self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
-            elif strategy != "duplicate":
-                raise ValueError(
-                    "Unsupported extension_strategy. Expected one of: duplicate, interpolate, interpolate_per_weight, duplicate_per_weight. "
-                    f"Got: {strategy}"
-                )
-
-            if dampening_factor < 1.0:
-                self._dampen_block_output(dup_base, dampening_factor)
-                self._dampen_block_output(dup_ft, dampening_factor)
-
-            insert_pos = -1
-            for i, item in enumerate(chain_base):
-                if item["orig_idx"] == src_idx:
-                    insert_pos = i
-            insert_pos += 1
-
-            chain_base.insert(insert_pos, {"mod": dup_base, "orig_idx": src_idx})
-            chain_ft.insert(insert_pos, {"mod": dup_ft, "orig_idx": src_idx})
-
-            self.model_base.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_base])
-            self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
-
-            self._diagnostic_context = {
-                "structural_step": step,
-                "final_block": insert_pos,
-                "source_block": src_idx,
-            }
-
-            if skip_correction:
-                self._vprint("skip_correction enabled, skipping aligner fit for this step")
-                continue
-
-            targets = [(i, chain_base[i]["orig_idx"]) for i in range(insert_pos + 1, len(chain_base))]
-            if not skip_final_ln:
-                targets.append(("final", "final"))
-            self._vprint(f"calibrating {len(targets)} targets")
-
-            for model_name, model in [("base", self.model_base), ("ft", self.model_ft)]:
-                self._debug_log_alignment_stats(model_name, model, targets, loader, n_batches)
-
-            for model_name, model in [("base", self.model_base), ("ft", self.model_ft)]:
-                for tgt, src_ref in targets:
-                    current = self._capture_single_input(model, tgt, loader, n_batches)
-                    if current.numel() == 0:
-                        continue
-
-                    ref_key = "final.input" if src_ref == "final" else f"{src_ref}.input"
-                    ref = self.reference_inputs[model_name].get(ref_key)
-                    if ref is None:
-                        continue
-
-                    A, T = self._match_rows(current, ref)
-                    if A.numel() == 0 or T.numel() == 0:
-                        continue
-
-                    W, b = self._fit_ridge(A, T)
-                    module = model.visual.ln_post if tgt == "final" else model.visual.transformer.resblocks[tgt]
-                    module.aligner.weight.copy_(W.to(module.aligner.weight.device, dtype=module.aligner.weight.dtype))
-                    module.aligner.bias.copy_(b.to(module.aligner.bias.device, dtype=module.aligner.bias.dtype))
-
-            for model_name, model in [("base", self.model_base), ("ft", self.model_ft)]:
-                self._debug_log_alignment_stats(model_name, model, targets, loader, n_batches)
-
-        final_depth = len(self.model_base.visual.transformer.resblocks)
-        self._vprint(f"extension completed. final_depth={final_depth}")
-        return final_depth
 
     @torch.no_grad()
     def _extend_per_weight(
@@ -1849,12 +1570,6 @@ def _as_optional_dict_float(value: Any) -> dict[str, float] | None:
     if not isinstance(value, Mapping):
         raise ValueError("Expected a dict for component_ridge.")
     return {str(k): float(v) for k, v in value.items()}
-
-
-def _extract_ln_weight(block: nn.Module) -> torch.Tensor:
-    if hasattr(block, "ln_1") and hasattr(block.ln_1, "weight"):
-        return block.ln_1.weight
-    raise AttributeError("Cannot infer transformer block width from ln_1.weight.")
 
 
 def _encode_image(model: nn.Module, images: torch.Tensor) -> torch.Tensor:

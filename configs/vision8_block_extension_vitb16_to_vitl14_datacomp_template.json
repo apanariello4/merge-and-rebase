@@ -10,7 +10,7 @@
     "blocks_to_add": null,
     "insertion_order": "bottom-top",
     "extension_density": "spread",
-    "extension_strategy": "interpolate",
+    "extension_strategy": "interpolate_per_weight",
     "dampening_factor": 1.0,
     "n_batches_act": 2,
     "calibration_split": "test",

@@ -945,6 +945,13 @@ class _LayerTransform:
 
 @dataclass(frozen=True)
 class _PrecomputeDiagnostics:
+    slots: int
+    usable: int
+    intentional_zero: int
+    incomplete: int
+    unsupported: int
+    skipped_not_in_target: int
+    examples: Mapping[str, tuple[str, ...]]
     assigned_keys: int
     shared_transform_count: int
     shared_group_count: int
@@ -952,14 +959,146 @@ class _PrecomputeDiagnostics:
 
 @dataclass(frozen=True)
 class _ApplyDiagnostics:
+    actively_transported: int
+    intentional_zero: int
+    missing_transform_zero: int
+    unsupported_zero: int
+    transport_failure_zero: int
+    wrong_shape_zero: int
+    out_of_scope_zero: int
+    skipped_not_in_target: int
+    examples: Mapping[str, tuple[str, ...]]
     transformed_weight: int
     transformed_bias: int
-    zero_passthrough: int
-    missing_transform: int
-    transport_failures: int
-    wrong_shape: int
-    wrong_shape_examples: tuple[str, ...]
-    skipped_not_in_target_visual: int
+
+    @property
+    def missing_transform(self) -> int:
+        return self.missing_transform_zero
+
+    @property
+    def transport_failures(self) -> int:
+        return self.transport_failure_zero
+
+    @property
+    def wrong_shape(self) -> int:
+        return self.wrong_shape_zero
+
+    @property
+    def zero_passthrough(self) -> int:
+        return self.intentional_zero
+
+    @property
+    def skipped_not_in_target_visual(self) -> int:
+        return self.skipped_not_in_target
+
+
+_DIAGNOSTIC_EXAMPLE_LIMIT = 5
+
+
+def _append_diagnostic_example(examples: dict[str, list[str]], category: str, key: str) -> None:
+    bucket = examples.setdefault(category, [])
+    if len(bucket) < _DIAGNOSTIC_EXAMPLE_LIMIT:
+        bucket.append(str(key))
+
+
+def _freeze_diagnostic_examples(examples: Mapping[str, list[str]]) -> dict[str, tuple[str, ...]]:
+    return {category: tuple(keys) for category, keys in examples.items() if keys}
+
+
+def _precompute_diagnostics_from_transforms(
+    *,
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    transforms_by_key: Mapping[str, _LayerTransform],
+) -> _PrecomputeDiagnostics:
+    counts = {"intentional_zero": 0, "incomplete": 0, "unsupported": 0, "skipped_not_in_target": 0}
+    examples: dict[str, list[str]] = {}
+    usable = 0
+    for key, delta_source in visual_delta.items():
+        if key not in target_visual_base:
+            counts["skipped_not_in_target"] += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
+            continue
+        transform = transforms_by_key.get(key)
+        if key in _ZERO_KEYS or (transform is not None and transform.kind == "zero"):
+            counts["intentional_zero"] += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
+        elif transform is None:
+            counts["incomplete"] += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+        elif transform.kind == "unsupported" or delta_source.ndim not in {1, 2}:
+            counts["unsupported"] += 1
+            _append_diagnostic_example(examples, "unsupported", key)
+        elif (
+            (transform.kind == "weight" and delta_source.ndim == 2 and transform.t_in is not None and transform.t_out is not None)
+            or (transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None)
+        ):
+            usable += 1
+        else:
+            counts["incomplete"] += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+    return _PrecomputeDiagnostics(
+        slots=len(visual_delta),
+        usable=usable,
+        intentional_zero=counts["intentional_zero"],
+        incomplete=counts["incomplete"],
+        unsupported=counts["unsupported"],
+        skipped_not_in_target=counts["skipped_not_in_target"],
+        examples=_freeze_diagnostic_examples(examples),
+        assigned_keys=len(transforms_by_key),
+        shared_transform_count=0,
+        shared_group_count=0,
+    )
+
+
+def _report_precompute_diagnostics(
+    *,
+    method_name: str,
+    diagnostics: _PrecomputeDiagnostics,
+    verbose: bool,
+) -> None:
+    if verbose:
+        print(
+            f"[{method_name}] prepare: transport slots={diagnostics.slots} "
+            f"usable={diagnostics.usable} intentional_zero={diagnostics.intentional_zero} "
+            f"incomplete={diagnostics.incomplete} unsupported={diagnostics.unsupported} "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}"
+        )
+        if diagnostics.examples:
+            print(f"[{method_name}] prepare: transport examples={diagnostics.examples}")
+    unexpected = {
+        category: count
+        for category, count in {
+            "incomplete": diagnostics.incomplete,
+            "unsupported": diagnostics.unsupported,
+            "skipped_not_in_target": diagnostics.skipped_not_in_target,
+        }.items()
+        if count
+    }
+    if unexpected:
+        logger.warning(
+            "[%s] prepare: transport coverage loss %s; examples=%s",
+            method_name, unexpected, diagnostics.examples,
+        )
+
+
+def _report_apply_diagnostics(*, method_name: str, diagnostics: _ApplyDiagnostics, verbose: bool) -> None:
+    if verbose:
+        print(
+            f"[{method_name}] apply: diagnostics "
+            f"active={diagnostics.actively_transported} "
+            f"matrices={diagnostics.transformed_weight} "
+            f"vectors={diagnostics.transformed_bias} "
+            f"intentional_zero={diagnostics.intentional_zero} "
+            f"missing_transform_zero={diagnostics.missing_transform_zero} "
+            f"unsupported_zero={diagnostics.unsupported_zero} "
+            f"transport_failure_zero={diagnostics.transport_failure_zero} "
+            f"wrong_shape_zero={diagnostics.wrong_shape_zero} "
+            f"out_of_scope_zero={diagnostics.out_of_scope_zero} "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}"
+        )
+        if diagnostics.examples:
+            print(f"[{method_name}] apply: transport examples={diagnostics.examples}")
 
 
 def _precompute_transforms(
@@ -979,6 +1118,12 @@ def _precompute_transforms(
 ) -> tuple[dict[str, _LayerTransform], _PrecomputeDiagnostics]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
+    examples: dict[str, list[str]] = {}
+    intentional_zero = 0
+    incomplete = 0
+    unsupported = 0
+    skipped_not_in_target = 0
+    usable = 0
     if family_adapter is not None:
         param_to_module = family_adapter.param_to_module(target_model)
     else:
@@ -1036,11 +1181,14 @@ def _precompute_transforms(
     )
     for key, delta_source in items:
         if key not in target_visual_base:
-            print(f"Theseus align: skipping task vector key:{key} as it is not in target visual base.")
+            skipped_not_in_target += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
             continue
 
         if key in _ZERO_KEYS:
             transforms_by_key[key] = _LayerTransform(kind="zero")
+            intentional_zero += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
             continue
 
         module_name = param_to_module.get(key, key.rsplit(".", 1)[0] if "." in key else "")
@@ -1069,8 +1217,11 @@ def _precompute_transforms(
             if t_in is not None and t_out is not None:
 
                 transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+                usable += 1
                 continue
             transforms_by_key[key] = _LayerTransform(kind="weight")
+            incomplete += 1
+            _append_diagnostic_example(examples, "incomplete", key)
             continue
 
         if delta_source.ndim == 1:
@@ -1079,6 +1230,7 @@ def _precompute_transforms(
                 weight_transform = transforms_by_key.get(weight_key)
                 if weight_transform is not None and weight_transform.t_out is not None:
                     transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
+                    usable += 1
                     continue
 
             # Robustness fallback: covers uncommon ordering/edge cases where
@@ -1086,6 +1238,7 @@ def _precompute_transforms(
             cached_t_out = t_out_cache.get(out_key)
             if cached_t_out is not None:
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=cached_t_out)
+                usable += 1
                 continue
 
             target_ref = target_visual_base[key]
@@ -1094,13 +1247,25 @@ def _precompute_transforms(
             if t_out is not None:
                 t_out_cache[out_key] = t_out
                 transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+                usable += 1
                 continue
             transforms_by_key[key] = _LayerTransform(kind="bias")
+            incomplete += 1
+            _append_diagnostic_example(examples, "incomplete", key)
             continue
 
         transforms_by_key[key] = _LayerTransform(kind="unsupported")
+        unsupported += 1
+        _append_diagnostic_example(examples, "unsupported", key)
 
     diagnostics = _PrecomputeDiagnostics(
+        slots=len(visual_delta),
+        usable=usable,
+        intentional_zero=intentional_zero,
+        incomplete=incomplete,
+        unsupported=unsupported,
+        skipped_not_in_target=skipped_not_in_target,
+        examples=_freeze_diagnostic_examples(examples),
         assigned_keys=len(transforms_by_key),
         shared_transform_count=(len(grouped_transforms) if transform_granularity != "param" else 0),
         shared_group_count=(len(grouped_covariances) if transform_granularity != "param" else 0),
@@ -1128,7 +1293,14 @@ def _precompute_transforms_data_free(
     )
     for key, delta_source in items:
         if key not in target_visual_base or key not in source_visual_base:
-            print(f"Theseus align: skipping task vector key:{key} as it is not in source/target visual base.")
+            logger.warning(
+                "%s prepare: skipping transform for %s because it is absent from the source or target base",
+                method_name, key,
+            )
+            continue
+
+        if key in _ZERO_KEYS:
+            transforms_by_key[key] = _LayerTransform(kind="zero")
             continue
 
         w_src_base = source_visual_base[key].detach().cpu().to(torch.float64)
@@ -1157,10 +1329,6 @@ def _precompute_transforms_data_free(
                 )
             transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
         elif w_delta.ndim == 1:
-            if key in _ZERO_KEYS:
-                transforms_by_key[key] = _LayerTransform(kind="zero")
-                continue
-
             if key.endswith(".bias"):
                 weight_key = f"{key[:-len('.bias')]}.weight"
                 weight_transform = transforms_by_key.get(weight_key)
@@ -1184,6 +1352,13 @@ def _precompute_transforms_data_free(
     return transforms_by_key
 
 
+class _WrongTransportShape(ValueError):
+    def __init__(self, actual: torch.Size, expected: torch.Size):
+        self.actual = tuple(actual)
+        self.expected = tuple(expected)
+        super().__init__(f"got {self.actual}, expected {self.expected}")
+
+
 def _apply_transforms_to_visual_delta(
     *,
     target_visual_base: Mapping[str, torch.Tensor],
@@ -1193,16 +1368,28 @@ def _apply_transforms_to_visual_delta(
     method_name: str,
     device: str = "cpu",
     strict: bool = False,
+    out_of_scope_keys: Iterable[str] = (),
+    skipped_not_in_target_keys: Iterable[str] = (),
 ) -> tuple[TensorDict, _ApplyDiagnostics]:
     aligned: TensorDict = {}
+    actively_transported = 0
+    intentional_zero = 0
+    missing_transform_zero = 0
+    unsupported_zero = 0
+    transport_failure_zero = 0
+    wrong_shape_zero = 0
+    out_of_scope_zero = 0
+    skipped_not_in_target = 0
     transformed_weight = 0
     transformed_bias = 0
-    zero_passthrough = 0
-    missing_transform = 0
-    transport_failures = 0
-    wrong_shape = 0
-    wrong_shape_examples: list[str] = []
-    skipped_not_in_target_visual = 0
+    examples: dict[str, list[str]] = {}
+
+    for key in out_of_scope_keys:
+        out_of_scope_zero += 1
+        _append_diagnostic_example(examples, "out_of_scope_zero", key)
+    for key in skipped_not_in_target_keys:
+        skipped_not_in_target += 1
+        _append_diagnostic_example(examples, "skipped_not_in_target", key)
 
     items = _iter_with_progress(
         visual_delta.items(),
@@ -1212,77 +1399,107 @@ def _apply_transforms_to_visual_delta(
     )
     for key, delta_source in items:
         if key not in target_visual_base:
-            print(f"Theseus align: skipping task vector key:{key} as it is not in target visual base.")
-            skipped_not_in_target_visual += 1
+            skipped_not_in_target += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
             continue
 
         target_ref = target_visual_base[key]
         transported = torch.zeros_like(target_ref, dtype=torch.float32, device=device)
 
         transform = transforms_by_key.get(key)
-        applied = False
-        if transform is not None:
-            if transform.kind == "zero":
-                zero_passthrough += 1
-                applied = True
-            if transform.kind == "weight" and delta_source.ndim == 2 and transform.t_in is not None and transform.t_out is not None:
-                try:
-                    delta_dev = delta_source.float().to(device=device)
-                    transported = _transport_weight(delta_dev, transform.t_in, transform.t_out, key=key)
-                    transformed_weight += 1
-                    applied = True
-                except RuntimeError as exc:
-                    logger.warning("Theseus transport failed for %s: %s", key, exc)
-                    transport_failures += 1
-            elif transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None:
-                try:
-                    transported = _transport_bias(delta_source.float().to(device=device), transform.t_out)
-                    transformed_bias += 1
-                    applied = True
-                except ValueError as exc:
-                    logger.warning("Theseus vector transport failed for %s: %s", key, exc)
-                    transport_failures += 1
-
-        if not applied and key in target_visual_base:
-            missing_transform += 1
-
-        if transported.shape != target_ref.shape:
-            logger.warning(
-                "Theseus produced wrong shape for %s: got %s expected %s. Zeroing.",
-                key,
-                tuple(transported.shape),
-                tuple(target_ref.shape),
-            )
-            wrong_shape += 1
-            if len(wrong_shape_examples) < 5:
-                wrong_shape_examples.append(key)
-            transported = torch.zeros_like(target_ref, dtype=torch.float32, device=device)
+        if transform is not None and transform.kind == "zero":
+            intentional_zero += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
+        elif transform is None:
+            missing_transform_zero += 1
+            _append_diagnostic_example(examples, "missing_transform_zero", key)
+        elif transform.kind == "unsupported" or delta_source.ndim not in {1, 2}:
+            unsupported_zero += 1
+            _append_diagnostic_example(examples, "unsupported_zero", key)
+        elif transform.kind == "weight" and delta_source.ndim == 2 and transform.t_in is not None and transform.t_out is not None:
+            try:
+                candidate = _transport_weight(
+                    delta_source.float().to(device=device), transform.t_in, transform.t_out, key=key
+                )
+                if candidate.shape != target_ref.shape:
+                    raise _WrongTransportShape(candidate.shape, target_ref.shape)
+                transported = candidate
+                transformed_weight += 1
+                actively_transported += 1
+            except _WrongTransportShape as exc:
+                wrong_shape_zero += 1
+                _append_diagnostic_example(examples, "wrong_shape_zero", key)
+                logger.warning(
+                    "%s transport produced wrong shape for %s: got %s expected %s; zeroing",
+                    method_name, key, exc.actual, exc.expected,
+                )
+            except (RuntimeError, ValueError) as exc:
+                transport_failure_zero += 1
+                _append_diagnostic_example(examples, "transport_failure_zero", key)
+                logger.warning("%s transport failed for %s: %s; zeroing", method_name, key, exc)
+        elif transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None:
+            try:
+                candidate = _transport_bias(delta_source.float().to(device=device), transform.t_out)
+                if candidate.shape != target_ref.shape:
+                    raise _WrongTransportShape(candidate.shape, target_ref.shape)
+                transported = candidate
+                transformed_bias += 1
+                actively_transported += 1
+            except _WrongTransportShape as exc:
+                wrong_shape_zero += 1
+                _append_diagnostic_example(examples, "wrong_shape_zero", key)
+                logger.warning(
+                    "%s transport produced wrong shape for %s: got %s expected %s; zeroing",
+                    method_name, key, exc.actual, exc.expected,
+                )
+            except (RuntimeError, ValueError) as exc:
+                transport_failure_zero += 1
+                _append_diagnostic_example(examples, "transport_failure_zero", key)
+                logger.warning("%s vector transport failed for %s: %s; zeroing", method_name, key, exc)
+        else:
+            missing_transform_zero += 1
+            _append_diagnostic_example(examples, "missing_transform_zero", key)
 
         aligned[key] = transported.to(dtype=target_ref.dtype, device=target_ref.device)
 
     diagnostics = _ApplyDiagnostics(
+        actively_transported=actively_transported,
+        intentional_zero=intentional_zero,
+        missing_transform_zero=missing_transform_zero,
+        unsupported_zero=unsupported_zero,
+        transport_failure_zero=transport_failure_zero,
+        wrong_shape_zero=wrong_shape_zero,
+        out_of_scope_zero=out_of_scope_zero,
+        skipped_not_in_target=skipped_not_in_target,
+        examples=_freeze_diagnostic_examples(examples),
         transformed_weight=transformed_weight,
         transformed_bias=transformed_bias,
-        zero_passthrough=zero_passthrough,
-        missing_transform=missing_transform,
-        transport_failures=transport_failures,
-        wrong_shape=wrong_shape,
-        wrong_shape_examples=tuple(wrong_shape_examples),
-        skipped_not_in_target_visual=skipped_not_in_target_visual,
     )
-    if strict and (
-        diagnostics.missing_transform
-        or diagnostics.transport_failures
-        or diagnostics.wrong_shape
-        or diagnostics.skipped_not_in_target_visual
-    ):
+    unexpected = {
+        category: count
+        for category, count in {
+            "missing_transform_zero": missing_transform_zero,
+            "unsupported_zero": unsupported_zero,
+            "transport_failure_zero": transport_failure_zero,
+            "wrong_shape_zero": wrong_shape_zero,
+            "skipped_not_in_target": skipped_not_in_target,
+        }.items()
+        if count
+    }
+    if unexpected:
+        logger.warning(
+            "%s transport diagnostics: unexpected loss %s; examples=%s",
+            method_name, unexpected, diagnostics.examples,
+        )
+    if strict and unexpected:
         raise RuntimeError(
             f"{method_name} strict transport failed: "
-            f"missing_transform={diagnostics.missing_transform}, "
-            f"transport_failures={diagnostics.transport_failures}, "
-            f"wrong_shape={diagnostics.wrong_shape}, "
-            f"skipped_not_in_target_visual={diagnostics.skipped_not_in_target_visual}, "
-            f"wrong_shape_examples={list(diagnostics.wrong_shape_examples)}"
+            f"missing_transform_zero={diagnostics.missing_transform_zero}, "
+            f"unsupported_zero={diagnostics.unsupported_zero}, "
+            f"transport_failure_zero={diagnostics.transport_failure_zero}, "
+            f"wrong_shape_zero={diagnostics.wrong_shape_zero}, "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}, "
+            f"examples={diagnostics.examples}"
         )
     return aligned, diagnostics
 
@@ -1382,7 +1599,18 @@ class TheseusRebase:
 
         activation_registry: dict[str, ActivationStore] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
-        precompute_diag = _PrecomputeDiagnostics(assigned_keys=0, shared_transform_count=0, shared_group_count=0)
+        precompute_diag = _PrecomputeDiagnostics(
+            slots=0,
+            usable=0,
+            intentional_zero=0,
+            incomplete=0,
+            unsupported=0,
+            skipped_not_in_target=0,
+            examples={},
+            assigned_keys=0,
+            shared_transform_count=0,
+            shared_group_count=0,
+        )
         split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
@@ -1495,14 +1723,24 @@ class TheseusRebase:
                         show_progress=bool(show_progress),
                         method_name=self.name,
                     )
+                    precompute_diag = _precompute_diagnostics_from_transforms(
+                        target_visual_base=target_visual_base,
+                        visual_delta=visual_delta,
+                        transforms_by_key=transforms_by_key,
+                    )
+                _report_precompute_diagnostics(
+                    method_name=self.name,
+                    diagnostics=precompute_diag,
+                    verbose=bool(verbose),
+                )
                 if verbose:
                     if covariance_mode == "activations" and transform_granularity != "param":
                         print(
-                            f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)} "
+                            f"{log_prefix} prepare: computed usable transforms = {precompute_diag.usable} "
                             f"(shared={precompute_diag.shared_transform_count}, groups={precompute_diag.shared_group_count})"
                         )
                     else:
-                        print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
+                        print(f"{log_prefix} prepare: computed usable transforms = {precompute_diag.usable}")
             elif verbose:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
         finally:
@@ -1534,6 +1772,13 @@ class TheseusRebase:
             "device_transform": device_transform,
             "compute_device": _resolve_device(device) if device_transform == "gpu" else torch.device("cpu"),
             "precompute_diagnostics": {
+                "slots": precompute_diag.slots,
+                "usable": precompute_diag.usable,
+                "intentional_zero": precompute_diag.intentional_zero,
+                "incomplete": precompute_diag.incomplete,
+                "unsupported": precompute_diag.unsupported,
+                "skipped_not_in_target": precompute_diag.skipped_not_in_target,
+                "examples": dict(precompute_diag.examples),
                 "assigned_keys": precompute_diag.assigned_keys,
                 "shared_transform_count": precompute_diag.shared_transform_count,
                 "shared_group_count": precompute_diag.shared_group_count,
@@ -1569,6 +1814,8 @@ class TheseusRebase:
             visual_delta_work = {k: delta[k] for k in visual_key_map if k in target_visual_base}
             target_visual_base_work = target_visual_base
             split_fused_qkv = False
+            out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
+            skipped_not_in_target_keys = tuple(k for k in visual_key_map if k not in target_base)
         else:
             visual_key_map = _visual_delta_keys(delta)
             target_visual_base = _visual_state_dict(target_base)
@@ -1576,16 +1823,27 @@ class TheseusRebase:
             visual_delta = {
                 stripped_key: delta[original_key]
                 for stripped_key, original_key in visual_key_map.items()
-                if stripped_key in target_visual_base
             }
+            has_visual_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
+            out_of_scope_keys = tuple(
+                key for key in delta
+                if has_visual_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
+            )
+            skipped_not_in_target_keys = tuple(
+                original_key
+                for stripped_key, original_key in visual_key_map.items()
+                if stripped_key not in target_visual_base and original_key not in out_of_scope_keys
+            )
 
             split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
             if split_fused_qkv:
                 target_visual_base_work = _split_fused_qkv_state(target_visual_base)
-                visual_delta_work = _split_fused_qkv_state(visual_delta)
+                visual_delta_work = _split_fused_qkv_state(
+                    {key: value for key, value in visual_delta.items() if key in target_visual_base}
+                )
             else:
                 target_visual_base_work = target_visual_base
-                visual_delta_work = visual_delta
+                visual_delta_work = {key: value for key, value in visual_delta.items() if key in target_visual_base}
 
             if strict and not visual_delta_work:
                 raise ValueError("Theseus did not find any visual delta keys to transport.")
@@ -1599,6 +1857,8 @@ class TheseusRebase:
             method_name=self.name,
             device=compute_device,
             strict=bool(strict),
+            out_of_scope_keys=out_of_scope_keys,
+            skipped_not_in_target_keys=skipped_not_in_target_keys,
         )
 
         if not family_adapter and split_fused_qkv:
@@ -1625,22 +1885,13 @@ class TheseusRebase:
             out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
 
         if strict:
-            missing = sorted(set(delta.keys()) - set(out.keys()))
+            expected_keys = {key for key in visual_key_map.values() if key in target_base}
+            missing = sorted(expected_keys - set(out.keys()))
             if missing:
                 raise KeyError(f"Theseus did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
-            if apply_diag.wrong_shape > 0:
-                print(
-                    f"{log_prefix} apply: warnings wrong_shape={apply_diag.wrong_shape} "
-                    f"examples={list(apply_diag.wrong_shape_examples)}"
-                )
-            print(
-                f"{log_prefix} apply: diagnostics "
-                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
-                f"zero={apply_diag.zero_passthrough} "
-                f"missing={apply_diag.missing_transform} failures={apply_diag.transport_failures}"
-            )
+            _report_apply_diagnostics(method_name=self.name, diagnostics=apply_diag, verbose=True)
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out

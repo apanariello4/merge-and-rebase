@@ -473,6 +473,18 @@ class BiCoRebase:
 
         activation_registry: dict[str, _t.ActivationStore] = {}
         transforms_by_key: dict[str, _t._LayerTransform] = {}
+        precompute_diag = _t._PrecomputeDiagnostics(
+            slots=0,
+            usable=0,
+            intentional_zero=0,
+            incomplete=0,
+            unsupported=0,
+            skipped_not_in_target=0,
+            examples={},
+            assigned_keys=0,
+            shared_transform_count=0,
+            shared_group_count=0,
+        )
         split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
@@ -521,7 +533,7 @@ class BiCoRebase:
                     target_visual_base = _t._split_fused_qkv_state(target_visual_base)
                     visual_delta = _t._split_fused_qkv_state(visual_delta)
 
-                transforms_by_key, _ = _t._precompute_transforms(
+                transforms_by_key, precompute_diag = _t._precompute_transforms(
                     target_model=target_model,
                     target_visual_base=target_visual_base,
                     visual_delta=visual_delta,
@@ -535,8 +547,13 @@ class BiCoRebase:
                     svd_device=svd_device,
                     family_adapter=family_adapter,
                 )
+                _t._report_precompute_diagnostics(
+                    method_name=self.name,
+                    diagnostics=precompute_diag,
+                    verbose=bool(verbose),
+                )
                 if verbose:
-                    print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
+                    print(f"{log_prefix} prepare: computed usable transforms = {precompute_diag.usable}")
             elif verbose:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
 
@@ -559,6 +576,18 @@ class BiCoRebase:
         return {
             "activation_registry": activation_registry,
             "transforms_by_key": transforms_by_key,
+            "precompute_diagnostics": {
+                "slots": precompute_diag.slots,
+                "usable": precompute_diag.usable,
+                "intentional_zero": precompute_diag.intentional_zero,
+                "incomplete": precompute_diag.incomplete,
+                "unsupported": precompute_diag.unsupported,
+                "skipped_not_in_target": precompute_diag.skipped_not_in_target,
+                "examples": dict(precompute_diag.examples),
+                "assigned_keys": precompute_diag.assigned_keys,
+                "shared_transform_count": precompute_diag.shared_transform_count,
+                "shared_group_count": precompute_diag.shared_group_count,
+            },
             "split_fused_qkv": split_fused_qkv,
             "n_batches": n_batches,
             "patched_source_blocks": patched_source,
@@ -599,6 +628,8 @@ class BiCoRebase:
             target_visual_base_work = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
             visual_delta_work = {k: delta[k] for k in visual_key_map if k in target_visual_base_work}
             split_fused_qkv = False
+            out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
+            skipped_not_in_target_keys = tuple(k for k in visual_key_map if k not in target_base)
         else:
             visual_key_map = _t._visual_delta_keys(delta)
             target_visual_base = _t._visual_state_dict(target_base)
@@ -606,16 +637,27 @@ class BiCoRebase:
             visual_delta = {
                 stripped_key: delta[original_key]
                 for stripped_key, original_key in visual_key_map.items()
-                if stripped_key in target_visual_base
             }
 
             split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
             if split_fused_qkv:
                 target_visual_base_work = _t._split_fused_qkv_state(target_visual_base)
-                visual_delta_work = _t._split_fused_qkv_state(visual_delta)
+                visual_delta_work = _t._split_fused_qkv_state(
+                    {key: value for key, value in visual_delta.items() if key in target_visual_base}
+                )
             else:
                 target_visual_base_work = target_visual_base
-                visual_delta_work = visual_delta
+                visual_delta_work = {key: value for key, value in visual_delta.items() if key in target_visual_base}
+            has_visual_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
+            out_of_scope_keys = tuple(
+                key for key in delta
+                if has_visual_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
+            )
+            skipped_not_in_target_keys = tuple(
+                original_key
+                for stripped_key, original_key in visual_key_map.items()
+                if stripped_key not in target_visual_base and original_key not in out_of_scope_keys
+            )
 
         if strict and not visual_delta_work:
             raise ValueError("BiCo did not find any visual delta keys to transport.")
@@ -629,6 +671,8 @@ class BiCoRebase:
             method_name=self.name,
             device=compute_device,
             strict=bool(strict),
+            out_of_scope_keys=out_of_scope_keys,
+            skipped_not_in_target_keys=skipped_not_in_target_keys,
         )
 
         if split_fused_qkv:
@@ -655,17 +699,13 @@ class BiCoRebase:
             out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
 
         if strict:
-            missing = sorted(set(delta.keys()) - set(out.keys()))
+            expected_keys = {key for key in visual_key_map.values() if key in target_base}
+            missing = sorted(expected_keys - set(out.keys()))
             if missing:
                 raise KeyError(f"BiCo did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
-            print(
-                f"{log_prefix} apply: diagnostics "
-                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
-                f"zero={apply_diag.zero_passthrough} missing={apply_diag.missing_transform} "
-                f"failures={apply_diag.transport_failures} wrong_shape={apply_diag.wrong_shape}"
-            )
+            _t._report_apply_diagnostics(method_name=self.name, diagnostics=apply_diag, verbose=True)
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out
