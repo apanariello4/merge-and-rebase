@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.methods import bico as bico_method
-from merge_and_rebase.rebase.registry import get_method, list_methods
 from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
+from merge_and_rebase.rebase.registry import get_method, list_methods
 
 
 class _TinyVisual(nn.Module):
@@ -94,6 +95,27 @@ def test_bico_collects_standard_text_batches() -> None:
 def test_bico_registered() -> None:
     assert "bico" in list_methods()
     assert get_method("bico").name == "bico"
+
+
+def test_bico_rejects_misaligned_calibration_labels() -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    x = torch.randn(4, 6)
+    source_loader = DataLoader(TensorDataset(x, torch.zeros(4, dtype=torch.long)), batch_size=4)
+    target_loader = DataLoader(TensorDataset(x, torch.ones(4, dtype=torch.long)), batch_size=4)
+
+    with pytest.raises(ValueError, match="not label-aligned"):
+        collect_bilinear_statistics(
+            source_model,
+            target_model,
+            source_loader,
+            target_loader,
+            _simple_recipe,
+            _simple_recipe,
+            device="cpu",
+            seq_align="mean",
+            n_batches=1,
+        )
 
 
 def test_bico_transport_smoke() -> None:

@@ -43,6 +43,38 @@ def test_theseus_registered() -> None:
     assert get_method("theseus").name == "theseus"
 
 
+def test_theseus_strict_apply_rejects_missing_transform() -> None:
+    with pytest.raises(RuntimeError, match="missing_transform=1"):
+        theseus_mod._apply_transforms_to_visual_delta(
+            target_visual_base={"weight": torch.zeros(2, 2)},
+            visual_delta={"weight": torch.ones(2, 2)},
+            transforms_by_key={},
+            show_progress=False,
+            method_name="theseus",
+            device="cpu",
+            strict=True,
+        )
+
+
+def test_theseus_rejects_misaligned_calibration_labels() -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    x = torch.randn(4, 6)
+    source_loader = DataLoader(TensorDataset(x, torch.zeros(4, dtype=torch.long)), batch_size=4)
+    target_loader = DataLoader(TensorDataset(x, torch.ones(4, dtype=torch.long)), batch_size=4)
+
+    with pytest.raises(ValueError, match="not label-aligned"):
+        theseus_mod.collect_activations(
+            source_model,
+            target_model,
+            source_loader,
+            target_loader,
+            device="cpu",
+            seq_align="mean",
+            n_batches=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("whiten_power", "whiten_eps"),
     [(-0.01, 1e-5), (0.51, 1e-5), (0.0, 0.0)],

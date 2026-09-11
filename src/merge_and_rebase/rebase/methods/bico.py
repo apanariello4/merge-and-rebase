@@ -170,6 +170,7 @@ def collect_bilinear_statistics(
         if iterator is None:
             iterator = zip(source_dataloader, target_dataloader, strict=True)
 
+        consumed_batches = 0
         for idx, (source_batch, target_batch) in enumerate(iterator):
             if n_batches is not None and idx >= n_batches:
                 break
@@ -181,6 +182,13 @@ def collect_bilinear_statistics(
                     "BiCo calibration expects aligned batch sizes. "
                     f"Got {source_inputs.shape[0]} and {target_inputs.shape[0]}."
                 )
+            source_labels = source_batch[1] if isinstance(source_batch, (tuple, list)) and len(source_batch) > 1 else None
+            target_labels = target_batch[1] if isinstance(target_batch, (tuple, list)) and len(target_batch) > 1 else None
+            if torch.is_tensor(source_labels) and torch.is_tensor(target_labels):
+                if source_labels.shape != target_labels.shape or not torch.equal(
+                    source_labels.detach().cpu(), target_labels.detach().cpu()
+                ):
+                    raise ValueError("BiCo calibration loaders are not label-aligned.")
             del source_inputs, target_inputs
 
             # Source: forward + backward on GPU
@@ -225,6 +233,13 @@ def collect_bilinear_statistics(
                     _t.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
                 )
                 store.update(src_rows, tgt_rows)
+
+            consumed_batches += 1
+
+        if n_batches is not None and consumed_batches < int(n_batches):
+            raise ValueError(
+                f"BiCo calibration loaders exhausted after {consumed_batches} batches; requested {int(n_batches)}."
+            )
 
     finally:
         source_hook.remove()
@@ -606,13 +621,14 @@ class BiCoRebase:
             raise ValueError("BiCo did not find any visual delta keys to transport.")
 
         compute_device = prepared.get("compute_device", "cpu")
-        aligned_visual, _ = _t._apply_transforms_to_visual_delta(
+        aligned_visual, apply_diag = _t._apply_transforms_to_visual_delta(
             target_visual_base=target_visual_base_work,
             visual_delta=visual_delta_work,
             transforms_by_key=transforms_by_key,
             show_progress=bool(show_progress),
             method_name=self.name,
             device=compute_device,
+            strict=bool(strict),
         )
 
         if split_fused_qkv:
@@ -644,6 +660,12 @@ class BiCoRebase:
                 raise KeyError(f"BiCo did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
+            print(
+                f"{log_prefix} apply: diagnostics "
+                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
+                f"zero={apply_diag.zero_passthrough} missing={apply_diag.missing_transform} "
+                f"failures={apply_diag.transport_failures} wrong_shape={apply_diag.wrong_shape}"
+            )
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out

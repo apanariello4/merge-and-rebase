@@ -579,6 +579,7 @@ def collect_activations(
         if iterator is None:
             iterator = zip(source_dataloader, target_dataloader, strict=True)
 
+        consumed_batches = 0
         for idx, (source_batch, target_batch) in enumerate(iterator):
             if n_batches is not None and idx >= n_batches:
                 break
@@ -609,8 +610,16 @@ def collect_activations(
                         "Theseus calibration expects aligned batch sizes. "
                         f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
                     )
+                source_labels = source_batch[1] if isinstance(source_batch, (tuple, list)) and len(source_batch) > 1 else None
+                target_labels = target_batch[1] if isinstance(target_batch, (tuple, list)) and len(target_batch) > 1 else None
+                if torch.is_tensor(source_labels) and torch.is_tensor(target_labels):
+                    if source_labels.shape != target_labels.shape or not torch.equal(
+                        source_labels.detach().cpu(), target_labels.detach().cpu()
+                    ):
+                        raise ValueError("Theseus calibration loaders are not label-aligned.")
                 _encode_image(source_model, source_imgs)
                 _encode_image(target_model, target_imgs)
+            consumed_batches += 1
 
             common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
             common_outputs = set(source_hook.outputs.keys()) & set(target_hook.outputs.keys())
@@ -641,6 +650,10 @@ def collect_activations(
 
             source_hook.clear()
             target_hook.clear()
+        if n_batches is not None and consumed_batches < int(n_batches):
+            raise ValueError(
+                f"Theseus calibration loaders exhausted after {consumed_batches} batches; requested {int(n_batches)}."
+            )
     finally:
         source_hook.remove()
         target_hook.remove()
@@ -1179,6 +1192,7 @@ def _apply_transforms_to_visual_delta(
     show_progress: bool,
     method_name: str,
     device: str = "cpu",
+    strict: bool = False,
 ) -> tuple[TensorDict, _ApplyDiagnostics]:
     aligned: TensorDict = {}
     transformed_weight = 0
@@ -1256,6 +1270,20 @@ def _apply_transforms_to_visual_delta(
         wrong_shape_examples=tuple(wrong_shape_examples),
         skipped_not_in_target_visual=skipped_not_in_target_visual,
     )
+    if strict and (
+        diagnostics.missing_transform
+        or diagnostics.transport_failures
+        or diagnostics.wrong_shape
+        or diagnostics.skipped_not_in_target_visual
+    ):
+        raise RuntimeError(
+            f"{method_name} strict transport failed: "
+            f"missing_transform={diagnostics.missing_transform}, "
+            f"transport_failures={diagnostics.transport_failures}, "
+            f"wrong_shape={diagnostics.wrong_shape}, "
+            f"skipped_not_in_target_visual={diagnostics.skipped_not_in_target_visual}, "
+            f"wrong_shape_examples={list(diagnostics.wrong_shape_examples)}"
+        )
     return aligned, diagnostics
 
 
@@ -1570,6 +1598,7 @@ class TheseusRebase:
             show_progress=bool(show_progress),
             method_name=self.name,
             device=compute_device,
+            strict=bool(strict),
         )
 
         if not family_adapter and split_fused_qkv:
