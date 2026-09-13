@@ -1,0 +1,65 @@
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: fp32
+
+  backbone:
+    name: hf_text
+    model_name_or_path: google-t5/t5-base
+    model_arch: t5
+    model_kind: sequence_classification
+    num_labels: 2
+    trust_remote_code: false
+    use_fast_tokenizer: true
+
+  data:
+    batch_size: 4
+    num_workers: 0
+    max_length: 512
+
+  train:
+    epochs: 1
+    optimizer:
+      name: adamw
+    lr: 5.0e-6
+    weight_decay: 0.01
+    accumulate_grad_batches: 32
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 200
+    grad_clip_norm: 1.0
+    early_stopping: false
+    early_stopping_patience: 5
+
+  strategy:
+    name: full
+
+  output:
+    out_dir: /leonardo_scratch/large/userexternal/frinaldi/finetuning/finetune_text_smoke
+    save_format: full
+    save_last_epoch: false
+    extract_heads: true
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
+datasets_order:
+  - scitail
+
+datasets:
+  scitail:
+    train:
+      epochs: 1
+    data:
+      max_train_samples: 128
+      max_val_samples: 16
+      max_test_samples: 16

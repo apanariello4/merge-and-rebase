@@ -70,6 +70,8 @@ from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
 
+_ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
+
 
 def _set_deterministic_seed(seed: int) -> None:
     """Seed torch/cuda and force deterministic kernels for this run.
@@ -159,7 +161,7 @@ def _evaluate_source_model_top1(
     eval_clf.build_zeroshot_text_features(
         classnames_task,
         source_build_cfg_task,
-        cache_dir="src/.cache/zs_cache",
+        cache_dir=_ZERO_SHOT_CACHE_DIR,
         force_rebuild=False,
     )
     return float(eval_clf.top1(eval_loader, device=device))
@@ -205,7 +207,7 @@ def _evaluate_source_lmc(
     eval_clf.build_zeroshot_text_features(
         classnames_task,
         source_build_cfg_task,
-        cache_dir="src/.cache/zs_cache",
+        cache_dir=_ZERO_SHOT_CACHE_DIR,
         force_rebuild=False,
     )
     eval_loader = resolve_eval_split_loader(loaders_obj, split)
@@ -341,7 +343,7 @@ def _evaluate_cross_task_source_lmc(
         eval_clf.build_zeroshot_text_features(
             ctx["classnames"],
             ctx["source_build_cfg_task"],
-            cache_dir="src/.cache/zs_cache",
+            cache_dir=_ZERO_SHOT_CACHE_DIR,
             force_rebuild=False,
         )
         if eval_clf._zs_text_features is None:

@@ -21,8 +21,19 @@ _ZERO_KEYS = {"class_embedding", "positional_embedding", "conv1.weight"}
 class _BiCoHook:
     """Register forward hooks for input activations and backward hooks for output gradients."""
 
-    def __init__(self, model: torch.nn.Module, *, scope: torch.nn.Module | None = None):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        scope: torch.nn.Module | None = None,
+        projection_mode: str = "gradient",
+    ):
         self.model = scope if scope is not None else _t._visual_module(model)
+        # "gradient" keeps the legacy behaviour (proj's in-map is read from the
+        # ln_post output-gradient store). "tokens"/"pooled" capture the actual
+        # activation that feeds visual.proj, pre- and post-pooling respectively.
+        self.projection_mode = str(projection_mode)
+        self.projection_input: torch.Tensor | None = None
         self.inputs: dict[str, torch.Tensor] = {}
         self.in_grads: dict[str, torch.Tensor] = {}
         self.out_grads: dict[str, torch.Tensor] = {}
@@ -53,6 +64,16 @@ class _BiCoHook:
             inp = inputs[0] if isinstance(inputs, (tuple, list)) and inputs else inputs
             if torch.is_tensor(inp):
                 self.inputs[name] = inp.detach().cpu()
+            if self.projection_mode != "gradient" and name == "ln_post" and torch.is_tensor(output):
+                projection_input = output.detach()
+                # ln_post runs before pooling unless final_ln_after_pool is set,
+                # so a 3-D output still has to be pooled to become proj's input.
+                if self.projection_mode == "pooled" and projection_input.ndim == 3:
+                    pooled = getattr(self.model, "_global_pool", None)
+                    if pooled is None:
+                        raise ValueError("BiCo pooled projection capture requires visual._global_pool.")
+                    projection_input, _ = pooled(projection_input)
+                self.projection_input = projection_input.cpu()
         return hook_fn
 
     def _make_backward_hook(self, name: str):
@@ -64,6 +85,7 @@ class _BiCoHook:
         return hook_fn
 
     def clear(self) -> None:
+        self.projection_input = None
         self.inputs.clear()
         self.in_grads.clear()
         self.out_grads.clear()
@@ -130,6 +152,7 @@ def collect_bilinear_statistics(
     batch_size: int | None = None,
     store_grams: bool = False,
     family_adapter: Any = None,
+    projection_mode: str = "gradient",
 ) -> dict[str, _t.ActivationStore]:
     """
     Collect input activation statistics and output-gradient statistics.
@@ -149,8 +172,8 @@ def collect_bilinear_statistics(
         target_scope = None
 
     registry: dict[str, _t.ActivationStore] = {}
-    source_hook = _BiCoHook(source_model, scope=source_scope)
-    target_hook = _BiCoHook(target_model, scope=target_scope)
+    source_hook = _BiCoHook(source_model, scope=source_scope, projection_mode=projection_mode)
+    target_hook = _BiCoHook(target_model, scope=target_scope, projection_mode=projection_mode)
     dev = _t._resolve_device(device)
 
     cpu_device = torch.device("cpu")
@@ -209,6 +232,16 @@ def collect_bilinear_statistics(
             target_model.to(cpu_device)
             torch.cuda.empty_cache()
 
+            if source_hook.projection_input is not None and target_hook.projection_input is not None:
+                src_rows, tgt_rows = _t._align_features(
+                    source_hook.projection_input, target_hook.projection_input, mode=seq_align
+                )
+                store = registry.setdefault(
+                    "__projection__.in",
+                    _t.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
+                )
+                store.update(src_rows, tgt_rows)
+
             # Align and update registries (all tensors are on CPU from hooks)
             common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
             for key in common_inputs:
@@ -265,6 +298,7 @@ def collect_gradin_statistics(
     batch_size: int | None = None,
     store_grams: bool = False,
     family_adapter: Any = None,
+    projection_mode: str = "gradient",
 ) -> dict[str, _t.ActivationStore]:
     """
     Like collect_bilinear_statistics, but fills .in using input-side gradients
@@ -430,6 +464,9 @@ class BiCoRebase:
             raise ValueError("transform_granularity must be one of: param, module_type, block, global")
         if transform_granularity != "param":
             raise ValueError("BiCo transform_granularity support currently requires 'param'.")
+        projection_input = str(kwargs.pop("projection_input", "gradient")).strip().lower()
+        if projection_input not in {"gradient", "tokens", "pooled"}:
+            raise ValueError("BiCo projection_input must be one of: gradient, tokens, pooled.")
         device_transform = str(kwargs.pop("device_transform", "cpu")).strip().lower()
         if device_transform not in {"cpu", "gpu"}:
             raise ValueError("device_transform must be one of: cpu, gpu")
@@ -451,7 +488,8 @@ class BiCoRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, n_batches={n_batches}, seed={int(seed)}, "
-                f"transform_granularity={transform_granularity}, device_transform={device_transform})"
+                f"transform_granularity={transform_granularity}, device_transform={device_transform}, "
+                f"projection_input={projection_input})"
             )
 
         patched_source = 0
@@ -506,6 +544,7 @@ class BiCoRebase:
                 seed=int(seed),
                 batch_size=batch_size,
                 store_grams=whiten_power > 0.0,
+                projection_mode=projection_input,
                 family_adapter=family_adapter,
             )
             if verbose:
@@ -546,6 +585,9 @@ class BiCoRebase:
                     method_name=self.name,
                     svd_device=svd_device,
                     family_adapter=family_adapter,
+                    projection_in_key=(
+                        "ln_post.out" if projection_input == "gradient" else "__projection__.in"
+                    ),
                 )
                 _t._report_precompute_diagnostics(
                     method_name=self.name,
@@ -610,6 +652,7 @@ class BiCoRebase:
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
+        zero_attention_delta: bool = False,
         **kwargs,
     ) -> TensorDict:
         del kwargs
@@ -697,6 +740,20 @@ class BiCoRebase:
             if key in processed or key not in target_base:
                 continue
             out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
+
+        if zero_attention_delta:
+            # Ablation: reproduce the transport coverage of the legacy
+            # InputAlignedBlock path, where the split-qkv patch landed on the
+            # wrapper while forward ran through the unhooked original block, so
+            # attention never produced calibration statistics and its delta was
+            # written as zeros.
+            zeroed = 0
+            for key in out:
+                if ".attn." in key:
+                    out[key] = torch.zeros_like(out[key])
+                    zeroed += 1
+            if verbose:
+                print(f"{log_prefix} apply: zero_attention_delta zeroed {zeroed} attention keys")
 
         if strict:
             expected_keys = {key for key in visual_key_map.values() if key in target_base}
@@ -790,6 +847,7 @@ class BiCoRebase:
             verbose=bool(verbose),
             show_progress=bool(show_progress),
             family_adapter=family_adapter,
+            zero_attention_delta=bool(kwargs.get("zero_attention_delta", False)),
         )
 
 

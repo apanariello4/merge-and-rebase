@@ -1115,6 +1115,7 @@ def _precompute_transforms(
     family_adapter: Any = None,
     whiten_power: float = 0.0,
     whiten_eps: float = 1e-6,
+    projection_in_key: str = "ln_post.out",
 ) -> tuple[dict[str, _LayerTransform], _PrecomputeDiagnostics]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
@@ -1193,7 +1194,7 @@ def _precompute_transforms(
 
         module_name = param_to_module.get(key, key.rsplit(".", 1)[0] if "." in key else "")
         if key == "proj":
-            in_key = "ln_post.out"
+            in_key = projection_in_key
             out_key = ".out"
             in_module = "ln_post"
             out_module = ""

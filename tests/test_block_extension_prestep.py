@@ -340,3 +340,88 @@ def test_lazy_reference_capture_matches_eager_capture_shrink(lmc_mode, monkeypat
 
     _assert_state_dicts_match(lazy_base, eager_base)
     _assert_state_dicts_match(lazy_ft, eager_ft)
+
+
+def _run_per_weight_via_config(*, reference_capture: str, strategy: str, lmc_mode: str,
+                               target_layers_total: int, loader) -> tuple[nn.Module, nn.Module]:
+    """Drive extend_and_calibrate through the real `reference_capture` knob.
+
+    The two tests above emulate the eager schedule with a monkeypatch. This
+    helper instead exercises the shipped config switch end to end, so the
+    diagnostic users can actually select from a config file is covered too.
+    """
+    torch.manual_seed(0)
+    base, ft = _make_per_weight_models()
+    cfg = BlockExtensionConfig(
+        target_layers_total=target_layers_total,
+        insertion_order="bottom-top",
+        extension_density="spread",
+        extension_strategy=strategy,
+        dampening_factor=1.0,
+        n_batches_act=2,
+        skip_correction=False,
+        skip_final_ln=False,
+        ridge_identity=100.0,
+        ridge_weight=1e-6,
+        lmc_mode=lmc_mode,
+        reference_capture=reference_capture,
+        verbose=False,
+        show_progress=False,
+    )
+    run_block_extension(
+        source_base_model=base,
+        source_ft_model=ft,
+        calibration_loader=loader,
+        target_layers_total=target_layers_total,
+        config=cfg,
+        device="cpu",
+    )
+    return base, ft
+
+
+def _assert_state_dicts_bit_identical(model_a: nn.Module, model_b: nn.Module) -> None:
+    state_a = model_a.state_dict()
+    state_b = model_b.state_dict()
+    assert state_a.keys() == state_b.keys()
+    for key in state_a:
+        assert torch.equal(state_a[key], state_b[key]), f"bitwise mismatch in {key}"
+
+
+@pytest.mark.parametrize("lmc_mode", ["independent", "shared"])
+@pytest.mark.parametrize(
+    ("strategy", "target_layers_total"),
+    [("duplicate_per_weight", 5), ("interpolate_per_weight", 2)],
+)
+def test_reference_capture_switch_is_bit_identical(lmc_mode, strategy, target_layers_total) -> None:
+    """`reference_capture=eager` must not change a single bit of the result.
+
+    The 2026-09-11 transport-swap reproducibility investigation named the
+    eager->lazy reference-capture rewrite as its leading hypothesis for a
+    ~7-point accuracy gap against a historical table row. This asserts the
+    stronger claim the sibling tests only check to atol=1e-5: on CPU the two
+    capture schedules agree exactly, so any residual gap must come from
+    somewhere else (device nondeterminism, or the artifact/transport path).
+    """
+    loader = _make_loader(n_samples=16, batch_size=4)
+
+    lazy_base, lazy_ft = _run_per_weight_via_config(
+        reference_capture="lazy", strategy=strategy, lmc_mode=lmc_mode,
+        target_layers_total=target_layers_total, loader=loader,
+    )
+    eager_base, eager_ft = _run_per_weight_via_config(
+        reference_capture="eager", strategy=strategy, lmc_mode=lmc_mode,
+        target_layers_total=target_layers_total, loader=loader,
+    )
+
+    _assert_state_dicts_bit_identical(lazy_base, eager_base)
+    _assert_state_dicts_bit_identical(lazy_ft, eager_ft)
+
+
+def test_resolve_block_extension_config_rejects_unknown_reference_capture() -> None:
+    with pytest.raises(ValueError):
+        resolve_block_extension_config(
+            {
+                "block_extension_enabled": True,
+                "block_extension_params": {"reference_capture": "legacy_eager"},
+            }
+        )

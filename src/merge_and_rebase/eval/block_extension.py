@@ -81,6 +81,10 @@ class BlockExtensionConfig:
     # ``shared`` fits the correction at the pretrained/base endpoint and
     # applies it to FT; ``shared_ft`` does the converse.
     lmc_mode: str = "independent"
+    # ``lazy`` recaptures only the references each structural step needs;
+    # ``eager`` captures every block for both endpoints once and reuses it,
+    # reproducing the pre-refactor capture schedule for A/B comparison.
+    reference_capture: str = "lazy"
     verbose: bool = True
     show_progress: bool = True
 
@@ -127,6 +131,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         share_ft_refs=bool(params.get("share_ft_refs", False)),
         component_ridge=_as_optional_dict_float(params.get("component_ridge", None)),
         lmc_mode=str(params.get("lmc_mode", "independent")),
+        reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
     )
@@ -322,6 +327,18 @@ class BlockExtender:
         endpoint copies provide the same references, while tensors from the
         previous structural step are released before the next capture.
         """
+        eager = getattr(self, "_reference_capture", "lazy") == "eager"
+        if eager:
+            cached = getattr(self, "_eager_reference_cache", None)
+            if cached is not None:
+                self.reference_inputs = cached
+                return
+            probe = reference_models.get("base") or next(iter(reference_models.values()))
+            all_blocks = tuple(range(len(probe.visual.transformer.resblocks)))
+            endpoints = ("base", "ft")
+            block_indices = all_blocks
+            input_indices = all_blocks + ("final",)
+
         # Drop the previous step before allocating the next reference window.
         self.reference_inputs = {"base": {}, "ft": {}}
         unique_blocks = tuple(dict.fromkeys(int(index) for index in block_indices))
@@ -405,6 +422,9 @@ class BlockExtender:
                 refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
                 del tensors
             self.reference_inputs[name] = refs
+
+        if eager:
+            self._eager_reference_cache = self.reference_inputs
 
     @torch.no_grad()
     def _capture_single_input(self, model: nn.Module, target: int | str, loader: Iterable[Any], n_batches: int):
@@ -1056,7 +1076,10 @@ class BlockExtender:
         share_ft_refs: bool = False,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
+        reference_capture: str = "lazy",
     ) -> int:
+        self._reference_capture = _as_reference_capture(reference_capture)
+        self._eager_reference_cache: dict[str, dict[str, torch.Tensor]] | None = None
         self._ridge_weight = float(ridge_weight)
         if self._ridge_weight < 0.0:
             raise ValueError("ridge_weight must be >= 0.")
@@ -1132,7 +1155,7 @@ class BlockExtender:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
         if not skip_correction:
-            reference_models = {
+            reference_models: dict[str, nn.Module] = {
                 "base": deepcopy(self.model_base).cpu(),
                 "ft": deepcopy(self.model_ft).cpu(),
             }
@@ -1291,7 +1314,7 @@ class BlockExtender:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
         if not skip_correction:
-            reference_models = {
+            reference_models: dict[str, nn.Module] = {
                 "base": deepcopy(self.model_base).cpu(),
                 "ft": deepcopy(self.model_ft).cpu(),
             }
@@ -1537,7 +1560,15 @@ def run_block_extension(
         share_ft_refs=bool(config.share_ft_refs),
         component_ridge=config.component_ridge,
         lmc_mode=str(config.lmc_mode),
+        reference_capture=str(config.reference_capture),
     )
+
+
+def _as_reference_capture(value: Any) -> str:
+    resolved = str(value).strip().lower()
+    if resolved not in {"lazy", "eager"}:
+        raise ValueError("block_extension_params.reference_capture must be 'lazy' or 'eager'.")
+    return resolved
 
 
 def _as_optional_int(value: Any) -> int | None:
