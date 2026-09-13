@@ -254,3 +254,8 @@ src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
 out
 sbatch*
+
+# Local experiment strays (see CLAUDE.md: results live on scratch, not in-tree)
+/wandb
+/slurm-*.out
+docs/*.aux
