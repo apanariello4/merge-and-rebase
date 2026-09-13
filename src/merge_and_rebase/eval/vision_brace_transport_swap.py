@@ -26,6 +26,7 @@ from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method
 from ..rebase.runtime import resolve_rebase_method_config
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from ..utils.alpha_search import PerTaskAlphaTracker
 from .datasets.vision8_14_20 import SUITES
 from .vision_brace_tv_swap import _expanded_template, state_dict_sha256, validate_artifact_bank
 from .vision_rebase import _build_rebase_prepared, _build_task_context
@@ -43,18 +44,28 @@ def _alpha_values(cfg: Mapping[str, Any]) -> list[float]:
 
 
 def _select_alpha(scores: list[tuple[float, float]], patience: int) -> tuple[float, float, list[tuple[float, float]]]:
-    """Use the legacy per-task early-stopping rule, including the smaller-alpha tie break."""
-    best_alpha, best_score, bad = scores[0][0], scores[0][1], 0
+    """Select alpha with the same early-stopping rule the main runner uses.
+
+    This delegates to ``PerTaskAlphaTracker`` rather than reimplementing the
+    rule.  A previous hand-written copy advanced the bad-step counter on any
+    non-improving step, including an exact tie, while the tracker resets it on
+    a plateau and only counts a genuine decline.  On EuroSAT the validation
+    curve plateaus at 0.7741 for seven consecutive alphas; the copy exhausted
+    patience=5 there and returned alpha=2.3 after visiting 30 of 101 grid
+    points, where the tracker continues past the plateau to the real optimum
+    near 6.1.  That single difference accounted for the swap table reading
+    79.92% against the in-memory runner's 87.49% on a matched cell, and was
+    misread as an artifact-reconstruction defect.
+    """
+    tracker = PerTaskAlphaTracker(task_names=["cell"], initial_alpha=scores[0][0], patience=int(patience))
     visited: list[tuple[float, float]] = []
     for alpha, score in scores:
         visited.append((alpha, score))
-        if score > best_score:
-            best_alpha, best_score, bad = alpha, score, 0
-        else:
-            bad += 1
-            if bad > patience:
-                break
-    return best_alpha, best_score, visited
+        if not tracker.primary_active[0]:
+            visited.pop()
+            break
+        tracker.update(alpha=float(alpha), indices=[0], primary_accs=[float(score)], secondary_accs=[float(score)])
+    return float(tracker.best_primary_alpha[0]), float(tracker.best_primary_acc[0]), visited
 
 
 def _read_bank(root: Path, tasks: list[str], condition: str) -> dict[str, dict[str, Any]]:
