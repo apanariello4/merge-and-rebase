@@ -776,8 +776,9 @@ def main() -> None:
 
         if is_harness_only or harness_tasks_resolved:
             from .lm_harness_runner import run as run_harness
+            from .lm_harness_runner import score_by_task
 
-            harness_num_fewshot = int(cfg.get("harness_num_fewshot", 0))
+            harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
             harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
             harness_limit = cfg.get("harness_limit", None)
 
@@ -826,7 +827,7 @@ def main() -> None:
                     for task_name, acc in harness_results.items():
                         print(f"  {task_name}: {acc:.4f}")
 
-                    score = sum(harness_results.values()) / max(1, len(harness_results))
+                    score = score_by_task(harness_results, list(harness_tasks_resolved))
                     result = SearchEvaluation(
                         candidate=candidate,
                         score=float(score),

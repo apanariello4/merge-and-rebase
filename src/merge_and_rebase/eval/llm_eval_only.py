@@ -99,7 +99,7 @@ def main() -> None:
             model=llm.model,
             tokenizer=llm.tokenizer,
             device=device,
-            num_fewshot=int(cfg.get("harness_num_fewshot", 0)),
+            num_fewshot=cfg.get("harness_num_fewshot", 0),
             batch_size=str(cfg.get("harness_batch_size", "auto")),
             limit=cfg.get("harness_limit", None),
         )
