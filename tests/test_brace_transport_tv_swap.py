@@ -151,7 +151,8 @@ def test_persisting_transported_deltas_records_a_verifiable_hash(tmp_path) -> No
     }
     records = _persist_transported_deltas(
         {"save_transported_deltas_root": str(tmp_path), "campaign": "unit"},
-        transported=transported, task="Cars", method_name="bico", bank_names=["shared", "skip"],
+        transported=transported, task="Cars", method_name="bico",
+        activation_banks=["shared", "skip"], vector_banks=["shared", "skip"],
     )
 
     assert sorted(records) == ["shared__shared", "shared__skip", "skip__shared", "skip__skip"]
@@ -165,7 +166,9 @@ def test_persisting_transported_deltas_is_off_by_default() -> None:
     """Persistence is opt-in so the 20260913 campaign replays byte-identically."""
     from merge_and_rebase.eval.vision_brace_transport_swap import _persist_transported_deltas
 
-    assert _persist_transported_deltas({}, transported={}, task="Cars", method_name="bico", bank_names=[]) is None
+    assert _persist_transported_deltas(
+        {}, transported={}, task="Cars", method_name="bico", activation_banks=[], vector_banks=[],
+    ) is None
 
 
 def test_persisting_transported_deltas_refuses_to_overwrite_a_run(tmp_path) -> None:
@@ -177,5 +180,42 @@ def test_persisting_transported_deltas_refuses_to_overwrite_a_run(tmp_path) -> N
         _persist_transported_deltas(
             {"save_transported_deltas_root": str(tmp_path)},
             transported={("shared", "shared"): {"visual.w": torch.zeros(2)}},
-            task="Cars", method_name="bico", bank_names=["shared"],
+            task="Cars", method_name="bico", activation_banks=["shared"], vector_banks=["shared"],
         )
+
+
+def test_bank_axes_default_to_the_single_banks_field() -> None:
+    """`banks` still sets both axes, so existing configs keep their meaning."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_bank_axes
+
+    assert _resolve_bank_axes({}) == (["shared", "skip"], ["shared", "skip"])
+    assert _resolve_bank_axes({"banks": ["shared", "skip", "independent"]}) == (
+        ["shared", "skip", "independent"], ["shared", "skip", "independent"],
+    )
+
+
+def test_bank_axes_can_be_set_independently() -> None:
+    """The asymmetric grid this campaign needs: two fits, three vectors.
+
+    BRACE builds the corrected base identically under shared and independent
+    correction, so naming independent on the activation axis would recompute the
+    shared column. It is only on the task-vector axis that it is a different
+    vector.
+    """
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_bank_axes
+
+    activation, vector = _resolve_bank_axes({
+        "activation_banks": ["shared", "skip"],
+        "vector_banks": ["shared", "skip", "independent"],
+    })
+    assert activation == ["shared", "skip"]
+    assert vector == ["shared", "skip", "independent"]
+
+
+def test_bank_axes_validate_each_axis_by_name() -> None:
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_bank_axes
+
+    with pytest.raises(ValueError, match="activation_banks"):
+        _resolve_bank_axes({"activation_banks": ["skip"], "vector_banks": ["shared"]})
+    with pytest.raises(ValueError, match="vector_banks"):
+        _resolve_bank_axes({"activation_banks": ["shared"], "vector_banks": ["shared", "bogus"]})
