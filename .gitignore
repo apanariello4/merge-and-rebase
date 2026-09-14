@@ -254,3 +254,4 @@ src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
 out
 sbatch*
+*.slurm
