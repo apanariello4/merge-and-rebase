@@ -330,6 +330,15 @@ class DecoderBlockExtender:
                 hooks.append(block.self_attn.register_forward_hook(
                     self._store_output_hook(store, f"{i}.attn_output")
                 ))
+                hooks.append(block.self_attn.q_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.q_proj_output")
+                ))
+                hooks.append(block.self_attn.k_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.k_proj_output")
+                ))
+                hooks.append(block.self_attn.v_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.v_proj_output")
+                ))
                 hooks.append(block.post_attention_layernorm.register_forward_hook(
                     self._store_output_hook(store, f"{i}.post_attn_ln_output")
                 ))
@@ -507,7 +516,7 @@ class DecoderBlockExtender:
 
             # 2: q_proj
             cur = self._capture_component_output(model, insert_pos, "q_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.q_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -518,7 +527,7 @@ class DecoderBlockExtender:
 
             # 3: k_proj
             cur = self._capture_component_output(model, insert_pos, "k_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.k_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -529,7 +538,7 @@ class DecoderBlockExtender:
 
             # 4: v_proj
             cur = self._capture_component_output(model, insert_pos, "v_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.v_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -1037,7 +1046,7 @@ class DecoderBlockExtender:
             # 2-4: q/k/v track the start
             for proj_name in ("q_proj", "k_proj", "v_proj"):
                 cur = self._capture_component_output(model, block_idx, proj_name, loader, n_batches)
-                ref = refs.get(f"{span_start_idx}.attn_output")
+                ref = refs.get(f"{span_start_idx}.{proj_name}_output")
                 if ref is not None and cur.numel() > 0:
                     A, T = self._match_rows(cur, ref)
                     if A.numel() > 0 and T.numel() > 0:
