@@ -32,8 +32,13 @@ from .vision_brace_tv_swap import _expanded_template, state_dict_sha256, validat
 from .vision_rebase import _build_rebase_prepared, _build_task_context
 
 
-BANKS = ("shared", "skip")
+DEFAULT_BANKS = ("shared", "skip")
+KNOWN_BANKS = ("shared", "skip", "independent")
 METHODS = ("theseus", "bico")
+
+# Retained under its historical name: the 2x2 shared/skip crossing is still the
+# default, and ``tests`` plus the 20260913 campaign refer to it.
+BANKS = DEFAULT_BANKS
 
 
 def _alpha_values(cfg: Mapping[str, Any]) -> list[float]:
@@ -68,6 +73,53 @@ def _select_alpha(scores: list[tuple[float, float]], patience: int) -> tuple[flo
     return float(tracker.best_primary_alpha[0]), float(tracker.best_primary_acc[0]), visited
 
 
+def _persist_transported_deltas(
+    cfg: Mapping[str, Any],
+    *,
+    transported: Mapping[tuple[str, str], Mapping[str, torch.Tensor]],
+    task: str,
+    method_name: str,
+    bank_names: list[str],
+) -> dict[str, Any] | None:
+    """Save each transported delta so the merge stage need not refit transport.
+
+    Merging the crossed cells requires the same transported vectors this runner
+    already produces.  Recomputing them inside a merge runner would refit
+    Theseus/BiCo per merger and put the two stages on different numerical
+    footings; persisting them keeps one transport fit behind every table that
+    quotes it, and the recorded hash lets a later stage prove it consumed the
+    exact vector this run evaluated.
+    """
+
+    root = cfg.get("save_transported_deltas_root")
+    if root in (None, ""):
+        return None
+    task_dir = Path(str(root)) / method_name / task
+    if task_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite transported deltas: {task_dir}")
+    task_dir.mkdir(parents=True, exist_ok=False)
+    records: dict[str, Any] = {}
+    for activation_bank in bank_names:
+        for vector_bank in bank_names:
+            delta = transported[(activation_bank, vector_bank)]
+            cell = f"{activation_bank}__{vector_bank}"
+            torch.save(dict(delta), task_dir / f"{cell}.pt")
+            records[cell] = {
+                "path": str(task_dir / f"{cell}.pt"),
+                "sha256": state_dict_sha256(delta),
+                "activation_bank": activation_bank,
+                "vector_bank": vector_bank,
+            }
+    metadata = {
+        "task": task, "method": method_name, "banks": bank_names,
+        "campaign": cfg.get("campaign"), "cells": records,
+    }
+    metadata_path = task_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (task_dir / "COMPLETE").touch(exist_ok=False)
+    return records
+
+
 def _read_bank(root: Path, tasks: list[str], condition: str) -> dict[str, dict[str, Any]]:
     path = root / condition
     if not (path / "COMPLETE").is_file():
@@ -78,6 +130,29 @@ def _read_bank(root: Path, tasks: list[str], condition: str) -> dict[str, dict[s
     if list(manifest.get("tasks", [])) != tasks:
         raise ValueError(f"Capture task order differs in {path}")
     return validate_artifact_bank(path, tasks)
+
+
+def _resolve_banks(cfg: Mapping[str, Any]) -> list[str]:
+    """Name the correction banks to cross.
+
+    The historical 2x2 shared/skip crossing stays the default so an existing
+    config reproduces its campaign unchanged.  Naming ``independent`` as well
+    turns the same runner into the full 3x3 crossing without touching any
+    transport, alpha, or evaluation rule.
+    """
+
+    raw = cfg.get("banks", DEFAULT_BANKS)
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    banks = [str(item) for item in raw]
+    if not banks or len(set(banks)) != len(banks):
+        raise ValueError("banks must name one or more distinct correction conditions.")
+    unknown = sorted(set(banks) - set(KNOWN_BANKS))
+    if unknown:
+        raise ValueError(f"Unknown correction banks: {unknown}; expected a subset of {list(KNOWN_BANKS)}.")
+    if "shared" not in banks:
+        raise ValueError("The shared bank is the alpha anchor and must be present.")
+    return banks
 
 
 def _validate_pair(shared: Mapping[str, Any], skip: Mapping[str, Any]) -> None:
@@ -104,8 +179,11 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
     if task not in tasks:
         raise ValueError(f"Unknown task {task!r}")
     capture_root = Path(str(cfg["artifact_capture_root"]))
-    banks = {bank: _read_bank(capture_root, tasks, bank) for bank in BANKS}
-    _validate_pair(banks["shared"], banks["skip"])
+    bank_names = _resolve_banks(cfg)
+    banks = {bank: _read_bank(capture_root, tasks, bank) for bank in bank_names}
+    for bank in bank_names:
+        if bank != "shared":
+            _validate_pair(banks["shared"], banks[bank])
 
     source_cfg = OpenClipBuildConfig(
         model_name=str(cfg["source_clip_model"]), pretrained=str(cfg["source_clip_pretrained"]),
@@ -142,7 +220,7 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
     transported: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
     prepare_records: dict[str, Any] = {}
     source_depth = int(banks["shared"][task]["metadata"]["target_depth"])
-    for activation_bank in BANKS:
+    for activation_bank in bank_names:
         source_model = _expanded_template(clf_source, source_depth, source_cfg.device)
         # Capture banks intentionally contain visual tensors only; the untouched
         # text-side state remains from the source OpenCLIP template.
@@ -161,9 +239,9 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
         )
         prepare_records[activation_bank] = {
             "source_base_sha256": state_dict_sha256(banks[activation_bank][task]["base"]),
-            "prepared_reused_for_tvs": list(BANKS),
+            "prepared_reused_for_tvs": list(bank_names),
         }
-        for vector_bank in BANKS:
+        for vector_bank in bank_names:
             delta = method.transport(
                 source_base=source_state, target_base=target_base,
                 delta=banks[vector_bank][task]["tv"], strict=True, prepared=prepared, **method_params,
@@ -176,9 +254,12 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
         curves[cell] = [(alpha, score(delta, alpha, "val")) for alpha in alpha_grid]
         selected[cell] = _select_alpha(curves[cell], patience)
     anchor = selected[("shared", "shared")][0]
+    delta_records = _persist_transported_deltas(
+        cfg, transported=transported, task=task, method_name=method_name, bank_names=bank_names,
+    )
     rows = []
-    for activation_bank in BANKS:
-        for vector_bank in BANKS:
+    for activation_bank in bank_names:
+        for vector_bank in bank_names:
             cell = (activation_bank, vector_bank)
             selected_alpha, selected_val, visited = selected[cell]
             delta = transported[cell]
@@ -193,6 +274,7 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
             })
     payload = {
         "campaign": cfg.get("campaign"), "task": task, "method": method_name,
+        "banks": bank_names, "transported_delta_artifacts": delta_records,
         "target_base_sha256": target_hash, "prepare_records": prepare_records,
         "capture_root": str(capture_root), "resolved_config": cfg,
         "slurm": {key: os.environ.get(key) for key in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID")},

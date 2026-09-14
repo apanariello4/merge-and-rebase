@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from merge_and_rebase.eval.vision_brace_transport_swap import _select_alpha, _validate_pair
@@ -104,3 +105,77 @@ def test_select_alpha_matches_per_task_alpha_tracker() -> None:
             tracker.update(alpha=a, indices=[0], primary_accs=[s], secondary_accs=[s])
         assert alpha == tracker.best_primary_alpha[0]
         assert score == tracker.best_primary_acc[0]
+
+
+def test_resolve_banks_defaults_to_the_historical_shared_skip_crossing() -> None:
+    """An existing 20260913 config must keep producing the same 2x2 table."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import DEFAULT_BANKS, _resolve_banks
+
+    assert _resolve_banks({}) == list(DEFAULT_BANKS) == ["shared", "skip"]
+
+
+def test_resolve_banks_accepts_the_independent_bank_for_the_full_crossing() -> None:
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_banks
+
+    assert _resolve_banks({"banks": ["shared", "skip", "independent"]}) == ["shared", "skip", "independent"]
+    assert _resolve_banks({"banks": "shared,independent"}) == ["shared", "independent"]
+
+
+def test_resolve_banks_requires_the_shared_alpha_anchor() -> None:
+    """`run` anchors its reported alpha on shared/shared, so shared must exist."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_banks
+
+    with pytest.raises(ValueError, match="alpha anchor"):
+        _resolve_banks({"banks": ["skip", "independent"]})
+
+
+def test_resolve_banks_rejects_unknown_and_repeated_conditions() -> None:
+    from merge_and_rebase.eval.vision_brace_transport_swap import _resolve_banks
+
+    with pytest.raises(ValueError, match="Unknown correction banks"):
+        _resolve_banks({"banks": ["shared", "steer"]})
+    with pytest.raises(ValueError, match="distinct"):
+        _resolve_banks({"banks": ["shared", "shared"]})
+
+
+def test_persisting_transported_deltas_records_a_verifiable_hash(tmp_path) -> None:
+    """The merge stage identifies its input by this hash, so it must be exact."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import _persist_transported_deltas
+    from merge_and_rebase.eval.vision_brace_tv_swap import state_dict_sha256
+
+    transported = {
+        (act, tv): {"visual.w": torch.full((2,), float(index))}
+        for index, (act, tv) in enumerate(
+            [(a, b) for a in ("shared", "skip") for b in ("shared", "skip")]
+        )
+    }
+    records = _persist_transported_deltas(
+        {"save_transported_deltas_root": str(tmp_path), "campaign": "unit"},
+        transported=transported, task="Cars", method_name="bico", bank_names=["shared", "skip"],
+    )
+
+    assert sorted(records) == ["shared__shared", "shared__skip", "skip__shared", "skip__skip"]
+    for cell, record in records.items():
+        reloaded = torch.load(tmp_path / "bico" / "Cars" / f"{cell}.pt", weights_only=True)
+        assert state_dict_sha256(reloaded) == record["sha256"]
+    assert (tmp_path / "bico" / "Cars" / "COMPLETE").is_file()
+
+
+def test_persisting_transported_deltas_is_off_by_default() -> None:
+    """Persistence is opt-in so the 20260913 campaign replays byte-identically."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import _persist_transported_deltas
+
+    assert _persist_transported_deltas({}, transported={}, task="Cars", method_name="bico", bank_names=[]) is None
+
+
+def test_persisting_transported_deltas_refuses_to_overwrite_a_run(tmp_path) -> None:
+    """Historical results are never overwritten, artifacts included."""
+    from merge_and_rebase.eval.vision_brace_transport_swap import _persist_transported_deltas
+
+    (tmp_path / "bico" / "Cars").mkdir(parents=True)
+    with pytest.raises(FileExistsError):
+        _persist_transported_deltas(
+            {"save_transported_deltas_root": str(tmp_path)},
+            transported={("shared", "shared"): {"visual.w": torch.zeros(2)}},
+            task="Cars", method_name="bico", bank_names=["shared"],
+        )
