@@ -254,3 +254,33 @@ def test_determinism_switch_seeds_from_the_run_seed(monkeypatch) -> None:
 
     swap._apply_determinism({"deterministic": True, "seed": 7})
     assert seeded == [7]
+
+
+def test_strict_determinism_demands_deterministic_kernels(monkeypatch) -> None:
+    """`warn_only=True` is not enough for BiCo, so strict mode is separate.
+
+    `_set_deterministic_seed` asks with `warn_only=True`, under which PyTorch
+    warns about a non-deterministic kernel and runs it anyway. BiCo's backward
+    pass reaches the memory-efficient attention backward, which did exactly that
+    in the 20260915 probe: four runs, four different transported deltas, with the
+    warning naming the kernel. Strict mode re-asserts the request with
+    `warn_only=False` so such an op raises rather than silently varying.
+    """
+    import torch
+
+    import merge_and_rebase.eval.vision_brace_transport_swap as swap
+
+    seeded: list[int] = []
+    asked: list[bool] = []
+    monkeypatch.setattr(swap, "_set_deterministic_seed", lambda seed: seeded.append(int(seed)))
+    monkeypatch.setattr(
+        torch, "use_deterministic_algorithms", lambda flag, warn_only=False: asked.append(bool(warn_only))
+    )
+
+    assert swap._apply_determinism({"deterministic": True, "seed": 89}) is True
+    assert asked == [], "non-strict mode must not re-assert the flag"
+
+    # Strict implies deterministic: seeding is a precondition, not an alternative.
+    assert swap._apply_determinism({"deterministic_strict": True, "seed": 89}) is True
+    assert seeded == [89, 89]
+    assert asked == [False]

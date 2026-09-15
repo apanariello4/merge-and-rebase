@@ -207,9 +207,21 @@ def _apply_determinism(cfg: Mapping[str, Any]) -> bool:
     resolved value so the summary can state which way the run went.
     """
 
-    deterministic = bool(cfg.get("deterministic", False))
+    strict = bool(cfg.get("deterministic_strict", False))
+    deterministic = strict or bool(cfg.get("deterministic", False))
     if deterministic:
         _set_deterministic_seed(int(cfg.get("seed", 89)))
+    if strict:
+        # `_set_deterministic_seed` asks with `warn_only=True`, which lets a
+        # non-deterministic kernel run after printing a warning instead of
+        # forcing a deterministic one.  BiCo's backward pass reaches the
+        # memory-efficient attention backward, which warns and proceeds, so the
+        # non-strict switch left four probe runs with four different deltas.
+        # PyTorch's own warning says determinism for that kernel requires
+        # `warn_only=False`; under it an op with no deterministic implementation
+        # raises instead of silently varying, which is the behaviour a
+        # reproducibility gate needs.
+        torch.use_deterministic_algorithms(True, warn_only=False)
     return deterministic
 
 
@@ -322,6 +334,7 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
     payload = {
         "campaign": cfg.get("campaign"), "task": task, "method": method_name,
         "deterministic": deterministic,
+        "deterministic_strict": bool(cfg.get("deterministic_strict", False)),
         "banks": bank_names, "activation_banks": activation_banks, "vector_banks": vector_banks,
         "transported_delta_artifacts": delta_records,
         "target_base_sha256": target_hash, "prepare_records": prepare_records,
