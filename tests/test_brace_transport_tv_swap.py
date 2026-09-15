@@ -219,3 +219,38 @@ def test_bank_axes_validate_each_axis_by_name() -> None:
         _resolve_bank_axes({"activation_banks": ["skip"], "vector_banks": ["shared"]})
     with pytest.raises(ValueError, match="vector_banks"):
         _resolve_bank_axes({"activation_banks": ["shared"], "vector_banks": ["shared", "bogus"]})
+
+
+def test_determinism_switch_defaults_off_and_is_recorded(monkeypatch) -> None:
+    """Seeding is opt-in, and every summary states which way it ran.
+
+    The swap runner borrowed vision_rebase's prepare/context helpers but not its
+    `_set_deterministic_seed` call, so BiCo -- which runs a backward pass to
+    populate its hooks -- fitted under unseeded, non-deterministic kernels. All
+    32 BiCo cells of the 20260914 campaign disagreed with their 20260913
+    counterparts at hash level while all 32 Theseus cells matched. The switch
+    stays off by default so the historical campaigns replay as they ran, and the
+    resolved value is returned so a summary can never be ambiguous about it.
+    """
+    import merge_and_rebase.eval.vision_brace_transport_swap as swap
+
+    seeded: list[int] = []
+    monkeypatch.setattr(swap, "_set_deterministic_seed", lambda seed: seeded.append(int(seed)))
+
+    assert swap._apply_determinism({}) is False
+    assert swap._apply_determinism({"deterministic": False, "seed": 89}) is False
+    assert seeded == []
+
+    assert swap._apply_determinism({"deterministic": True, "seed": 89}) is True
+    assert seeded == [89]
+
+
+def test_determinism_switch_seeds_from_the_run_seed(monkeypatch) -> None:
+    """The campaign seed is the one pinned, not a hardcoded default."""
+    import merge_and_rebase.eval.vision_brace_transport_swap as swap
+
+    seeded: list[int] = []
+    monkeypatch.setattr(swap, "_set_deterministic_seed", lambda seed: seeded.append(int(seed)))
+
+    swap._apply_determinism({"deterministic": True, "seed": 7})
+    assert seeded == [7]

@@ -29,7 +29,7 @@ from ..run_logging import default_summary_path, finish_with_error, merge_logging
 from ..utils.alpha_search import PerTaskAlphaTracker
 from .datasets.vision8_14_20 import SUITES
 from .vision_brace_tv_swap import _expanded_template, state_dict_sha256, validate_artifact_bank
-from .vision_rebase import _build_rebase_prepared, _build_task_context
+from .vision_rebase import _build_rebase_prepared, _build_task_context, _set_deterministic_seed
 
 
 DEFAULT_BANKS = ("shared", "skip")
@@ -197,9 +197,26 @@ def _validate_pair(shared: Mapping[str, Any], skip: Mapping[str, Any]) -> None:
                 raise ValueError(f"Shared/Skip capture metadata mismatch for {task}:{field}")
 
 
+def _apply_determinism(cfg: Mapping[str, Any]) -> bool:
+    """Seed and pin deterministic kernels when the config asks for it.
+
+    ``vision_rebase`` does this in its own runner, but this module borrowed only
+    its prepare/context helpers, so BiCo has been fitting here under unseeded,
+    non-deterministic kernels.  Theseus is forward-only and reproduces anyway;
+    BiCo runs a backward pass to populate its hooks and does not.  Returns the
+    resolved value so the summary can state which way the run went.
+    """
+
+    deterministic = bool(cfg.get("deterministic", False))
+    if deterministic:
+        _set_deterministic_seed(int(cfg.get("seed", 89)))
+    return deterministic
+
+
 def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -> dict[str, Any]:
     if method_name not in METHODS:
         raise ValueError(f"method must be one of {METHODS}")
+    deterministic = _apply_determinism(cfg)
     suite = SUITES[str(cfg.get("suite", "vision8"))]
     tasks = list(suite.tasks)
     if task not in tasks:
@@ -304,6 +321,7 @@ def run(cfg: dict[str, Any], *, task: str, method_name: str, output_dir: Path) -
             })
     payload = {
         "campaign": cfg.get("campaign"), "task": task, "method": method_name,
+        "deterministic": deterministic,
         "banks": bank_names, "activation_banks": activation_banks, "vector_banks": vector_banks,
         "transported_delta_artifacts": delta_records,
         "target_base_sha256": target_hash, "prepare_records": prepare_records,
