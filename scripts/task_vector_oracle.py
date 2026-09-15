@@ -29,6 +29,7 @@ from pathlib import Path
 EVAL_DIR = Path("results/eval")
 SOURCE_BASE = "qwen2_1.5b_base"
 SOURCE_TUNED = "qwen2_1.5b_instruct"
+TARGET_BASE = "qwen25_3b_base"
 
 
 def _task_metrics(model: str, task: str) -> dict[str, float]:
@@ -63,6 +64,17 @@ def _cosine(a: list[float], b: list[float]) -> float | None:
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
 
+def _flatten_before(before: dict) -> dict[str, float]:
+    """Before-rebase results are flat for one task vector, nested for several."""
+    out: dict[str, float] = {}
+    for key, value in before.items():
+        if isinstance(value, dict):
+            out.update({f"{key}/{k}": v for k, v in value.items()})
+        elif isinstance(value, (int, float)):
+            out[key] = float(value)
+    return out
+
+
 def report_run(path: Path, oracle: dict[str, float]) -> None:
     summary = json.loads(path.read_text())
     logging_block = summary.get("run_logging", {})
@@ -72,8 +84,19 @@ def report_run(path: Path, oracle: dict[str, float]) -> None:
         return
 
     before = summary.get("harness_results_before_rebase") or {}
+    before_model = str(summary.get("before_rebase_model", "target_base"))
     tasks = list(oracle)
     print(f"\n### {path.name}   method={summary.get('method')}")
+
+    if before_model != "target_base":
+        # Newer runs spend their before-rebase pass on the (block-extended)
+        # source model, which is not a reference for target-side deltas; the
+        # target base comes from its standalone eval files instead.
+        if before:
+            print(f"  before rebase ({before_model}):")
+            for name, acc in sorted(_flatten_before(before).items()):
+                print(f"    {name}: {acc:.4f}")
+        before = {}
 
     stats = summary.get("merged_delta")
     if stats:
@@ -82,7 +105,10 @@ def report_run(path: Path, oracle: dict[str, float]) -> None:
             f"/{int(stats['key_count'])} rel_norm={stats['merged_delta_rel_norm']:.6f}"
         )
 
-    base_scores = {t: _task_score(before, t) for t in tasks}
+    base_scores: dict[str, float | None] = {}
+    for t in tasks:
+        ref = _task_score(before, t)
+        base_scores[t] = ref if ref is not None else _task_score(_task_metrics(TARGET_BASE, t), t)
     header = "  " + "alpha".ljust(8) + "".join(t[:14].ljust(16) for t in tasks) + "cosine"
     print(header)
     print("  " + "oracle".ljust(8) + "".join(f"{oracle[t] * 100:+.2f}".ljust(16) for t in tasks) + "1.000")

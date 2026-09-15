@@ -99,6 +99,9 @@ def test_theseus_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_partial_whitening_changes_alignment_map() -> None:
@@ -162,6 +165,9 @@ def test_theseus_transport_with_partial_whitening_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
@@ -195,6 +201,9 @@ def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_data_free_transforms_handle_biases_and_zero_keys() -> None:

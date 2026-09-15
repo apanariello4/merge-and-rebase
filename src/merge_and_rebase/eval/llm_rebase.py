@@ -527,6 +527,42 @@ def main() -> None:
 
         harness_tasks_raw = cfg.get("harness_tasks", None)
         is_harness_only = harness_tasks_raw is not None and cfg.get("tasks") is None and cfg.get("suite") is None
+        harness_tasks_resolved = (
+            parse_csv(harness_tasks_raw)
+            if isinstance(harness_tasks_raw, str)
+            else (harness_tasks_raw or [])
+        )
+        harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
+        harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
+        harness_limit = cfg.get("harness_limit", None)
+
+        # The "before rebase" reference is the SOURCE model exactly as transport
+        # sees it: resized (and LMC-corrected) to the target depth by block
+        # extension, before any task vector is transported. The target base is
+        # not a useful reference here -- block extension never touches it, so
+        # its score says nothing about how much the extension cost us.
+        eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
+        run_before_rebase_eval = eval_before_rebase and bool(harness_tasks_resolved)
+        if eval_before_rebase and not harness_tasks_resolved:
+            print("eval_before_rebase requested but no harness_tasks configured; skipping.")
+        baseline_harness_results_by_task: dict[str, dict[str, float]] = {}
+
+        def _eval_before_rebase(model: torch.nn.Module, label: str) -> None:
+            from .lm_harness_runner import run as run_harness
+
+            print(f"\nEvaluating source model ({label}) with lm-harness (before rebase)...")
+            results = run_harness(
+                tasks=list(harness_tasks_resolved),
+                model=model,
+                tokenizer=source_llm.tokenizer,
+                device=device,
+                num_fewshot=harness_num_fewshot,
+                batch_size=harness_batch_size,
+                limit=harness_limit,
+            )
+            for task_name, acc in results.items():
+                print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")
+            baseline_harness_results_by_task[label] = results
 
         if is_harness_only:
             tasks = []
@@ -612,7 +648,15 @@ def main() -> None:
                 max_length=calib_max_length,
             )
 
-        for ckpt_ref in tuned_ref_list:
+        if run_before_rebase_eval and not run_block_extension_prestep:
+            # No depth change: the model transport starts from is the plain
+            # source base, so one pass is enough for every task.
+            load_into_model(source_llm.model, source_base_sd, strict=False)
+            _eval_before_rebase(source_llm.model, "source_base")
+            source_llm.model.to("cpu")
+
+        for task_idx, ckpt_ref in enumerate(tuned_ref_list):
+            task_label = tasks[task_idx] if task_idx < len(tasks) else f"task_{task_idx}"
             if run_block_extension_prestep:
                 # Each task starts from an immutable source template, then its
                 # own copy is resized to the target depth before transport.
@@ -645,9 +689,18 @@ def main() -> None:
                     device=device,
                 )
                 print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
+                # The resized ft model has already been absorbed into the delta;
+                # drop it before the eval below so it is not holding device
+                # memory while lm-harness runs.
+                del source_ft_model_task
+                if run_before_rebase_eval:
+                    # Scored here, after extension and before transport: this is
+                    # the extended source base that BiCo/Theseus will read from.
+                    _eval_before_rebase(
+                        source_base_model_task, f"extended_source_base:{task_label}"
+                    )
                 prepared_tasks.append(prepared_task)
                 source_base_model_task.to("cpu")
-                del source_ft_model_task
             else:
                 aligned = load_aligned_tuned_from_ref(
                     ckpt_ref=ckpt_ref,
@@ -817,35 +870,21 @@ def main() -> None:
         )
 
         # ---- Dispatch evaluation backend ----
-        harness_tasks_resolved = parse_csv(harness_tasks_raw) if isinstance(harness_tasks_raw, str) else (harness_tasks_raw or [])
-
         if is_harness_only or harness_tasks_resolved:
             from .lm_harness_runner import run as run_harness
             from .lm_harness_runner import score_by_task
-
-            harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
-            harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
-            harness_limit = cfg.get("harness_limit", None)
 
             best_harness_eval: SearchEvaluation | None = None
             harness_results_by_alpha: dict[float, dict[str, float]] = {}
             harness_search_results: list[SearchEvaluation] = []
 
-            baseline_harness_results: dict[str, float] | None = None
-            if bool(cfg.get("eval_before_rebase", False)):
-                load_into_model(target_llm.model, target_base_sd, strict=False)
-                print("\nEvaluating untransported target with lm-harness (before rebase)...")
-                baseline_harness_results = run_harness(
-                    tasks=list(harness_tasks_resolved),
-                    model=target_llm.model,
-                    tokenizer=target_llm.tokenizer,
-                    device=device,
-                    num_fewshot=harness_num_fewshot,
-                    batch_size=harness_batch_size,
-                    limit=harness_limit,
+            baseline_harness_results: dict[str, float] | dict[str, dict[str, float]] | None = None
+            if baseline_harness_results_by_task:
+                baseline_harness_results = (
+                    next(iter(baseline_harness_results_by_task.values()))
+                    if len(baseline_harness_results_by_task) == 1
+                    else dict(baseline_harness_results_by_task)
                 )
-                for task_name, acc in baseline_harness_results.items():
-                    print(f"  [before rebase] {task_name}: {acc:.4f}")
 
             while True:
                 batch = search_planner.next_batch()
@@ -923,6 +962,9 @@ def main() -> None:
                     "backend": "lm_harness",
                     "harness_results": best_harness_results,
                     "harness_results_before_rebase": baseline_harness_results,
+                    "before_rebase_model": (
+                        "extended_source_base" if run_block_extension_prestep else "source_base"
+                    ),
                     # Named per-alpha metrics: search_results only keeps a flat
                     # per_task_acc list, which loses which task each number is.
                     "harness_results_by_alpha": {
