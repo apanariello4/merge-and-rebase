@@ -319,6 +319,15 @@ def main() -> None:
             default=None,
             help="Optionally evaluate source model before rebase for pre/post comparison.",
         )
+        p.add_argument(
+            "--eval-before-rebase-only",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run block extension and the before-rebase eval, then stop before "
+                "transport. Implies --eval-before-rebase."
+            ),
+        )
 
         add_logging_args(p)
         args = p.parse_args()
@@ -377,6 +386,7 @@ def main() -> None:
             "block_extension_enabled": args.block_extension_enabled,
             "block_extension_params": block_extension_params_cli,
             "eval_before_rebase": args.eval_before_rebase,
+            "eval_before_rebase_only": args.eval_before_rebase_only,
         }
         cfg = merge_non_none(cfg, cli_overrides)
 
@@ -541,11 +551,24 @@ def main() -> None:
         # extension, before any task vector is transported. The target base is
         # not a useful reference here -- block extension never touches it, so
         # its score says nothing about how much the extension cost us.
-        eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
+        eval_before_rebase_only = bool(cfg.get("eval_before_rebase_only", False))
+        eval_before_rebase = bool(cfg.get("eval_before_rebase", False)) or eval_before_rebase_only
+        if eval_before_rebase_only and not harness_tasks_resolved:
+            raise ValueError(
+                "eval_before_rebase_only needs harness_tasks: there is nothing else to run."
+            )
         run_before_rebase_eval = eval_before_rebase and bool(harness_tasks_resolved)
         if eval_before_rebase and not harness_tasks_resolved:
             print("eval_before_rebase requested but no harness_tasks configured; skipping.")
         baseline_harness_results_by_task: dict[str, dict[str, float]] = {}
+
+        def _baseline_summary() -> dict[str, Any] | None:
+            """Flat for a single task vector, label -> results for several."""
+            if not baseline_harness_results_by_task:
+                return None
+            if len(baseline_harness_results_by_task) == 1:
+                return next(iter(baseline_harness_results_by_task.values()))
+            return dict(baseline_harness_results_by_task)
 
         def _eval_before_rebase(model: torch.nn.Module, label: str) -> None:
             from .lm_harness_runner import run as run_harness
@@ -735,6 +758,26 @@ def main() -> None:
                     )
                 )
 
+        if eval_before_rebase_only:
+            # Everything the before-rebase reference needs is done: block
+            # extension has run and the extended source base has been scored.
+            # Transport is the expensive half and contributes nothing here.
+            print("\nStopping after the before-rebase eval (eval_before_rebase_only).")
+            if run_logger is not None:
+                run_logger.log_summary({
+                    "method": method_name,
+                    "backend": "lm_harness",
+                    "stopped_after": "before_rebase_eval",
+                    "harness_results_before_rebase": _baseline_summary(),
+                    "before_rebase_model": (
+                        "extended_source_base" if run_block_extension_prestep else "source_base"
+                    ),
+                    "source_depth": source_depth,
+                    "target_depth": target_depth,
+                })
+                run_logger.finish("success")
+            return
+
         weights_raw = cfg.get("weights", None)
         if weights_raw is None:
             weights = [1.0] * len(tuned_ref_list)
@@ -878,13 +921,7 @@ def main() -> None:
             harness_results_by_alpha: dict[float, dict[str, float]] = {}
             harness_search_results: list[SearchEvaluation] = []
 
-            baseline_harness_results: dict[str, float] | dict[str, dict[str, float]] | None = None
-            if baseline_harness_results_by_task:
-                baseline_harness_results = (
-                    next(iter(baseline_harness_results_by_task.values()))
-                    if len(baseline_harness_results_by_task) == 1
-                    else dict(baseline_harness_results_by_task)
-                )
+            baseline_harness_results = _baseline_summary()
 
             while True:
                 batch = search_planner.next_batch()
