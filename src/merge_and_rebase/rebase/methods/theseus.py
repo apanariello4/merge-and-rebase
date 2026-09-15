@@ -996,6 +996,32 @@ class _ApplyDiagnostics:
     wrong_shape: int
     wrong_shape_examples: tuple[str, ...]
     skipped_not_in_target_visual: int
+    missing_transform_examples: tuple[str, ...] = ()
+
+
+def _log_apply_diagnostics(diag: _ApplyDiagnostics, log_prefix: str) -> None:
+    """Print apply-stage counters, shared by every method that transports deltas.
+
+    A transport that assigns no transform at all still returns a full set of
+    correctly shaped keys, so the counters below are the only way to tell a
+    working run from one that quietly emitted the zero delta.
+    """
+    if diag.wrong_shape > 0:
+        print(
+            f"{log_prefix} apply: warnings wrong_shape={diag.wrong_shape} "
+            f"examples={list(diag.wrong_shape_examples)}"
+        )
+    if diag.missing_transform > 0:
+        print(
+            f"{log_prefix} apply: warnings missing_transform={diag.missing_transform} "
+            f"examples={list(diag.missing_transform_examples)}"
+        )
+    print(
+        f"{log_prefix} apply: diagnostics "
+        f"weights={diag.transformed_weight} biases={diag.transformed_bias} "
+        f"zero={diag.zero_passthrough} "
+        f"missing={diag.missing_transform} failures={diag.transport_failures}"
+    )
 
 
 def _precompute_transforms(
@@ -1238,6 +1264,7 @@ def _apply_transforms_to_visual_delta(
     wrong_shape = 0
     wrong_shape_examples: list[str] = []
     skipped_not_in_target_visual = 0
+    missing_transform_examples: list[str] = []
 
     items = _iter_with_progress(
         visual_delta.items(),
@@ -1280,6 +1307,8 @@ def _apply_transforms_to_visual_delta(
 
         if not applied and key in target_visual_base:
             missing_transform += 1
+            if len(missing_transform_examples) < 10:
+                missing_transform_examples.append(key)
 
         if transported.shape != target_ref.shape:
             logger.warning(
@@ -1304,7 +1333,20 @@ def _apply_transforms_to_visual_delta(
         wrong_shape=wrong_shape,
         wrong_shape_examples=tuple(wrong_shape_examples),
         skipped_not_in_target_visual=skipped_not_in_target_visual,
+        missing_transform_examples=tuple(missing_transform_examples),
     )
+
+    # A run where no key at all received a transform returns a full set of
+    # correctly shaped zeros, which downstream code cannot distinguish from a
+    # legitimate result. Refuse to hand that back silently.
+    if visual_delta and transformed_weight == 0 and transformed_bias == 0:
+        raise RuntimeError(
+            f"{method_name} transported no keys: every one of {len(visual_delta)} delta keys "
+            f"was zeroed (missing={missing_transform}, failures={transport_failures}, "
+            f"wrong_shape={wrong_shape}). The transported delta would be identically zero. "
+            f"Examples: {missing_transform_examples[:5]}"
+        )
+
     return aligned, diagnostics
 
 
@@ -1650,17 +1692,7 @@ class TheseusRebase:
                 raise KeyError(f"Theseus did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
-            if apply_diag.wrong_shape > 0:
-                print(
-                    f"{log_prefix} apply: warnings wrong_shape={apply_diag.wrong_shape} "
-                    f"examples={list(apply_diag.wrong_shape_examples)}"
-                )
-            print(
-                f"{log_prefix} apply: diagnostics "
-                f"weights={apply_diag.transformed_weight} biases={apply_diag.transformed_bias} "
-                f"zero={apply_diag.zero_passthrough} "
-                f"missing={apply_diag.missing_transform} failures={apply_diag.transport_failures}"
-            )
+            _log_apply_diagnostics(apply_diag, log_prefix)
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out

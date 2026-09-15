@@ -606,7 +606,7 @@ class BiCoRebase:
             raise ValueError("BiCo did not find any visual delta keys to transport.")
 
         compute_device = prepared.get("compute_device", "cpu")
-        aligned_visual = _t._apply_transforms_to_visual_delta(
+        aligned_visual, apply_diag = _t._apply_transforms_to_visual_delta(
             target_visual_base=target_visual_base_work,
             visual_delta=visual_delta_work,
             transforms_by_key=transforms_by_key,
@@ -644,6 +644,7 @@ class BiCoRebase:
                 raise KeyError(f"BiCo did not transport all delta keys. Example: {missing[:10]}")
 
         if verbose:
+            _t._log_apply_diagnostics(apply_diag, log_prefix)
             print(f"{log_prefix} apply: done (transported_keys={len(out)})")
 
         return out

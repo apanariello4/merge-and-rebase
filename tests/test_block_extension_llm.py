@@ -81,7 +81,8 @@ class DummyDecoderModel(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         x = self.embed_tokens(input_ids)
-        for layer in self.model.layers:
+        # Mirrors HF decoders, which iterate `self.layers[: config.num_hidden_layers]`.
+        for layer in self.model.layers[: self.config.num_hidden_layers]:
             x = layer(x)
         x = self.model.norm(x)
         return type("Output", (), {"logits": self.lm_head(x)})()
@@ -404,3 +405,44 @@ class TestRunBlockExtensionLLM:
             device="cpu",
         )
         assert final_depth == 5
+        assert len(model_base.model.layers) == 5
+        # A longer ModuleList alone is inert: HF decoders slice by
+        # config.num_hidden_layers, so the appended blocks never run while
+        # state_dict still reports them.
+        assert model_base.config.num_hidden_layers == 5
+        assert model_ft.config.num_hidden_layers == 5
+
+    def test_extended_model_executes_every_layer(self):
+        model_base = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+        model_ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
+        adapter = DummyFamilyAdapter()
+        loader = _make_calibration_loader(vocab=100, batch_size=2, seq_len=8, n_batches=1)
+        config = BlockExtensionConfig(
+            blocks_to_add=2,
+            extension_strategy="interpolate",
+            n_batches_act=1,
+            verbose=False,
+            show_progress=False,
+        )
+        run_block_extension_llm(
+            source_base_model=model_base,
+            source_ft_model=model_ft,
+            calibration_loader=loader,
+            target_layers_total=5,
+            config=config,
+            family_adapter=adapter,
+            device="cpu",
+        )
+
+        executed: list[int] = []
+        handles = [
+            layer.register_forward_hook(lambda _m, _i, _o, idx=idx: executed.append(idx))
+            for idx, layer in enumerate(model_base.model.layers)
+        ]
+        try:
+            model_base(input_ids=torch.randint(0, 100, (1, 8)))
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert executed == [0, 1, 2, 3, 4]

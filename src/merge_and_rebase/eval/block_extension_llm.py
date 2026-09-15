@@ -1120,7 +1120,45 @@ class DecoderBlockExtender:
     def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
         scope = self.family_adapter.transport_scope(model)
         scope.layers = nn.ModuleList(new_layers)
+        self._set_depth(model, scope, len(scope.layers))
         self._reindex_layers(model, scope.layers)
+
+    @staticmethod
+    def _set_depth(model: nn.Module, scope: nn.Module, depth: int) -> None:
+        # HF decoders iterate `self.layers[: self.config.num_hidden_layers]`, so
+        # a longer ModuleList alone does nothing: the appended blocks never run.
+        # Everything downstream still sees them (state_dict reports them, deltas
+        # are computed over them), which makes the truncation invisible -- the
+        # model simply behaves as if it were never extended.
+        for holder in (model, scope):
+            config = getattr(holder, "config", None)
+            if config is None:
+                continue
+            if getattr(config, "num_hidden_layers", None) == depth:
+                continue
+            config.num_hidden_layers = depth
+
+    @staticmethod
+    def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] | None:
+        """Grow `config.layer_types` to the new depth, keeping it authoritative.
+
+        Models with alternating attention patterns key off this list, and the
+        reindex below reads it positionally. Left short, every layer past the
+        original depth keeps whichever `attention_type` it was duplicated with
+        while the config claims a shorter model.
+        """
+        config = getattr(model, "config", None)
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            return None
+        resolved = list(layer_types)
+        if len(resolved) >= len(layers):
+            return resolved[: len(layers)]
+        for idx in range(len(resolved), len(layers)):
+            own = getattr(layers[idx], "attention_type", None)
+            resolved.append(own if own is not None else resolved[-1])
+        config.layer_types = resolved
+        return resolved
 
     @staticmethod
     def _reindex_layers(model: nn.Module, layers: nn.ModuleList) -> None:
@@ -1132,7 +1170,7 @@ class DecoderBlockExtender:
         # leftover keys/values, silently doubling the sequence length the
         # rest of that layer's attention sees (crashes as a seq-length
         # mismatch against the attention mask, or worse, doesn't crash).
-        layer_types = getattr(getattr(model, "config", None), "layer_types", None)
+        layer_types = DecoderBlockExtender._resolve_layer_types(model, layers)
         for new_idx, layer in enumerate(layers):
             for holder in (layer, getattr(layer, "self_attn", None)):
                 if holder is not None and hasattr(holder, "layer_idx"):

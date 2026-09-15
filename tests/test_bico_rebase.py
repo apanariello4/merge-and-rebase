@@ -133,6 +133,9 @@ def test_bico_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_bico_deterministic() -> None:
@@ -238,6 +241,9 @@ def test_bico_gradin_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_bico_gradin_deterministic() -> None:

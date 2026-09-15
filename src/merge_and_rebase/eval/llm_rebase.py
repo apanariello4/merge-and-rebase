@@ -164,6 +164,39 @@ def _prepare_resized_task_delta(
     )
 
 
+def _summarize_merged_delta(
+    merged_delta: dict[str, torch.Tensor],
+    target_base: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Measure how much of the target model the transported delta actually moves.
+
+    A transport that silently zeroes every key still returns a full set of
+    correctly shaped tensors, so the alpha sweep looks healthy while every
+    candidate evaluates the same untouched base model. These numbers go into the
+    run summary so that failure mode is visible in the JSON, not only in stdout.
+    """
+    sq_delta = 0.0
+    sq_base = 0.0
+    nonzero = 0
+    for key, value in merged_delta.items():
+        val = value.float()
+        sq_delta += float(val.pow(2).sum())
+        if float(val.abs().sum()) > 0.0:
+            nonzero += 1
+        base_ref = target_base.get(key)
+        if base_ref is not None:
+            sq_base += float(base_ref.float().pow(2).sum())
+
+    delta_norm = sq_delta ** 0.5
+    base_norm = sq_base ** 0.5
+    return {
+        "key_count": float(len(merged_delta)),
+        "nonzero_key_count": float(nonzero),
+        "merged_delta_norm": delta_norm,
+        "merged_delta_rel_norm": (delta_norm / base_norm) if base_norm > 0.0 else 0.0,
+    }
+
+
 def _build_text_calibration_loader(
     *,
     tokenizer: Any,
@@ -766,6 +799,18 @@ def main() -> None:
 
         # Merge transported deltas
         merged_delta = compose_weighted_deltas(transported_deltas, weights)
+        delta_stats = _summarize_merged_delta(merged_delta, target_base_sd)
+        print(
+            f"\nMerged delta: keys={delta_stats['key_count']} "
+            f"nonzero_keys={delta_stats['nonzero_key_count']} "
+            f"norm={delta_stats['merged_delta_norm']:.4f} "
+            f"rel_norm={delta_stats['merged_delta_rel_norm']:.6f}"
+        )
+        if delta_stats["nonzero_key_count"] == 0:
+            raise RuntimeError(
+                "Merged transported delta is identically zero: every alpha would evaluate "
+                "the untouched target base model. Check the transport diagnostics above."
+            )
 
         search_planner = build_search_planner(
             cfg=cfg, base_method_params=method_params
@@ -878,6 +923,12 @@ def main() -> None:
                     "backend": "lm_harness",
                     "harness_results": best_harness_results,
                     "harness_results_before_rebase": baseline_harness_results,
+                    # Named per-alpha metrics: search_results only keeps a flat
+                    # per_task_acc list, which loses which task each number is.
+                    "harness_results_by_alpha": {
+                        f"{a:g}": r for a, r in sorted(harness_results_by_alpha.items())
+                    },
+                    "merged_delta": delta_stats,
                     "search_strategy": search_planner.search_summary(),
                     "search_results": summarize_search_results(harness_search_results),
                     "saved_merged_path": cfg.get("save_merged"),
@@ -1068,6 +1119,7 @@ def main() -> None:
                 "method": method_name,
                 "best_alpha": best_alpha,
                 "tasks": [td.task for td in task_data],
+                "merged_delta": delta_stats,
                 "search_strategy": search_planner.search_summary(),
                 "search_results": summarize_search_results(search_results),
                 "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
