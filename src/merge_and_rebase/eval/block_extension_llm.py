@@ -1191,6 +1191,11 @@ class DecoderBlockExtender:
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
         if strategy == "interpolate":
+            raise ValueError(
+                f"extension_strategy '{strategy}' (non per-weight) is disabled. "
+                f"Use '{strategy}_per_weight' instead."
+            )
+        if strategy == "interpolate":
             return self._extend_interpolate(
                 loader=loader,
                 n_batches=n_batches,

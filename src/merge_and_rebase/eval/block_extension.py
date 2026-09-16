@@ -1176,6 +1176,12 @@ class BlockExtender:
                 f"Got: {strategy}"
             )
 
+        if strategy in ("interpolate", "duplicate"):
+            raise ValueError(
+                f"extension_strategy '{strategy}' (non per-weight) is disabled. "
+                f"Use '{strategy}_per_weight' instead."
+            )
+
         self._vprint("starting extension and calibration")
         self.wrap_with_aligners()
         self._vprint("wrapping with aligners completed")
