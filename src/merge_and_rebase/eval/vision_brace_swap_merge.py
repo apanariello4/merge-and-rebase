@@ -40,6 +40,7 @@ from ..eval.utils import eval_task_top1, to_cpu_fp32
 from ..io.ckpt import load_into_model
 from ..merge.methods._common import axpy_state_dict
 from ..merge.registry import get_method as get_merge_method
+from ..merge.tv_conditioning import condition_transported_deltas, spec_from_config
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from .datasets.vision8_14_20 import SUITES
@@ -189,6 +190,18 @@ def run(
 
     strict_load = bool(cfg.get("strict_load", True))
     merge_params = dict(cfg.get("merge_params", {}))
+
+    # Conditioning happens after the hash gate and before the merger, so the
+    # summary can name both the transported vector it started from and the
+    # operation that was applied to it.  The default spec is a no-op.
+    conditioning_spec = spec_from_config(cfg.get("tv_conditioning"))
+    transported_delta_sha256 = {task: state_dict_sha256(deltas[task]) for task in tasks}
+    deltas, conditioning_diagnostics = condition_transported_deltas(deltas, conditioning_spec)
+    conditioned_delta_sha256 = {task: state_dict_sha256(deltas[task]) for task in tasks}
+    if conditioning_spec.mode == "off" and conditioned_delta_sha256 != transported_delta_sha256:
+        raise AssertionError("tv_conditioning mode 'off' must leave every transported delta untouched.")
+    print(f"tv_conditioning: {conditioning_spec.as_dict()}")
+
     merger = get_merge_method(merge_method)
     tuned = [axpy_state_dict(target_base, deltas[task], alpha=1.0) for task in tasks]
     prepared = merger.prepare(base=target_base, tuned=tuned, strict=strict_load, **merge_params)
@@ -239,7 +252,9 @@ def run(
         "merge_params": merge_params, "activation_bank": activation_bank, "vector_bank": vector_bank,
         "cell": _cell_name(activation_bank, vector_bank), "tasks": tasks,
         "target_base_sha256": target_hash,
-        "transported_delta_sha256": {task: state_dict_sha256(deltas[task]) for task in tasks},
+        "transported_delta_sha256": transported_delta_sha256,
+        "conditioned_delta_sha256": conditioned_delta_sha256,
+        "tv_conditioning": conditioning_diagnostics,
         "transported_deltas_root": str(delta_root),
         "alpha_protocol": {
             "split": "val", "grid": alpha_grid, "patience": patience, "policy": "shared",

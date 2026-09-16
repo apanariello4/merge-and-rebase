@@ -38,6 +38,12 @@ _V_PROJ_BIAS = ".attn.v_proj.bias"
 _ACTIVATION_COVARIANCE_MODES = {"activation", "activations"}
 _DATA_FREE_COVARIANCE_MODES = {"data_free", "data-free", "weight", "weights", "weight_space", "weight-space"}
 
+# Registry keys collected against the fine-tuned source endpoint are stored in
+# the same flat dict as the base-endpoint keys so that one activation-cache
+# payload still round-trips a whole prepare call.
+_FT_REGISTRY_PREFIX = "ft::"
+_COVARIANCE_SOURCES = ("base", "ft", "delta", "mixture")
+
 
 def _resolve_device(device: str | torch.device) -> torch.device:
     dev = torch.device(device)
@@ -429,6 +435,7 @@ def _activation_cache_fingerprint(
     whiten_power: float,
     whiten_eps: float,
     source_activation_plan: InterpolatedBlockActivations | None = None,
+    source_model_ft: nn.Module | None = None,
 ) -> str:
     """Fingerprint every input that affects streamed activation statistics."""
     digest = sha256()
@@ -443,7 +450,11 @@ def _activation_cache_fingerprint(
         None if source_activation_plan is None else source_activation_plan.fingerprint(),
     ):
         digest.update(repr(value).encode())
-    for model in (source_model, target_model):
+    # The combination weights are applied after collection, so they do not
+    # enter the fingerprint: one cached payload serves every covariance_source
+    # that the same pair of banks supports.
+    models = (source_model, target_model) if source_model_ft is None else (source_model, source_model_ft, target_model)
+    for model in models:
         for name, tensor in sorted(model.state_dict().items()):
             digest.update(name.encode())
             digest.update(str(tensor.dtype).encode())
@@ -500,6 +511,85 @@ def _activation_registry_from_payload(payload: Mapping[str, Mapping[str, Any]]) 
             setattr(store, name, values[name])
         registry[key] = store
     return registry
+
+
+def _resolve_covariance_source(source: str) -> str:
+    key = str(source).strip().lower()
+    if key in {"base", "source_base", "source-base"}:
+        return "base"
+    if key in {"ft", "fine_tuned", "fine-tuned", "source_ft"}:
+        return "ft"
+    if key in {"delta", "delta_activations", "delta-activations"}:
+        return "delta"
+    if key in {"mixture", "mix", "interpolate"}:
+        return "mixture"
+    raise ValueError(f"Theseus covariance_source must be one of {_COVARIANCE_SOURCES}; got {source!r}.")
+
+
+def _covariance_source_coefficients(covariance_source: str, mixture_beta: float) -> tuple[float, float]:
+    """Return ``(c_base, c_ft)`` for the effective source rows ``c_base X_base + c_ft X_ft``.
+
+    Every supported source is an affine combination of the two collected source
+    banks, and the cross-covariance against a shared target bank is linear in
+    the source rows.  Combining the accumulated statistics is therefore exact:
+    no second pass over the calibration data is needed once both banks exist.
+    """
+
+    if covariance_source == "base":
+        return 1.0, 0.0
+    if covariance_source == "ft":
+        return 0.0, 1.0
+    if covariance_source == "delta":
+        return -1.0, 1.0
+    if covariance_source == "mixture":
+        beta = float(mixture_beta)
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError("Theseus covariance_mixture_beta must be in [0, 1].")
+        return 1.0 - beta, beta
+    raise ValueError(f"Unsupported covariance_source {covariance_source!r}.")
+
+
+def _combine_activation_registry(
+    registry: Mapping[str, ActivationStore],
+    *,
+    covariance_source: str,
+    mixture_beta: float,
+) -> dict[str, ActivationStore]:
+    """Collapse the paired base/FT banks into one registry of combined statistics."""
+
+    base_registry = {key: store for key, store in registry.items() if not key.startswith(_FT_REGISTRY_PREFIX)}
+    if covariance_source == "base":
+        return base_registry
+
+    c_base, c_ft = _covariance_source_coefficients(covariance_source, mixture_beta)
+    combined: dict[str, ActivationStore] = {}
+    for key, base_store in base_registry.items():
+        ft_store = registry.get(f"{_FT_REGISTRY_PREFIX}{key}")
+        if ft_store is None:
+            raise ValueError(
+                f"covariance_source='{covariance_source}' requires a fine-tuned source bank for '{key}'."
+            )
+        if base_store.at_b is None or ft_store.at_b is None:
+            continue
+        if base_store.n_samples != ft_store.n_samples:
+            raise ValueError(
+                f"Paired activation banks disagree on sample count for '{key}': "
+                f"{base_store.n_samples} != {ft_store.n_samples}."
+            )
+        # Both banks were streamed from the same batches against the same
+        # target forward, so the target-side statistics must be identical.
+        # A mismatch means the two passes did not see the same calibration
+        # rows, which would silently void the comparison.
+        if base_store.sum_b is None or ft_store.sum_b is None or not torch.equal(base_store.sum_b, ft_store.sum_b):
+            raise ValueError(f"Paired activation banks disagree on target statistics for '{key}'.")
+
+        store = ActivationStore()
+        store.at_b = c_base * base_store.at_b + c_ft * ft_store.at_b
+        store.sum_a = c_base * base_store.sum_a + c_ft * ft_store.sum_a
+        store.sum_b = base_store.sum_b.clone()
+        store.n_samples = int(base_store.n_samples)
+        combined[key] = store
+    return combined
 
 
 @dataclass(frozen=True)
@@ -635,7 +725,17 @@ def collect_activations(
     store_b_gram: bool = False,
     family_adapter: Any = None,
     source_activation_plan: InterpolatedBlockActivations | None = None,
+    source_model_ft: torch.nn.Module | None = None,
 ) -> dict[str, ActivationStore]:
+    """Stream paired source/target activation statistics.
+
+    When ``source_model_ft`` is given, the fine-tuned source endpoint is run on
+    the same batches in the same pass and its statistics are stored under the
+    ``ft::`` key prefix.  Sharing the pass is what makes the two banks exactly
+    comparable: they see identical calibration rows and an identical target
+    forward, which ``_combine_activation_registry`` then relies on.
+    """
+
     if family_adapter is not None:
         source_scope = family_adapter.transport_scope(source_model)
         target_scope = family_adapter.transport_scope(target_model)
@@ -646,6 +746,10 @@ def collect_activations(
     registry: dict[str, ActivationStore] = {}
     source_hook = _ActivationHook(source_model, scope=source_scope)
     target_hook = _ActivationHook(target_model, scope=target_scope)
+    source_ft_hook: _ActivationHook | None = None
+    if source_model_ft is not None:
+        source_ft_scope = family_adapter.transport_scope(source_model_ft) if family_adapter is not None else None
+        source_ft_hook = _ActivationHook(source_model_ft, scope=source_ft_scope)
     dev = _resolve_device(device)
 
     try:
@@ -698,6 +802,8 @@ def collect_activations(
                     ):
                         raise ValueError("Theseus calibration loaders are not label-aligned.")
                 _encode_image(source_model, source_imgs)
+                if source_model_ft is not None:
+                    _encode_image(source_model_ft, source_imgs)
                 _encode_image(target_model, target_imgs)
             consumed_batches += 1
 
@@ -705,35 +811,30 @@ def collect_activations(
                 source_activation_plan.apply(source_hook.inputs)
                 source_activation_plan.apply(source_hook.outputs)
 
-            common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
-            common_outputs = set(source_hook.outputs.keys()) & set(target_hook.outputs.keys())
+            def _accumulate(hook: _ActivationHook, *, prefix: str) -> None:
+                for side, source_side, target_side in (
+                    ("in", hook.inputs, target_hook.inputs),
+                    ("out", hook.outputs, target_hook.outputs),
+                ):
+                    for key in set(source_side.keys()) & set(target_side.keys()):
+                        src_rows, tgt_rows = _align_features(source_side[key], target_side[key], mode=seq_align)
+                        registry.setdefault(
+                            f"{prefix}{key}.{side}",
+                            ActivationStore(
+                                store_raw=store_raw,
+                                store_a_gram=store_a_gram,
+                                store_b_gram=store_b_gram,
+                            ),
+                        ).update(src_rows, tgt_rows)
 
-            for key in common_inputs:
-                src_rows, tgt_rows = _align_features(source_hook.inputs[key], target_hook.inputs[key], mode=seq_align)
-                reg_key = f"{key}.in"
-                registry.setdefault(
-                    reg_key,
-                    ActivationStore(
-                        store_raw=store_raw,
-                        store_a_gram=store_a_gram,
-                        store_b_gram=store_b_gram,
-                    ),
-                ).update(src_rows, tgt_rows)
-
-            for key in common_outputs:
-                src_rows, tgt_rows = _align_features(source_hook.outputs[key], target_hook.outputs[key], mode=seq_align)
-                reg_key = f"{key}.out"
-                registry.setdefault(
-                    reg_key,
-                    ActivationStore(
-                        store_raw=store_raw,
-                        store_a_gram=store_a_gram,
-                        store_b_gram=store_b_gram,
-                    ),
-                ).update(src_rows, tgt_rows)
+            _accumulate(source_hook, prefix="")
+            if source_ft_hook is not None:
+                _accumulate(source_ft_hook, prefix=_FT_REGISTRY_PREFIX)
 
             source_hook.clear()
             target_hook.clear()
+            if source_ft_hook is not None:
+                source_ft_hook.clear()
         if n_batches is not None and consumed_batches < int(n_batches):
             raise ValueError(
                 f"Theseus calibration loaders exhausted after {consumed_batches} batches; requested {int(n_batches)}."
@@ -741,6 +842,8 @@ def collect_activations(
     finally:
         source_hook.remove()
         target_hook.remove()
+        if source_ft_hook is not None:
+            source_ft_hook.remove()
 
     return registry
 
@@ -1623,6 +1726,9 @@ class TheseusRebase:
         whiten_power: float = 0.0,
         whiten_eps: float = 1e-6,
         covariance_mode: str = "activations",
+        covariance_source: str = "base",
+        covariance_mixture_beta: float = 0.5,
+        source_model_ft: torch.nn.Module | None = None,
         source_activation_plan: InterpolatedBlockActivations | None = None,
         **kwargs,
     ) -> dict[str, Any]:
@@ -1650,10 +1756,35 @@ class TheseusRebase:
         log_prefix = f"[{self.name}]"
 
         covariance_mode = _resolve_covariance_mode(covariance_mode)
+        covariance_source = _resolve_covariance_source(covariance_source)
+        covariance_mixture_beta = float(covariance_mixture_beta)
         whiten_power = float(whiten_power)
         whiten_eps = float(whiten_eps)
         if not 0.0 <= whiten_power <= 0.5:
             raise ValueError("Theseus whiten_power must be in [0, 0.5].")
+        if covariance_source != "base":
+            if covariance_mode != "activations":
+                raise ValueError(
+                    "covariance_source only reweights streamed activations and is undefined for "
+                    f"covariance_mode='{covariance_mode}'."
+                )
+            if source_model_ft is None:
+                raise ValueError(f"covariance_source='{covariance_source}' requires source_model_ft.")
+            if whiten_power > 0.0:
+                # Whitening needs the source Gram of the effective rows, which
+                # is quadratic and therefore not recoverable from the two
+                # accumulated banks.  Refuse rather than whiten the wrong Gram.
+                raise ValueError("Theseus whitening is only implemented for covariance_source='base'.")
+            if source_activation_plan is not None:
+                raise ValueError(
+                    "The interpolated-activation baseline substitutes base-endpoint activations and is "
+                    f"undefined for covariance_source='{covariance_source}'."
+                )
+        elif source_model_ft is not None:
+            raise ValueError("source_model_ft was supplied but covariance_source='base' would ignore it.")
+        # Validate the mixture weight even when it is inactive, so a typo in a
+        # config is rejected at prepare time rather than silently ignored.
+        _covariance_source_coefficients("mixture", covariance_mixture_beta)
         if source_activation_plan is not None and covariance_mode != "activations":
             raise ValueError(
                 "The interpolated-activation baseline substitutes collected activations and is "
@@ -1668,6 +1799,8 @@ class TheseusRebase:
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, n_batches={n_batches}, "
                 f"seed={int(seed)}, transform_granularity={transform_granularity}, "
                 f"device_transform={device_transform}, covariance_mode={covariance_mode}, "
+                f"covariance_source={covariance_source}, "
+                f"covariance_mixture_beta={covariance_mixture_beta}, "
                 f"whiten_power={whiten_power})"
             )
 
@@ -1677,6 +1810,8 @@ class TheseusRebase:
             if verbose:
                 print(f"{log_prefix} prepare: patching fused qkv blocks if needed")
             patched_source = _split_fused_qkv_if_needed(source_model)
+            if source_model_ft is not None:
+                _split_fused_qkv_if_needed(source_model_ft)
             patched_target = _split_fused_qkv_if_needed(target_model)
             if patched_source > 0 or patched_target > 0:
                 logger.info(
@@ -1722,6 +1857,7 @@ class TheseusRebase:
                         whiten_power=whiten_power,
                         whiten_eps=whiten_eps,
                         source_activation_plan=source_activation_plan,
+                        source_model_ft=source_model_ft,
                     )
                     cache_path = Path(activation_cache_dir) / f"theseus_activations_{fingerprint}.pt"
                     if activation_cache_mode != "refresh" and cache_path.exists():
@@ -1750,6 +1886,7 @@ class TheseusRebase:
                         store_b_gram=whiten_power > 0.0,
                         family_adapter=family_adapter,
                         source_activation_plan=source_activation_plan,
+                        source_model_ft=source_model_ft,
                     )
                     if cache_path is not None:
                         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1758,8 +1895,16 @@ class TheseusRebase:
                         temporary_path.replace(cache_path)
                         if verbose:
                             print(f"{log_prefix} prepare: saved activations to {cache_path}")
+                activation_registry = _combine_activation_registry(
+                    activation_registry,
+                    covariance_source=covariance_source,
+                    mixture_beta=covariance_mixture_beta,
+                )
                 if verbose:
-                    print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
+                    print(
+                        f"{log_prefix} prepare: collected activation entries = {len(activation_registry)} "
+                        f"(covariance_source={covariance_source})"
+                    )
             elif verbose:
                 print(f"{log_prefix} prepare: skipping activation collection (data-free covariance mode)")
 
@@ -1862,6 +2007,9 @@ class TheseusRebase:
             "unpatched_source_blocks": unpatched_source,
             "unpatched_target_blocks": unpatched_target,
             "transform_granularity": transform_granularity,
+            "covariance_mode": covariance_mode,
+            "covariance_source": covariance_source,
+            "covariance_mixture_beta": covariance_mixture_beta,
             "device_transform": device_transform,
             "compute_device": _resolve_device(device) if device_transform == "gpu" else torch.device("cpu"),
             "precompute_diagnostics": {

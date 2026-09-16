@@ -1116,9 +1116,26 @@ def _build_rebase_prepared(
         source_model_for_theseus.to(device).eval()
         target_model_for_theseus.to(device).eval()
 
+        # ``covariance_source`` other than the default fits the alignment on the
+        # fine-tuned source endpoint as well as the base one.  That endpoint is
+        # the corrected base plus the corrected task vector, which is the same
+        # theta_ft_bar the transported task vector is defined against.
+        source_ft_model_for_theseus: torch.nn.Module | None = None
+        if str(theseus_params.get("covariance_source", "base")).strip().lower() not in {"base", "source_base", "source-base"}:
+            if task_delta is None:
+                raise RuntimeError("A non-default Theseus covariance_source requires the task delta.")
+            source_ft_model_for_theseus = deepcopy(source_model_for_theseus)
+            load_into_model(
+                source_ft_model_for_theseus,
+                axpy_state_dict(task_source_base_sd, task_delta, alpha=1.0),
+                strict=True,
+            )
+            source_ft_model_for_theseus.to(device).eval()
+
         return method.prepare(
             source_model=source_model_for_theseus,
             target_model=target_model_for_theseus,
+            source_model_ft=source_ft_model_for_theseus,
             source_dataloader=source_loaders.train,
             target_dataloader=loaders.train,
             target_base=target_base_sd,
