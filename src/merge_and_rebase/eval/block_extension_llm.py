@@ -15,7 +15,11 @@ try:
 except Exception:
     tqdm = None
 
-from .block_extension import BlockExtensionConfig, _deterministic_calibration_loader
+from .block_extension import (
+    BlockExtensionConfig,
+    _deterministic_calibration_loader,
+    spread_anchor_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,19 +189,18 @@ class DecoderBlockExtender:
             return [i % n_gaps for i in range(n_needed)]
         if extension_density != "spread":
             raise ValueError(
-                f"Unsupported extension_density. Expected: spread, clump. Got: {extension_density}"
+                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule: list[int] = []
-        while len(schedule) < n_needed:
-            if insertion_order == "random":
-                cycle = list(range(curr_layers))
-                np.random.shuffle(cycle)
-            else:
-                cycle = priority
-            need = n_needed - len(schedule)
-            schedule.extend(cycle[:need])
-        return schedule
+        # Once there is at least one duplicate per block every block is an
+        # anchor anyway; below that keep the final block out of the anchor set.
+        # Duplicating it puts an extra full block update directly before the
+        # output norm with no later layer to absorb it, which is far more
+        # destructive than any other placement (Qwen2.5-1.5B 28 -> 36,
+        # interpolate, no correction: wikitext-2 ppl 1847 with it vs 28 without).
+        n_positions = curr_layers if n_needed >= curr_layers else max(1, curr_layers - 1)
+        return spread_anchor_schedule(n_needed, n_positions, insertion_order)
 
     @staticmethod
     def _build_collapse_schedule(
@@ -229,24 +232,11 @@ class DecoderBlockExtender:
 
         if extension_density != "spread":
             raise ValueError(
-                f"Unsupported extension_density. Expected: spread, clump. Got: {extension_density}"
+                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule: list[int] = []
-        if insertion_order == "top-bottom":
-            priority = list(range(max_anchor, -1, -1))
-        elif insertion_order == "random":
-            priority = list(range(max_anchor + 1))
-            np.random.shuffle(priority)
-        else:
-            priority = list(range(max_anchor + 1))
-
-        while len(schedule) < n_to_remove:
-            need = n_to_remove - len(schedule)
-            schedule.extend(priority[:need])
-            if insertion_order == "random":
-                np.random.shuffle(priority)
-        return schedule
+        return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
 
     @staticmethod
     def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:

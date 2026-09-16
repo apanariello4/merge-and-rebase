@@ -154,6 +154,27 @@ def test_resolve_block_extension_config_accepts_task_independent_dataset() -> No
     }
 
 
+def test_spread_duplication_covers_the_whole_model() -> None:
+    # Same fix as the decoder extender: "spread" distributes the added blocks
+    # over the depth instead of stacking them at one end.
+    sched = BlockExtender._build_duplication_schedule(28, 8, "bottom-top", "spread")
+    assert len(sched) == 8
+    assert len(set(sched)) == 8
+    assert sched[0] == 0
+    assert 27 not in sched
+    gaps = [b - a for a, b in zip(sched, sched[1:], strict=False)]
+    assert max(gaps) - min(gaps) <= 1
+    # spread_mod stays on the old prefix schedule for reproducing earlier runs
+    assert BlockExtender._build_duplication_schedule(28, 8, "bottom-top", "spread_mod") == list(range(8))
+
+
+def test_spread_collapse_covers_the_whole_model() -> None:
+    sched = BlockExtender._build_collapse_schedule(28, 8, "bottom-top", "spread")
+    assert len(sched) == 8
+    assert len(set(sched)) == 8
+    assert all(0 <= a <= 26 for a in sched)
+
+
 def test_select_loader_split_precedence() -> None:
     train = object()
     test = object()

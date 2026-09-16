@@ -176,12 +176,56 @@ class TestDuplicationSchedule:
     def test_zero_needed(self):
         assert DecoderBlockExtender._build_duplication_schedule(4, 0, "bottom-top", "spread") == []
 
+    def test_spread_covers_the_whole_model(self):
+        # Qwen2.5-1.5B -> 3B: 8 blocks added to a 28-layer model. This used to
+        # return [0..7], doubling the bottom third and leaving 8-27 untouched.
+        sched = DecoderBlockExtender._build_duplication_schedule(28, 8, "bottom-top", "spread")
+        assert len(sched) == 8
+        assert len(set(sched)) == 8
+        assert sched == sorted(sched)
+        assert sched[0] == 0
+        gaps = [b - a for a, b in zip(sched, sched[1:], strict=False)]
+        assert max(gaps) - min(gaps) <= 1
+        assert sched[-1] >= 28 - max(gaps) - 1  # reaches the top of the model
+        # never the final block: duplicating it right before the output norm is
+        # far more destructive than any other single placement
+        assert 27 not in sched
+
+    def test_spread_top_bottom_runs_from_the_top(self):
+        sched = DecoderBlockExtender._build_duplication_schedule(28, 8, "top-bottom", "spread")
+        assert len(set(sched)) == 8
+        assert sched == sorted(sched, reverse=True)
+        assert sched[0] == 26  # highest anchor, but never the final block
+        assert 27 not in sched
+
+    def test_spread_covers_every_block_when_doubling(self):
+        # n_needed >= curr_layers: every block gets a duplicate, final one included
+        assert DecoderBlockExtender._build_duplication_schedule(6, 12, "bottom-top", "spread") == [
+            0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5
+        ]
+
+    def test_spread_unchanged_at_one_duplicate_per_block(self):
+        assert DecoderBlockExtender._build_duplication_schedule(6, 6, "bottom-top", "spread") == list(range(6))
+
+    def test_spread_mod_still_gives_the_old_prefix_schedule(self):
+        # kept as the escape hatch for reproducing pre-fix runs
+        assert DecoderBlockExtender._build_duplication_schedule(28, 8, "bottom-top", "spread_mod") == list(range(8))
+
 
 class TestCollapseSchedule:
     def test_bottom_top_spread(self):
         sched = DecoderBlockExtender._build_collapse_schedule(6, 2, "bottom-top", "spread")
         assert len(sched) == 2
         assert all(0 <= s < 5 for s in sched)
+
+    def test_spread_covers_the_whole_model(self):
+        sched = DecoderBlockExtender._build_collapse_schedule(28, 8, "bottom-top", "spread")
+        assert len(sched) == 8
+        assert len(set(sched)) == 8
+        assert sched[0] == 0
+        assert all(0 <= a <= 26 for a in sched)  # max anchor is curr_layers - 2
+        gaps = [b - a for a, b in zip(sched, sched[1:], strict=False)]
+        assert max(gaps) - min(gaps) <= 1
 
     def test_clump(self):
         sched = DecoderBlockExtender._build_collapse_schedule(6, 2, "bottom-top", "clump")

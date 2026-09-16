@@ -55,6 +55,50 @@ def _deterministic_calibration_loader(loader, n_batches: int):
     )
 
 
+def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: str) -> list[int]:
+    """Anchor blocks for ``extension_density="spread"``, spaced evenly over the depth.
+
+    ``spread`` used to take the first ``n_anchors`` entries of an ordered
+    priority list, which only spreads once at least one anchor per block is
+    needed. Below that it piled every change onto one end of the model: growing
+    28 -> 36 layers duplicated blocks 0-7 and left 8-27 untouched, measurably
+    worse than spacing them out (Qwen2.5-1.5B, interpolate, no correction:
+    wikitext-2 ppl 145 that way vs 26 spaced evenly). It now splits
+    ``range(n_positions)`` into ``n_anchors`` equal runs and anchors at the
+    start of each. ``spread_mod`` still reproduces the old bottom-top schedule
+    for comparing against earlier results.
+
+    Splitting into runs (rather than taking even fractions of the closed range
+    ``[0, n_positions - 1]``) also keeps the last anchor one run short of the
+    top, which matters: see the caller's note on why the final block must not
+    become an anchor.
+
+    ``insertion_order`` picks which end the anchors are laid out from;
+    ``random`` keeps its meaning of an arbitrary (deliberately unspread) choice.
+    """
+    if n_anchors <= 0 or n_positions <= 0:
+        return []
+
+    if insertion_order == "random":
+        anchors: list[int] = []
+        while len(anchors) < n_anchors:
+            cycle = list(range(n_positions))
+            np.random.shuffle(cycle)
+            anchors.extend(cycle[: n_anchors - len(anchors)])
+        return anchors
+
+    if insertion_order not in {"bottom-top", "top-bottom"}:
+        raise ValueError(
+            "Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. "
+            f"Got: {insertion_order}"
+        )
+
+    anchors = [(i * n_positions) // n_anchors for i in range(n_anchors)]
+    if insertion_order == "top-bottom":
+        anchors = [n_positions - 1 - a for a in anchors]
+    return anchors
+
+
 @dataclass(frozen=True)
 class BlockExtensionConfig:
     blocks_to_add: int | None = None
@@ -937,20 +981,18 @@ class BlockExtender:
             return [i % n_gaps for i in range(n_needed)]
         if extension_density != "spread":
             raise ValueError(
-                "Unsupported extension_density. Expected one of: spread, clump. " f"Got: {extension_density}"
+                "Unsupported extension_density. Expected one of: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule = []
-        while len(schedule) < n_needed:
-            if insertion_order == "random":
-                cycle = list(range(curr_layers))
-                np.random.shuffle(cycle)
-            else:
-                cycle = priority
-            need = n_needed - len(schedule)
-            schedule.extend(cycle[:need])
-
-        return schedule
+        # Once there is at least one duplicate per block every block is an
+        # anchor anyway; below that keep the final block out of the anchor set.
+        # Duplicating it puts an extra full block update directly before the
+        # output norm with no later layer to absorb it, which is far more
+        # destructive than any other placement (Qwen2.5-1.5B 28 -> 36,
+        # interpolate, no correction: wikitext-2 ppl 1847 with it vs 28 without).
+        n_positions = curr_layers if n_needed >= curr_layers else max(1, curr_layers - 1)
+        return spread_anchor_schedule(n_needed, n_positions, insertion_order)
 
     @staticmethod
     def _build_collapse_schedule(
@@ -977,7 +1019,10 @@ class BlockExtender:
                 )
             return [0] * n_to_remove
 
-        if extension_density not in {"spread", "spread_mod"}:
+        if extension_density == "spread":
+            return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
+
+        if extension_density != "spread_mod":
             raise ValueError(
                 "Unsupported extension_density. Expected one of: spread, spread_mod, clump. "
                 f"Got: {extension_density}"
