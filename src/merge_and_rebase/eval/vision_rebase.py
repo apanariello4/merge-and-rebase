@@ -54,6 +54,7 @@ from ..merge.registry import list_methods as list_merge_methods
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
+from ..rebase.methods.theseus import InterpolatedBlockActivations
 from ..rebase.runtime import (
     format_rebase_method_label,
     resolve_rebase_method_config,
@@ -987,6 +988,26 @@ def _merge_direction(
     return {k: v - base_sd[k] for k, v in merged.items() if k in base_sd}
 
 
+def _resolve_source_activation_plan(
+    block_extension_cfg: Any,
+    extension_layout: Mapping[str, Any] | None,
+) -> InterpolatedBlockActivations | None:
+    """Build the interpolated-activation baseline plan, or ``None`` for ARIADNE.
+
+    The plan is derived from the layout the extender actually realized rather
+    than re-derived from the schedule, so it stays correct for insertion orders
+    that draw source blocks at random.
+    """
+    if str(getattr(block_extension_cfg, "transport_activation_mode", "model")) == "model":
+        return None
+    if not extension_layout:
+        raise RuntimeError(
+            "transport_activation_mode='interpolate_neighbors' requires a recorded block "
+            "extension layout; the extension prestep did not run."
+        )
+    return InterpolatedBlockActivations.from_extension_layout(extension_layout)
+
+
 def _build_rebase_prepared(
     *,
     method_name: str,
@@ -1014,6 +1035,7 @@ def _build_rebase_prepared(
     transfusion_prepared: dict[str, Any] | None,
     source_text_features: torch.Tensor | None = None,
     target_text_features: torch.Tensor | None = None,
+    source_activation_plan: Any | None = None,
 ) -> Any:
     """Compute the rebase method's prepared state for one task context.
 
@@ -1054,6 +1076,12 @@ def _build_rebase_prepared(
             recipe=recipe,
             device=device,
             **method_params,
+        )
+
+    if source_activation_plan is not None and not (theseus_like_method or bico_mode):
+        raise ValueError(
+            "The interpolated-activation baseline only applies to the activation-aligned "
+            f"transport methods; method '{method_name}' does not consume activations."
         )
 
     if theseus_like_method:
@@ -1097,6 +1125,7 @@ def _build_rebase_prepared(
             delta=task_delta,
             device=device,
             seed=transport_seed,
+            source_activation_plan=source_activation_plan,
             **theseus_params,
         )
 
@@ -1154,6 +1183,7 @@ def _build_rebase_prepared(
             delta=task_delta,
             device=device,
             seed=transport_seed,
+            source_activation_plan=source_activation_plan,
             **bico_params,
         )
         del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
@@ -1653,6 +1683,10 @@ def main() -> None:
         corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
         corrected_ft_templates: dict[str, torch.nn.Module] = {}
         independent_base_by_task: dict[str, dict[str, torch.Tensor]] = {}
+        # Last realized per-task extension layout. The insertion schedule
+        # depends only on the source/target depths, so every task shares it;
+        # the merged-pair transport paths reuse it to address inserted blocks.
+        recorded_extension_layout: dict[str, Any] = {}
         independent_ft_by_task: dict[str, dict[str, torch.Tensor]] = {}
         independent_base_average: dict[str, torch.Tensor] | None = None
         independent_base_distance_by_task: dict[str, float] = {}
@@ -1843,6 +1877,7 @@ def main() -> None:
                         test_loader=source_loaders.test,
                         val_loader=source_loaders.val,
                     )
+                task_extension_layout = {}
                 final_depth = run_block_extension(
                     source_base_model=source_base_model_task,
                     source_ft_model=source_ft_model_task,
@@ -1850,6 +1885,11 @@ def main() -> None:
                     target_layers_total=target_depth,
                     config=block_extension_cfg,
                     device=device,
+                    layout_out=task_extension_layout,
+                )
+                recorded_extension_layout = dict(task_extension_layout)
+                task_source_activation_plan = _resolve_source_activation_plan(
+                    block_extension_cfg, task_extension_layout
                 )
                 if final_depth != target_depth:
                     raise RuntimeError(
@@ -2067,6 +2107,7 @@ def main() -> None:
                     task_delta=task_delta,
                     source_base_model_task=source_base_model_task,
                     transfusion_prepared=transfusion_prepared,
+                    source_activation_plan=task_source_activation_plan,
                 )
 
                 prepare_seconds = time.perf_counter() - prepare_started
@@ -2266,6 +2307,7 @@ def main() -> None:
                 )
                 source_template_once = None
                 prepared_has_brace = False
+                merged_source_activation_plan = None
             elif merge_mode == "brace_merge_then_transport":
                 if corrected_source_template is None or not independent_base_by_task:
                     raise RuntimeError("BRACE-then-merge requires corrected source endpoints for every task.")
@@ -2294,6 +2336,9 @@ def main() -> None:
                 )
                 source_template_once = corrected_source_template
                 prepared_has_brace = True
+                merged_source_activation_plan = _resolve_source_activation_plan(
+                    block_extension_cfg, recorded_extension_layout
+                )
             elif merge_mode == "merge_then_brace_then_transport":
                 native_merged_direction = _merge_direction(
                     base_sd=source_base_sd,
@@ -2321,6 +2366,7 @@ def main() -> None:
                     transport_loader=transport_ctx.source_loaders.train,
                     correction_enabled=not block_extension_cfg.skip_correction,
                 )
+                merged_extension_layout = {}
                 final_depth = run_block_extension(
                     source_base_model=source_base_model_once,
                     source_ft_model=source_ft_model_once,
@@ -2328,6 +2374,7 @@ def main() -> None:
                     target_layers_total=target_depth,
                     config=block_extension_cfg,
                     device=device,
+                    layout_out=merged_extension_layout,
                 )
                 if final_depth != target_depth:
                     raise RuntimeError(
@@ -2343,6 +2390,9 @@ def main() -> None:
                 ).delta
                 source_template_once = deepcopy(source_base_model_once).cpu()
                 prepared_has_brace = True
+                merged_source_activation_plan = _resolve_source_activation_plan(
+                    block_extension_cfg, merged_extension_layout
+                )
             else:  # pragma: no cover - validated by _resolve_merge_mode_config
                 raise AssertionError(f"Unhandled merge mode: {merge_mode}")
 
@@ -2372,6 +2422,7 @@ def main() -> None:
                 transfusion_prepared=transfusion_prepared,
                 source_text_features=transport_ctx.source_text_features,
                 target_text_features=transport_ctx.target_text_features,
+                source_activation_plan=merged_source_activation_plan,
             )
             transport_started = time.perf_counter()
             transported_merged_delta = method.transport(

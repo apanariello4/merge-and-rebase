@@ -428,6 +428,7 @@ def _activation_cache_fingerprint(
     cache_key: str | None,
     whiten_power: float,
     whiten_eps: float,
+    source_activation_plan: InterpolatedBlockActivations | None = None,
 ) -> str:
     """Fingerprint every input that affects streamed activation statistics."""
     digest = sha256()
@@ -439,6 +440,7 @@ def _activation_cache_fingerprint(
         cache_key,
         float(whiten_power),
         float(whiten_eps),
+        None if source_activation_plan is None else source_activation_plan.fingerprint(),
     ):
         digest.update(repr(value).encode())
     for model in (source_model, target_model):
@@ -500,6 +502,83 @@ def _activation_registry_from_payload(payload: Mapping[str, Mapping[str, Any]]) 
     return registry
 
 
+@dataclass(frozen=True)
+class InterpolatedBlockActivations:
+    """Source-side activation override for the ARIADNE interpolated-activation baseline.
+
+    ARIADNE inserts a block into the source model and fits it so that its
+    activations reproduce a reference bank. This baseline asks what a width
+    transport method would do if the inserted position carried no computed
+    activations at all: at every component module of an inserted block, the
+    source rows are replaced by the midpoint of the same component's rows in
+    the two original blocks whose weights initialized it. Target rows and
+    original source positions are never touched, so the substitution ablates
+    exactly one thing — the inserted block's own forward pass.
+
+    ``entries`` holds ``(inserted_position, left_position, right_position)``
+    triples over the extended block list, as produced by
+    ``merge_and_rebase.eval.block_extension.build_extension_layout``.
+    """
+
+    entries: tuple[tuple[int, int, int], ...]
+    block_prefix: str = "transformer.resblocks"
+
+    @classmethod
+    def from_extension_layout(
+        cls,
+        layout: Mapping[str, Any],
+        *,
+        block_prefix: str = "transformer.resblocks",
+    ) -> InterpolatedBlockActivations:
+        entries = tuple(
+            (int(block["position"]), int(block["source_position"]), int(block["neighbour_position"]))
+            for block in layout.get("inserted_blocks", ())
+        )
+        if not entries:
+            raise ValueError(
+                "The interpolated-activation baseline needs at least one inserted block; "
+                "the recorded extension layout has none."
+            )
+        return cls(entries=entries, block_prefix=str(block_prefix))
+
+    def fingerprint(self) -> str:
+        payload = self.block_prefix + "|" + ";".join(
+            f"{position}:{left}:{right}" for position, left, right in self.entries
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def apply(self, store: dict[str, torch.Tensor]) -> None:
+        """Replace every inserted-position tensor in ``store`` with the neighbour midpoint."""
+
+        if not self.entries:
+            return
+        # Snapshot first: inserted positions read only original positions, but
+        # a snapshot makes that independent of iteration order.
+        captured = dict(store)
+        for position, left, right in self.entries:
+            prefix = f"{self.block_prefix}.{position}"
+            for key in list(store.keys()):
+                if key != prefix and not key.startswith(f"{prefix}."):
+                    continue
+                suffix = key[len(prefix) :]
+                left_key = f"{self.block_prefix}.{left}{suffix}"
+                right_key = f"{self.block_prefix}.{right}{suffix}"
+                left_rows = captured.get(left_key)
+                right_rows = captured.get(right_key)
+                if left_rows is None or right_rows is None:
+                    missing = left_key if left_rows is None else right_key
+                    raise KeyError(
+                        "Interpolated-activation baseline needs both neighbour activations for "
+                        f"'{key}'; '{missing}' was not captured."
+                    )
+                if left_rows.shape != right_rows.shape:
+                    raise ValueError(
+                        f"Neighbour activations for '{key}' disagree in shape: "
+                        f"{tuple(left_rows.shape)} vs {tuple(right_rows.shape)}."
+                    )
+                store[key] = (0.5 * (left_rows.float() + right_rows.float())).to(store[key].dtype)
+
+
 class _ActivationHook:
     def __init__(self, model: torch.nn.Module, *, scope: torch.nn.Module | None = None):
         self.model = scope if scope is not None else _visual_module(model)
@@ -555,6 +634,7 @@ def collect_activations(
     store_a_gram: bool = False,
     store_b_gram: bool = False,
     family_adapter: Any = None,
+    source_activation_plan: InterpolatedBlockActivations | None = None,
 ) -> dict[str, ActivationStore]:
     if family_adapter is not None:
         source_scope = family_adapter.transport_scope(source_model)
@@ -620,6 +700,10 @@ def collect_activations(
                 _encode_image(source_model, source_imgs)
                 _encode_image(target_model, target_imgs)
             consumed_batches += 1
+
+            if source_activation_plan is not None:
+                source_activation_plan.apply(source_hook.inputs)
+                source_activation_plan.apply(source_hook.outputs)
 
             common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
             common_outputs = set(source_hook.outputs.keys()) & set(target_hook.outputs.keys())
@@ -1539,6 +1623,7 @@ class TheseusRebase:
         whiten_power: float = 0.0,
         whiten_eps: float = 1e-6,
         covariance_mode: str = "activations",
+        source_activation_plan: InterpolatedBlockActivations | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         activation_cache_dir = kwargs.pop("activation_cache_dir", None)
@@ -1569,6 +1654,11 @@ class TheseusRebase:
         whiten_eps = float(whiten_eps)
         if not 0.0 <= whiten_power <= 0.5:
             raise ValueError("Theseus whiten_power must be in [0, 0.5].")
+        if source_activation_plan is not None and covariance_mode != "activations":
+            raise ValueError(
+                "The interpolated-activation baseline substitutes collected activations and is "
+                f"undefined for covariance_mode='{covariance_mode}'."
+            )
         if whiten_eps <= 0.0:
             raise ValueError("Theseus whiten_eps must be > 0.")
 
@@ -1631,6 +1721,7 @@ class TheseusRebase:
                         cache_key=activation_cache_key,
                         whiten_power=whiten_power,
                         whiten_eps=whiten_eps,
+                        source_activation_plan=source_activation_plan,
                     )
                     cache_path = Path(activation_cache_dir) / f"theseus_activations_{fingerprint}.pt"
                     if activation_cache_mode != "refresh" and cache_path.exists():
@@ -1658,6 +1749,7 @@ class TheseusRebase:
                         store_a_gram=whiten_power > 0.0,
                         store_b_gram=whiten_power > 0.0,
                         family_adapter=family_adapter,
+                        source_activation_plan=source_activation_plan,
                     )
                     if cache_path is not None:
                         cache_path.parent.mkdir(parents=True, exist_ok=True)

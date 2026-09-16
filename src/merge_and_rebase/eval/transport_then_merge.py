@@ -29,6 +29,7 @@ from merge_and_rebase.merge.methods._common import axpy_state_dict
 from merge_and_rebase.merge.registry import get_method as get_merge_method
 from merge_and_rebase.merge.task_vectors import TaskVector
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from merge_and_rebase.rebase.methods.theseus import InterpolatedBlockActivations
 from merge_and_rebase.rebase.registry import get_method as get_rebase_method
 from merge_and_rebase.run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from merge_and_rebase.utils.helpers import load_json
@@ -109,6 +110,7 @@ def _extend_and_prepare(
 
     print(f"  [transport] {task}: extending source depth {len(source_base_model.visual.transformer.resblocks)} -> {ctx.target_depth}")
 
+    extension_layout: dict[str, Any] = {}
     final_depth = run_block_extension(
         source_base_model=source_base_model,
         source_ft_model=source_ft_model,
@@ -120,6 +122,12 @@ def _extend_and_prepare(
         target_layers_total=ctx.target_depth,
         config=block_ext_cfg,
         device=device,
+        layout_out=extension_layout,
+    )
+    source_activation_plan = (
+        None
+        if str(getattr(block_ext_cfg, "transport_activation_mode", "model")) == "model"
+        else InterpolatedBlockActivations.from_extension_layout(extension_layout)
     )
     print(f"  [transport] {task}: block extension done, final_depth={final_depth}")
 
@@ -138,7 +146,8 @@ def _extend_and_prepare(
         prepared = method.prepare(
             source_model=source_model, target_model=target_model,
             source_dataloader=source_loaders.train, target_dataloader=target_loaders.train,
-            target_base=ctx.target_base_sd, delta=task_delta, device=device, **params,
+            target_base=ctx.target_base_sd, delta=task_delta, device=device,
+            source_activation_plan=source_activation_plan, **params,
         )
     elif method_name == "bico":
         from merge_and_rebase.models.grad_recipes import clip_contrastive_recipe
@@ -152,9 +161,15 @@ def _extend_and_prepare(
             source_model=source_model, target_model=target_model,
             source_dataloader=source_loaders.train, target_dataloader=target_loaders.train,
             source_recipe=source_recipe, target_recipe=target_recipe,
-            target_base=ctx.target_base_sd, delta=task_delta, device=device, **params,
+            target_base=ctx.target_base_sd, delta=task_delta, device=device,
+            source_activation_plan=source_activation_plan, **params,
         )
     else:
+        if source_activation_plan is not None:
+            raise ValueError(
+                "The interpolated-activation baseline only applies to activation-aligned "
+                f"transport; method '{method_name}' does not consume activations."
+            )
         prepared = None
 
     return task_delta, task_source_base_sd, prepared, source_base_model, source_ft_model

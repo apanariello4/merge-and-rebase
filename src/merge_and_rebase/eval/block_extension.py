@@ -85,6 +85,16 @@ class BlockExtensionConfig:
     # ``eager`` captures every block for both endpoints once and reuses it,
     # reproducing the pre-refactor capture schedule for A/B comparison.
     reference_capture: str = "lazy"
+    # Depth baselines against the ARIADNE inserted block. ``residual_identity``
+    # zeroes the inserted block's output projections, so the expanded model is
+    # an exact function-preserving copy of the original and the extra depth
+    # carries no computation of its own.
+    inserted_block_mode: str = "ariadne"
+    # ``interpolate_neighbors`` tells the downstream width-transport method
+    # (Theseus/BiCo) to read the inserted position's source activations as the
+    # midpoint of the two original blocks that initialized it, instead of
+    # forwarding the inserted block itself.
+    transport_activation_mode: str = "model"
     verbose: bool = True
     show_progress: bool = True
 
@@ -110,6 +120,26 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
     if ridge_weight < 0.0:
         raise ValueError("block_extension_params.ridge_weight must be >= 0.")
 
+    skip_correction = bool(params.get("skip_correction", False))
+    inserted_block_mode = _as_inserted_block_mode(params.get("inserted_block_mode", "ariadne"))
+    transport_activation_mode = _as_transport_activation_mode(params.get("transport_activation_mode", "model"))
+    # Both depth baselines replace ARIADNE's component correction rather than
+    # composing with it: a fitted correction would immediately undo an identity
+    # block, and interpolated transport activations describe an uncorrected
+    # inserted block. Refuse the ambiguous combination instead of silently
+    # picking an order.
+    if inserted_block_mode != "ariadne" and not skip_correction:
+        raise ValueError(
+            "block_extension_params.inserted_block_mode='residual_identity' requires skip_correction=true: "
+            "fitting the ARIADNE correction on a zero-projection block destroys the identity it is testing."
+        )
+    if transport_activation_mode != "model" and not skip_correction:
+        raise ValueError(
+            "block_extension_params.transport_activation_mode='interpolate_neighbors' requires "
+            "skip_correction=true: the baseline replaces the inserted block's activations, so a "
+            "correction fitted against them would not be interpretable."
+        )
+
     return enabled, BlockExtensionConfig(
         blocks_to_add=_as_optional_int(params.get("blocks_to_add", None)),
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
@@ -121,7 +151,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         calibration_split=str(params.get("calibration_split", "test")),
         calibration_dataset=_as_optional_calibration_dataset(params.get("calibration_dataset", None)),
         calibration_task=_as_optional_str(params.get("calibration_task", None)),
-        skip_correction=bool(params.get("skip_correction", False)),
+        skip_correction=skip_correction,
         skip_final_ln=bool(params.get("skip_final_ln", False)),
         eval_before_extension=bool(params.get("eval_before_extension", False)),
         first_n_eval_batches=_as_optional_int(params.get("first_n_eval_batches", None)),
@@ -132,6 +162,8 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         component_ridge=_as_optional_dict_float(params.get("component_ridge", None)),
         lmc_mode=str(params.get("lmc_mode", "independent")),
         reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
+        inserted_block_mode=inserted_block_mode,
+        transport_activation_mode=transport_activation_mode,
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
     )
@@ -197,6 +229,9 @@ class BlockExtender:
         self.model_ft = model_ft
         self.device = device
         self.reference_inputs: dict[str, dict[str, torch.Tensor]] = {"base": {}, "ft": {}}
+        # Populated by the extension paths with the realized block layout, so a
+        # downstream transport method can address inserted positions by index.
+        self.extension_layout: dict[str, Any] | None = None
         self.verbose = bool(verbose)
         self.show_progress = bool(show_progress)
         self._ridge_weight = 1e-6
@@ -529,6 +564,33 @@ class BlockExtender:
             inner.attn.out_proj.weight.mul_(factor)
         if hasattr(inner, "mlp") and hasattr(inner.mlp, "c_proj"):
             inner.mlp.c_proj.weight.mul_(factor)
+
+    @torch.no_grad()
+    def _zero_block_output_projections(self, block: nn.Module):
+        """Turn an inserted block into an exact identity on the residual stream.
+
+        With both output projections zeroed (weight and bias), the attention
+        and MLP branches contribute nothing and the block returns its input
+        unchanged, so the expanded model computes exactly the original
+        function. This is the residual-identity depth baseline: it separates
+        the cost of extra depth from the cost of the computation ARIADNE puts
+        in the inserted block.
+        """
+        inner = self._inner_block(block)
+        projections = []
+        if hasattr(inner, "attn") and hasattr(inner.attn, "out_proj"):
+            projections.append(inner.attn.out_proj)
+        if hasattr(inner, "mlp") and hasattr(inner.mlp, "c_proj"):
+            projections.append(inner.mlp.c_proj)
+        if len(projections) != 2:
+            raise ValueError(
+                "residual_identity requires a block exposing attn.out_proj and mlp.c_proj; "
+                f"found {len(projections)} output projections on {type(inner).__name__}."
+            )
+        for projection in projections:
+            projection.weight.zero_()
+            if getattr(projection, "bias", None) is not None:
+                projection.bias.zero_()
 
     def _get_ridge(self, component: str, default: float) -> float:
         cr = getattr(self, "_component_ridge", None)
@@ -1077,6 +1139,7 @@ class BlockExtender:
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
         reference_capture: str = "lazy",
+        inserted_block_mode: str = "ariadne",
     ) -> int:
         self._reference_capture = _as_reference_capture(reference_capture)
         self._eager_reference_cache: dict[str, dict[str, torch.Tensor]] | None = None
@@ -1103,13 +1166,26 @@ class BlockExtender:
             component_ridge=component_ridge,
             lmc_mode=lmc_mode,
         )
+        inserted_block_mode = _as_inserted_block_mode(inserted_block_mode)
+        if inserted_block_mode != "ariadne":
+            if n_needed < 0:
+                raise ValueError(
+                    "inserted_block_mode='residual_identity' is an extension baseline; "
+                    "block shrink has no inserted block to make an identity."
+                )
+            if not skip_correction:
+                raise ValueError(
+                    "inserted_block_mode='residual_identity' requires skip_correction=True."
+                )
+        common_kwargs["inserted_block_mode"] = inserted_block_mode
+        shrink_kwargs = {k: v for k, v in common_kwargs.items() if k != "inserted_block_mode"}
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
-                return self._shrink_per_weight(per_weight_mode="cascade", **common_kwargs)
+                return self._shrink_per_weight(per_weight_mode="cascade", **shrink_kwargs)
             return self._extend_per_weight(per_weight_mode="cascade", **common_kwargs)
         if strategy == "duplicate_per_weight":
             if n_needed < 0:
-                return self._shrink_per_weight(per_weight_mode="duplicate", **common_kwargs)
+                return self._shrink_per_weight(per_weight_mode="duplicate", **shrink_kwargs)
             return self._extend_per_weight(per_weight_mode="duplicate", **common_kwargs)
 
         if strategy == "interpolate":
@@ -1150,6 +1226,7 @@ class BlockExtender:
         skip_correction: bool = False,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
+        inserted_block_mode: str = "ariadne",
     ) -> int:
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
@@ -1185,8 +1262,8 @@ class BlockExtender:
         orig_base = list(self.model_base.visual.transformer.resblocks)
         orig_ft = list(self.model_ft.visual.transformer.resblocks)
 
-        chain_base = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_base)]
-        chain_ft = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_ft)]
+        chain_base = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_base)]
+        chain_ft = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_ft)]
 
         step_iter = _iter_with_progress(
             enumerate(schedule, start=1),
@@ -1201,8 +1278,12 @@ class BlockExtender:
             dup_base = deepcopy(orig_base[src_idx])
             dup_ft = deepcopy(orig_ft[src_idx])
 
+            # The neighbour is defined for every init mode: ``cascade`` blends
+            # its weights in, and the interpolated-activation baseline reads
+            # its activations. The last block has no successor and is its own
+            # neighbour, matching the clamp used for the weight midpoint.
+            src_next = min(src_idx + 1, len(orig_base) - 1)
             if per_weight_mode == "cascade":
-                src_next = min(src_idx + 1, len(orig_base) - 1)
                 self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
                 self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
 
@@ -1210,14 +1291,19 @@ class BlockExtender:
                 self._dampen_block_output(dup_base, dampening_factor)
                 self._dampen_block_output(dup_ft, dampening_factor)
 
+            if inserted_block_mode == "residual_identity":
+                self._zero_block_output_projections(dup_base)
+                self._zero_block_output_projections(dup_ft)
+
             insert_pos = -1
             for i, item in enumerate(chain_base):
                 if item["orig_idx"] == src_idx:
                     insert_pos = i
             insert_pos += 1
 
-            chain_base.insert(insert_pos, {"mod": dup_base, "orig_idx": src_idx})
-            chain_ft.insert(insert_pos, {"mod": dup_ft, "orig_idx": src_idx})
+            inserted_meta = {"orig_idx": src_idx, "inserted": True, "neighbour_orig_idx": src_next}
+            chain_base.insert(insert_pos, {"mod": dup_base, **inserted_meta})
+            chain_ft.insert(insert_pos, {"mod": dup_ft, **inserted_meta})
 
             self.model_base.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_base])
             self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
@@ -1284,6 +1370,7 @@ class BlockExtender:
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
+        self.extension_layout = build_extension_layout(chain_base)
         self.reference_inputs = {"base": {}, "ft": {}}
         reference_models.clear()
         if torch.cuda.is_available():
@@ -1523,6 +1610,42 @@ class BlockExtender:
 
 
 @torch.no_grad()
+def build_extension_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe the realized block chain of an extended model.
+
+    Positions index the extended ``resblocks`` list. Each inserted entry also
+    records where the two original blocks that initialized it ended up, which
+    is what the interpolated-activation baseline needs in order to address the
+    pair of activation banks that bracket an inserted position.
+    """
+    original_positions: dict[int, int] = {}
+    for position, item in enumerate(chain):
+        if not bool(item.get("inserted", False)):
+            original_positions[int(item["orig_idx"])] = position
+
+    inserted_blocks: list[dict[str, int]] = []
+    for position, item in enumerate(chain):
+        if not bool(item.get("inserted", False)):
+            continue
+        source_orig_idx = int(item["orig_idx"])
+        neighbour_orig_idx = int(item["neighbour_orig_idx"])
+        inserted_blocks.append(
+            {
+                "position": position,
+                "source_orig_idx": source_orig_idx,
+                "neighbour_orig_idx": neighbour_orig_idx,
+                "source_position": original_positions[source_orig_idx],
+                "neighbour_position": original_positions[neighbour_orig_idx],
+            }
+        )
+
+    return {
+        "final_depth": len(chain),
+        "original_positions": {idx: original_positions[idx] for idx in sorted(original_positions)},
+        "inserted_blocks": tuple(inserted_blocks),
+    }
+
+
 def run_block_extension(
     *,
     source_base_model: nn.Module,
@@ -1532,7 +1655,15 @@ def run_block_extension(
     config: BlockExtensionConfig,
     device: str | torch.device,
     diagnostic_collector: Any | None = None,
+    layout_out: dict[str, Any] | None = None,
 ) -> int:
+    """Resize ``source_base_model``/``source_ft_model`` in place.
+
+    ``layout_out``, when given, is cleared and filled with the realized block
+    layout (see :func:`build_extension_layout`). Callers that need to address
+    inserted positions downstream read it instead of re-deriving the schedule,
+    which would diverge for ``insertion_order='random'``.
+    """
     extender = BlockExtender(
         source_base_model,
         source_ft_model,
@@ -1543,7 +1674,7 @@ def run_block_extension(
         diagnostic_mode=str(config.lmc_mode),
     )
     resolved_target_layers_total = target_layers_total if target_layers_total is not None else config.target_layers_total
-    return extender.extend_and_calibrate(
+    final_depth = extender.extend_and_calibrate(
         loader=calibration_loader,
         n_batches=config.n_batches_act,
         strategy=config.extension_strategy,
@@ -1561,7 +1692,31 @@ def run_block_extension(
         component_ridge=config.component_ridge,
         lmc_mode=str(config.lmc_mode),
         reference_capture=str(config.reference_capture),
+        inserted_block_mode=str(config.inserted_block_mode),
     )
+    if layout_out is not None:
+        layout_out.clear()
+        if extender.extension_layout is not None:
+            layout_out.update(extender.extension_layout)
+    return final_depth
+
+
+def _as_inserted_block_mode(value: Any) -> str:
+    resolved = str(value).strip().lower()
+    if resolved not in {"ariadne", "residual_identity"}:
+        raise ValueError(
+            "block_extension_params.inserted_block_mode must be 'ariadne' or 'residual_identity'."
+        )
+    return resolved
+
+
+def _as_transport_activation_mode(value: Any) -> str:
+    resolved = str(value).strip().lower()
+    if resolved not in {"model", "interpolate_neighbors"}:
+        raise ValueError(
+            "block_extension_params.transport_activation_mode must be 'model' or 'interpolate_neighbors'."
+        )
+    return resolved
 
 
 def _as_reference_capture(value: Any) -> str:

@@ -153,6 +153,7 @@ def collect_bilinear_statistics(
     store_grams: bool = False,
     family_adapter: Any = None,
     projection_mode: str = "gradient",
+    source_activation_plan: _t.InterpolatedBlockActivations | None = None,
 ) -> dict[str, _t.ActivationStore]:
     """
     Collect input activation statistics and output-gradient statistics.
@@ -232,6 +233,13 @@ def collect_bilinear_statistics(
             target_model.to(cpu_device)
             torch.cuda.empty_cache()
 
+            if source_activation_plan is not None:
+                # BiCo's bilinear statistics pair input activations with output
+                # gradients, so the baseline substitutes both sides of the
+                # inserted position, not just the forward activations.
+                source_activation_plan.apply(source_hook.inputs)
+                source_activation_plan.apply(source_hook.out_grads)
+
             if source_hook.projection_input is not None and target_hook.projection_input is not None:
                 src_rows, tgt_rows = _t._align_features(
                     source_hook.projection_input, target_hook.projection_input, mode=seq_align
@@ -299,6 +307,7 @@ def collect_gradin_statistics(
     store_grams: bool = False,
     family_adapter: Any = None,
     projection_mode: str = "gradient",
+    source_activation_plan: _t.InterpolatedBlockActivations | None = None,
 ) -> dict[str, _t.ActivationStore]:
     """
     Like collect_bilinear_statistics, but fills .in using input-side gradients
@@ -369,6 +378,11 @@ def collect_gradin_statistics(
             )
             target_model.to(cpu_device)
             torch.cuda.empty_cache()
+
+            if source_activation_plan is not None:
+                source_activation_plan.apply(source_hook.in_grads)
+                source_activation_plan.apply(source_hook.inputs)
+                source_activation_plan.apply(source_hook.out_grads)
 
             # Collect .in from grad_input, fallback to forward inputs
             all_keys = set(source_hook.in_grads.keys())
@@ -454,6 +468,7 @@ class BiCoRebase:
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
+        source_activation_plan: _t.InterpolatedBlockActivations | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         split_qkv = kwargs.pop("split_qkv", None)
@@ -546,6 +561,7 @@ class BiCoRebase:
                 store_grams=whiten_power > 0.0,
                 projection_mode=projection_input,
                 family_adapter=family_adapter,
+                source_activation_plan=source_activation_plan,
             )
             if verbose:
                 print(f"{log_prefix} prepare: collected activation+gradient entries = {len(activation_registry)}")
