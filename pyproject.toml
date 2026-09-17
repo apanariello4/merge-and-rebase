@@ -61,6 +61,12 @@ harness = [
   "sympy>=1.12",
   "antlr4-python3-runtime==4.11",
   "math_verify[antlr4_11_0]",
+  # needed for the ifeval task's instruction-following checkers; also pulls the
+  # nltk punkt_tab data, which must be fetched on a login node with network
+  # access before an offline SLURM job runs it (see AGENTS.md).
+  "langdetect",
+  "immutabledict",
+  "nltk>=3.9.1",
 ]
 
 [tool.uv]
