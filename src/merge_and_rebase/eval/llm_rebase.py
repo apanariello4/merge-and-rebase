@@ -30,6 +30,7 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ..data.llm_calibration import resolve_calibration_texts
 from ..data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
@@ -68,40 +69,6 @@ from .llm_common import (
 )
 from .print_utils import pretty_print_task_accuracies
 
-_DEFAULT_CALIBRATION_PROMPTS = [
-    "Write a short summary of the moon landing.",
-    "Explain why the sky looks blue.",
-    "Translate 'good morning' into French.",
-    "Give three healthy breakfast ideas.",
-    "What is the capital of Japan?",
-    "Write a polite email asking for a meeting.",
-    "List two differences between cats and dogs.",
-    "Solve: 17 plus 26.",
-    "What is the derivative of x^3 + 2x with respect to x?",
-    "Simplify the fraction 24/36.",
-    "Solve for x: 3x - 7 = 14.",
-    "What is the area of a circle with radius 5?",
-    "Factor the polynomial x^2 - 9.",
-    "What is the least common multiple of 8 and 12?",
-    "Convert 0.75 into a fraction in lowest terms.",
-    "Explain the Pythagorean theorem in one sentence.",
-    "What is the sum of the first 10 positive integers?",
-    "Solve the inequality 2x + 3 > 11.",
-    "What is 15% of 240?",
-    "Find the slope of the line passing through (2, 3) and (4, 9).",
-    "Explain what a prime number is.",
-    "What is the value of 7! (7 factorial)?",
-    "Solve the system: x + y = 10, x - y = 2.",
-    "What is the perimeter of a rectangle with sides 4 and 9?",
-    "Write a short poem about autumn.",
-    "Summarize the plot of Romeo and Juliet in two sentences.",
-    "What are the main causes of the French Revolution?",
-    "Explain how photosynthesis works.",
-    "Describe the water cycle briefly.",
-    "What is the boiling point of water at sea level?",
-    "Give a brief definition of inflation in economics.",
-    "Name three renewable energy sources.",
-]
 
 
 class _TokenizedPromptDataset(Dataset):
@@ -200,11 +167,13 @@ def _summarize_merged_delta(
 def _build_text_calibration_loader(
     *,
     tokenizer: Any,
-    prompts: list[str] | None = None,
+    texts: list[str],
     batch_size: int = 2,
     max_length: int = 128,
 ) -> DataLoader:
-    prompt_list = list(prompts or _DEFAULT_CALIBRATION_PROMPTS)
+    prompt_list = list(texts)
+    if not prompt_list:
+        raise ValueError("Calibration loader needs at least one text sequence.")
     enc = tokenizer(
         prompt_list,
         truncation=True,
@@ -582,6 +551,7 @@ def main() -> None:
                 num_fewshot=harness_num_fewshot,
                 batch_size=harness_batch_size,
                 limit=harness_limit,
+                samples=harness_samples,
             )
             for task_name, acc in results.items():
                 print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")
@@ -659,14 +629,52 @@ def main() -> None:
                 "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one."
             )
 
+        # Calibration text comes from the dataset the run is actually scored
+        # on (or an explicitly configured one), not from a fixed prompt bank:
+        # size the slice to what the run will consume so n_batches is real.
+        calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
+        calib_max_length = int(cfg.get("calibration_max_length", 128))
+        n_calib_batches = max(
+            int(block_extension_cfg.n_batches_act),
+            int(method_params.get("n_batches", 0) or 0),
+        )
+        # Resolved on first use: building it from an lm-harness task has to
+        # index the task registry, which is far too expensive to pay for on a
+        # run that never collects activations at all.
+        _calibration_cache: list[Any] = []
+
+        def _calibration() -> Any:
+            if not _calibration_cache:
+                resolved = resolve_calibration_texts(
+                    prompts=calibration_prompts_cfg,
+                    calibration_dataset=(
+                        block_extension_cfg.calibration_dataset
+                        or block_extension_cfg.calibration_task
+                    ),
+                    calibration_split=str(block_extension_cfg.calibration_split),
+                    harness_tasks=list(harness_tasks_resolved),
+                    n_sequences=max(1, n_calib_batches) * calib_batch_size,
+                    seed=int(cfg.get("seed", 0)),
+                )
+                print(f"Calibration corpus: {resolved.describe()}")
+                _calibration_cache.append(resolved)
+            return _calibration_cache[0]
+
+        needs_calibration = run_block_extension_prestep or method_name in (
+            "theseus",
+            "theseus_gqa",
+            "bico",
+        )
+        # The eval slice must be known before the first before-rebase eval, so
+        # resolve up front whenever this run will calibrate at all.
+        harness_samples = _calibration().eval_samples or None if needs_calibration else None
+
         # Block extension: build calibration loader once if needed
         blockext_calib_loader = None
         if run_block_extension_prestep:
-            calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
-            calib_max_length = int(cfg.get("calibration_max_length", 128))
             blockext_calib_loader = _build_text_calibration_loader(
                 tokenizer=source_llm.tokenizer,
-                prompts=calibration_prompts_cfg,
+                texts=_calibration().texts,
                 batch_size=calib_batch_size,
                 max_length=calib_max_length,
             )
@@ -811,17 +819,15 @@ def main() -> None:
                 passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
 
                 transport_kwargs = dict(method_params)
-                calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
-                calib_max_length = int(cfg.get("calibration_max_length", 128))
                 source_calib = _build_text_calibration_loader(
                     tokenizer=source_llm.tokenizer,
-                    prompts=calibration_prompts_cfg,
+                    texts=_calibration().texts,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
                 target_calib = _build_text_calibration_loader(
                     tokenizer=target_llm.tokenizer,
-                    prompts=calibration_prompts_cfg,
+                    texts=_calibration().texts,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
@@ -944,6 +950,7 @@ def main() -> None:
                         num_fewshot=harness_num_fewshot,
                         batch_size=harness_batch_size,
                         limit=harness_limit,
+                        samples=harness_samples,
                     )
                     for task_name, acc in harness_results.items():
                         print(f"  {task_name}: {acc:.4f}")

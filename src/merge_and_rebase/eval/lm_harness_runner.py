@@ -76,6 +76,34 @@ def _extract_metrics(results: dict[str, Any] | None) -> dict[str, float]:
     return out
 
 
+def _samples_for(
+    samples: dict[str, list[int]] | None, group_tasks: list[str]
+) -> dict[str, dict[str, list[int]]]:
+    """Restrict `samples` to the tasks in this few-shot group.
+
+    lm-eval rejects a `samples` mapping naming a task it was not asked to run,
+    and tasks are dispatched one few-shot group at a time, so the mapping has
+    to be narrowed per call. Returns {} when nothing applies, which keeps the
+    kwarg off the call entirely for older lm-eval versions.
+    """
+    if not samples:
+        return {}
+    scoped = {t: samples[t] for t in group_tasks if t in samples}
+    return {"samples": scoped} if scoped else {}
+
+
+def _check_samples_conflict(limit: int | None, samples: dict[str, list[int]] | None) -> None:
+    """lm-eval rejects `limit` and `samples` together; fail with the reason why."""
+    if limit is not None and samples:
+        raise ValueError(
+            "harness_limit cannot be combined with a held-out calibration slice: "
+            "lm-eval accepts either 'limit' or explicit 'samples', not both. "
+            "Set harness_limit to null, or point "
+            "block_extension_params.calibration_dataset at a separate corpus so "
+            "no eval docs are held out."
+        )
+
+
 def run(
     tasks: list[str],
     model: nn.Module,
@@ -84,6 +112,7 @@ def run(
     num_fewshot: int | list[int] | dict[str, int] = 0,
     batch_size: str = "auto",
     limit: int | None = None,
+    samples: dict[str, list[int]] | None = None,
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -100,6 +129,9 @@ def run(
         count are batched into a single `simple_evaluate` call.
     batch_size : Batch size ("auto" or int).
     limit : Optional max eval examples per task.
+    samples : Optional explicit doc indices to score per task. Used to keep
+        the scored docs disjoint from the calibration slice carved out of
+        the same task (see `data.llm_calibration`).
 
     Returns
     -------
@@ -115,6 +147,8 @@ def run(
             "lm-eval harness requires `lm-eval` to be installed. "
             "Install with: pip install 'merge-and-rebase[harness]'"
         ) from None
+
+    _check_samples_conflict(limit, samples)
 
     model.eval()
     if hasattr(model, "to"):
@@ -145,6 +179,7 @@ def run(
                     batch_size=batch_size,
                     device=device,
                     limit=limit,
+                    **_samples_for(samples, group_tasks),
                 )
             except TypeError:
                 results = simple_evaluate(
@@ -155,6 +190,7 @@ def run(
                     batch_size=batch_size,
                     device=device,
                     limit=limit,
+                    **_samples_for(samples, group_tasks),
                 )
             out.update(_extract_metrics(results))
     finally:
