@@ -9,7 +9,7 @@
   "method": "theseus",
   "method_params": {
     "seq_align": "interpolate",
-    "n_batches": 2,
+    "num_batches": 16,
     "device_transform": "gpu"
   },
   "alpha_search": false,
@@ -34,7 +34,7 @@
   "harness_num_fewshot": 0,
   "harness_batch_size": 4,
   "harness_limit": 50,
-  "calibration_batch_size": 2,
+  "calibration_batch_size": 8,
   "calibration_max_length": 128,
   "device": "cuda",
   "dtype": "bf16"
