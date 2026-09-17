@@ -9,33 +9,38 @@
   "method": "theseus",
   "method_params": {
     "seq_align": "interpolate",
-    "num_batches": 16,
+    "num_batches": 100,
     "device_transform": "gpu"
   },
   "alpha_search": false,
   "alpha": 1.0,
   "block_extension_enabled": true,
   "block_extension_params": {
-    "extension_strategy": "interpolate_per_weight",
+    "extension_strategy": "duplicate_per_weight",
     "insertion_order": "bottom-top",
     "extension_density": "spread",
-    "n_batches_act": 2,
-    "calibration_split": "test",
+    "n_batches_act": 100,
+    "calibration_split": "val",
     "dampening_factor": 1.0,
-    "skip_correction": true,
+    "skip_correction": false,
     "n_cascade_iters": 1,
-    "lmc_mode": "independent",
-    "ridge_identity": 0.0
+    "lmc_mode": "shared",
+    "ridge_identity": 1000.0
   },
+  "eval_before_rebase": true,
   "harness_tasks": [
-    "ifeval",
-    "mmlu"
+    "ifeval"
   ],
   "harness_num_fewshot": 0,
   "harness_batch_size": 4,
-  "harness_limit": 50,
-  "calibration_batch_size": 8,
-  "calibration_max_length": 128,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
   "device": "cuda",
-  "dtype": "bf16"
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "online",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/rebase/llm_ifeval_skip_correction_20260917/theseus_skipcorr_false_ridge1000"
+  }
 }

@@ -269,8 +269,12 @@ def main() -> None:
 
         # Harness
         p.add_argument("--harness-tasks", type=str, default=None)
-        p.add_argument("--harness-num-fewshot", type=int, default=0)
-        p.add_argument("--harness-batch-size", type=str, default="auto")
+        # None, not 0/"auto": merge_non_none only lets a CLI value win over the
+        # config when the flag was actually passed. A concrete default here
+        # would silently clobber the config's harness_num_fewshot/
+        # harness_batch_size on every run, whether or not the flag was given.
+        p.add_argument("--harness-num-fewshot", type=int, default=None)
+        p.add_argument("--harness-batch-size", type=str, default=None)
         p.add_argument("--harness-limit", type=int, default=None)
 
         # Block extension
@@ -356,6 +360,9 @@ def main() -> None:
             ),
             "save_merged": args.save_merged,
             "harness_tasks": args.harness_tasks,
+            "harness_num_fewshot": args.harness_num_fewshot,
+            "harness_batch_size": args.harness_batch_size,
+            "harness_limit": args.harness_limit,
             "block_extension_enabled": args.block_extension_enabled,
             "block_extension_params": block_extension_params_cli,
             "eval_before_rebase": args.eval_before_rebase,
@@ -677,6 +684,19 @@ def main() -> None:
                 _calibration_cache.append(resolved)
             return _calibration_cache[0]
 
+        configured_harness_samples_raw = cfg.get("harness_samples", None)
+        configured_harness_samples: dict[str, list[int]] | None = None
+        if configured_harness_samples_raw is not None:
+            if not isinstance(configured_harness_samples_raw, dict):
+                raise ValueError("config['harness_samples'] must map task names to document-index lists.")
+            configured_harness_samples = {}
+            for task_name, indices in configured_harness_samples_raw.items():
+                if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
+                    raise ValueError(
+                        "config['harness_samples'] values must be lists of non-negative document indices."
+                    )
+                configured_harness_samples[str(task_name)] = list(indices)
+
         needs_calibration = run_block_extension_prestep or method_name in (
             "theseus",
             "theseus_gqa",
@@ -684,7 +704,17 @@ def main() -> None:
         )
         # The eval slice must be known before the first before-rebase eval, so
         # resolve up front whenever this run will calibrate at all.
-        harness_samples = _calibration().eval_samples or None if needs_calibration else None
+        calibration_eval_samples = _calibration().eval_samples or None if needs_calibration else None
+        if (
+            configured_harness_samples is not None
+            and calibration_eval_samples is not None
+            and configured_harness_samples != calibration_eval_samples
+        ):
+            raise ValueError(
+                "config['harness_samples'] disagrees with the IFEval hold-out derived from calibration; "
+                "use the derived samples or an independent calibration corpus."
+            )
+        harness_samples = configured_harness_samples or calibration_eval_samples
 
         # Block extension: build calibration loader once if needed
         blockext_calib_loader = None

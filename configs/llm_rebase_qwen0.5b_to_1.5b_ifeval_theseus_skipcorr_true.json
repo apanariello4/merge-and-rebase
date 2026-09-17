@@ -16,7 +16,7 @@
   "alpha": 1.0,
   "block_extension_enabled": true,
   "block_extension_params": {
-    "extension_strategy": "interpolate_per_weight",
+    "extension_strategy": "duplicate_per_weight",
     "insertion_order": "bottom-top",
     "extension_density": "spread",
     "n_batches_act": 100,
@@ -24,7 +24,7 @@
     "dampening_factor": 1.0,
     "skip_correction": true,
     "n_cascade_iters": 1,
-    "lmc_mode": "independent",
+    "lmc_mode": "shared",
     "ridge_identity": 0.0
   },
   "eval_before_rebase": true,

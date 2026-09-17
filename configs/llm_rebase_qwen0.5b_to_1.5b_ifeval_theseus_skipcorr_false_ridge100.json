@@ -6,7 +6,7 @@
   "tuned_bodies": {
     "it": "Qwen/Qwen2.5-0.5B-Instruct"
   },
-  "method": "bico",
+  "method": "theseus",
   "method_params": {
     "seq_align": "interpolate",
     "num_batches": 100,
@@ -16,7 +16,7 @@
   "alpha": 1.0,
   "block_extension_enabled": true,
   "block_extension_params": {
-    "extension_strategy": "interpolate_per_weight",
+    "extension_strategy": "duplicate_per_weight",
     "insertion_order": "bottom-top",
     "extension_density": "spread",
     "n_batches_act": 100,
@@ -24,8 +24,8 @@
     "dampening_factor": 1.0,
     "skip_correction": false,
     "n_cascade_iters": 1,
-    "lmc_mode": "independent",
-    "ridge_identity": 10000000.0
+    "lmc_mode": "shared",
+    "ridge_identity": 100.0
   },
   "eval_before_rebase": true,
   "harness_tasks": [
@@ -41,6 +41,6 @@
   "logging": {
     "use_wandb": false,
     "mode": "online",
-    "local_log_dir": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/rebase/llm_ifeval_skip_correction_20260917/bico_skipcorr_false"
+    "local_log_dir": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/rebase/llm_ifeval_skip_correction_20260917/theseus_skipcorr_false_ridge100"
   }
 }
