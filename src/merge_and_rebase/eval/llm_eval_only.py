@@ -40,6 +40,19 @@ def main() -> None:
         p.add_argument("--harness-num-fewshot", type=int, default=None)
         p.add_argument("--harness-batch-size", type=str, default=None)
         p.add_argument("--harness-limit", type=int, default=None)
+        p.add_argument(
+            "--exclude-calib-batches",
+            type=int,
+            default=None,
+            help=(
+                "Hold out the same doc slice a merge job's calibration would have "
+                "consumed (exclude_calib_batches * calibration_batch_size docs, "
+                "picked the same way as llm_rebase.py's calibration/eval split) "
+                "so this baseline is scored on exactly the docs the merge run was."
+            ),
+        )
+        p.add_argument("--calibration-batch-size", type=int, default=None)
+        p.add_argument("--calibration-split", type=str, default=None)
         add_logging_args(p)
         args = p.parse_args()
 
@@ -58,6 +71,9 @@ def main() -> None:
                 "harness_num_fewshot": args.harness_num_fewshot,
                 "harness_batch_size": args.harness_batch_size,
                 "harness_limit": args.harness_limit,
+                "exclude_calib_batches": args.exclude_calib_batches,
+                "calibration_batch_size": args.calibration_batch_size,
+                "calibration_split": args.calibration_split,
             },
         )
         cfg["logging"] = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
@@ -72,6 +88,25 @@ def main() -> None:
         harness_tasks = (
             parse_csv(harness_tasks_raw) if isinstance(harness_tasks_raw, str) else list(harness_tasks_raw)
         )
+
+        exclude_calib_batches = int(cfg.get("exclude_calib_batches", 0) or 0)
+        harness_samples: dict[str, list[int]] | None = None
+        if exclude_calib_batches > 0:
+            # Mirror llm_rebase.py's calibration/eval doc split exactly (same
+            # harness_tasks/calibration_split/seed) so this baseline is scored
+            # on precisely the docs a merge job with the same
+            # n_batches_act/calibration_batch_size never used for calibration.
+            from ..data.llm_calibration import resolve_calibration_texts
+
+            calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 4) or 4))
+            calibration = resolve_calibration_texts(
+                calibration_split=str(cfg.get("calibration_split", "val")),
+                harness_tasks=harness_tasks,
+                n_sequences=exclude_calib_batches * calib_batch_size,
+                seed=int(cfg.get("seed", 0)),
+            )
+            print(f"Calibration hold-out: {calibration.describe()}")
+            harness_samples = calibration.eval_samples or None
 
         run_logger = start_run(
             entrypoint="eval.llm_eval_only",
@@ -102,6 +137,7 @@ def main() -> None:
             num_fewshot=cfg.get("harness_num_fewshot", 0),
             batch_size=str(cfg.get("harness_batch_size", "auto")),
             limit=cfg.get("harness_limit", None),
+            samples=harness_samples,
         )
         print("\n=== Harness results ===")
         for name, value in harness_results.items():
