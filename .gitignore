@@ -260,7 +260,7 @@ sbatch*
 /slurm-*.out
 docs/*.aux
 
-# Local BRACE/ARIADNE research handoff and preserved pre-curation artifacts.
+# Local research handoff and preserved pre-curation artifacts.
 /AGENTS.md
 /CLAUDE.md
 /docs/.local/
