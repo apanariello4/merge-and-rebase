@@ -122,6 +122,7 @@ class BlockExtensionConfig:
     share_ft_refs: bool = False
     component_ridge: dict[str, float] | None = None
     lmc_mode: str = "independent"
+    insertion_target_mode: str = "direct"
     verbose: bool = True
     show_progress: bool = True
 
@@ -190,6 +191,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         share_ft_refs=bool(params.get("share_ft_refs", False)),
         component_ridge=_as_optional_dict_float(params.get("component_ridge", None)),
         lmc_mode=str(params.get("lmc_mode", "independent")),
+        insertion_target_mode=str(params.get("insertion_target_mode", "direct")),
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
     )
@@ -606,6 +608,7 @@ class BlockExtender:
         component_ridge: dict[str, float] | None = None,
         lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        insertion_target_mode: str = "direct",
     ):
         block = model.visual.transformer.resblocks[insert_pos]
         inner = self._inner_block(block)
@@ -688,16 +691,30 @@ class BlockExtender:
             # Step 5: attn output (after out_proj) — full absorption into out_proj
             cur = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
             ref = refs.get(f"{src_idx}.attn_output")
-            if ref is not None and cur.numel() > 0:
+            if insertion_target_mode == "residual":
+                # Pin the post-attention residual stream to the source block's
+                # y_s = x_s + a_s instead of matching a_s alone, absorbing the
+                # gap between the inserted block's input and x_s exactly once.
+                ref_input = refs.get(f"{src_idx}.input")
+                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
+                if ref is not None and ref_input is not None and cur.numel() > 0 and cur_input.numel() > 0:
+                    n = min(cur.shape[0], cur_input.shape[0], ref.shape[0], ref_input.shape[0])
+                    A = cur[:n]
+                    T = ref_input[:n].to(A.device) + ref[:n].to(A.device) - cur_input[:n].to(A.device)
+                else:
+                    A = T = torch.empty(0)
+            elif ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
-                    if lmc_store is not None:
-                        lmc_store["out_proj"] = (W.clone(), b.clone())
-                    W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
-                    b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
-                    inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
-                    inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
+            else:
+                A = T = torch.empty(0)
+            if A.numel() > 0 and T.numel() > 0:
+                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
+                if lmc_store is not None:
+                    lmc_store["out_proj"] = (W.clone(), b.clone())
+                W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
+                b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
+                inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
+                inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
 
             # Step 6: ln_2 — element-wise (diagonal) absorption
             cur = self._capture_component_output(model, insert_pos, "ln_2", loader, n_batches)
@@ -730,16 +747,44 @@ class BlockExtender:
             # Step 8: mlp.c_proj (after GELU, before ls_2) — full absorption into c_proj
             cur = self._capture_component_output(model, insert_pos, "c_proj", loader, n_batches)
             ref = refs.get(f"{src_idx}.c_proj_output")
-            if ref is not None and cur.numel() > 0:
+            if insertion_target_mode == "residual":
+                # Target the source block's OUTPUT x_{s+1} = x_s + a_s + m_s,
+                # minus the stream actually reaching the MLP, which is the block
+                # input plus the already-corrected attention output. Subtracting
+                # only the block input here would consume the input gap a second
+                # time and invert the block (see the shrink path, which has
+                # always subtracted cur_attn).
+                ref_input = refs.get(f"{src_idx}.input")
+                ref_attn = refs.get(f"{src_idx}.attn_output")
+                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
+                cur_attn = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
+                if (
+                    ref is not None and ref_input is not None and ref_attn is not None
+                    and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0
+                ):
+                    n = min(
+                        cur.shape[0], cur_input.shape[0], cur_attn.shape[0],
+                        ref.shape[0], ref_input.shape[0], ref_attn.shape[0],
+                    )
+                    A = cur[:n]
+                    T = (
+                        ref_input[:n].to(A.device) + ref_attn[:n].to(A.device) + ref[:n].to(A.device)
+                        - cur_input[:n].to(A.device) - cur_attn[:n].to(A.device)
+                    )
+                else:
+                    A = T = torch.empty(0)
+            elif ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
-                    if lmc_store is not None:
-                        lmc_store["c_proj"] = (W.clone(), b.clone())
-                    W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
-                    b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
-                    inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
-                    inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
+            else:
+                A = T = torch.empty(0)
+            if A.numel() > 0 and T.numel() > 0:
+                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
+                if lmc_store is not None:
+                    lmc_store["c_proj"] = (W.clone(), b.clone())
+                W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
+                b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
+                inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
+                inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
 
     @torch.no_grad()
     def _correct_collapsed_block_weights_cascade(
@@ -1174,8 +1219,14 @@ class BlockExtender:
         share_ft_refs: bool = False,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
+        insertion_target_mode: str = "direct",
     ) -> int:
         curr_layers = len(self.model_base.visual.transformer.resblocks)
+        if insertion_target_mode not in ("direct", "residual"):
+            raise ValueError(
+                f"Unsupported insertion_target_mode '{insertion_target_mode}'. "
+                "Expected 'direct' (published behaviour) or 'residual'."
+            )
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
         n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
@@ -1198,11 +1249,15 @@ class BlockExtender:
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="cascade", **common_kwargs)
-            return self._extend_per_weight(per_weight_mode="cascade", **common_kwargs)
+            return self._extend_per_weight(
+                per_weight_mode="cascade", insertion_target_mode=insertion_target_mode, **common_kwargs
+            )
         if strategy == "duplicate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="duplicate", **common_kwargs)
-            return self._extend_per_weight(per_weight_mode="duplicate", **common_kwargs)
+            return self._extend_per_weight(
+                per_weight_mode="duplicate", insertion_target_mode=insertion_target_mode, **common_kwargs
+            )
 
         if n_needed < 0:
             raise ValueError(
@@ -1342,6 +1397,7 @@ class BlockExtender:
         skip_correction: bool = False,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
+        insertion_target_mode: str = "direct",
     ) -> int:
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
@@ -1417,11 +1473,13 @@ class BlockExtender:
                     self._correct_block_weights_cascade(
                         "base", self.model_base, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         ref_source=base_ref, component_ridge=component_ridge,
                     )
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         component_ridge=component_ridge,
                     )
                 elif lmc_mode == "steer":
@@ -1429,12 +1487,14 @@ class BlockExtender:
                     self._correct_block_weights_cascade(
                         "base", self.model_base, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         ref_source=base_ref, component_ridge=component_ridge,
                         lmc_store=base_corrections,
                     )
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         component_ridge=component_ridge,
                         lmc_targets=base_corrections,
                     )
@@ -1443,6 +1503,7 @@ class BlockExtender:
                     self._correct_block_weights_cascade(
                         "base", self.model_base, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         ref_source=base_ref, component_ridge=component_ridge,
                         lmc_store=base_corrections,
                     )
@@ -1452,6 +1513,7 @@ class BlockExtender:
                     self._correct_block_weights_cascade(
                         "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
                         ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                        insertion_target_mode=insertion_target_mode,
                         component_ridge=component_ridge,
                         lmc_store=ft_corrections,
                     )
@@ -1704,6 +1766,7 @@ def run_block_extension(
         share_ft_refs=bool(config.share_ft_refs),
         component_ridge=config.component_ridge,
         lmc_mode=str(config.lmc_mode),
+        insertion_target_mode=str(config.insertion_target_mode),
     )
 
 

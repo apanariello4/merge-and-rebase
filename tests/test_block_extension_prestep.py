@@ -320,3 +320,156 @@ def test_vision8_shared_configs_differ_only_by_lmc_direction() -> None:
     assert reverse["block_extension_params"]["lmc_mode"] == "shared_reverse"
     shared["block_extension_params"]["lmc_mode"] = "shared_reverse"
     assert shared == reverse
+
+
+# --- Faithful CLIP-style block, for exercising the real correction cascade ---
+# The _TinyModel above is a structural stub (no fused in_proj, no c_fc), fine for
+# tests that monkeypatch the cascade. Running the cascade for real needs the
+# module names and shapes it actually reaches into.
+
+
+class _ClipLikeAttn(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.in_proj_weight = nn.Parameter(torch.randn(3 * dim, dim) * 0.2)
+        self.in_proj_bias = nn.Parameter(torch.zeros(3 * dim))
+        self.out_proj = nn.Linear(dim, dim)
+        self.dim = dim
+
+    def forward(self, query, key=None, value=None, **kwargs):
+        del key, value, kwargs
+        qkv = nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+        w = torch.softmax(q @ k.transpose(-2, -1) / (self.dim**0.5), dim=-1)
+        return self.out_proj(w @ v)
+
+
+class _ClipLikeMLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.c_fc = nn.Linear(dim, dim * 2)
+        self.c_proj = nn.Linear(dim * 2, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.c_proj(nn.functional.gelu(self.c_fc(x)))
+
+
+class _ClipLikeBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(dim)
+        self.attn = _ClipLikeAttn(dim)
+        self.ln_2 = nn.LayerNorm(dim)
+        self.mlp = _ClipLikeMLP(dim)
+
+    def forward(self, x: torch.Tensor, attn_mask=None, **kwargs):
+        del attn_mask, kwargs
+        x = x + self.attn(self.ln_1(x))
+        return x + self.mlp(self.ln_2(x))
+
+
+class _ClipLikeVisual(nn.Module):
+    def __init__(self, in_dim: int, width: int, depth: int):
+        super().__init__()
+        self.input_proj = nn.Linear(in_dim, width)
+        self.transformer = nn.Module()
+        self.transformer.resblocks = nn.ModuleList([_ClipLikeBlock(width) for _ in range(depth)])
+        self.ln_post = nn.LayerNorm(width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1).repeat(1, 4, 1)
+        x = self.input_proj(x)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return self.ln_post(x).mean(dim=1)
+
+
+class _ClipLikeModel(nn.Module):
+    def __init__(self, in_dim: int = 6, width: int = 8, depth: int = 3):
+        super().__init__()
+        self.visual = _ClipLikeVisual(in_dim=in_dim, width=width, depth=depth)
+
+    def encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        return self.visual(x)
+
+
+def _inserted_block_placement(mode: str) -> tuple[float, float]:
+    """Extend by one block and measure where the inserted copy sends the stream.
+
+    Returns (err_to_next, err_to_src): distance from the inserted block's output
+    to its source block's OUTPUT x_(s+1), and to its source block's INPUT x_s.
+    A correction that reproduces the source block lands nearer x_(s+1); one that
+    consumes the input gap twice inverts the block and lands on x_s.
+    """
+    torch.manual_seed(0)
+    source_base = _ClipLikeModel(depth=3)
+    source_ft = _ClipLikeModel(depth=3)
+    loader = _make_loader(n_samples=64, batch_size=8)
+
+    cfg = BlockExtensionConfig(
+        blocks_to_add=1,
+        insertion_order="bottom-top",
+        extension_density="spread",
+        extension_strategy="duplicate_per_weight",
+        n_batches_act=4,
+        skip_correction=False,
+        ridge_identity=0.0,
+        lmc_mode="independent",
+        insertion_target_mode=mode,
+        verbose=False,
+        show_progress=False,
+    )
+
+    src_block = source_base.visual.transformer.resblocks[0]
+    run_block_extension(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        calibration_loader=loader,
+        target_layers_total=None,
+        config=cfg,
+        device="cpu",
+    )
+    blocks = source_base.visual.transformer.resblocks
+    assert len(blocks) == 4
+    inserted = blocks[1]
+
+    x = torch.randn(8, 4, 8)
+    with torch.no_grad():
+        x_next = src_block(x)       # x_(s+1): what the source block produces
+        out = inserted(x_next)      # the inserted copy consumes x_(s+1)
+    return (out - x_next).norm().item(), (out - x).norm().item()
+
+
+@pytest.mark.parametrize("mode", ["direct", "residual"])
+def test_inserted_block_does_not_invert_its_source(mode: str) -> None:
+    """An inserted block must advance the residual stream, never reverse it.
+
+    This is the invariant the LLM cascade violates: subtracting the block input
+    at both the attention step and the MLP step consumes the input gap twice and
+    sends the stream back to x_s. Both vision insertion-target modes must hold it.
+    """
+    err_next, err_src = _inserted_block_placement(mode)
+    assert err_next < err_src, (
+        f"insertion_target_mode={mode!r}: inserted block landed nearer its source's "
+        f"INPUT ({err_src:.4f}) than its OUTPUT ({err_next:.4f}) -- it inverted the block"
+    )
+
+
+def test_insertion_target_mode_is_validated() -> None:
+    cfg = BlockExtensionConfig(
+        blocks_to_add=1,
+        extension_strategy="duplicate_per_weight",
+        n_batches_act=1,
+        skip_correction=True,
+        insertion_target_mode="resiudal",  # typo must not resolve to a silent default
+    )
+    with pytest.raises(ValueError, match="insertion_target_mode"):
+        run_block_extension(
+            source_base_model=_ClipLikeModel(depth=3),
+            source_ft_model=_ClipLikeModel(depth=3),
+            calibration_loader=_make_loader(),
+            target_layers_total=None,
+            config=cfg,
+            device="cpu",
+        )
