@@ -93,6 +93,11 @@ class _PreparedTaskDelta:
     source_model: torch.nn.Module
 
 
+# Calibration batches used by theseus/bico when a config names neither
+# method_params.num_batches nor method_params.n_batches.
+_DEFAULT_CALIB_BATCHES = 2
+
+
 def _prepare_resized_task_delta(
     *,
     source_base_model: torch.nn.Module,
@@ -633,9 +638,22 @@ def main() -> None:
         # size the slice to what the run will consume so n_batches is real.
         calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
         calib_max_length = int(cfg.get("calibration_max_length", 128))
+        # Vision configs express the calibration budget as
+        # method_params.num_batches, and theseus/bico accept either name
+        # (preferring n_batches). Resolve it once here so a vision-style config
+        # means the same thing on this path: without this, num_batches was
+        # neither counted when sizing the corpus nor able to beat the n_batches
+        # default injected at the transport call, so it silently did nothing.
+        calib_n_batches_cfg = method_params.get("n_batches", method_params.get("num_batches"))
+        calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
+        # These are two separate budgets over one shared text pool, not one
+        # knob: block extension consumes n_batches_act batches for its
+        # activation capture, theseus/bico consume num_batches for theirs, and
+        # neither is derived from the other. The max only sizes the pool, so
+        # whichever consumer asks for more still finds enough text.
         n_calib_batches = max(
             int(block_extension_cfg.n_batches_act),
-            int(method_params.get("n_batches", 0) or 0),
+            int(calib_n_batches or 0),
         )
         # Resolved on first use: building it from an lm-harness task has to
         # index the task registry, which is far too expensive to pay for on a
@@ -833,7 +851,8 @@ def main() -> None:
 
                 if method_name in ("theseus", "theseus_gqa"):
                     transport_kwargs.setdefault("seq_align", "interpolate")
-                    transport_kwargs.setdefault("n_batches", 2)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
@@ -851,7 +870,8 @@ def main() -> None:
                     from ..models.grad_recipes import causal_lm_recipe
 
                     transport_kwargs.setdefault("seq_align", "interpolate")
-                    transport_kwargs.setdefault("n_batches", 2)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
