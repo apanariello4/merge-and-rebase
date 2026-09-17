@@ -88,7 +88,10 @@ class BlockExtensionConfig:
     # Depth baselines against the ARIADNE inserted block. ``residual_identity``
     # zeroes the inserted block's output projections, so the expanded model is
     # an exact function-preserving copy of the original and the extra depth
-    # carries no computation of its own.
+    # carries no computation of its own. ``residual_identity_inert`` goes one
+    # step further and gives both endpoints the same inserted block, so the
+    # inserted position's task vector is zero on every parameter rather than
+    # only on the projections.
     inserted_block_mode: str = "ariadne"
     # ``interpolate_neighbors`` tells the downstream width-transport method
     # (Theseus/BiCo) to read the inserted position's source activations as the
@@ -130,8 +133,9 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
     # picking an order.
     if inserted_block_mode != "ariadne" and not skip_correction:
         raise ValueError(
-            "block_extension_params.inserted_block_mode='residual_identity' requires skip_correction=true: "
-            "fitting the ARIADNE correction on a zero-projection block destroys the identity it is testing."
+            f"block_extension_params.inserted_block_mode='{inserted_block_mode}' requires "
+            "skip_correction=true: fitting the ARIADNE correction on a zero-projection block "
+            "destroys the identity it is testing."
         )
     if transport_activation_mode != "model" and not skip_correction:
         raise ValueError(
@@ -1170,12 +1174,12 @@ class BlockExtender:
         if inserted_block_mode != "ariadne":
             if n_needed < 0:
                 raise ValueError(
-                    "inserted_block_mode='residual_identity' is an extension baseline; "
+                    f"inserted_block_mode='{inserted_block_mode}' is an extension baseline; "
                     "block shrink has no inserted block to make an identity."
                 )
             if not skip_correction:
                 raise ValueError(
-                    "inserted_block_mode='residual_identity' requires skip_correction=True."
+                    f"inserted_block_mode='{inserted_block_mode}' requires skip_correction=True."
                 )
         common_kwargs["inserted_block_mode"] = inserted_block_mode
         shrink_kwargs = {k: v for k, v in common_kwargs.items() if k != "inserted_block_mode"}
@@ -1291,9 +1295,17 @@ class BlockExtender:
                 self._dampen_block_output(dup_base, dampening_factor)
                 self._dampen_block_output(dup_ft, dampening_factor)
 
-            if inserted_block_mode == "residual_identity":
+            if inserted_block_mode in {"residual_identity", "residual_identity_inert"}:
                 self._zero_block_output_projections(dup_base)
                 self._zero_block_output_projections(dup_ft)
+            if inserted_block_mode == "residual_identity_inert":
+                # Give the FT endpoint the base endpoint's inserted block, so
+                # the inserted position's task vector is zero on every
+                # parameter and not only on the output projections. The base
+                # endpoint is untouched, so this arm and 'residual_identity'
+                # fit byte-identical transport maps and differ in exactly one
+                # quantity: the delta being transported.
+                dup_ft.load_state_dict(dup_base.state_dict())
 
             insert_pos = -1
             for i, item in enumerate(chain_base):
@@ -1703,9 +1715,10 @@ def run_block_extension(
 
 def _as_inserted_block_mode(value: Any) -> str:
     resolved = str(value).strip().lower()
-    if resolved not in {"ariadne", "residual_identity"}:
+    if resolved not in {"ariadne", "residual_identity", "residual_identity_inert"}:
         raise ValueError(
-            "block_extension_params.inserted_block_mode must be 'ariadne' or 'residual_identity'."
+            "block_extension_params.inserted_block_mode must be 'ariadne', "
+            "'residual_identity', or 'residual_identity_inert'."
         )
     return resolved
 

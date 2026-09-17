@@ -18,6 +18,8 @@ midpoint, so either property failing is a defect and not numerical drift.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 import torch.nn as nn
@@ -112,6 +114,7 @@ def _make_loader(n_samples: int = 16, in_dim: int = 6, batch_size: int = 4) -> D
 
 _BASELINE_PARAMS = {
     "residual_identity": {"inserted_block_mode": "residual_identity"},
+    "residual_identity_inert": {"inserted_block_mode": "residual_identity_inert"},
     "interpolated_activations": {"transport_activation_mode": "interpolate_neighbors"},
 }
 
@@ -123,12 +126,16 @@ def _extend(
     strategy: str = "interpolate_per_weight",
     inserted_block_mode: str = "ariadne",
     seed: int = 0,
-) -> tuple[torch.nn.Module, torch.nn.Module, dict, torch.nn.Module]:
+) -> tuple[torch.nn.Module, torch.nn.Module, dict, torch.nn.Module, torch.nn.Module]:
     torch.manual_seed(seed)
     source_base = _TinyModel(depth=depth)
     source_ft = _TinyModel(depth=depth)
+    # Snapshot both endpoints before the extender edits them in place: the
+    # function-preservation assertions compare against these.
     pristine_base = _TinyModel(depth=depth)
     pristine_base.load_state_dict(source_base.state_dict())
+    pristine_ft = _TinyModel(depth=depth)
+    pristine_ft.load_state_dict(source_ft.state_dict())
 
     cfg = BlockExtensionConfig(
         blocks_to_add=blocks_to_add,
@@ -150,7 +157,7 @@ def _extend(
         device="cpu",
         layout_out=layout,
     )
-    return source_base, source_ft, layout, pristine_base
+    return source_base, source_ft, layout, pristine_base, pristine_ft
 
 
 @pytest.mark.parametrize("params", list(_BASELINE_PARAMS.values()), ids=list(_BASELINE_PARAMS))
@@ -190,7 +197,7 @@ def test_block_extension_config_rejects_unknown_baseline(field: str) -> None:
 
 def test_residual_identity_preserves_the_original_function_exactly() -> None:
     """A zero-projection block is an identity, so depth changes but outputs do not."""
-    source_base, _, layout, pristine_base = _extend(inserted_block_mode="residual_identity")
+    source_base, _, layout, pristine_base, _ = _extend(inserted_block_mode="residual_identity")
 
     inputs = torch.randn(5, 6)
     with torch.no_grad():
@@ -204,7 +211,7 @@ def test_residual_identity_preserves_the_original_function_exactly() -> None:
 
 
 def test_residual_identity_zeroes_both_output_projections() -> None:
-    source_base, source_ft, layout, _ = _extend(inserted_block_mode="residual_identity")
+    source_base, source_ft, layout, _, _ = _extend(inserted_block_mode="residual_identity")
 
     inserted_positions = {block["position"] for block in layout["inserted_blocks"]}
     for model in (source_base, source_ft):
@@ -224,7 +231,7 @@ def test_residual_identity_task_vector_is_inert_at_inserted_projections() -> Non
     Both endpoints carry zero output projections, so the task vector is exactly
     zero there and no merge weighting can reintroduce computation at that depth.
     """
-    source_base, source_ft, layout, _ = _extend(inserted_block_mode="residual_identity")
+    source_base, source_ft, layout, _, _ = _extend(inserted_block_mode="residual_identity")
     base_sd = source_base.state_dict()
     ft_sd = source_ft.state_dict()
 
@@ -241,7 +248,7 @@ def test_residual_identity_task_vector_is_inert_at_inserted_projections() -> Non
 
 def test_extension_layout_records_the_bracketing_original_blocks() -> None:
     """bottom-top/spread inserts a descendant of block 0, then one of block 1."""
-    _, _, layout, _ = _extend(blocks_to_add=2)
+    _, _, layout, _, _ = _extend(blocks_to_add=2)
 
     assert layout["final_depth"] == 5
     assert layout["inserted_blocks"] == (
@@ -359,7 +366,7 @@ def _raw_source_rows(registry, key: str) -> torch.Tensor:
 
 def test_collect_activations_substitutes_the_inserted_block_bank() -> None:
     """End to end: Theseus sees the neighbour midpoint at the inserted position."""
-    source_base, _, layout, _ = _extend(blocks_to_add=2)
+    source_base, _, layout, _, _ = _extend(blocks_to_add=2)
     torch.manual_seed(1)
     target_model = _TinyModel(depth=5)
 
@@ -398,3 +405,66 @@ def test_collect_activations_substitutes_the_inserted_block_bank() -> None:
         checked += 1
 
     assert checked > 0
+
+
+def _state_hash(model: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode())
+        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def test_inert_insertion_zeroes_the_whole_inserted_task_vector() -> None:
+    """The inert arm removes the inserted block from the task vector entirely.
+
+    ``residual_identity`` still carries the source block's input-side deltas
+    (ln, q/k/v, c_fc) at the inserted position. The inert arm gives both
+    endpoints the same block, so nothing at that depth is transported, and the
+    merged target keeps its own weights there.
+    """
+    source_base, source_ft, layout, _, _ = _extend(inserted_block_mode="residual_identity_inert")
+    base_sd = source_base.state_dict()
+    ft_sd = source_ft.state_dict()
+
+    for block in layout["inserted_blocks"]:
+        prefix = f"visual.transformer.resblocks.{block['position']}."
+        inserted_keys = [key for key in base_sd if key.startswith(prefix)]
+        assert inserted_keys
+        for key in inserted_keys:
+            assert torch.count_nonzero(ft_sd[key] - base_sd[key]) == 0, key
+
+
+def test_inert_insertion_preserves_both_endpoint_functions_exactly() -> None:
+    source_base, source_ft, _, pristine_base, pristine_ft = _extend(
+        inserted_block_mode="residual_identity_inert"
+    )
+
+    inputs = torch.randn(5, 6)
+    with torch.no_grad():
+        assert torch.equal(source_base.encode_image(inputs), pristine_base.encode_image(inputs))
+        # The FT endpoint's inserted blocks come from the base endpoint, but a
+        # zero-projection block is an identity in any model, so the FT function
+        # is preserved too.
+        assert torch.equal(source_ft.encode_image(inputs), pristine_ft.encode_image(inputs))
+
+
+def test_inert_insertion_shares_the_base_endpoint_with_residual_identity() -> None:
+    """The two arms must fit byte-identical transport maps.
+
+    Theseus and BiCo both calibrate on the source *base* endpoint, so an
+    identical base endpoint means identical activations and identical fitted
+    maps. That is what licenses reading the accuracy difference between the two
+    arms as the effect of the transported delta alone.
+    """
+    identity_base, identity_ft, _, _, _ = _extend(inserted_block_mode="residual_identity")
+    inert_base, inert_ft, _, _, _ = _extend(inserted_block_mode="residual_identity_inert")
+
+    assert _state_hash(identity_base) == _state_hash(inert_base)
+    # The FT endpoints must differ, or the ablation changed nothing at all.
+    assert _state_hash(identity_ft) != _state_hash(inert_ft)
+
+
+def test_inert_insertion_is_extension_only() -> None:
+    with pytest.raises(ValueError, match="extension baseline"):
+        _extend(depth=5, blocks_to_add=-2, inserted_block_mode="residual_identity_inert")
