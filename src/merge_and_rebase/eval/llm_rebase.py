@@ -70,7 +70,6 @@ from .llm_common import (
 from .print_utils import pretty_print_task_accuracies
 
 
-
 class _TokenizedPromptDataset(Dataset):
     def __init__(self, features: list[dict[str, Any]]) -> None:
         self.features = features

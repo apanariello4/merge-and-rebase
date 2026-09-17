@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -186,7 +187,7 @@ def test_select_loader_split_precedence() -> None:
     assert select_loader("test", train, test, val) is test
 
 
-def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
+def test_run_block_extension_increases_depth() -> None:
     source_base = _TinyModel(depth=3)
     source_ft = _TinyModel(depth=3)
     loader = _make_loader()
@@ -195,7 +196,7 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
         blocks_to_add=2,
         insertion_order="bottom-top",
         extension_density="spread",
-        extension_strategy="duplicate",
+        extension_strategy="duplicate_per_weight",
         dampening_factor=1.0,
         n_batches_act=1,
         skip_correction=True,
@@ -214,8 +215,31 @@ def test_run_block_extension_increases_depth_and_wraps_modules() -> None:
     assert final_depth == 5
     assert len(source_base.visual.transformer.resblocks) == 5
     assert len(source_ft.visual.transformer.resblocks) == 5
-    assert isinstance(source_base.visual.transformer.resblocks[0], InputAlignedBlock)
-    assert isinstance(source_base.visual.ln_post, InputAlignedFinalLayer)
+    # The per-weight cascade corrects block weights in place; it does not wrap
+    # blocks in aligner modules the way the retired non-per-weight path did.
+    assert not isinstance(source_base.visual.transformer.resblocks[0], InputAlignedBlock)
+    assert not isinstance(source_base.visual.ln_post, InputAlignedFinalLayer)
+
+
+@pytest.mark.parametrize("strategy", ["interpolate", "duplicate"])
+def test_run_block_extension_rejects_non_per_weight_strategies(strategy: str) -> None:
+    """The bare strategies were deprecated; only the per-weight cascade is supported."""
+    cfg = BlockExtensionConfig(
+        blocks_to_add=2,
+        extension_strategy=strategy,
+        n_batches_act=1,
+        skip_correction=True,
+    )
+
+    with pytest.raises(ValueError, match="non per-weight"):
+        run_block_extension(
+            source_base_model=_TinyModel(depth=3),
+            source_ft_model=_TinyModel(depth=3),
+            calibration_loader=_make_loader(),
+            target_layers_total=None,
+            config=cfg,
+            device="cpu",
+        )
 
 
 def test_calibration_loader_replays_the_same_randomized_window():

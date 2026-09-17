@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import islice
 from typing import Any
 
@@ -125,6 +126,38 @@ class BlockExtensionConfig:
     show_progress: bool = True
 
 
+# Keys the campaign generators write into ``block_extension_params`` purely to
+# record provenance in the run summary. They are not knobs and are not read
+# here, so they must not trigger the unknown-key warning below.
+_ANNOTATION_PARAMS: frozenset[str] = frozenset({
+    "calibration_protocol",
+    "inserted_block_mode",
+    "reference_capture",
+    "ridge_weight",
+    "transport_activation_mode",
+})
+
+
+def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
+    """Warn about params that are silently dropped.
+
+    A misspelled knob (``lambda_l2`` for ``ridge_identity``, say) otherwise
+    resolves to the default without a trace, which makes the run look like an
+    ablation it is not. Warn rather than raise: existing campaign configs carry
+    the annotation keys above and must keep resolving.
+    """
+    known = {f.name for f in fields(BlockExtensionConfig)} | _ANNOTATION_PARAMS
+    unknown = sorted(k for k in params if k not in known)
+    if unknown:
+        warnings.warn(
+            "Ignoring unrecognized block_extension_params "
+            f"{unknown}; these have no effect on the run. "
+            f"Known fields: {sorted(f.name for f in fields(BlockExtensionConfig))}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockExtensionConfig]:
     raw_params = cfg.get("block_extension_params", {})
     if raw_params is None:
@@ -133,6 +166,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         raise ValueError("config['block_extension_params'] must be a dict when provided.")
 
     params = dict(raw_params)
+    _warn_unknown_block_extension_params(params)
     enabled_raw = cfg.get("block_extension_enabled", None)
     enabled = bool(enabled_raw) if enabled_raw is not None else bool(params)
 

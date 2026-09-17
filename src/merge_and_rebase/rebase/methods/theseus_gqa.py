@@ -10,8 +10,8 @@ from ..registry import register
 from .theseus import (
     ActivationStore,
     TheseusRebase,
-    _LayerTransform,
     _compute_procrustes_map_from_cov,
+    _LayerTransform,
 )
 
 logger = logging.getLogger(__name__)

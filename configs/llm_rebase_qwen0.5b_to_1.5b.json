@@ -16,7 +16,7 @@
   "alpha": 1.0,
   "block_extension_enabled": true,
   "block_extension_params": {
-    "extension_strategy": "interpolate",
+    "extension_strategy": "interpolate_per_weight",
     "insertion_order": "bottom-top",
     "extension_density": "spread",
     "n_batches_act": 2,
@@ -25,9 +25,12 @@
     "skip_correction": true,
     "n_cascade_iters": 1,
     "lmc_mode": "independent",
-    "lambda_l2": 1e-6
+    "ridge_identity": 0.0
   },
-  "harness_tasks": ["hellaswag", "piqa"],
+  "harness_tasks": [
+    "hellaswag",
+    "piqa"
+  ],
   "harness_num_fewshot": 0,
   "harness_batch_size": 4,
   "harness_limit": 50,

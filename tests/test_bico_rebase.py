@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.rebase.registry import get_method, list_methods
 from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
+from merge_and_rebase.rebase.registry import get_method, list_methods
 
 
 class _TinyVisual(nn.Module):

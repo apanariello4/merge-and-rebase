@@ -32,7 +32,7 @@ class _TinyTokenizer:
 def test_text_calibration_masks_only_padded_labels() -> None:
     loader = _build_text_calibration_loader(
         tokenizer=_TinyTokenizer(),
-        prompts=["one token", "one two three"],
+        texts=["one token", "one two three"],
         batch_size=2,
         max_length=5,
     )

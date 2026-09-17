@@ -537,15 +537,15 @@ class DecoderBlockExtender:
                         lmc_store["v_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.self_attn.v_proj, W, b)
 
-            # 5: o_proj — corrected against residual
+            # 5: attention output — full absorption into o_proj.
+            # An inserted block targets its source block's component activations
+            # directly, matching the vision cascade. A residual-aware target
+            # belongs to the collapse path only, where the span boundary (not a
+            # single source block) defines the reference.
             cur = self._capture_component_output(model, insert_pos, "o_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-            ref_input = refs.get(f"{src_idx}.input")
-            ref_attn = refs.get(f"{src_idx}.attn_output")
-            if ref_input is not None and ref_attn is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_attn.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_attn[:n] - cur_input[:n]
+            ref = refs.get(f"{src_idx}.attn_output")
+            if ref is not None and cur.numel() > 0:
+                A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("o_proj", ridge_identity), ridge_target=_ridge_target("o_proj"))
                     if lmc_store is not None:
@@ -585,15 +585,14 @@ class DecoderBlockExtender:
                         lmc_store["up_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.mlp.up_proj, W, b)
 
-            # 9: down_proj — corrected against residual
+            # 9: mlp output — full absorption into down_proj, direct target as
+            # in step 5. The previous residual-aware target subtracted the block
+            # input a second time (step 5 had already absorbed it), which drove
+            # the inserted block towards inverting its own source block.
             cur = self._capture_component_output(model, insert_pos, "down_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-            ref_input = refs.get(f"{src_idx}.input")
-            ref_down = refs.get(f"{src_idx}.down_proj_output")
-            if ref_input is not None and ref_down is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_down.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_down[:n] - cur_input[:n]
+            ref = refs.get(f"{src_idx}.down_proj_output")
+            if ref is not None and cur.numel() > 0:
+                A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
                     if lmc_store is not None:
@@ -1093,14 +1092,18 @@ class DecoderBlockExtender:
                         lmc_store["up_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.mlp.up_proj, W, b)
 
-            # 9: down_proj corrected against the final target output
+            # 9: down_proj corrected against the final target output of the
+            # removed span. The pre-MLP residual stream is the block input plus
+            # the already-corrected attention output, so both are subtracted
+            # (the vision cascade subtracts the same two terms).
             cur = self._capture_component_output(model, block_idx, "down_proj", loader, n_batches)
             cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
+            cur_attn = self._capture_component_output(model, block_idx, "attn", loader, n_batches)
             ref = refs.get(output_ref_key)
-            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref.shape[0])
+            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0:
+                n = min(cur.shape[0], cur_input.shape[0], cur_attn.shape[0], ref.shape[0])
                 A = cur[:n]
-                T = ref[:n] - cur_input[:n]
+                T = ref[:n] - cur_input[:n] - cur_attn[:n]
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
                     if lmc_store is not None:
@@ -1190,21 +1193,10 @@ class DecoderBlockExtender:
     ) -> int:
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
-        if strategy == "interpolate":
+        if strategy in ("interpolate", "duplicate"):
             raise ValueError(
                 f"extension_strategy '{strategy}' (non per-weight) is disabled. "
                 f"Use '{strategy}_per_weight' instead."
-            )
-        if strategy == "interpolate":
-            return self._extend_interpolate(
-                loader=loader,
-                n_batches=n_batches,
-                dampening_factor=dampening_factor,
-                blocks_to_add=blocks_to_add,
-                target_layers_total=target_layers_total,
-                insertion_order=insertion_order,
-                extension_density=extension_density,
-                skip_final_ln=skip_final_ln,
             )
         if strategy in ("per_weight", "per-weight", "interpolate_per_weight", "interpolate-per-weight", "duplicate_per_weight", "duplicate-per-weight"):
             per_weight_mode = "duplicate" if strategy in ("duplicate_per_weight", "duplicate-per-weight") else "cascade"
