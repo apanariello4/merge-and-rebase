@@ -255,3 +255,16 @@ todo.md
 out
 sbatch*
 *.slurm
+
+# Local experiment strays (see CLAUDE.md: results live on scratch, not in-tree)
+/wandb
+/slurm-*.out
+docs/*.aux
+
+# Local BRACE/ARIADNE research handoff and preserved pre-curation artifacts.
+/AGENTS.md
+/CLAUDE.md
+/docs/.local/
+/.repo-archive/
+/scripts/
+/configs/final/
