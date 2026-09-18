@@ -16,12 +16,22 @@ class _PairSupport:
 
 _METHOD_SUPPORT: dict[str, _PairSupport] = {
     "theseus": _PairSupport(cross_size=True),
+    "theseus_gqa": _PairSupport(cross_size=True),
     "bico": _PairSupport(cross_size=True),
     "identity": _PairSupport(cross_size=False),
     "orthogonal_shift": _PairSupport(cross_size=False),
     "gradfix": _PairSupport(cross_size=False),
     "transfusion": _PairSupport(cross_size=False, required=False),
 }
+
+# Families that don't share a model_type but are the same "hf_decoder" shape
+# (model.layers.N.self_attn/mlp.* naming) closely enough for activation-driven
+# transport (theseus) to be meaningful across them. Qwen3 only adds per-head
+# QK-RMSNorm weights on top of the Qwen2 layout, which aren't transportable
+# keys to begin with (see Qwen3DecoderAdapter), so they're just left as-is.
+_COMPATIBLE_CROSS_FAMILY_PAIRS: frozenset[frozenset[str]] = frozenset({
+    frozenset({"qwen2", "qwen3"}),
+})
 
 
 def check_pair(
@@ -49,10 +59,12 @@ def check_pair(
         return
 
     if source_meta.family != target_meta.family:
-        raise ValueError(
-            f"Model family mismatch: source='{source_meta.family}', target='{target_meta.family}'. "
-            "Cross-family rebasing is not supported in v1."
-        )
+        pair = frozenset({source_meta.family, target_meta.family})
+        if pair not in _COMPATIBLE_CROSS_FAMILY_PAIRS:
+            raise ValueError(
+                f"Model family mismatch: source='{source_meta.family}', target='{target_meta.family}'. "
+                "Cross-family rebasing is not supported in v1."
+            )
 
     source_depth = source_meta.num_hidden_layers
     target_depth = target_meta.num_hidden_layers

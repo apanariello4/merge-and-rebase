@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import islice
 from typing import Any
 
@@ -53,6 +54,50 @@ def _deterministic_calibration_loader(loader, n_batches: int):
             getattr(loader, "persistent_workers", False) and loader.num_workers > 0
         ),
     )
+
+
+def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: str) -> list[int]:
+    """Anchor blocks for ``extension_density="spread"``, spaced evenly over the depth.
+
+    ``spread`` used to take the first ``n_anchors`` entries of an ordered
+    priority list, which only spreads once at least one anchor per block is
+    needed. Below that it piled every change onto one end of the model: growing
+    28 -> 36 layers duplicated blocks 0-7 and left 8-27 untouched, measurably
+    worse than spacing them out (Qwen2.5-1.5B, interpolate, no correction:
+    wikitext-2 ppl 145 that way vs 26 spaced evenly). It now splits
+    ``range(n_positions)`` into ``n_anchors`` equal runs and anchors at the
+    start of each. ``spread_mod`` still reproduces the old bottom-top schedule
+    for comparing against earlier results.
+
+    Splitting into runs (rather than taking even fractions of the closed range
+    ``[0, n_positions - 1]``) also keeps the last anchor one run short of the
+    top, which matters: see the caller's note on why the final block must not
+    become an anchor.
+
+    ``insertion_order`` picks which end the anchors are laid out from;
+    ``random`` keeps its meaning of an arbitrary (deliberately unspread) choice.
+    """
+    if n_anchors <= 0 or n_positions <= 0:
+        return []
+
+    if insertion_order == "random":
+        anchors: list[int] = []
+        while len(anchors) < n_anchors:
+            cycle = list(range(n_positions))
+            np.random.shuffle(cycle)
+            anchors.extend(cycle[: n_anchors - len(anchors)])
+        return anchors
+
+    if insertion_order not in {"bottom-top", "top-bottom"}:
+        raise ValueError(
+            "Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. "
+            f"Got: {insertion_order}"
+        )
+
+    anchors = [(i * n_positions) // n_anchors for i in range(n_anchors)]
+    if insertion_order == "top-bottom":
+        anchors = [n_positions - 1 - a for a in anchors]
+    return anchors
 
 
 @dataclass(frozen=True)
@@ -106,8 +151,44 @@ class BlockExtensionConfig:
     # midpoint of the two original blocks that initialized it, instead of
     # forwarding the inserted block itself.
     transport_activation_mode: str = "model"
+    # Text path: what the inserted block's ``out_proj``/``c_proj`` ridge fit
+    # targets. ``direct`` pins the component output; ``residual`` pins the
+    # residual stream at the block boundary.
+    insertion_target_mode: str = "direct"
     verbose: bool = True
     show_progress: bool = True
+
+
+# Keys the campaign generators write into ``block_extension_params`` purely to
+# record provenance in the run summary. They are not knobs and are not read
+# here, so they must not trigger the unknown-key warning below.
+_ANNOTATION_PARAMS: frozenset[str] = frozenset({
+    "calibration_protocol",
+    "inserted_block_mode",
+    "reference_capture",
+    "ridge_weight",
+    "transport_activation_mode",
+})
+
+
+def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
+    """Warn about params that are silently dropped.
+
+    A misspelled knob (``lambda_l2`` for ``ridge_identity``, say) otherwise
+    resolves to the default without a trace, which makes the run look like an
+    ablation it is not. Warn rather than raise: existing campaign configs carry
+    the annotation keys above and must keep resolving.
+    """
+    known = {f.name for f in fields(BlockExtensionConfig)} | _ANNOTATION_PARAMS
+    unknown = sorted(k for k in params if k not in known)
+    if unknown:
+        warnings.warn(
+            "Ignoring unrecognized block_extension_params "
+            f"{unknown}; these have no effect on the run. "
+            f"Known fields: {sorted(f.name for f in fields(BlockExtensionConfig))}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockExtensionConfig]:
@@ -118,6 +199,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         raise ValueError("config['block_extension_params'] must be a dict when provided.")
 
     params = dict(raw_params)
+    _warn_unknown_block_extension_params(params)
     enabled_raw = cfg.get("block_extension_enabled", None)
     enabled = bool(enabled_raw) if enabled_raw is not None else bool(params)
 
@@ -194,6 +276,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         inserted_block_mode=inserted_block_mode,
         correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
+        insertion_target_mode=str(params.get("insertion_target_mode", "direct")),
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
     )
@@ -651,6 +734,7 @@ class BlockExtender:
         component_ridge: dict[str, float] | None = None,
         lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        insertion_target_mode: str = "direct",
     ):
         block = model.visual.transformer.resblocks[insert_pos]
         inner = self._inner_block(block)
@@ -737,17 +821,31 @@ class BlockExtender:
             # Step 5: attn output (after out_proj) — full absorption into out_proj
             cur = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
             ref = refs.get(f"{src_idx}.attn_output")
-            if ref is not None and cur.numel() > 0:
+            if insertion_target_mode == "residual":
+                # Pin the post-attention residual stream to the source block's
+                # y_s = x_s + a_s instead of matching a_s alone, absorbing the
+                # gap between the inserted block's input and x_s exactly once.
+                ref_input = refs.get(f"{src_idx}.input")
+                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
+                if ref is not None and ref_input is not None and cur.numel() > 0 and cur_input.numel() > 0:
+                    n = min(cur.shape[0], cur_input.shape[0], ref.shape[0], ref_input.shape[0])
+                    A = cur[:n]
+                    T = ref_input[:n].to(A.device) + ref[:n].to(A.device) - cur_input[:n].to(A.device)
+                else:
+                    A = T = torch.empty(0)
+            elif ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
-                    if lmc_store is not None:
-                        lmc_store["out_proj"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "out_proj", W, b)
-                    W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
-                    b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
-                    inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
-                    inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
+            else:
+                A = T = torch.empty(0)
+            if A.numel() > 0 and T.numel() > 0:
+                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
+                if lmc_store is not None:
+                    lmc_store["out_proj"] = (W.clone(), b.clone())
+                self._record_correction(model_name, "out_proj", W, b)
+                W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
+                b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
+                inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
+                inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
 
             # Step 6: ln_2 — element-wise (diagonal) absorption
             cur = self._capture_component_output(model, insert_pos, "ln_2", loader, n_batches)
@@ -782,17 +880,45 @@ class BlockExtender:
             # Step 8: mlp.c_proj (after GELU, before ls_2) — full absorption into c_proj
             cur = self._capture_component_output(model, insert_pos, "c_proj", loader, n_batches)
             ref = refs.get(f"{src_idx}.c_proj_output")
-            if ref is not None and cur.numel() > 0:
+            if insertion_target_mode == "residual":
+                # Target the source block's OUTPUT x_{s+1} = x_s + a_s + m_s,
+                # minus the stream actually reaching the MLP, which is the block
+                # input plus the already-corrected attention output. Subtracting
+                # only the block input here would consume the input gap a second
+                # time and invert the block (see the shrink path, which has
+                # always subtracted cur_attn).
+                ref_input = refs.get(f"{src_idx}.input")
+                ref_attn = refs.get(f"{src_idx}.attn_output")
+                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
+                cur_attn = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
+                if (
+                    ref is not None and ref_input is not None and ref_attn is not None
+                    and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0
+                ):
+                    n = min(
+                        cur.shape[0], cur_input.shape[0], cur_attn.shape[0],
+                        ref.shape[0], ref_input.shape[0], ref_attn.shape[0],
+                    )
+                    A = cur[:n]
+                    T = (
+                        ref_input[:n].to(A.device) + ref_attn[:n].to(A.device) + ref[:n].to(A.device)
+                        - cur_input[:n].to(A.device) - cur_attn[:n].to(A.device)
+                    )
+                else:
+                    A = T = torch.empty(0)
+            elif ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
-                    if lmc_store is not None:
-                        lmc_store["c_proj"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "c_proj", W, b)
-                    W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
-                    b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
-                    inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
-                    inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
+            else:
+                A = T = torch.empty(0)
+            if A.numel() > 0 and T.numel() > 0:
+                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
+                if lmc_store is not None:
+                    lmc_store["c_proj"] = (W.clone(), b.clone())
+                self._record_correction(model_name, "c_proj", W, b)
+                W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
+                b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
+                inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
+                inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
 
     @torch.no_grad()
     def _correct_collapsed_block_weights_cascade(
@@ -1076,20 +1202,18 @@ class BlockExtender:
             return [i % n_gaps for i in range(n_needed)]
         if extension_density != "spread":
             raise ValueError(
-                "Unsupported extension_density. Expected one of: spread, clump. " f"Got: {extension_density}"
+                "Unsupported extension_density. Expected one of: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule = []
-        while len(schedule) < n_needed:
-            if insertion_order == "random":
-                cycle = list(range(curr_layers))
-                np.random.shuffle(cycle)
-            else:
-                cycle = priority
-            need = n_needed - len(schedule)
-            schedule.extend(cycle[:need])
-
-        return schedule
+        # Once there is at least one duplicate per block every block is an
+        # anchor anyway; below that keep the final block out of the anchor set.
+        # Duplicating it puts an extra full block update directly before the
+        # output norm with no later layer to absorb it, which is far more
+        # destructive than any other placement (Qwen2.5-1.5B 28 -> 36,
+        # interpolate, no correction: wikitext-2 ppl 1847 with it vs 28 without).
+        n_positions = curr_layers if n_needed >= curr_layers else max(1, curr_layers - 1)
+        return spread_anchor_schedule(n_needed, n_positions, insertion_order)
 
     @staticmethod
     def _build_collapse_schedule(
@@ -1116,7 +1240,10 @@ class BlockExtender:
                 )
             return [0] * n_to_remove
 
-        if extension_density not in {"spread", "spread_mod"}:
+        if extension_density == "spread":
+            return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
+
+        if extension_density != "spread_mod":
             raise ValueError(
                 "Unsupported extension_density. Expected one of: spread, spread_mod, clump. "
                 f"Got: {extension_density}"
@@ -1171,6 +1298,7 @@ class BlockExtender:
         reference_capture: str = "lazy",
         inserted_block_mode: str = "ariadne",
         correction_scope: str = "inserted",
+        insertion_target_mode: str = "direct",
     ) -> int:
         self._reference_capture = _as_reference_capture(reference_capture)
         self._eager_reference_cache: dict[str, dict[str, torch.Tensor]] | None = None
@@ -1178,6 +1306,11 @@ class BlockExtender:
         if self._ridge_weight < 0.0:
             raise ValueError("ridge_weight must be >= 0.")
         curr_layers = len(self.model_base.visual.transformer.resblocks)
+        if insertion_target_mode not in ("direct", "residual"):
+            raise ValueError(
+                f"Unsupported insertion_target_mode '{insertion_target_mode}'. "
+                "Expected 'direct' (published behaviour) or 'residual'."
+            )
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
         n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
@@ -1226,11 +1359,15 @@ class BlockExtender:
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="cascade", **shrink_kwargs)
-            return self._extend_per_weight(per_weight_mode="cascade", **common_kwargs)
+            return self._extend_per_weight(
+                per_weight_mode="cascade", insertion_target_mode=insertion_target_mode, **common_kwargs
+            )
         if strategy == "duplicate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="duplicate", **shrink_kwargs)
-            return self._extend_per_weight(per_weight_mode="duplicate", **common_kwargs)
+            return self._extend_per_weight(
+                per_weight_mode="duplicate", insertion_target_mode=insertion_target_mode, **common_kwargs
+            )
 
         if strategy == "interpolate":
             raise ValueError(
@@ -1302,6 +1439,7 @@ class BlockExtender:
         share_ft_refs: bool,
         component_ridge: dict[str, float] | None,
         lmc_mode: str,
+        insertion_target_mode: str = "direct",
     ) -> None:
         """Capture references for one block and fit/absorb its correction.
 
@@ -1323,6 +1461,7 @@ class BlockExtender:
             ridge_identity=ridge_identity,
             n_iters=n_cascade_iters,
             component_ridge=component_ridge,
+            insertion_target_mode=insertion_target_mode,
         )
         if lmc_mode == "independent":
             self._correct_block_weights_cascade(
@@ -1384,6 +1523,7 @@ class BlockExtender:
         lmc_mode: str = "independent",
         inserted_block_mode: str = "ariadne",
         correction_scope: str = "inserted",
+        insertion_target_mode: str = "direct",
     ) -> int:
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
@@ -1485,6 +1625,7 @@ class BlockExtender:
                     share_ft_refs=share_ft_refs,
                     component_ridge=component_ridge,
                     lmc_mode=lmc_mode,
+                    insertion_target_mode=insertion_target_mode,
                 )
                 # Repair the original blocks the insertion just disturbed. The
                 # bottom-to-top schedule visits each original block as an
@@ -1509,6 +1650,7 @@ class BlockExtender:
                         share_ft_refs=share_ft_refs,
                         component_ridge=component_ridge,
                         lmc_mode=lmc_mode,
+                        insertion_target_mode=insertion_target_mode,
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
@@ -1836,6 +1978,7 @@ def run_block_extension(
         reference_capture=str(config.reference_capture),
         inserted_block_mode=str(config.inserted_block_mode),
         correction_scope=str(config.correction_scope),
+        insertion_target_mode=str(config.insertion_target_mode),
     )
     if layout_out is not None:
         layout_out.clear()

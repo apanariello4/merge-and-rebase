@@ -254,13 +254,14 @@ src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
 out
 sbatch*
+*.slurm
 
 # Local experiment strays (see CLAUDE.md: results live on scratch, not in-tree)
 /wandb
 /slurm-*.out
 docs/*.aux
 
-# Local research handoff and preserved pre-curation artifacts.
+# Local BRACE/ARIADNE research handoff and preserved pre-curation artifacts.
 /AGENTS.md
 /CLAUDE.md
 /docs/.local/

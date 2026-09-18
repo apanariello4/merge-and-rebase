@@ -112,6 +112,30 @@ def _calibration_primary_input(batch: Any, family_adapter: Any = None) -> torch.
     return _t._extract_model_inputs(batch)
 
 
+def _calibration_row_mask(
+    source_batch: Any,
+    target_batch: Any,
+    family_adapter: Any,
+) -> torch.Tensor | None:
+    """Non-padding row mask for a text calibration pair, or None for vision.
+
+    Text batches are padded to a fixed length, so a short prompt is mostly pad
+    tokens whose activations say nothing about how the two models represent
+    content. Theseus drops those rows before accumulating its covariances; BiCo
+    fits the same kind of map from the same activations and needs the same
+    treatment. Vision batches have no padding, so this returns None and every
+    row is kept, leaving the vision path byte-identical.
+    """
+    if family_adapter is None:
+        return None
+    masks: list[torch.Tensor | None] = []
+    for batch in (source_batch, target_batch):
+        inputs = family_adapter.extract_calibration_batch(batch)
+        mask = inputs.get("attention_mask") if isinstance(inputs, Mapping) else None
+        masks.append(mask if torch.is_tensor(mask) else None)
+    return _t._content_row_mask(masks[0], masks[1])
+
+
 def _collect_batch(
     model: torch.nn.Module,
     recipe,
@@ -215,6 +239,8 @@ def collect_bilinear_statistics(
                     raise ValueError("BiCo calibration loaders are not label-aligned.")
             del source_inputs, target_inputs
 
+            row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
+
             # Source: forward + backward on GPU
             source_hook.clear()
             _collect_batch(
@@ -256,6 +282,7 @@ def collect_bilinear_statistics(
                 src_rows, tgt_rows = _t._align_features(
                     source_hook.inputs[key], target_hook.inputs[key], mode=seq_align
                 )
+                src_rows, tgt_rows = _t._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.in"
                 store = registry.setdefault(
                     reg_key,
@@ -268,6 +295,7 @@ def collect_bilinear_statistics(
                 src_rows, tgt_rows = _t._align_features(
                     source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align
                 )
+                src_rows, tgt_rows = _t._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.out"
                 store = registry.setdefault(
                     reg_key,
@@ -361,6 +389,8 @@ def collect_gradin_statistics(
                 )
             del source_inputs, target_inputs
 
+            row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
+
             # Source: forward + backward on GPU with inputs marked grad
             source_hook.clear()
             _collect_batch(
@@ -400,6 +430,7 @@ def collect_gradin_statistics(
                     )
                 else:
                     continue
+                src_rows, tgt_rows = _t._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.in"
                 store = registry.setdefault(
                     reg_key,
@@ -413,6 +444,7 @@ def collect_gradin_statistics(
                 src_rows, tgt_rows = _t._align_features(
                     source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align
                 )
+                src_rows, tgt_rows = _t._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.out"
                 store = registry.setdefault(
                     reg_key,

@@ -296,6 +296,51 @@ def _align_features(
     return source_tokens.reshape(-1, source_tokens.shape[-1]), target_tokens.reshape(-1, target_tokens.shape[-1])
 
 
+def _content_row_mask(
+    source_attention_mask: torch.Tensor | None,
+    target_attention_mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Flat (batch*tokens,) bool mask selecting the non-padding activation rows.
+
+    Text calibration batches are padded to a fixed length, so most positions in
+    a short prompt are pad tokens. Their activations carry no signal about how
+    the two models represent content, and folding them into the cross-covariance
+    lets padding dominate the fitted Procrustes maps. Returns None whenever a
+    trustworthy mask can't be built, in which case callers keep every row.
+    """
+    masks = [
+        m.detach().to(device="cpu").reshape(-1).bool()
+        for m in (source_attention_mask, target_attention_mask)
+        if isinstance(m, torch.Tensor) and m.ndim == 2
+    ]
+    if not masks:
+        return None
+    if len({int(m.numel()) for m in masks}) != 1:
+        # Source and target tokenized to different lengths, so rows no longer
+        # correspond one-to-one after sequence alignment; don't guess.
+        return None
+    mask = masks[0]
+    for extra in masks[1:]:
+        mask = mask & extra
+    if bool(mask.all()) or not bool(mask.any()):
+        return None
+    return mask
+
+
+def _drop_padding_rows(
+    source_rows: torch.Tensor,
+    target_rows: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mask is None:
+        return source_rows, target_rows
+    n = int(mask.numel())
+    if int(source_rows.shape[0]) != n or int(target_rows.shape[0]) != n:
+        # Not one row per input token (pooled/head-split features); leave as-is.
+        return source_rows, target_rows
+    return source_rows[mask], target_rows[mask]
+
+
 class ActivationStore:
     """Streaming activation statistics with optional Gram and raw storage."""
 
@@ -786,6 +831,7 @@ def collect_activations(
 
                 source_model(**({"input_ids": s_inp, "attention_mask": s_attn} if s_attn is not None else {"input_ids": s_inp}))
                 target_model(**({"input_ids": t_inp, "attention_mask": t_attn} if t_attn is not None else {"input_ids": t_inp}))
+                row_mask = _content_row_mask(s_attn, t_attn)
             else:
                 source_imgs = _extract_model_inputs(source_batch).to(dev)
                 target_imgs = _extract_model_inputs(target_batch).to(dev)
@@ -805,19 +851,21 @@ def collect_activations(
                 if source_model_ft is not None:
                     _encode_image(source_model_ft, source_imgs)
                 _encode_image(target_model, target_imgs)
+                row_mask = None
             consumed_batches += 1
 
             if source_activation_plan is not None:
                 source_activation_plan.apply(source_hook.inputs)
                 source_activation_plan.apply(source_hook.outputs)
 
-            def _accumulate(hook: _ActivationHook, *, prefix: str) -> None:
+            def _accumulate(hook: _ActivationHook, *, prefix: str, row_mask=row_mask) -> None:
                 for side, source_side, target_side in (
                     ("in", hook.inputs, target_hook.inputs),
                     ("out", hook.outputs, target_hook.outputs),
                 ):
                     for key in set(source_side.keys()) & set(target_side.keys()):
                         src_rows, tgt_rows = _align_features(source_side[key], target_side[key], mode=seq_align)
+                        src_rows, tgt_rows = _drop_padding_rows(src_rows, tgt_rows, row_mask)
                         registry.setdefault(
                             f"{prefix}{key}.{side}",
                             ActivationStore(
@@ -1678,6 +1726,19 @@ def _apply_transforms_to_visual_delta(
         logger.warning(
             "%s transport diagnostics: unexpected loss %s; examples=%s",
             method_name, unexpected, diagnostics.examples,
+        )
+    # A run where every key was zeroed for an *unintended* reason returns a full set of
+    # correctly shaped zeros, which downstream code cannot distinguish from a legitimate
+    # result. Refuse to hand that back silently, whether or not ``strict`` is set.
+    # Deliberate zeroing (``intentional_zero``/``out_of_scope_zero``, e.g. the depth
+    # baselines) is a valid all-zero outcome and is exempt.
+    if visual_delta and actively_transported == 0 and not (intentional_zero or out_of_scope_zero):
+        raise RuntimeError(
+            f"{method_name} transported no keys: every one of {len(visual_delta)} delta keys "
+            f"was zeroed (missing_transform_zero={missing_transform_zero}, "
+            f"transport_failure_zero={transport_failure_zero}, "
+            f"unsupported_zero={unsupported_zero}, wrong_shape_zero={wrong_shape_zero}). "
+            f"The transported delta would be identically zero. Examples: {diagnostics.examples}"
         )
     if strict and unexpected:
         raise RuntimeError(

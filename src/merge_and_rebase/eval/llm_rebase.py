@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from copy import deepcopy
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from copy import copy, deepcopy
+from dataclasses import dataclass, is_dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,7 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ..data.llm_calibration import resolve_calibration_texts
 from ..data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
@@ -68,17 +71,6 @@ from .llm_common import (
 )
 from .print_utils import pretty_print_task_accuracies
 
-_DEFAULT_CALIBRATION_PROMPTS = [
-    "Write a short summary of the moon landing.",
-    "Explain why the sky looks blue.",
-    "Translate 'good morning' into French.",
-    "Give three healthy breakfast ideas.",
-    "What is the capital of Japan?",
-    "Write a polite email asking for a meeting.",
-    "List two differences between cats and dogs.",
-    "Solve: 17 plus 26.",
-]
-
 
 class _TokenizedPromptDataset(Dataset):
     def __init__(self, features: list[dict[str, Any]]) -> None:
@@ -101,6 +93,44 @@ class _PreparedTaskDelta:
     source_base: dict[str, torch.Tensor]
     transport_keys: set[str]
     source_model: torch.nn.Module
+    # The same task vector resized without correction. Under lmc_mode="shared"
+    # the fitted correction W is applied to base and ft alike, so the corrected
+    # delta is W @ delta: correction changes the task vector's scale as well as
+    # its direction. Keeping the uncorrected delta lets a run transport one and
+    # normalize to the other, separating those two effects.
+    uncorrected_delta: dict[str, torch.Tensor] | None = None
+
+
+def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
+    """Frobenius norm of a task vector, optionally restricted to `keys`."""
+    total = 0.0
+    for key, value in delta.items():
+        if keys is not None and key not in keys:
+            continue
+        total += float(value.float().pow(2).sum())
+    return total ** 0.5
+
+
+# Calibration batches used by theseus/bico when a config names neither
+# method_params.num_batches nor method_params.n_batches.
+_DEFAULT_CALIB_BATCHES = 2
+
+
+def _config_with_correction_disabled(config: Any) -> Any | None:
+    """Same block-extension config with correction off, or None if not derivable.
+
+    Real runs pass a BlockExtensionConfig dataclass. Tests pass lightweight
+    stubs, and a stub that cannot express skip_correction simply means no
+    uncorrected reference vector is available for that call.
+    """
+    if is_dataclass(config) and not isinstance(config, type):
+        return dataclass_replace(config, skip_correction=True)
+    clone = copy(config)
+    try:
+        clone.skip_correction = True
+    except (AttributeError, TypeError):
+        return None
+    return clone
 
 
 def _prepare_resized_task_delta(
@@ -114,6 +144,29 @@ def _prepare_resized_task_delta(
     device: str,
 ) -> _PreparedTaskDelta:
     """Resize one task pair and retain the exact source context for transport."""
+    # Reference resize with correction disabled, kept so the caller can compare
+    # or substitute the uncorrected task vector. This costs a deepcopy and no
+    # forward passes: with skip_correction the extension only duplicates blocks,
+    # it never captures reference or component activations.
+    uncorrected_delta: dict[str, torch.Tensor] | None = None
+    reference_config = _config_with_correction_disabled(config)
+    if reference_config is not None and not bool(getattr(config, "skip_correction", False)):
+        ref_base = deepcopy(source_base_model)
+        ref_ft = deepcopy(source_ft_model)
+        run_block_extension_llm(
+            source_base_model=ref_base,
+            source_ft_model=ref_ft,
+            calibration_loader=calibration_loader,
+            target_layers_total=target_layers_total,
+            config=reference_config,
+            family_adapter=family_adapter,
+            device=device,
+        )
+        uncorrected_delta = TaskVector.from_checkpoints(
+            to_cpu_fp32(ref_base.state_dict()), to_cpu_fp32(ref_ft.state_dict()), strict=False
+        ).delta
+        del ref_base, ref_ft
+
     final_depth = run_block_extension_llm(
         source_base_model=source_base_model,
         source_ft_model=source_ft_model,
@@ -132,22 +185,61 @@ def _prepare_resized_task_delta(
     source_base = to_cpu_fp32(source_base_model.state_dict())
     source_ft = to_cpu_fp32(source_ft_model.state_dict())
     task_vector = TaskVector.from_checkpoints(source_base, source_ft, strict=False)
+    if uncorrected_delta is None:
+        # skip_correction: the corrected and uncorrected resizes are the same run.
+        uncorrected_delta = task_vector.delta
     return _PreparedTaskDelta(
         delta=task_vector.delta,
         source_base=source_base,
         transport_keys=set(family_adapter.transportable_keys(source_base)),
         source_model=source_base_model,
+        uncorrected_delta=uncorrected_delta,
     )
+
+
+def _summarize_merged_delta(
+    merged_delta: dict[str, torch.Tensor],
+    target_base: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Measure how much of the target model the transported delta actually moves.
+
+    A transport that silently zeroes every key still returns a full set of
+    correctly shaped tensors, so the alpha sweep looks healthy while every
+    candidate evaluates the same untouched base model. These numbers go into the
+    run summary so that failure mode is visible in the JSON, not only in stdout.
+    """
+    sq_delta = 0.0
+    sq_base = 0.0
+    nonzero = 0
+    for key, value in merged_delta.items():
+        val = value.float()
+        sq_delta += float(val.pow(2).sum())
+        if float(val.abs().sum()) > 0.0:
+            nonzero += 1
+        base_ref = target_base.get(key)
+        if base_ref is not None:
+            sq_base += float(base_ref.float().pow(2).sum())
+
+    delta_norm = sq_delta ** 0.5
+    base_norm = sq_base ** 0.5
+    return {
+        "key_count": float(len(merged_delta)),
+        "nonzero_key_count": float(nonzero),
+        "merged_delta_norm": delta_norm,
+        "merged_delta_rel_norm": (delta_norm / base_norm) if base_norm > 0.0 else 0.0,
+    }
 
 
 def _build_text_calibration_loader(
     *,
     tokenizer: Any,
-    prompts: list[str] | None = None,
+    texts: list[str],
     batch_size: int = 2,
     max_length: int = 128,
 ) -> DataLoader:
-    prompt_list = list(prompts or _DEFAULT_CALIBRATION_PROMPTS)
+    prompt_list = list(texts)
+    if not prompt_list:
+        raise ValueError("Calibration loader needs at least one text sequence.")
     enc = tokenizer(
         prompt_list,
         truncation=True,
@@ -239,8 +331,12 @@ def main() -> None:
 
         # Harness
         p.add_argument("--harness-tasks", type=str, default=None)
-        p.add_argument("--harness-num-fewshot", type=int, default=0)
-        p.add_argument("--harness-batch-size", type=str, default="auto")
+        # None, not 0/"auto": merge_non_none only lets a CLI value win over the
+        # config when the flag was actually passed. A concrete default here
+        # would silently clobber the config's harness_num_fewshot/
+        # harness_batch_size on every run, whether or not the flag was given.
+        p.add_argument("--harness-num-fewshot", type=int, default=None)
+        p.add_argument("--harness-batch-size", type=str, default=None)
         p.add_argument("--harness-limit", type=int, default=None)
 
         # Block extension
@@ -261,6 +357,15 @@ def main() -> None:
             action=argparse.BooleanOptionalAction,
             default=None,
             help="Optionally evaluate source model before rebase for pre/post comparison.",
+        )
+        p.add_argument(
+            "--eval-before-rebase-only",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run block extension and the before-rebase eval, then stop before "
+                "transport. Implies --eval-before-rebase."
+            ),
         )
 
         add_logging_args(p)
@@ -317,9 +422,13 @@ def main() -> None:
             ),
             "save_merged": args.save_merged,
             "harness_tasks": args.harness_tasks,
+            "harness_num_fewshot": args.harness_num_fewshot,
+            "harness_batch_size": args.harness_batch_size,
+            "harness_limit": args.harness_limit,
             "block_extension_enabled": args.block_extension_enabled,
             "block_extension_params": block_extension_params_cli,
             "eval_before_rebase": args.eval_before_rebase,
+            "eval_before_rebase_only": args.eval_before_rebase_only,
         }
         cfg = merge_non_none(cfg, cli_overrides)
 
@@ -336,6 +445,13 @@ def main() -> None:
         method_name = str(cfg.get("method", "theseus"))
         method = get_method(method_name)
         method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
+        if "n_batches" in method_params:
+            raise ValueError(
+                "config['method_params'].n_batches is deprecated: it silently "
+                "raced with method_params.num_batches (whichever the resolver "
+                "checked first won, so the other was ignored without warning). "
+                "Rename it to 'num_batches' in the config."
+            )
 
         model_arch = str(cfg.get("model_arch", "auto"))
         model_kind = str(cfg.get("model_kind", "causal_lm"))
@@ -410,7 +526,7 @@ def main() -> None:
         target_meta = target_family.metadata(target_llm.model) if target_family else None
 
         # Block extension config
-        blockext_like_method = method_name in {"theseus", "bico"}
+        blockext_like_method = method_name in {"theseus", "theseus_gqa", "bico"}
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
@@ -470,6 +586,56 @@ def main() -> None:
 
         harness_tasks_raw = cfg.get("harness_tasks", None)
         is_harness_only = harness_tasks_raw is not None and cfg.get("tasks") is None and cfg.get("suite") is None
+        harness_tasks_resolved = (
+            parse_csv(harness_tasks_raw)
+            if isinstance(harness_tasks_raw, str)
+            else (harness_tasks_raw or [])
+        )
+        harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
+        harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
+        harness_limit = cfg.get("harness_limit", None)
+
+        # The "before rebase" reference is the SOURCE model exactly as transport
+        # sees it: resized (and LMC-corrected) to the target depth by block
+        # extension, before any task vector is transported. The target base is
+        # not a useful reference here -- block extension never touches it, so
+        # its score says nothing about how much the extension cost us.
+        eval_before_rebase_only = bool(cfg.get("eval_before_rebase_only", False))
+        eval_before_rebase = bool(cfg.get("eval_before_rebase", False)) or eval_before_rebase_only
+        if eval_before_rebase_only and not harness_tasks_resolved:
+            raise ValueError(
+                "eval_before_rebase_only needs harness_tasks: there is nothing else to run."
+            )
+        run_before_rebase_eval = eval_before_rebase and bool(harness_tasks_resolved)
+        if eval_before_rebase and not harness_tasks_resolved:
+            print("eval_before_rebase requested but no harness_tasks configured; skipping.")
+        baseline_harness_results_by_task: dict[str, dict[str, float]] = {}
+
+        def _baseline_summary() -> dict[str, Any] | None:
+            """Flat for a single task vector, label -> results for several."""
+            if not baseline_harness_results_by_task:
+                return None
+            if len(baseline_harness_results_by_task) == 1:
+                return next(iter(baseline_harness_results_by_task.values()))
+            return dict(baseline_harness_results_by_task)
+
+        def _eval_before_rebase(model: torch.nn.Module, label: str) -> None:
+            from .lm_harness_runner import run as run_harness
+
+            print(f"\nEvaluating source model ({label}) with lm-harness (before rebase)...")
+            results = run_harness(
+                tasks=list(harness_tasks_resolved),
+                model=model,
+                tokenizer=source_llm.tokenizer,
+                device=device,
+                num_fewshot=harness_num_fewshot,
+                batch_size=harness_batch_size,
+                limit=harness_limit,
+                samples=harness_samples,
+            )
+            for task_name, acc in results.items():
+                print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")
+            baseline_harness_results_by_task[label] = results
 
         if is_harness_only:
             tasks = []
@@ -532,18 +698,133 @@ def main() -> None:
             if tp_keys:
                 print(f"Transportable body keys: {len(tp_keys)} / {len(full_fp_keys)} total FP keys")
 
+        calibration_prompts_cfg = cfg.get("calibration_prompts", None)
+        if isinstance(calibration_prompts_cfg, str):
+            # Allow pointing at a JSON file shaped {"prompts": [...]}, so a large
+            # domain-specific calibration bank doesn't have to be inlined into
+            # (and duplicated across) every config.
+            calibration_prompts_cfg = load_json(calibration_prompts_cfg).get("prompts", None)
+        if calibration_prompts_cfg is not None and not isinstance(calibration_prompts_cfg, list):
+            raise ValueError(
+                "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one."
+            )
+
+        # Calibration text comes from the dataset the run is actually scored
+        # on (or an explicitly configured one), not from a fixed prompt bank:
+        # size the slice to what the run will consume so num_batches is real.
+        calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
+        calib_max_length = int(cfg.get("calibration_max_length", 128))
+        # method_params.num_batches is the one calibration-budget knob theseus/bico
+        # read from config (method_params.n_batches is rejected above). Resolve it
+        # once here so it's counted when sizing the corpus and can beat the
+        # _DEFAULT_CALIB_BATCHES default injected at the transport call below.
+        calib_n_batches_cfg = method_params.get("num_batches")
+        calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
+        # These are two separate budgets over one shared text pool, not one
+        # knob: block extension consumes n_batches_act batches for its
+        # activation capture, theseus/bico consume num_batches for theirs, and
+        # neither is derived from the other. The max only sizes the pool, so
+        # whichever consumer asks for more still finds enough text.
+        # Vision configs express the calibration budget as
+        # method_params.num_batches, and theseus/bico accept either name
+        # (preferring n_batches). Resolve it once here so a vision-style config
+        # means the same thing on this path: without this, num_batches was
+        # neither counted when sizing the corpus nor able to beat the n_batches
+        # default injected at the transport call, so it silently did nothing.
+        calib_n_batches_cfg = method_params.get("n_batches", method_params.get("num_batches"))
+        calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
+        # These are two separate budgets over one shared text pool, not one
+        # knob: block extension consumes n_batches_act batches for its
+        # activation capture, theseus/bico consume num_batches for theirs, and
+        # neither is derived from the other. The max only sizes the pool, so
+        # whichever consumer asks for more still finds enough text.
+        n_calib_batches = max(
+            int(block_extension_cfg.n_batches_act),
+            int(calib_n_batches or 0),
+            int(calib_n_batches or 0),
+        )
+        # Resolved on first use: building it from an lm-harness task has to
+        # index the task registry, which is far too expensive to pay for on a
+        # run that never collects activations at all.
+        _calibration_cache: list[Any] = []
+
+        def _calibration() -> Any:
+            if not _calibration_cache:
+                resolved = resolve_calibration_texts(
+                    prompts=calibration_prompts_cfg,
+                    calibration_dataset=(
+                        block_extension_cfg.calibration_dataset
+                        or block_extension_cfg.calibration_task
+                    ),
+                    calibration_split=str(block_extension_cfg.calibration_split),
+                    harness_tasks=list(harness_tasks_resolved),
+                    n_sequences=max(1, n_calib_batches) * calib_batch_size,
+                    seed=int(cfg.get("seed", 0)),
+                )
+                print(f"Calibration corpus: {resolved.describe()}")
+                _calibration_cache.append(resolved)
+            return _calibration_cache[0]
+
+        configured_harness_samples_raw = cfg.get("harness_samples", None)
+        configured_harness_samples: dict[str, list[int]] | None = None
+        if configured_harness_samples_raw is not None:
+            if not isinstance(configured_harness_samples_raw, dict):
+                raise ValueError("config['harness_samples'] must map task names to document-index lists.")
+            configured_harness_samples = {}
+            for task_name, indices in configured_harness_samples_raw.items():
+                if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
+                    raise ValueError(
+                        "config['harness_samples'] values must be lists of non-negative document indices."
+                    )
+                configured_harness_samples[str(task_name)] = list(indices)
+
+        needs_calibration = run_block_extension_prestep or method_name in (
+            "theseus",
+            "theseus_gqa",
+            "bico",
+        )
+        # The eval slice must be known before the first before-rebase eval, so
+        # resolve up front whenever this run will calibrate at all.
+        calibration_eval_samples = _calibration().eval_samples or None if needs_calibration else None
+        if (
+            configured_harness_samples is not None
+            and calibration_eval_samples is not None
+            and configured_harness_samples != calibration_eval_samples
+        ):
+            raise ValueError(
+                "config['harness_samples'] disagrees with the IFEval hold-out derived from calibration; "
+                "use the derived samples or an independent calibration corpus."
+            )
+        harness_samples = configured_harness_samples or calibration_eval_samples
+
         # Block extension: build calibration loader once if needed
         blockext_calib_loader = None
         if run_block_extension_prestep:
-            calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
-            calib_max_length = int(cfg.get("calibration_max_length", 128))
             blockext_calib_loader = _build_text_calibration_loader(
                 tokenizer=source_llm.tokenizer,
+                texts=_calibration().texts,
                 batch_size=calib_batch_size,
                 max_length=calib_max_length,
             )
 
-        for ckpt_ref in tuned_ref_list:
+        if run_before_rebase_eval and not run_block_extension_prestep:
+            # No depth change: the model transport starts from is the plain
+            # source base, so one pass is enough for every task.
+            load_into_model(source_llm.model, source_base_sd, strict=False)
+            _eval_before_rebase(source_llm.model, "source_base")
+            source_llm.model.to("cpu")
+        elif run_before_rebase_eval and bool(cfg.get("eval_source_before_extension", False)):
+            # The unextended source, scored on the same eval slice. Without it
+            # the only "before" number is the extended source base, so there is
+            # nothing to say whether correction restores the original model or
+            # improves on it -- the two are indistinguishable from the extended
+            # score alone.
+            load_into_model(source_llm.model, source_base_sd, strict=False)
+            _eval_before_rebase(source_llm.model, "source_base_unextended")
+            source_llm.model.to("cpu")
+
+        for task_idx, ckpt_ref in enumerate(tuned_ref_list):
+            task_label = tasks[task_idx] if task_idx < len(tasks) else f"task_{task_idx}"
             if run_block_extension_prestep:
                 # Each task starts from an immutable source template, then its
                 # own copy is resized to the target depth before transport.
@@ -576,9 +857,18 @@ def main() -> None:
                     device=device,
                 )
                 print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
+                # The resized ft model has already been absorbed into the delta;
+                # drop it before the eval below so it is not holding device
+                # memory while lm-harness runs.
+                del source_ft_model_task
+                if run_before_rebase_eval:
+                    # Scored here, after extension and before transport: this is
+                    # the extended source base that BiCo/Theseus will read from.
+                    _eval_before_rebase(
+                        source_base_model_task, f"extended_source_base:{task_label}"
+                    )
                 prepared_tasks.append(prepared_task)
                 source_base_model_task.to("cpu")
-                del source_ft_model_task
             else:
                 aligned = load_aligned_tuned_from_ref(
                     ckpt_ref=ckpt_ref,
@@ -613,6 +903,26 @@ def main() -> None:
                     )
                 )
 
+        if eval_before_rebase_only:
+            # Everything the before-rebase reference needs is done: block
+            # extension has run and the extended source base has been scored.
+            # Transport is the expensive half and contributes nothing here.
+            print("\nStopping after the before-rebase eval (eval_before_rebase_only).")
+            if run_logger is not None:
+                run_logger.log_summary({
+                    "method": method_name,
+                    "backend": "lm_harness",
+                    "stopped_after": "before_rebase_eval",
+                    "harness_results_before_rebase": _baseline_summary(),
+                    "before_rebase_model": (
+                        "extended_source_base" if run_block_extension_prestep else "source_base"
+                    ),
+                    "source_depth": source_depth,
+                    "target_depth": target_depth,
+                })
+                run_logger.finish("success")
+            return
+
         weights_raw = cfg.get("weights", None)
         if weights_raw is None:
             weights = [1.0] * len(tuned_ref_list)
@@ -627,8 +937,32 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
 
         family_adapter = target_family or source_family
+        # Which task vector gets transported. "corrected" is the status quo:
+        # activations and delta both come from the corrected resize.
+        # "uncorrected" keeps the corrected model for activation capture -- so
+        # the fitted alignment map is unchanged -- but transports the delta from
+        # the uncorrected resize, isolating whether correction helps the map or
+        # only distorts the vector.
+        delta_source = str(cfg.get("transport_delta_source", "corrected")).strip().lower()
+        if delta_source not in {"corrected", "uncorrected"}:
+            raise ValueError(
+                f"transport_delta_source must be 'corrected' or 'uncorrected'. Got: {delta_source!r}"
+            )
+        # Rescale the transported delta to the uncorrected task vector's norm.
+        # Procrustes transport is orthogonal and norm-preserving, so without
+        # this the correction's effect on scale reaches the target model in full
+        # and a fixed alpha cannot distinguish scale from direction.
+        norm_match = cfg.get("delta_norm_match", None)
+        norm_match = str(norm_match).strip().lower() if norm_match is not None else None
+        if norm_match not in {None, "none", "uncorrected"}:
+            raise ValueError(
+                f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
+            )
+        task_vector_norms: list[dict[str, float]] = []
         for idx, prepared_task in enumerate(prepared_tasks):
-            delta = prepared_task.delta
+            corrected_delta = prepared_task.delta
+            reference_delta = prepared_task.uncorrected_delta or corrected_delta
+            delta = reference_delta if delta_source == "uncorrected" else corrected_delta
             transport_keys = prepared_task.transport_keys
             if tasks:
                 label = tasks[idx]
@@ -640,28 +974,31 @@ def main() -> None:
             if run_block_extension_prestep:
                 prepared_task.source_model.to(device)
 
-            if method_name in ("theseus", "bico") and transport_keys:
+            if method_name in ("theseus", "theseus_gqa", "bico") and transport_keys:
                 # Hybrid: transport body keys, identity-pass the rest
                 body_delta = {k: v for k, v in delta.items() if k in transport_keys}
                 passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
 
                 transport_kwargs = dict(method_params)
-                calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
-                calib_max_length = int(cfg.get("calibration_max_length", 128))
                 source_calib = _build_text_calibration_loader(
                     tokenizer=source_llm.tokenizer,
+                    texts=_calibration().texts,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
                 target_calib = _build_text_calibration_loader(
                     tokenizer=target_llm.tokenizer,
+                    texts=_calibration().texts,
                     batch_size=calib_batch_size,
                     max_length=calib_max_length,
                 )
 
-                if method_name == "theseus":
+                if method_name in ("theseus", "theseus_gqa"):
                     transport_kwargs.setdefault("seq_align", "interpolate")
-                    transport_kwargs.setdefault("n_batches", 2)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
@@ -679,7 +1016,10 @@ def main() -> None:
                     from ..models.grad_recipes import causal_lm_recipe
 
                     transport_kwargs.setdefault("seq_align", "interpolate")
-                    transport_kwargs.setdefault("n_batches", 2)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
@@ -719,6 +1059,29 @@ def main() -> None:
                 )
             elapsed = time.time() - t0
             print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
+
+            # Norms are reported for every run, not only when matching is on, so
+            # the scale effect of correction is visible in the summary.
+            n_corrected = _delta_norm(corrected_delta, transport_keys)
+            n_uncorrected = _delta_norm(reference_delta, transport_keys)
+            n_transported = _delta_norm(transported)
+            scale = 1.0
+            if norm_match == "uncorrected" and n_transported > 0.0:
+                scale = n_uncorrected / n_transported
+                transported = {k: v * scale for k, v in transported.items()}
+            norms = {
+                "source_corrected": n_corrected,
+                "source_uncorrected": n_uncorrected,
+                "transported_before_match": n_transported,
+                "norm_match_scale": scale,
+                "transported_after_match": n_transported * scale,
+            }
+            task_vector_norms.append(norms)
+            print(
+                f"  ||tv|| source corrected={n_corrected:.2f} uncorrected={n_uncorrected:.2f}"
+                f" transported={n_transported:.2f}"
+                + (f" -> rescaled x{scale:.3e}" if norm_match == "uncorrected" else "")
+            )
             transported_deltas.append(transported)
             if run_block_extension_prestep:
                 # Release each task-local resized model immediately after its
@@ -728,40 +1091,104 @@ def main() -> None:
 
         # Merge transported deltas
         merged_delta = compose_weighted_deltas(transported_deltas, weights)
+        delta_stats = _summarize_merged_delta(merged_delta, target_base_sd)
+        task_vector_report = {
+            "transport_delta_source": delta_source,
+            "delta_norm_match": norm_match or "none",
+            "per_task": task_vector_norms,
+        }
+        print(
+            f"\nMerged delta: keys={delta_stats['key_count']} "
+            f"nonzero_keys={delta_stats['nonzero_key_count']} "
+            f"norm={delta_stats['merged_delta_norm']:.4f} "
+            f"rel_norm={delta_stats['merged_delta_rel_norm']:.6f}"
+        )
+        if delta_stats["nonzero_key_count"] == 0:
+            raise RuntimeError(
+                "Merged transported delta is identically zero: every alpha would evaluate "
+                "the untouched target base model. Check the transport diagnostics above."
+            )
 
         search_planner = build_search_planner(
             cfg=cfg, base_method_params=method_params
         )
 
         # ---- Dispatch evaluation backend ----
-        harness_tasks_resolved = parse_csv(harness_tasks_raw) if isinstance(harness_tasks_raw, str) else (harness_tasks_raw or [])
-
         if is_harness_only or harness_tasks_resolved:
             from .lm_harness_runner import run as run_harness
+            from .lm_harness_runner import score_by_task
 
-            harness_num_fewshot = int(cfg.get("harness_num_fewshot", 0))
-            harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
-            harness_limit = cfg.get("harness_limit", None)
+            best_harness_eval: SearchEvaluation | None = None
+            harness_results_by_alpha: dict[float, dict[str, float]] = {}
+            harness_search_results: list[SearchEvaluation] = []
 
-            best_alpha = float(cfg.get("alpha", 1.0))
-            best_sd = apply_delta(target_base_sd, {k: v * best_alpha for k, v in merged_delta.items()})
+            baseline_harness_results = _baseline_summary()
 
-            load_into_model(target_llm.model, best_sd, strict=False)
-            print(f"\nEvaluating with lm-harness (alpha={best_alpha:.2f})...")
-            harness_results = run_harness(
-                tasks=list(harness_tasks_resolved),
-                model=target_llm.model,
-                tokenizer=target_llm.tokenizer,
-                device=device,
-                num_fewshot=harness_num_fewshot,
-                batch_size=harness_batch_size,
-                limit=harness_limit,
-            )
-            print("\n=== Harness results ===")
-            for task_name, acc in harness_results.items():
+            while True:
+                batch = search_planner.next_batch()
+                if batch is None:
+                    break
+                batch_results: list[SearchEvaluation] = []
+
+                for candidate in batch:
+                    alpha = float(candidate.alpha)
+                    scaled = {k: v * alpha for k, v in merged_delta.items()}
+                    merged_sd = apply_delta(target_base_sd, scaled)
+                    load_into_model(target_llm.model, merged_sd, strict=False)
+
+                    print(f"\nEvaluating with lm-harness (alpha={alpha:.3f})...")
+                    harness_results = run_harness(
+                        tasks=list(harness_tasks_resolved),
+                        model=target_llm.model,
+                        tokenizer=target_llm.tokenizer,
+                        device=device,
+                        num_fewshot=harness_num_fewshot,
+                        batch_size=harness_batch_size,
+                        limit=harness_limit,
+                        samples=harness_samples,
+                    )
+                    for task_name, acc in harness_results.items():
+                        print(f"  {task_name}: {acc:.4f}")
+
+                    score = score_by_task(harness_results, list(harness_tasks_resolved))
+                    result = SearchEvaluation(
+                        candidate=candidate,
+                        score=float(score),
+                        avg_acc=float(score),
+                        avg_norm_acc=0.0,
+                        per_task_acc=[float(v) for v in harness_results.values()],
+                        per_task_norm_acc=[],
+                    )
+                    batch_results.append(result)
+                    harness_search_results.append(result)
+                    harness_results_by_alpha[alpha] = harness_results
+
+                    if best_harness_eval is None or result.score > best_harness_eval.score:
+                        best_harness_eval = result
+
+                    print(f"  alpha={alpha:.3f}  avg_score={score:.6f}")
+                    del merged_sd
+
+                search_planner.observe(batch_results)
+
+            if best_harness_eval is None:
+                raise RuntimeError("Harness alpha search produced no results.")
+
+            if len(harness_search_results) > 1:
+                print("\n=== Harness alpha search summary ===")
+                for r in harness_search_results:
+                    print(f"{describe_candidate(r.candidate)}  avg_score={r.avg_acc:.6f}")
+
+            best_alpha = float(best_harness_eval.candidate.alpha)
+            best_harness_results = harness_results_by_alpha[best_alpha]
+            print(f"\nBest alpha={best_alpha:.3f} -> avg_score={best_harness_eval.avg_acc:.6f}")
+            print("\n=== Harness results (best alpha) ===")
+            for task_name, acc in best_harness_results.items():
                 print(f"  {task_name}: {acc:.4f}")
 
             if cfg.get("save_merged", None) is not None:
+                scaled = {k: v * best_alpha for k, v in merged_delta.items()}
+                best_sd = apply_delta(target_base_sd, scaled)
                 outp = Path(str(cfg["save_merged"]))
                 outp.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(to_cpu_fp32(best_sd), str(outp))
@@ -772,7 +1199,20 @@ def main() -> None:
                     "method": method_name,
                     "best_alpha": best_alpha,
                     "backend": "lm_harness",
-                    "harness_results": harness_results,
+                    "harness_results": best_harness_results,
+                    "harness_results_before_rebase": baseline_harness_results,
+                    "before_rebase_model": (
+                        "extended_source_base" if run_block_extension_prestep else "source_base"
+                    ),
+                    # Named per-alpha metrics: search_results only keeps a flat
+                    # per_task_acc list, which loses which task each number is.
+                    "harness_results_by_alpha": {
+                        f"{a:g}": r for a, r in sorted(harness_results_by_alpha.items())
+                    },
+                    "merged_delta": delta_stats,
+                    "task_vectors": task_vector_report,
+                    "search_strategy": search_planner.search_summary(),
+                    "search_results": summarize_search_results(harness_search_results),
                     "saved_merged_path": cfg.get("save_merged"),
                 })
                 run_logger.finish("success")
@@ -961,6 +1401,8 @@ def main() -> None:
                 "method": method_name,
                 "best_alpha": best_alpha,
                 "tasks": [td.task for td in task_data],
+                "merged_delta": delta_stats,
+                "task_vectors": task_vector_report,
                 "search_strategy": search_planner.search_summary(),
                 "search_results": summarize_search_results(search_results),
                 "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},

@@ -196,6 +196,9 @@ def test_bico_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_bico_split_qkv_after_per_weight_extension_has_full_transport_coverage() -> None:
@@ -403,6 +406,9 @@ def test_bico_gradin_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_bico_gradin_deterministic() -> None:
@@ -460,3 +466,57 @@ def test_bico_gradin_deterministic() -> None:
     assert set(result_a.keys()) == set(result_b.keys())
     for key in result_a:
         assert torch.allclose(result_a[key], result_b[key]), f"Mismatch for key {key}"
+
+
+def test_bico_drops_padding_rows_from_text_statistics() -> None:
+    """Pad positions must not reach BiCo's covariances.
+
+    Text calibration batches are padded to a fixed length, so a short prompt is
+    mostly pad tokens. Their activations say nothing about how the two models
+    represent content, and folding them in lets padding dominate the fitted
+    maps -- which is why theseus drops them in its own collection. BiCo fits the
+    same kind of map from the same activations, so it must drop them too.
+    """
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
+        "labels": torch.tensor([[1, 2, 3, -100], [4, 5, -100, -100]]),
+    }
+    n_rows = int(batch["attention_mask"].numel())          # 8 padded rows
+    n_content = int(batch["attention_mask"].sum())         # 5 real rows
+    assert 0 < n_content < n_rows
+
+    stats = collect_bilinear_statistics(
+        _TinyTextModel(),
+        _TinyTextModel(),
+        [batch],
+        [batch],
+        _text_recipe,
+        _text_recipe,
+        device="cpu",
+        seq_align="interpolate",
+        n_batches=1,
+        family_adapter=_TinyTextFamily(),
+    )
+
+    assert stats
+    counts = {key: store.n_samples for key, store in stats.items()}
+    assert set(counts.values()) == {n_content}, counts
+
+
+def test_bico_vision_batches_keep_every_row() -> None:
+    """With no family adapter there is no padding, so no row may be dropped."""
+    loader = _make_loader(n_samples=8, batch_size=4)
+    stats = collect_bilinear_statistics(
+        _TinyModel(),
+        _TinyModel(),
+        loader,
+        loader,
+        _simple_recipe,
+        _simple_recipe,
+        device="cpu",
+        seq_align="mean",
+        n_batches=1,
+    )
+    assert stats
+    assert set(store.n_samples for store in stats.values()) == {4}

@@ -1,0 +1,52 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-3B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "instruct": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "n_batches": 100
+  },
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": {
+      "values": [0.5, 1.0, 2.0, 5.0]
+    }
+  },
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "top-bottom",
+    "extension_density": "spread",
+    "n_batches_act": 100,
+    "calibration_split": "val",
+    "dampening_factor": 1.0,
+    "ridge_identity": 10000000,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "share_ft_refs": false,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "show_progress": false,
+    "verbose": false
+  },
+  "eval_before_rebase": true,
+  "harness_tasks": "ifeval",
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "online",
+    "log_every_n_steps": 50,
+    "local_log_dir": "results/transport_qwen25_0.5binstruct_to_3b_theseus_ifeval/dup_pw_ridge1e7"
+  }
+}

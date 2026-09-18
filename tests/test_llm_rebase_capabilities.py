@@ -60,6 +60,20 @@ def test_family_mismatch_rejected() -> None:
         check_pair("theseus", src, tgt)
 
 
+def test_family_mismatch_rejected_for_unlisted_pair() -> None:
+    src = _meta(family="llama")
+    tgt = _meta(family="qwen3")
+    with pytest.raises(ValueError, match="family mismatch"):
+        check_pair("theseus", src, tgt)
+
+
+def test_qwen2_qwen3_cross_family_allowed() -> None:
+    # Same "hf_decoder" layout, different model_type -- explicitly allowlisted.
+    src = _meta(family="qwen2", hidden=1536, intermediate=8960)
+    tgt = _meta(family="qwen3", hidden=2048, intermediate=6144)
+    check_pair("theseus", src, tgt)
+
+
 def test_source_deeper_than_target_rejected() -> None:
     src = _meta(layers=40)
     tgt = _meta(layers=32)

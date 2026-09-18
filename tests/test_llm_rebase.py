@@ -32,7 +32,7 @@ class _TinyTokenizer:
 def test_text_calibration_masks_only_padded_labels() -> None:
     loader = _build_text_calibration_loader(
         tokenizer=_TinyTokenizer(),
-        prompts=["one token", "one two three"],
+        texts=["one token", "one two three"],
         batch_size=2,
         max_length=5,
     )
@@ -104,3 +104,91 @@ def test_resized_task_contexts_extend_fresh_source_copies_and_keep_new_transport
     assert "layers.2.weight" in second.transport_keys
     assert "layers.2.weight" in first.source_base
     assert not torch.equal(first.delta["layers.0.weight"], second.delta["layers.0.weight"])
+
+
+def test_resized_task_delta_also_returns_an_uncorrected_reference(monkeypatch) -> None:
+    """The prepared delta carries the same task vector resized without correction.
+
+    Under lmc_mode="shared" the fitted correction W is applied to base and ft
+    alike, so the corrected delta is W @ delta: correction changes the task
+    vector's scale as well as its direction, and Procrustes transport is
+    orthogonal so that scale reaches the target model untouched. Keeping the
+    uncorrected vector is what lets a run separate those two effects.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass
+    class _Cfg:
+        skip_correction: bool = False
+
+    def fake_extend(*, source_base_model, source_ft_model, target_layers_total, config, **kwargs):
+        for model in (source_base_model, source_ft_model):
+            while len(model.layers) < target_layers_total:
+                model.layers.append(nn.Linear(3, 3, bias=False))
+        if not config.skip_correction:
+            # Stand in for the correction: scale the ft side only, so the
+            # corrected delta differs from the uncorrected one by that factor.
+            for layer in source_ft_model.layers:
+                layer.weight.data.mul_(4.0)
+        return len(source_base_model.layers)
+
+    monkeypatch.setattr(llm_rebase, "run_block_extension_llm", fake_extend)
+    base = _DepthModel(depth=2)
+    ft = _DepthModel(depth=2)
+    ft.load_state_dict(base.state_dict())
+    ft.layers[0].weight.data.add_(1.0)
+
+    prepared = _prepare_resized_task_delta(
+        source_base_model=base,
+        source_ft_model=ft,
+        calibration_loader=object(),
+        target_layers_total=3,
+        config=_Cfg(skip_correction=False),
+        family_adapter=_DepthFamily(),
+        device="cpu",
+    )
+
+    assert prepared.uncorrected_delta is not None
+    assert prepared.uncorrected_delta is not prepared.delta
+    n_corr = llm_rebase._delta_norm(prepared.delta)
+    n_unco = llm_rebase._delta_norm(prepared.uncorrected_delta)
+    assert n_corr > n_unco, (n_corr, n_unco)
+
+
+def test_skip_correction_reuses_one_resize_for_both_vectors(monkeypatch) -> None:
+    """With correction off there is nothing to compare against, so the
+    uncorrected reference is the corrected vector itself rather than a second,
+    pointless extension pass."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class _Cfg:
+        skip_correction: bool = True
+
+    calls = []
+
+    def fake_extend(*, source_base_model, source_ft_model, target_layers_total, config, **kwargs):
+        calls.append(config.skip_correction)
+        for model in (source_base_model, source_ft_model):
+            while len(model.layers) < target_layers_total:
+                model.layers.append(nn.Linear(3, 3, bias=False))
+        return len(source_base_model.layers)
+
+    monkeypatch.setattr(llm_rebase, "run_block_extension_llm", fake_extend)
+    base = _DepthModel(depth=2)
+    ft = _DepthModel(depth=2)
+    ft.load_state_dict(base.state_dict())
+    ft.layers[0].weight.data.add_(1.0)
+
+    prepared = _prepare_resized_task_delta(
+        source_base_model=base,
+        source_ft_model=ft,
+        calibration_loader=object(),
+        target_layers_total=3,
+        config=_Cfg(skip_correction=True),
+        family_adapter=_DepthFamily(),
+        device="cpu",
+    )
+
+    assert calls == [True], "skip_correction must not trigger a second resize"
+    assert prepared.uncorrected_delta is prepared.delta

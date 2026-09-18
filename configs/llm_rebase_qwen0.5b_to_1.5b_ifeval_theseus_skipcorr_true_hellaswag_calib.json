@@ -1,0 +1,54 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "it": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 100,
+    "device_transform": "gpu"
+  },
+  "alpha_search": false,
+  "alpha": 1.0,
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "bottom-top",
+    "extension_density": "spread",
+    "n_batches_act": 100,
+    "calibration_split": "val",
+    "calibration_dataset": {
+      "path": "Rowan/hellaswag",
+      "split": "validation",
+      "text_column": "ctx"
+    },
+    "dampening_factor": 1.0,
+    "skip_correction": true,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "ridge_identity": 0.0
+  },
+  "harness_samples": {
+    "ifeval": [0, 7, 16, 19, 31, 32, 35, 41, 42, 45, 46, 47, 55, 63, 66, 72, 75, 76, 94, 95, 96, 97, 101, 103, 104, 110, 113, 120, 122, 123, 124, 133, 140, 141, 142, 143, 147, 148, 149, 150, 154, 162, 163, 166, 170, 182, 197, 200, 204, 209, 214, 223, 227, 229, 230, 243, 250, 252, 256, 260, 265, 266, 267, 268, 276, 278, 280, 282, 288, 290, 294, 296, 300, 301, 305, 308, 310, 313, 317, 320, 323, 328, 336, 338, 342, 347, 349, 358, 360, 361, 362, 363, 366, 368, 373, 387, 394, 401, 408, 409, 411, 412, 414, 417, 420, 422, 423, 428, 430, 443, 444, 445, 448, 453, 455, 458, 460, 468, 469, 470, 475, 479, 483, 484, 487, 488, 490, 491, 496, 497, 504, 505, 508, 515, 516, 519, 523, 525, 532, 538, 539]
+  },
+  "eval_before_rebase": true,
+  "harness_tasks": [
+    "ifeval"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "online",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/rebase/llm_ifeval_skip_correction_20260917/theseus_skipcorr_true_hellaswag_calib"
+  }
+}

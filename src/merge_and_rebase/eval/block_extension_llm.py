@@ -15,7 +15,11 @@ try:
 except Exception:
     tqdm = None
 
-from .block_extension import BlockExtensionConfig, _deterministic_calibration_loader
+from .block_extension import (
+    BlockExtensionConfig,
+    _deterministic_calibration_loader,
+    spread_anchor_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,19 +189,18 @@ class DecoderBlockExtender:
             return [i % n_gaps for i in range(n_needed)]
         if extension_density != "spread":
             raise ValueError(
-                f"Unsupported extension_density. Expected: spread, clump. Got: {extension_density}"
+                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule: list[int] = []
-        while len(schedule) < n_needed:
-            if insertion_order == "random":
-                cycle = list(range(curr_layers))
-                np.random.shuffle(cycle)
-            else:
-                cycle = priority
-            need = n_needed - len(schedule)
-            schedule.extend(cycle[:need])
-        return schedule
+        # Once there is at least one duplicate per block every block is an
+        # anchor anyway; below that keep the final block out of the anchor set.
+        # Duplicating it puts an extra full block update directly before the
+        # output norm with no later layer to absorb it, which is far more
+        # destructive than any other placement (Qwen2.5-1.5B 28 -> 36,
+        # interpolate, no correction: wikitext-2 ppl 1847 with it vs 28 without).
+        n_positions = curr_layers if n_needed >= curr_layers else max(1, curr_layers - 1)
+        return spread_anchor_schedule(n_needed, n_positions, insertion_order)
 
     @staticmethod
     def _build_collapse_schedule(
@@ -229,24 +232,11 @@ class DecoderBlockExtender:
 
         if extension_density != "spread":
             raise ValueError(
-                f"Unsupported extension_density. Expected: spread, clump. Got: {extension_density}"
+                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
+                f"Got: {extension_density}"
             )
 
-        schedule: list[int] = []
-        if insertion_order == "top-bottom":
-            priority = list(range(max_anchor, -1, -1))
-        elif insertion_order == "random":
-            priority = list(range(max_anchor + 1))
-            np.random.shuffle(priority)
-        else:
-            priority = list(range(max_anchor + 1))
-
-        while len(schedule) < n_to_remove:
-            need = n_to_remove - len(schedule)
-            schedule.extend(priority[:need])
-            if insertion_order == "random":
-                np.random.shuffle(priority)
-        return schedule
+        return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
 
     @staticmethod
     def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
@@ -329,6 +319,15 @@ class DecoderBlockExtender:
                 ))
                 hooks.append(block.self_attn.register_forward_hook(
                     self._store_output_hook(store, f"{i}.attn_output")
+                ))
+                hooks.append(block.self_attn.q_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.q_proj_output")
+                ))
+                hooks.append(block.self_attn.k_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.k_proj_output")
+                ))
+                hooks.append(block.self_attn.v_proj.register_forward_hook(
+                    self._store_output_hook(store, f"{i}.v_proj_output")
                 ))
                 hooks.append(block.post_attention_layernorm.register_forward_hook(
                     self._store_output_hook(store, f"{i}.post_attn_ln_output")
@@ -507,7 +506,7 @@ class DecoderBlockExtender:
 
             # 2: q_proj
             cur = self._capture_component_output(model, insert_pos, "q_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.q_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -518,7 +517,7 @@ class DecoderBlockExtender:
 
             # 3: k_proj
             cur = self._capture_component_output(model, insert_pos, "k_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.k_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -529,7 +528,7 @@ class DecoderBlockExtender:
 
             # 4: v_proj
             cur = self._capture_component_output(model, insert_pos, "v_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
+            ref = refs.get(f"{src_idx}.v_proj_output")
             if ref is not None and cur.numel() > 0:
                 A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
@@ -538,15 +537,15 @@ class DecoderBlockExtender:
                         lmc_store["v_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.self_attn.v_proj, W, b)
 
-            # 5: o_proj — corrected against residual
+            # 5: attention output — full absorption into o_proj.
+            # An inserted block targets its source block's component activations
+            # directly, matching the vision cascade. A residual-aware target
+            # belongs to the collapse path only, where the span boundary (not a
+            # single source block) defines the reference.
             cur = self._capture_component_output(model, insert_pos, "o_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-            ref_input = refs.get(f"{src_idx}.input")
-            ref_attn = refs.get(f"{src_idx}.attn_output")
-            if ref_input is not None and ref_attn is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_attn.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_attn[:n] - cur_input[:n]
+            ref = refs.get(f"{src_idx}.attn_output")
+            if ref is not None and cur.numel() > 0:
+                A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("o_proj", ridge_identity), ridge_target=_ridge_target("o_proj"))
                     if lmc_store is not None:
@@ -586,15 +585,14 @@ class DecoderBlockExtender:
                         lmc_store["up_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.mlp.up_proj, W, b)
 
-            # 9: down_proj — corrected against residual
+            # 9: mlp output — full absorption into down_proj, direct target as
+            # in step 5. The previous residual-aware target subtracted the block
+            # input a second time (step 5 had already absorbed it), which drove
+            # the inserted block towards inverting its own source block.
             cur = self._capture_component_output(model, insert_pos, "down_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-            ref_input = refs.get(f"{src_idx}.input")
-            ref_down = refs.get(f"{src_idx}.down_proj_output")
-            if ref_input is not None and ref_down is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_down.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_down[:n] - cur_input[:n]
+            ref = refs.get(f"{src_idx}.down_proj_output")
+            if ref is not None and cur.numel() > 0:
+                A, T = self._match_rows(cur, ref)
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
                     if lmc_store is not None:
@@ -1037,7 +1035,7 @@ class DecoderBlockExtender:
             # 2-4: q/k/v track the start
             for proj_name in ("q_proj", "k_proj", "v_proj"):
                 cur = self._capture_component_output(model, block_idx, proj_name, loader, n_batches)
-                ref = refs.get(f"{span_start_idx}.attn_output")
+                ref = refs.get(f"{span_start_idx}.{proj_name}_output")
                 if ref is not None and cur.numel() > 0:
                     A, T = self._match_rows(cur, ref)
                     if A.numel() > 0 and T.numel() > 0:
@@ -1094,14 +1092,18 @@ class DecoderBlockExtender:
                         lmc_store["up_proj"] = (W.clone(), b.clone())
                     self._correct_linear(block.mlp.up_proj, W, b)
 
-            # 9: down_proj corrected against the final target output
+            # 9: down_proj corrected against the final target output of the
+            # removed span. The pre-MLP residual stream is the block input plus
+            # the already-corrected attention output, so both are subtracted
+            # (the vision cascade subtracts the same two terms).
             cur = self._capture_component_output(model, block_idx, "down_proj", loader, n_batches)
             cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
+            cur_attn = self._capture_component_output(model, block_idx, "attn", loader, n_batches)
             ref = refs.get(output_ref_key)
-            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref.shape[0])
+            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0:
+                n = min(cur.shape[0], cur_input.shape[0], cur_attn.shape[0], ref.shape[0])
                 A = cur[:n]
-                T = ref[:n] - cur_input[:n]
+                T = ref[:n] - cur_input[:n] - cur_attn[:n]
                 if A.numel() > 0 and T.numel() > 0:
                     W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
                     if lmc_store is not None:
@@ -1111,6 +1113,63 @@ class DecoderBlockExtender:
     def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
         scope = self.family_adapter.transport_scope(model)
         scope.layers = nn.ModuleList(new_layers)
+        self._set_depth(model, scope, len(scope.layers))
+        self._reindex_layers(model, scope.layers)
+
+    @staticmethod
+    def _set_depth(model: nn.Module, scope: nn.Module, depth: int) -> None:
+        # HF decoders iterate `self.layers[: self.config.num_hidden_layers]`, so
+        # a longer ModuleList alone does nothing: the appended blocks never run.
+        # Everything downstream still sees them (state_dict reports them, deltas
+        # are computed over them), which makes the truncation invisible -- the
+        # model simply behaves as if it were never extended.
+        for holder in (model, scope):
+            config = getattr(holder, "config", None)
+            if config is None:
+                continue
+            if getattr(config, "num_hidden_layers", None) == depth:
+                continue
+            config.num_hidden_layers = depth
+
+    @staticmethod
+    def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] | None:
+        """Grow `config.layer_types` to the new depth, keeping it authoritative.
+
+        Models with alternating attention patterns key off this list, and the
+        reindex below reads it positionally. Left short, every layer past the
+        original depth keeps whichever `attention_type` it was duplicated with
+        while the config claims a shorter model.
+        """
+        config = getattr(model, "config", None)
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            return None
+        resolved = list(layer_types)
+        if len(resolved) >= len(layers):
+            return resolved[: len(layers)]
+        for idx in range(len(resolved), len(layers)):
+            own = getattr(layers[idx], "attention_type", None)
+            resolved.append(own if own is not None else resolved[-1])
+        config.layer_types = resolved
+        return resolved
+
+    @staticmethod
+    def _reindex_layers(model: nn.Module, layers: nn.ModuleList) -> None:
+        # Each decoder layer's attention module caches its own `layer_idx`
+        # (set at construction) to key into the shared KV cache during a
+        # forward pass. Duplicating/reordering layers without updating it
+        # leaves two layers pointing at the same cache slot: the second one
+        # to run has its `update()` call concatenate onto the first's
+        # leftover keys/values, silently doubling the sequence length the
+        # rest of that layer's attention sees (crashes as a seq-length
+        # mismatch against the attention mask, or worse, doesn't crash).
+        layer_types = DecoderBlockExtender._resolve_layer_types(model, layers)
+        for new_idx, layer in enumerate(layers):
+            for holder in (layer, getattr(layer, "self_attn", None)):
+                if holder is not None and hasattr(holder, "layer_idx"):
+                    holder.layer_idx = new_idx
+            if layer_types is not None and hasattr(layer, "attention_type") and new_idx < len(layer_types):
+                layer.attention_type = layer_types[new_idx]
 
     @torch.no_grad()
     def extend_and_calibrate(
@@ -1134,16 +1193,10 @@ class DecoderBlockExtender:
     ) -> int:
         if not skip_correction:
             loader = _deterministic_calibration_loader(loader, n_batches)
-        if strategy == "interpolate":
-            return self._extend_interpolate(
-                loader=loader,
-                n_batches=n_batches,
-                dampening_factor=dampening_factor,
-                blocks_to_add=blocks_to_add,
-                target_layers_total=target_layers_total,
-                insertion_order=insertion_order,
-                extension_density=extension_density,
-                skip_final_ln=skip_final_ln,
+        if strategy in ("interpolate", "duplicate"):
+            raise ValueError(
+                f"extension_strategy '{strategy}' (non per-weight) is disabled. "
+                f"Use '{strategy}_per_weight' instead."
             )
         if strategy in ("per_weight", "per-weight", "interpolate_per_weight", "interpolate-per-weight", "duplicate_per_weight", "duplicate-per-weight"):
             per_weight_mode = "duplicate" if strategy in ("duplicate_per_weight", "duplicate-per-weight") else "cascade"
