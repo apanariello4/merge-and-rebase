@@ -445,6 +445,13 @@ def main() -> None:
         method_name = str(cfg.get("method", "theseus"))
         method = get_method(method_name)
         method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
+        if "n_batches" in method_params:
+            raise ValueError(
+                "config['method_params'].n_batches is deprecated: it silently "
+                "raced with method_params.num_batches (whichever the resolver "
+                "checked first won, so the other was ignored without warning). "
+                "Rename it to 'num_batches' in the config."
+            )
 
         model_arch = str(cfg.get("model_arch", "auto"))
         model_kind = str(cfg.get("model_kind", "causal_lm"))
@@ -704,9 +711,20 @@ def main() -> None:
 
         # Calibration text comes from the dataset the run is actually scored
         # on (or an explicitly configured one), not from a fixed prompt bank:
-        # size the slice to what the run will consume so n_batches is real.
+        # size the slice to what the run will consume so num_batches is real.
         calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
         calib_max_length = int(cfg.get("calibration_max_length", 128))
+        # method_params.num_batches is the one calibration-budget knob theseus/bico
+        # read from config (method_params.n_batches is rejected above). Resolve it
+        # once here so it's counted when sizing the corpus and can beat the
+        # _DEFAULT_CALIB_BATCHES default injected at the transport call below.
+        calib_n_batches_cfg = method_params.get("num_batches")
+        calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
+        # These are two separate budgets over one shared text pool, not one
+        # knob: block extension consumes n_batches_act batches for its
+        # activation capture, theseus/bico consume num_batches for theirs, and
+        # neither is derived from the other. The max only sizes the pool, so
+        # whichever consumer asks for more still finds enough text.
         # Vision configs express the calibration budget as
         # method_params.num_batches, and theseus/bico accept either name
         # (preferring n_batches). Resolve it once here so a vision-style config
@@ -722,6 +740,7 @@ def main() -> None:
         # whichever consumer asks for more still finds enough text.
         n_calib_batches = max(
             int(block_extension_cfg.n_batches_act),
+            int(calib_n_batches or 0),
             int(calib_n_batches or 0),
         )
         # Resolved on first use: building it from an lm-harness task has to
@@ -978,6 +997,8 @@ def main() -> None:
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     if calib_n_batches is None:
                         transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
@@ -995,6 +1016,8 @@ def main() -> None:
                     from ..models.grad_recipes import causal_lm_recipe
 
                     transport_kwargs.setdefault("seq_align", "interpolate")
+                    if calib_n_batches is None:
+                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     if calib_n_batches is None:
                         transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                     transported_body = method.transport(
