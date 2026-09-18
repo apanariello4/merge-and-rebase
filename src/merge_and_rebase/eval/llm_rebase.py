@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from copy import deepcopy
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from copy import copy, deepcopy
+from dataclasses import dataclass, is_dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -91,11 +93,44 @@ class _PreparedTaskDelta:
     source_base: dict[str, torch.Tensor]
     transport_keys: set[str]
     source_model: torch.nn.Module
+    # The same task vector resized without correction. Under lmc_mode="shared"
+    # the fitted correction W is applied to base and ft alike, so the corrected
+    # delta is W @ delta: correction changes the task vector's scale as well as
+    # its direction. Keeping the uncorrected delta lets a run transport one and
+    # normalize to the other, separating those two effects.
+    uncorrected_delta: dict[str, torch.Tensor] | None = None
+
+
+def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
+    """Frobenius norm of a task vector, optionally restricted to `keys`."""
+    total = 0.0
+    for key, value in delta.items():
+        if keys is not None and key not in keys:
+            continue
+        total += float(value.float().pow(2).sum())
+    return total ** 0.5
 
 
 # Calibration batches used by theseus/bico when a config names neither
 # method_params.num_batches nor method_params.n_batches.
 _DEFAULT_CALIB_BATCHES = 2
+
+
+def _config_with_correction_disabled(config: Any) -> Any | None:
+    """Same block-extension config with correction off, or None if not derivable.
+
+    Real runs pass a BlockExtensionConfig dataclass. Tests pass lightweight
+    stubs, and a stub that cannot express skip_correction simply means no
+    uncorrected reference vector is available for that call.
+    """
+    if is_dataclass(config) and not isinstance(config, type):
+        return dataclass_replace(config, skip_correction=True)
+    clone = copy(config)
+    try:
+        clone.skip_correction = True
+    except (AttributeError, TypeError):
+        return None
+    return clone
 
 
 def _prepare_resized_task_delta(
@@ -109,6 +144,29 @@ def _prepare_resized_task_delta(
     device: str,
 ) -> _PreparedTaskDelta:
     """Resize one task pair and retain the exact source context for transport."""
+    # Reference resize with correction disabled, kept so the caller can compare
+    # or substitute the uncorrected task vector. This costs a deepcopy and no
+    # forward passes: with skip_correction the extension only duplicates blocks,
+    # it never captures reference or component activations.
+    uncorrected_delta: dict[str, torch.Tensor] | None = None
+    reference_config = _config_with_correction_disabled(config)
+    if reference_config is not None and not bool(getattr(config, "skip_correction", False)):
+        ref_base = deepcopy(source_base_model)
+        ref_ft = deepcopy(source_ft_model)
+        run_block_extension_llm(
+            source_base_model=ref_base,
+            source_ft_model=ref_ft,
+            calibration_loader=calibration_loader,
+            target_layers_total=target_layers_total,
+            config=reference_config,
+            family_adapter=family_adapter,
+            device=device,
+        )
+        uncorrected_delta = TaskVector.from_checkpoints(
+            to_cpu_fp32(ref_base.state_dict()), to_cpu_fp32(ref_ft.state_dict()), strict=False
+        ).delta
+        del ref_base, ref_ft
+
     final_depth = run_block_extension_llm(
         source_base_model=source_base_model,
         source_ft_model=source_ft_model,
@@ -127,11 +185,15 @@ def _prepare_resized_task_delta(
     source_base = to_cpu_fp32(source_base_model.state_dict())
     source_ft = to_cpu_fp32(source_ft_model.state_dict())
     task_vector = TaskVector.from_checkpoints(source_base, source_ft, strict=False)
+    if uncorrected_delta is None:
+        # skip_correction: the corrected and uncorrected resizes are the same run.
+        uncorrected_delta = task_vector.delta
     return _PreparedTaskDelta(
         delta=task_vector.delta,
         source_base=source_base,
         transport_keys=set(family_adapter.transportable_keys(source_base)),
         source_model=source_base_model,
+        uncorrected_delta=uncorrected_delta,
     )
 
 
@@ -732,6 +794,15 @@ def main() -> None:
             load_into_model(source_llm.model, source_base_sd, strict=False)
             _eval_before_rebase(source_llm.model, "source_base")
             source_llm.model.to("cpu")
+        elif run_before_rebase_eval and bool(cfg.get("eval_source_before_extension", False)):
+            # The unextended source, scored on the same eval slice. Without it
+            # the only "before" number is the extended source base, so there is
+            # nothing to say whether correction restores the original model or
+            # improves on it -- the two are indistinguishable from the extended
+            # score alone.
+            load_into_model(source_llm.model, source_base_sd, strict=False)
+            _eval_before_rebase(source_llm.model, "source_base_unextended")
+            source_llm.model.to("cpu")
 
         for task_idx, ckpt_ref in enumerate(tuned_ref_list):
             task_label = tasks[task_idx] if task_idx < len(tasks) else f"task_{task_idx}"
@@ -847,8 +918,32 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
 
         family_adapter = target_family or source_family
+        # Which task vector gets transported. "corrected" is the status quo:
+        # activations and delta both come from the corrected resize.
+        # "uncorrected" keeps the corrected model for activation capture -- so
+        # the fitted alignment map is unchanged -- but transports the delta from
+        # the uncorrected resize, isolating whether correction helps the map or
+        # only distorts the vector.
+        delta_source = str(cfg.get("transport_delta_source", "corrected")).strip().lower()
+        if delta_source not in {"corrected", "uncorrected"}:
+            raise ValueError(
+                f"transport_delta_source must be 'corrected' or 'uncorrected'. Got: {delta_source!r}"
+            )
+        # Rescale the transported delta to the uncorrected task vector's norm.
+        # Procrustes transport is orthogonal and norm-preserving, so without
+        # this the correction's effect on scale reaches the target model in full
+        # and a fixed alpha cannot distinguish scale from direction.
+        norm_match = cfg.get("delta_norm_match", None)
+        norm_match = str(norm_match).strip().lower() if norm_match is not None else None
+        if norm_match not in {None, "none", "uncorrected"}:
+            raise ValueError(
+                f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
+            )
+        task_vector_norms: list[dict[str, float]] = []
         for idx, prepared_task in enumerate(prepared_tasks):
-            delta = prepared_task.delta
+            corrected_delta = prepared_task.delta
+            reference_delta = prepared_task.uncorrected_delta or corrected_delta
+            delta = reference_delta if delta_source == "uncorrected" else corrected_delta
             transport_keys = prepared_task.transport_keys
             if tasks:
                 label = tasks[idx]
@@ -941,6 +1036,29 @@ def main() -> None:
                 )
             elapsed = time.time() - t0
             print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
+
+            # Norms are reported for every run, not only when matching is on, so
+            # the scale effect of correction is visible in the summary.
+            n_corrected = _delta_norm(corrected_delta, transport_keys)
+            n_uncorrected = _delta_norm(reference_delta, transport_keys)
+            n_transported = _delta_norm(transported)
+            scale = 1.0
+            if norm_match == "uncorrected" and n_transported > 0.0:
+                scale = n_uncorrected / n_transported
+                transported = {k: v * scale for k, v in transported.items()}
+            norms = {
+                "source_corrected": n_corrected,
+                "source_uncorrected": n_uncorrected,
+                "transported_before_match": n_transported,
+                "norm_match_scale": scale,
+                "transported_after_match": n_transported * scale,
+            }
+            task_vector_norms.append(norms)
+            print(
+                f"  ||tv|| source corrected={n_corrected:.2f} uncorrected={n_uncorrected:.2f}"
+                f" transported={n_transported:.2f}"
+                + (f" -> rescaled x{scale:.3e}" if norm_match == "uncorrected" else "")
+            )
             transported_deltas.append(transported)
             if run_block_extension_prestep:
                 # Release each task-local resized model immediately after its
@@ -951,6 +1069,11 @@ def main() -> None:
         # Merge transported deltas
         merged_delta = compose_weighted_deltas(transported_deltas, weights)
         delta_stats = _summarize_merged_delta(merged_delta, target_base_sd)
+        task_vector_report = {
+            "transport_delta_source": delta_source,
+            "delta_norm_match": norm_match or "none",
+            "per_task": task_vector_norms,
+        }
         print(
             f"\nMerged delta: keys={delta_stats['key_count']} "
             f"nonzero_keys={delta_stats['nonzero_key_count']} "
@@ -1064,6 +1187,7 @@ def main() -> None:
                         f"{a:g}": r for a, r in sorted(harness_results_by_alpha.items())
                     },
                     "merged_delta": delta_stats,
+                    "task_vectors": task_vector_report,
                     "search_strategy": search_planner.search_summary(),
                     "search_results": summarize_search_results(harness_search_results),
                     "saved_merged_path": cfg.get("save_merged"),
@@ -1255,6 +1379,7 @@ def main() -> None:
                 "best_alpha": best_alpha,
                 "tasks": [td.task for td in task_data],
                 "merged_delta": delta_stats,
+                "task_vectors": task_vector_report,
                 "search_strategy": search_planner.search_summary(),
                 "search_results": summarize_search_results(search_results),
                 "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
