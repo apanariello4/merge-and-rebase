@@ -93,6 +93,14 @@ class BlockExtensionConfig:
     # inserted position's task vector is zero on every parameter rather than
     # only on the projections.
     inserted_block_mode: str = "ariadne"
+    # Which blocks receive a component correction. ``inserted`` is the paper's
+    # scope and the default. ``interleaved_once`` additionally repairs the
+    # original block immediately above each insertion, which over the
+    # bottom-to-top schedule corrects every original block exactly once, always
+    # against an input that is already final. ``iterative_all`` repairs every
+    # original block above each insertion, re-correcting the same block once
+    # per later insertion.
+    correction_scope: str = "inserted"
     # ``interpolate_neighbors`` tells the downstream width-transport method
     # (Theseus/BiCo) to read the inserted position's source activations as the
     # midpoint of the two original blocks that initialized it, instead of
@@ -125,6 +133,23 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
 
     skip_correction = bool(params.get("skip_correction", False))
     inserted_block_mode = _as_inserted_block_mode(params.get("inserted_block_mode", "ariadne"))
+    correction_scope = _as_correction_scope(params.get("correction_scope", "inserted"))
+    if correction_scope != "inserted":
+        # Repairing the original blocks presupposes that a correction runs at
+        # all, and that the inserted block is the ARIADNE one that disturbs the
+        # residual stream. The identity baselines deliberately disturb nothing,
+        # so there is no damage for an original-block pass to repair.
+        if skip_correction:
+            raise ValueError(
+                f"block_extension_params.correction_scope='{correction_scope}' requires "
+                "skip_correction=false: there is no correction to extend to the original blocks."
+            )
+        if inserted_block_mode != "ariadne":
+            raise ValueError(
+                f"block_extension_params.correction_scope='{correction_scope}' requires "
+                "inserted_block_mode='ariadne': the identity baselines leave the residual "
+                "stream untouched, so the original blocks have nothing to repair."
+            )
     transport_activation_mode = _as_transport_activation_mode(params.get("transport_activation_mode", "model"))
     # Both depth baselines replace ARIADNE's component correction rather than
     # composing with it: a fitted correction would immediately undo an identity
@@ -167,6 +192,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         lmc_mode=str(params.get("lmc_mode", "independent")),
         reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
         inserted_block_mode=inserted_block_mode,
+        correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
         verbose=bool(params.get("verbose", True)),
         show_progress=bool(params.get("show_progress", True)),
@@ -1144,6 +1170,7 @@ class BlockExtender:
         lmc_mode: str = "independent",
         reference_capture: str = "lazy",
         inserted_block_mode: str = "ariadne",
+        correction_scope: str = "inserted",
     ) -> int:
         self._reference_capture = _as_reference_capture(reference_capture)
         self._eager_reference_cache: dict[str, dict[str, torch.Tensor]] | None = None
@@ -1181,8 +1208,21 @@ class BlockExtender:
                 raise ValueError(
                     f"inserted_block_mode='{inserted_block_mode}' requires skip_correction=True."
                 )
+        correction_scope = _as_correction_scope(correction_scope)
+        if correction_scope != "inserted":
+            if n_needed < 0:
+                raise ValueError(
+                    f"correction_scope='{correction_scope}' is an extension option; "
+                    "block shrink has no insertion to repair around."
+                )
+            if skip_correction:
+                raise ValueError(f"correction_scope='{correction_scope}' requires skip_correction=False.")
         common_kwargs["inserted_block_mode"] = inserted_block_mode
-        shrink_kwargs = {k: v for k, v in common_kwargs.items() if k != "inserted_block_mode"}
+        common_kwargs["correction_scope"] = correction_scope
+        shrink_kwargs = {
+            k: v for k, v in common_kwargs.items()
+            if k not in {"inserted_block_mode", "correction_scope"}
+        }
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="cascade", **shrink_kwargs)
@@ -1212,6 +1252,118 @@ class BlockExtender:
             f"'duplicate_per_weight'. Got: {strategy}"
         )
 
+    @staticmethod
+    def _original_block_position(chain: Sequence[Mapping[str, Any]], orig_idx: int) -> int:
+        """Current chain position of an original (non-inserted) block.
+
+        ``orig_idx`` repeats across a block's inserted descendants, so the
+        lookup must reject inserted entries.
+        """
+        for position, item in enumerate(chain):
+            if not bool(item.get("inserted", False)) and int(item["orig_idx"]) == orig_idx:
+                return position
+        raise ValueError(f"Original block {orig_idx} is not present in the current chain.")
+
+    @staticmethod
+    def _original_blocks_to_correct(
+        chain: Sequence[Mapping[str, Any]], *, insert_pos: int, scope: str
+    ) -> tuple[int, ...]:
+        """Original block indices to correct after inserting at ``insert_pos``."""
+        if scope == "inserted":
+            return ()
+        above = [
+            int(item["orig_idx"])
+            for position, item in enumerate(chain)
+            if position > insert_pos and not bool(item.get("inserted", False))
+        ]
+        if scope == "iterative_all":
+            return tuple(above)
+        if scope == "interleaved_once":
+            # Only the block immediately above the insertion. Over the whole
+            # bottom-to-top schedule this corrects every original block exactly
+            # once, with no block ever corrected twice.
+            return tuple(above[:1])
+        raise ValueError(
+            f"Unsupported correction_scope '{scope}'. "
+            "Expected 'inserted', 'interleaved_once', or 'iterative_all'."
+        )
+
+    @torch.no_grad()
+    def _correct_one_block(
+        self,
+        *,
+        reference_models: Mapping[str, nn.Module],
+        position: int,
+        ref_block_idx: int,
+        loader: Iterable[Any],
+        n_batches: int,
+        ridge_identity: float,
+        n_cascade_iters: int,
+        share_ft_refs: bool,
+        component_ridge: dict[str, float] | None,
+        lmc_mode: str,
+    ) -> None:
+        """Capture references for one block and fit/absorb its correction.
+
+        ``position`` is the block's index in the current chain; ``ref_block_idx``
+        is the original block whose pristine activations are the target. For an
+        inserted block those differ; for an original block being repaired they
+        refer to the same block at its shifted position.
+        """
+        self._capture_per_weight_reference_subset(
+            reference_models,
+            endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
+            block_indices=(ref_block_idx,),
+            input_indices=(),
+            loader=loader,
+            n_batches=n_batches,
+        )
+        base_ref = "ft" if share_ft_refs else None
+        common = dict(
+            ridge_identity=ridge_identity,
+            n_iters=n_cascade_iters,
+            component_ridge=component_ridge,
+        )
+        if lmc_mode == "independent":
+            self._correct_block_weights_cascade(
+                "base", self.model_base, position, ref_block_idx, loader, n_batches,
+                ref_source=base_ref, **common,
+            )
+            self._correct_block_weights_cascade(
+                "ft", self.model_ft, position, ref_block_idx, loader, n_batches, **common,
+            )
+        elif lmc_mode == "steer":
+            base_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            self._correct_block_weights_cascade(
+                "base", self.model_base, position, ref_block_idx, loader, n_batches,
+                ref_source=base_ref, lmc_store=base_corrections, **common,
+            )
+            self._correct_block_weights_cascade(
+                "ft", self.model_ft, position, ref_block_idx, loader, n_batches,
+                lmc_targets=base_corrections, **common,
+            )
+        elif lmc_mode == "shared":
+            base_corrections = {}
+            self._correct_block_weights_cascade(
+                "base", self.model_base, position, ref_block_idx, loader, n_batches,
+                ref_source=base_ref, lmc_store=base_corrections, **common,
+            )
+            self._apply_block_corrections(self.model_ft, position, base_corrections)
+            self._record_corrections("ft", base_corrections)
+        elif lmc_mode == "shared_ft":
+            ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            self._correct_block_weights_cascade(
+                "ft", self.model_ft, position, ref_block_idx, loader, n_batches,
+                lmc_store=ft_corrections, **common,
+            )
+            self._apply_block_corrections(self.model_base, position, ft_corrections)
+            self._record_corrections("base", ft_corrections)
+        else:
+            raise ValueError(
+                f"Unsupported lmc_mode '{lmc_mode}'. "
+                "Expected 'independent', 'steer', 'shared', or 'shared_ft'."
+            )
+
     @torch.no_grad()
     def _extend_per_weight(
         self,
@@ -1231,6 +1383,7 @@ class BlockExtender:
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
         inserted_block_mode: str = "ariadne",
+        correction_scope: str = "inserted",
     ) -> int:
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
@@ -1321,64 +1474,41 @@ class BlockExtender:
             self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
 
             if not skip_correction:
-                self._capture_per_weight_reference_subset(
-                    reference_models,
-                    endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
-                    block_indices=(src_idx,),
-                    input_indices=(),
+                self._correct_one_block(
+                    reference_models=reference_models,
+                    position=insert_pos,
+                    ref_block_idx=src_idx,
                     loader=loader,
                     n_batches=n_batches,
+                    ridge_identity=ridge_identity,
+                    n_cascade_iters=n_cascade_iters,
+                    share_ft_refs=share_ft_refs,
+                    component_ridge=component_ridge,
+                    lmc_mode=lmc_mode,
                 )
-                base_ref = "ft" if share_ft_refs else None
-                if lmc_mode == "independent":
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                    )
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
+                # Repair the original blocks the insertion just disturbed. The
+                # bottom-to-top schedule visits each original block as an
+                # insertion source exactly once, so correcting the block
+                # immediately above the new insertion touches every original
+                # block once and always fits against an input that is already
+                # final: everything below it has been edited for the last time,
+                # and later edits land above it. A pass that instead corrected
+                # original blocks *below* an already-fitted inserted block
+                # would silently invalidate that block's absorbed correction.
+                for original_idx in self._original_blocks_to_correct(
+                    chain_base, insert_pos=insert_pos, scope=correction_scope
+                ):
+                    self._correct_one_block(
+                        reference_models=reference_models,
+                        position=self._original_block_position(chain_base, original_idx),
+                        ref_block_idx=original_idx,
+                        loader=loader,
+                        n_batches=n_batches,
+                        ridge_identity=ridge_identity,
+                        n_cascade_iters=n_cascade_iters,
+                        share_ft_refs=share_ft_refs,
                         component_ridge=component_ridge,
-                    )
-                elif lmc_mode == "steer":
-                    base_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_targets=base_corrections,
-                    )
-                elif lmc_mode == "shared":
-                    base_corrections = {}
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
-                    self._record_corrections("ft", base_corrections)
-                elif lmc_mode == "shared_ft":
-                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_store=ft_corrections,
-                    )
-                    self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
-                    self._record_corrections("base", ft_corrections)
-                else:
-                    raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. "
-                        "Expected 'independent', 'steer', 'shared', or 'shared_ft'."
+                        lmc_mode=lmc_mode,
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
@@ -1705,12 +1835,23 @@ def run_block_extension(
         lmc_mode=str(config.lmc_mode),
         reference_capture=str(config.reference_capture),
         inserted_block_mode=str(config.inserted_block_mode),
+        correction_scope=str(config.correction_scope),
     )
     if layout_out is not None:
         layout_out.clear()
         if extender.extension_layout is not None:
             layout_out.update(extender.extension_layout)
     return final_depth
+
+
+def _as_correction_scope(value: Any) -> str:
+    resolved = str(value).strip().lower()
+    if resolved not in {"inserted", "interleaved_once", "iterative_all"}:
+        raise ValueError(
+            "block_extension_params.correction_scope must be 'inserted', "
+            "'interleaved_once', or 'iterative_all'."
+        )
+    return resolved
 
 
 def _as_inserted_block_mode(value: Any) -> str:

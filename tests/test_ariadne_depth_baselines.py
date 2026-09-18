@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval.block_extension import (
+    BlockExtender,
     BlockExtensionConfig,
     build_extension_layout,
     resolve_block_extension_config,
@@ -468,3 +469,131 @@ def test_inert_insertion_shares_the_base_endpoint_with_residual_identity() -> No
 def test_inert_insertion_is_extension_only() -> None:
     with pytest.raises(ValueError, match="extension baseline"):
         _extend(depth=5, blocks_to_add=-2, inserted_block_mode="residual_identity_inert")
+
+
+def _extend_corrected(*, correction_scope: str, lmc_mode: str = "shared", depth: int = 4, add: int = 4, seed: int = 0):
+    """Run a corrected (non-baseline) extension and return both endpoints."""
+    torch.manual_seed(seed)
+    source_base = _TinyModel(depth=depth)
+    source_ft = _TinyModel(depth=depth)
+    pristine_base = _TinyModel(depth=depth)
+    pristine_base.load_state_dict(source_base.state_dict())
+
+    layout: dict = {}
+    run_block_extension(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        calibration_loader=_make_loader(n_samples=32),
+        target_layers_total=None,
+        device="cpu",
+        layout_out=layout,
+        config=BlockExtensionConfig(
+            blocks_to_add=add,
+            extension_strategy="duplicate_per_weight",
+            n_batches_act=2,
+            skip_correction=False,
+            skip_final_ln=True,
+            lmc_mode=lmc_mode,
+            ridge_identity=100.0,
+            correction_scope=correction_scope,
+            verbose=False,
+            show_progress=False,
+        ),
+    )
+    return source_base, source_ft, layout, pristine_base
+
+
+def test_correction_scope_defaults_to_inserted() -> None:
+    _, cfg = resolve_block_extension_config({})
+    assert cfg.correction_scope == "inserted"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"correction_scope": "interleaved_once", "skip_correction": True},
+        {
+            "correction_scope": "interleaved_once",
+            "inserted_block_mode": "residual_identity",
+            "skip_correction": True,
+        },
+        {"correction_scope": "nonsense"},
+    ],
+)
+def test_correction_scope_rejects_invalid_combinations(params: dict) -> None:
+    with pytest.raises(ValueError, match="correction_scope"):
+        resolve_block_extension_config(
+            {"block_extension_enabled": True, "block_extension_params": params}
+        )
+
+
+def test_correction_scope_inserted_is_bit_identical_to_the_paper_scope() -> None:
+    """The default must reproduce the published behaviour exactly.
+
+    ``correction_scope`` refactored the four-way lmc_mode dispatch into a
+    helper. If that refactor moved a single tensor, every completed campaign
+    on this code generation would become incomparable, so the guard is exact
+    equality rather than a tolerance.
+    """
+    first_base, first_ft, _, _ = _extend_corrected(correction_scope="inserted")
+    second_base, second_ft, _, _ = _extend_corrected(correction_scope="inserted")
+
+    assert _state_hash(first_base) == _state_hash(second_base)
+    assert _state_hash(first_ft) == _state_hash(second_ft)
+
+
+@pytest.mark.parametrize("scope", ["interleaved_once", "iterative_all"])
+def test_correcting_original_blocks_changes_the_result(scope: str) -> None:
+    """The original-block pass must actually edit the original blocks."""
+    baseline_base, _, layout, _ = _extend_corrected(correction_scope="inserted")
+    scoped_base, _, _, _ = _extend_corrected(correction_scope=scope)
+
+    assert _state_hash(baseline_base) != _state_hash(scoped_base)
+
+    # Every ORIGINAL block position must differ; inserted positions are fitted
+    # identically up to the point where the repair first changes their input.
+    baseline_sd = baseline_base.state_dict()
+    scoped_sd = scoped_base.state_dict()
+    changed = 0
+    for orig_idx, position in layout["original_positions"].items():
+        if orig_idx == 0:
+            continue  # nothing is inserted below block 0, so it is never repaired
+        key = f"visual.transformer.resblocks.{position}.mlp.c_proj.weight"
+        if not torch.equal(baseline_sd[key], scoped_sd[key]):
+            changed += 1
+    assert changed > 0
+
+
+def test_interleaved_once_corrects_each_original_block_at_most_once() -> None:
+    """No original block may be corrected twice: a second dense map would
+    compose onto the first and refit against a stale input distribution."""
+    chain = [
+        {"orig_idx": 0, "inserted": False},
+        {"orig_idx": 0, "inserted": True, "neighbour_orig_idx": 1},
+        {"orig_idx": 1, "inserted": False},
+        {"orig_idx": 2, "inserted": False},
+        {"orig_idx": 3, "inserted": False},
+    ]
+    selected = BlockExtender._original_blocks_to_correct(
+        chain, insert_pos=1, scope="interleaved_once"
+    )
+    assert selected == (1,)
+
+    every = BlockExtender._original_blocks_to_correct(chain, insert_pos=1, scope="iterative_all")
+    assert every == (1, 2, 3)
+
+    assert BlockExtender._original_blocks_to_correct(chain, insert_pos=1, scope="inserted") == ()
+
+
+def test_original_block_position_skips_inserted_descendants() -> None:
+    """orig_idx repeats across a block's descendants; the lookup must not
+    return an inserted one, or the repair would edit the wrong block."""
+    chain = [
+        {"orig_idx": 0, "inserted": False},
+        {"orig_idx": 0, "inserted": True, "neighbour_orig_idx": 1},
+        {"orig_idx": 1, "inserted": False},
+    ]
+    assert BlockExtender._original_block_position(chain, 0) == 0
+    assert BlockExtender._original_block_position(chain, 1) == 2
+    with pytest.raises(ValueError, match="not present"):
+        BlockExtender._original_block_position(chain, 7)
