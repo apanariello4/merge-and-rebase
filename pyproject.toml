@@ -61,6 +61,9 @@ harness = [
   "sympy>=1.12",
   "antlr4-python3-runtime==4.11",
   "math_verify[antlr4_11_0]",
+  # needed for the ifeval task (lm_eval/tasks/ifeval/instructions_util.py)
+  "langdetect>=1.0.9",
+  "immutabledict>=4.0",
 ]
 
 [tool.uv]
