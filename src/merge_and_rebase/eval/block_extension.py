@@ -320,6 +320,18 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
                 "block_extension_params.target_shared_correction fits a real inserted block and "
                 f"is undefined for inserted_block_mode='{inserted_block_mode}'."
             )
+        if (
+            target_shared_correction.num_batches is not None
+            and target_shared_correction.num_batches != n_batches_act
+        ):
+            raise ValueError(
+                "block_extension_params.target_shared_correction.num_batches="
+                f"{target_shared_correction.num_batches} must equal n_batches_act={n_batches_act}: "
+                "the source-side c_proj reference bank (captured over n_batches_act calibration "
+                "batches) and the target-side reference bank (captured over "
+                "target_shared_correction.num_batches) must come from the same calibration images "
+                "for the per-image Procrustes pairing to be formable."
+            )
 
     target_residual_completion = parse_residual_completion_config(params.get("target_residual_completion", None))
     if target_residual_completion.enabled:

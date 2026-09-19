@@ -268,3 +268,4 @@ docs/*.aux
 /.repo-archive/
 /scripts/
 /configs/final/
+/tests/test_target_informed_campaign.py

@@ -69,3 +69,55 @@ def test_config_without_target_shared_correction_defaults_to_none() -> None:
     }
     _, resolved = resolve_block_extension_config(cfg)
     assert resolved.target_shared_correction is None
+
+
+# Regression for the 2026-09-19 smoke-job failure: a generator reduced
+# n_batches_act for the smoke family but left target_shared_correction's
+# nested num_batches at the full-campaign value, so the source-side c_proj
+# reference bank and the target-side reference bank were captured over
+# different numbers of calibration images and the per-image Procrustes
+# pairing in ``_blend_target_reference`` could not be formed. This must fail
+# at config-resolution time, not minutes into a GPU job.
+def test_target_shared_correction_num_batches_mismatch_raises() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 2,
+            "target_shared_correction": {"target_weight": 0.3, "num_batches": 5},
+        },
+    }
+    with pytest.raises(ValueError, match=r"num_batches=5.*n_batches_act=2"):
+        resolve_block_extension_config(cfg)
+
+
+def test_target_shared_correction_num_batches_equal_resolves() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 2,
+            "target_shared_correction": {"target_weight": 0.3, "num_batches": 2},
+        },
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction.num_batches == 2
+    assert resolved.n_batches_act == 2
+
+
+def test_target_shared_correction_num_batches_unset_resolves() -> None:
+    """``num_batches: None`` defers to n_batches_act at runtime, so it never
+    conflicts with the invariant regardless of n_batches_act's value."""
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 3,
+            "target_shared_correction": {"target_weight": 0.3},
+        },
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction.num_batches is None
