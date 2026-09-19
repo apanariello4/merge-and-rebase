@@ -101,6 +101,32 @@ def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: st
 
 
 @dataclass(frozen=True)
+class TargetSharedCorrection:
+    """Blend the pretrained target block's activations into the correction target.
+
+    ARIADNE fits each inserted block to reproduce its *source* ancestor's
+    component outputs. That objective is source-internal: a zero-projection
+    block already solves it exactly, which is why the residual-identity
+    baseline is competitive. This option instead moves part of the target
+    toward the representation the pretrained target model holds at the
+    corresponding depth, so the inserted block occupies the representational
+    slot that width transport actually has to align to.
+
+    ``target_weight`` is the blend strength eta. Zero reproduces standard
+    ARIADNE exactly and bypasses every target-side capture.
+    """
+
+    target_weight: float
+    component: str = "c_proj"
+    added_blocks: str = "all"
+    num_batches: int | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.target_weight > 0.0
+
+
+@dataclass(frozen=True)
 class BlockExtensionConfig:
     blocks_to_add: int | None = None
     target_layers_total: int | None = None
@@ -138,6 +164,8 @@ class BlockExtensionConfig:
     # inserted position's task vector is zero on every parameter rather than
     # only on the projections.
     inserted_block_mode: str = "ariadne"
+    # Opt-in target-informed correction target for inserted blocks.
+    target_shared_correction: TargetSharedCorrection | None = None
     # Which blocks receive a component correction. ``inserted`` is the paper's
     # scope and the default. ``interleaved_once`` additionally repairs the
     # original block immediately above each insertion, which over the
@@ -251,6 +279,26 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
             "correction fitted against them would not be interpretable."
         )
 
+    target_shared_correction = _as_target_shared_correction(params.get("target_shared_correction", None))
+    if target_shared_correction is not None and target_shared_correction.active:
+        # The blend changes what the *shared* correction is fitted to. Fitting it
+        # independently per endpoint, or skipping correction entirely, would not
+        # be the method this option describes.
+        if skip_correction:
+            raise ValueError(
+                "block_extension_params.target_shared_correction requires skip_correction=false: "
+                "it modifies the correction's regression target."
+            )
+        if str(params.get("lmc_mode", "independent")) != "shared":
+            raise ValueError(
+                "block_extension_params.target_shared_correction requires lmc_mode='shared'."
+            )
+        if inserted_block_mode != "ariadne":
+            raise ValueError(
+                "block_extension_params.target_shared_correction fits a real inserted block and "
+                f"is undefined for inserted_block_mode='{inserted_block_mode}'."
+            )
+
     return enabled, BlockExtensionConfig(
         blocks_to_add=_as_optional_int(params.get("blocks_to_add", None)),
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
@@ -274,6 +322,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         lmc_mode=str(params.get("lmc_mode", "independent")),
         reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
         inserted_block_mode=inserted_block_mode,
+        target_shared_correction=target_shared_correction,
         correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
         insertion_target_mode=str(params.get("insertion_target_mode", "direct")),
@@ -337,14 +386,22 @@ class BlockExtender:
         show_progress: bool = True,
         diagnostic_collector: Any | None = None,
         diagnostic_mode: str = "independent",
+        target_model: nn.Module | None = None,
     ):
         self.model_base = model_base
         self.model_ft = model_ft
+        # Pretrained target backbone, used only by the target-informed
+        # correction option; ``None`` for every standard ARIADNE path.
+        self.target_model = target_model
         self.device = device
         self.reference_inputs: dict[str, dict[str, torch.Tensor]] = {"base": {}, "ft": {}}
         # Populated by the extension paths with the realized block layout, so a
         # downstream transport method can address inserted positions by index.
         self.extension_layout: dict[str, Any] | None = None
+        # Target-side component banks keyed by final chain position, plus the
+        # sample count they were captured over (needed to recover tokens/sample).
+        self._target_reference_banks: dict[int, torch.Tensor] = {}
+        self._target_reference_samples = 0
         self.verbose = bool(verbose)
         self.show_progress = bool(show_progress)
         self._ridge_weight = 1e-6
@@ -679,6 +736,129 @@ class BlockExtender:
             inner.mlp.c_proj.weight.mul_(factor)
 
     @torch.no_grad()
+    def _capture_target_component_references(
+        self,
+        *,
+        positions: Sequence[int],
+        loader: Iterable[Any],
+        n_batches: int,
+    ) -> dict[int, torch.Tensor]:
+        """Capture the pretrained target model's c_proj outputs at ``positions``.
+
+        Runs on the same frozen calibration loader the corrections use, so row
+        ``i`` of a target bank and row ``i`` of a source reference bank come
+        from the same image. Banks are kept token-shaped ``(N, T_target, D_L)``
+        because the target's patch grid differs from the source's and has to be
+        resampled before the two can be paired.
+        """
+        target = self.target_model
+        if target is None:
+            raise RuntimeError(
+                "target_shared_correction requires the pretrained target model; "
+                "pass target_model= to run_block_extension."
+            )
+        blocks = target.visual.transformer.resblocks
+        buffers: dict[int, list[torch.Tensor]] = {int(p): [] for p in positions}
+        for position in buffers:
+            if not 0 <= position < len(blocks):
+                raise ValueError(
+                    f"Target block position {position} is outside the target depth {len(blocks)}."
+                )
+
+        original_device = next(target.parameters()).device
+        handles: list[Any] = []
+        n_samples = 0
+        try:
+            target.to(self.device).eval()
+            for position in buffers:
+                inner = self._inner_block(blocks[position])
+                handles.append(
+                    inner.mlp.c_proj.register_forward_hook(self._store_output_hook(buffers, position))
+                )
+            iterator = iter(loader)
+            for _ in range(int(n_batches)):
+                try:
+                    images, _ = next(iterator)
+                except StopIteration:
+                    break
+                n_samples += int(images.shape[0])
+                _encode_image(target, images.to(self.device))
+        finally:
+            for handle in handles:
+                handle.remove()
+            target.to(original_device)
+
+        banks: dict[int, torch.Tensor] = {}
+        for position, chunks in buffers.items():
+            if chunks:
+                banks[position] = torch.cat(chunks, dim=0)
+        self._target_reference_samples = n_samples
+        self._vprint(
+            f"captured target component references for {len(banks)} positions "
+            f"over {n_samples} calibration samples"
+        )
+        return banks
+
+    @staticmethod
+    def _blend_target_reference(
+        source_ref: torch.Tensor,
+        target_bank: torch.Tensor | None,
+        n_samples: int,
+        target_weight: float,
+    ) -> torch.Tensor:
+        """Return ``(Y_S + eta * Y_{L->S}) / (1 + eta)``.
+
+        ``Y_{L->S}`` is the target bank expressed in source coordinates through
+        a centred rectangular Procrustes map fitted on this block's paired rows.
+        The map is orthogonal, so the backprojection keeps only the part of the
+        wider target representation that source coordinates can carry; it does
+        not import the whole target activation. Normalising by ``1 + eta``
+        keeps the blended target's scale comparable to the source target, so
+        the identity ridge is not silently re-weighted by ``eta``.
+        """
+        if target_bank is None or target_weight <= 0.0:
+            return source_ref
+        if n_samples <= 0:
+            raise ValueError("Target reference blending needs a positive calibration sample count.")
+
+        from ..rebase.methods.theseus import _compute_procrustes_map_from_cov, _interp_2d_tokens
+
+        rows = int(source_ref.shape[0])
+        if rows % n_samples != 0:
+            raise ValueError(
+                f"Source reference rows ({rows}) are not a multiple of the calibration "
+                f"sample count ({n_samples}); cannot recover tokens per sample."
+            )
+        source_tokens = rows // n_samples
+        if int(target_bank.shape[0]) != n_samples:
+            raise ValueError(
+                f"Target bank holds {int(target_bank.shape[0])} samples, expected {n_samples}."
+            )
+
+        target_tokens = target_bank.float()
+        if int(target_tokens.shape[1]) != source_tokens:
+            # Patch grids differ (14x14 vs 16x16 at 224px); resample the target
+            # grid onto the source grid, keeping the CLS token separate.
+            target_tokens = _interp_2d_tokens(target_tokens, source_tokens)
+        target_rows = target_tokens.reshape(-1, target_tokens.shape[-1])
+        source_rows = source_ref.float()
+        if target_rows.shape[0] != source_rows.shape[0]:
+            raise ValueError(
+                f"Row counts disagree after token resampling: source {source_rows.shape[0]}, "
+                f"target {target_rows.shape[0]}."
+            )
+        target_rows = target_rows.to(source_rows.device)
+
+        mu_source = source_rows.mean(dim=0, keepdim=True)
+        mu_target = target_rows.mean(dim=0, keepdim=True)
+        cov = (source_rows - mu_source).T @ (target_rows - mu_target)
+        q_map = _compute_procrustes_map_from_cov(cov).to(source_rows.device)
+        backprojected = (target_rows - mu_target) @ q_map.T + mu_source
+
+        blended = (source_rows + float(target_weight) * backprojected) / (1.0 + float(target_weight))
+        return blended.to(dtype=source_ref.dtype)
+
+    @torch.no_grad()
     def _zero_block_output_projections(self, block: nn.Module):
         """Turn an inserted block into an exact identity on the residual stream.
 
@@ -735,6 +915,8 @@ class BlockExtender:
         lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         insertion_target_mode: str = "direct",
+        target_reference: torch.Tensor | None = None,
+        target_weight: float = 0.0,
     ):
         block = model.visual.transformer.resblocks[insert_pos]
         inner = self._inner_block(block)
@@ -880,6 +1062,10 @@ class BlockExtender:
             # Step 8: mlp.c_proj (after GELU, before ls_2) — full absorption into c_proj
             cur = self._capture_component_output(model, insert_pos, "c_proj", loader, n_batches)
             ref = refs.get(f"{src_idx}.c_proj_output")
+            if ref is not None and target_reference is not None and target_weight > 0.0:
+                ref = self._blend_target_reference(
+                    ref, target_reference, self._target_reference_samples, target_weight
+                )
             if insertion_target_mode == "residual":
                 # Target the source block's OUTPUT x_{s+1} = x_s + a_s + m_s,
                 # minus the stream actually reaching the MLP, which is the block
@@ -1299,6 +1485,7 @@ class BlockExtender:
         inserted_block_mode: str = "ariadne",
         correction_scope: str = "inserted",
         insertion_target_mode: str = "direct",
+        target_shared_correction: TargetSharedCorrection | None = None,
     ) -> int:
         self._reference_capture = _as_reference_capture(reference_capture)
         self._eager_reference_cache: dict[str, dict[str, torch.Tensor]] | None = None
@@ -1350,11 +1537,20 @@ class BlockExtender:
                 )
             if skip_correction:
                 raise ValueError(f"correction_scope='{correction_scope}' requires skip_correction=False.")
+        if target_shared_correction is not None and target_shared_correction.active:
+            if n_needed < 0:
+                raise ValueError(
+                    "target_shared_correction is an extension option; block shrink has no "
+                    "inserted block whose correction target could be blended."
+                )
+            if skip_correction:
+                raise ValueError("target_shared_correction requires skip_correction=False.")
         common_kwargs["inserted_block_mode"] = inserted_block_mode
         common_kwargs["correction_scope"] = correction_scope
+        common_kwargs["target_shared_correction"] = target_shared_correction
         shrink_kwargs = {
             k: v for k, v in common_kwargs.items()
-            if k not in {"inserted_block_mode", "correction_scope"}
+            if k not in {"inserted_block_mode", "correction_scope", "target_shared_correction"}
         }
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
@@ -1440,6 +1636,8 @@ class BlockExtender:
         component_ridge: dict[str, float] | None,
         lmc_mode: str,
         insertion_target_mode: str = "direct",
+        target_reference: torch.Tensor | None = None,
+        target_weight: float = 0.0,
     ) -> None:
         """Capture references for one block and fit/absorb its correction.
 
@@ -1462,6 +1660,8 @@ class BlockExtender:
             n_iters=n_cascade_iters,
             component_ridge=component_ridge,
             insertion_target_mode=insertion_target_mode,
+            target_reference=target_reference,
+            target_weight=target_weight,
         )
         if lmc_mode == "independent":
             self._correct_block_weights_cascade(
@@ -1524,6 +1724,7 @@ class BlockExtender:
         inserted_block_mode: str = "ariadne",
         correction_scope: str = "inserted",
         insertion_target_mode: str = "direct",
+        target_shared_correction: TargetSharedCorrection | None = None,
     ) -> int:
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
@@ -1555,6 +1756,23 @@ class BlockExtender:
 
         logger.info("Block extension planned duplications: %s", schedule)
         self._vprint(f"planned duplications: {schedule}")
+
+        # Final positions are needed before the loop: the correction step only
+        # knows the position in the partially built chain, but a target-side
+        # reference must be addressed by the block's position in the finished
+        # model, which is what the target backbone's own depth indexes.
+        inserted_positions = plan_inserted_positions(curr_layers, schedule)
+        self._target_reference_banks = {}
+        self._target_reference_samples = 0
+        target_weight = 0.0
+        if target_shared_correction is not None and target_shared_correction.active:
+            target_weight = float(target_shared_correction.target_weight)
+            target_batches = target_shared_correction.num_batches or n_batches
+            self._target_reference_banks = self._capture_target_component_references(
+                positions=inserted_positions,
+                loader=loader,
+                n_batches=target_batches,
+            )
 
         orig_base = list(self.model_base.visual.transformer.resblocks)
         orig_ft = list(self.model_ft.visual.transformer.resblocks)
@@ -1614,6 +1832,8 @@ class BlockExtender:
             self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
 
             if not skip_correction:
+                # Original-block repairs below keep their ordinary source
+                # targets; only the inserted block's target is blended.
                 self._correct_one_block(
                     reference_models=reference_models,
                     position=insert_pos,
@@ -1626,6 +1846,8 @@ class BlockExtender:
                     component_ridge=component_ridge,
                     lmc_mode=lmc_mode,
                     insertion_target_mode=insertion_target_mode,
+                    target_reference=self._target_reference_banks.get(inserted_positions[step - 1]),
+                    target_weight=target_weight,
                 )
                 # Repair the original blocks the insertion just disturbed. The
                 # bottom-to-top schedule visits each original block as an
@@ -1655,6 +1877,7 @@ class BlockExtender:
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
         self.extension_layout = build_extension_layout(chain_base)
+        self._target_reference_banks = {}
         self.reference_inputs = {"base": {}, "ft": {}}
         reference_models.clear()
         if torch.cuda.is_available():
@@ -1894,6 +2117,34 @@ class BlockExtender:
 
 
 @torch.no_grad()
+def plan_inserted_positions(curr_layers: int, schedule: Sequence[int]) -> list[int]:
+    """Final chain positions of each inserted block, in schedule order.
+
+    The correction loop knows only ``insert_pos``, the position in the chain as
+    it stands at that step, which later insertions below can still shift. A
+    target-side reference has to be addressed by the block's *final* position,
+    so replay the insertion bookkeeping on plain indices first. This mirrors
+    ``_extend_per_weight`` exactly, including that a descendant shares its
+    source's ``orig_idx`` and so is itself a valid insertion anchor.
+    """
+    chain: list[dict[str, Any]] = [
+        {"orig_idx": i, "inserted": False, "step": None} for i in range(int(curr_layers))
+    ]
+    for step, src_idx in enumerate(schedule):
+        insert_pos = -1
+        for i, item in enumerate(chain):
+            if item["orig_idx"] == int(src_idx):
+                insert_pos = i
+        insert_pos += 1
+        chain.insert(insert_pos, {"orig_idx": int(src_idx), "inserted": True, "step": step})
+
+    positions = [0] * len(schedule)
+    for position, item in enumerate(chain):
+        if item["inserted"]:
+            positions[int(item["step"])] = position
+    return positions
+
+
 def build_extension_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Describe the realized block chain of an extended model.
 
@@ -1940,6 +2191,7 @@ def run_block_extension(
     device: str | torch.device,
     diagnostic_collector: Any | None = None,
     layout_out: dict[str, Any] | None = None,
+    target_model: nn.Module | None = None,
 ) -> int:
     """Resize ``source_base_model``/``source_ft_model`` in place.
 
@@ -1956,6 +2208,7 @@ def run_block_extension(
         show_progress=bool(config.show_progress),
         diagnostic_collector=diagnostic_collector,
         diagnostic_mode=str(config.lmc_mode),
+        target_model=target_model,
     )
     resolved_target_layers_total = target_layers_total if target_layers_total is not None else config.target_layers_total
     final_depth = extender.extend_and_calibrate(
@@ -1977,6 +2230,7 @@ def run_block_extension(
         lmc_mode=str(config.lmc_mode),
         reference_capture=str(config.reference_capture),
         inserted_block_mode=str(config.inserted_block_mode),
+        target_shared_correction=config.target_shared_correction,
         correction_scope=str(config.correction_scope),
         insertion_target_mode=str(config.insertion_target_mode),
     )
@@ -1995,6 +2249,51 @@ def _as_correction_scope(value: Any) -> str:
             "'interleaved_once', or 'iterative_all'."
         )
     return resolved
+
+
+def _as_target_shared_correction(value: Any) -> TargetSharedCorrection | None:
+    """Parse the ``target_shared_correction`` config group.
+
+    ``None`` and ``enabled: false`` both return ``None`` so that the standard
+    ARIADNE path is reached without evaluating any target-side option.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("block_extension_params.target_shared_correction must be an object.")
+    params = dict(value)
+    if not bool(params.pop("enabled", True)):
+        return None
+
+    component = str(params.pop("component", "c_proj")).strip()
+    if component != "c_proj":
+        raise ValueError(
+            "block_extension_params.target_shared_correction.component must be 'c_proj' "
+            f"in this campaign; got {component!r}."
+        )
+    added_blocks = str(params.pop("added_blocks", "all")).strip()
+    if added_blocks != "all":
+        raise ValueError(
+            "block_extension_params.target_shared_correction.added_blocks must be 'all'; "
+            f"got {added_blocks!r}."
+        )
+    target_weight = float(params.pop("target_weight", 0.0))
+    if target_weight < 0.0:
+        raise ValueError("block_extension_params.target_shared_correction.target_weight must be >= 0.")
+    num_batches = _as_optional_int(params.pop("num_batches", None))
+    if num_batches is not None and num_batches <= 0:
+        raise ValueError("block_extension_params.target_shared_correction.num_batches must be > 0.")
+    if params:
+        raise ValueError(
+            "Unknown block_extension_params.target_shared_correction keys: "
+            f"{sorted(params)}."
+        )
+    return TargetSharedCorrection(
+        target_weight=target_weight,
+        component=component,
+        added_blocks=added_blocks,
+        num_batches=num_batches,
+    )
 
 
 def _as_inserted_block_mode(value: Any) -> str:

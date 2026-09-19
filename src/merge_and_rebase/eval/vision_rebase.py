@@ -1903,6 +1903,13 @@ def main() -> None:
                     config=block_extension_cfg,
                     device=device,
                     layout_out=task_extension_layout,
+                    # Only the target-informed correction option reads this; every
+                    # standard ARIADNE path leaves the target backbone untouched.
+                    target_model=(
+                        clf_target.model
+                        if block_extension_cfg.target_shared_correction is not None
+                        else None
+                    ),
                 )
                 recorded_extension_layout = dict(task_extension_layout)
                 task_source_activation_plan = _resolve_source_activation_plan(
