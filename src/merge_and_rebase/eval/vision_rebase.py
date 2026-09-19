@@ -7,7 +7,7 @@ import os
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +70,13 @@ from .block_extension import (
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
+from .target_informed_runtime import (
+    capture_residual_references,
+    complete_residuals,
+    projection_transforms,
+    scale_completion,
+)
+from .target_residual_completion import ResidualCompletionConfig
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
 
@@ -1209,6 +1216,83 @@ def _build_rebase_prepared(
     return transfusion_prepared
 
 
+def _maybe_capture_target_residual_references(
+    *,
+    config: ResidualCompletionConfig,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    source_loader: Any,
+    target_loader: Any,
+    seed: int,
+    device: str,
+) -> dict[str, Any] | None:
+    """Capture ARIADNE proposal-1 native reference banks, or no-op when disabled.
+
+    Must be called before ``run_block_extension`` structurally resizes
+    ``source_base_model``/``source_ft_model``: the native references are the
+    un-resized source model's own boundary activations, paired against the
+    pretrained target model at the doubled positions those source blocks will
+    be inserted at. Returns ``None`` when the option is disabled, so callers
+    that thread the result through unconditionally get a byte-identical no-op.
+    """
+    if not config.enabled:
+        return None
+    return capture_residual_references(
+        source_base_model,
+        source_ft_model,
+        target_model,
+        source_loader,
+        target_loader,
+        num_batches=config.num_batches,
+        seed=seed,
+        device=device,
+    )
+
+
+def _maybe_complete_target_residual_task_vector(
+    *,
+    config: ResidualCompletionConfig,
+    references: dict[str, Any] | None,
+    prepared: Any,
+    layout: Mapping[str, Any],
+    target_model: torch.nn.Module,
+    target_base_sd: Mapping[str, torch.Tensor],
+    transported_delta: dict[str, torch.Tensor],
+    target_loader: Any,
+    device: str,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
+    """Complete the transported task vector's inserted c_proj keys, or no-op.
+
+    Runs after transport is fitted, using the already-fitted ``prepared``
+    transforms; it only ever adds to the *task vector*, never the target base
+    weights. ``config.enabled=False`` or missing ``references`` (the option
+    was disabled when references would have been captured) returns
+    ``transported_delta`` completely unchanged -- same dict object, so a
+    caller comparing state-dict hashes sees byte-identical output. Fitting
+    always happens at gamma=1 (see ``complete_residuals``); ``config.strength``
+    is applied afterwards by ``scale_completion``, and ``strength=0.0`` is a
+    true null ablation because ``scale_completion`` short-circuits to the
+    baseline in that case.
+    """
+    if not config.enabled or references is None:
+        return transported_delta, None
+    transforms = projection_transforms(prepared, layout)
+    _source_corrections, target_corrections, diagnostics = complete_residuals(
+        target_model,
+        target_base_sd,
+        transported_delta,
+        references,
+        transforms,
+        layout,
+        target_loader,
+        config=config,
+        device=device,
+    )
+    completed_delta = scale_completion(transported_delta, target_corrections, config.strength)
+    return completed_delta, diagnostics
+
+
 def main() -> None:
     run_logger = None
     try:
@@ -1692,6 +1776,7 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
         transport_timings: dict[str, dict[str, float]] = {}
+        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -1777,6 +1862,8 @@ def main() -> None:
                 continue
 
             task_source_base_sd = source_base_sd
+            task_residual_references: dict[str, Any] | None = None
+            task_residual_target_loader: Any = None
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
@@ -1894,6 +1981,31 @@ def main() -> None:
                         test_loader=source_loaders.test,
                         val_loader=source_loaders.val,
                     )
+                if block_extension_cfg.target_residual_completion.enabled:
+                    # ARIADNE proposal 1: capture the native reference banks
+                    # (source base/ft boundary activations, paired against the
+                    # pretrained target model) BEFORE block extension resizes
+                    # source_base_model_task/source_ft_model_task in place.
+                    # These are the un-transported, un-inserted references the
+                    # completion step later regresses each inserted block's
+                    # c_proj projection against.
+                    task_residual_target_loader = select_loader(
+                        block_extension_cfg.calibration_split,
+                        train_loader=loaders.train,
+                        test_loader=loaders.test,
+                        val_loader=loaders.val,
+                    )
+                    task_residual_references = _maybe_capture_target_residual_references(
+                        config=block_extension_cfg.target_residual_completion,
+                        source_base_model=source_base_model_task,
+                        source_ft_model=source_ft_model_task,
+                        target_model=clf_target.model,
+                        source_loader=calibration_loader,
+                        target_loader=task_residual_target_loader,
+                        seed=int(cfg.get("seed", 42)),
+                        device=device,
+                    )
+
                 task_extension_layout = {}
                 final_depth = run_block_extension(
                     source_base_model=source_base_model_task,
@@ -2157,6 +2269,28 @@ def main() -> None:
                     "transport_seconds": time.perf_counter() - transport_started,
                     "peak_memory_allocated_bytes": peak_memory_bytes,
                 }
+
+                if task_block_extension_prestep and block_extension_cfg.target_residual_completion.enabled:
+                    # ARIADNE proposal 1: complete the just-transported task
+                    # vector's inserted c_proj keys. Runs after transport is
+                    # fitted; never touches the target base weights. Gated on
+                    # ``task_block_extension_prestep`` too so ``task_extension_layout``
+                    # (only assigned inside that prestep) is never read stale
+                    # or undefined.
+                    transported_delta, task_residual_diagnostics = _maybe_complete_target_residual_task_vector(
+                        config=block_extension_cfg.target_residual_completion,
+                        references=task_residual_references,
+                        prepared=prepared,
+                        layout=task_extension_layout,
+                        target_model=clf_target.model,
+                        target_base_sd=target_base_sd,
+                        transported_delta=transported_delta,
+                        target_loader=task_residual_target_loader,
+                        device=device,
+                    )
+                    if task_residual_diagnostics is not None:
+                        residual_completion_diagnostics[task] = task_residual_diagnostics
+
                 transported_deltas.append(transported_delta)
                 original_deltas.append(task_delta)
                 print(f"  {task}: transported delta computed for {len(transported_delta)} params")
@@ -3228,6 +3362,14 @@ def main() -> None:
             "all_task_source_lmc": all_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
+            "target_residual_completion": (
+                {
+                    "config": asdict(block_extension_cfg.target_residual_completion),
+                    "diagnostics_by_task": residual_completion_diagnostics,
+                }
+                if block_extension_cfg.target_residual_completion.enabled
+                else None
+            ),
             "saved_merged_path": saved_merged_path,
         }
         run_logger.log_summary(final_summary)

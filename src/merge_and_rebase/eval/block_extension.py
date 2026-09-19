@@ -5,7 +5,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from itertools import islice
 from typing import Any
 
@@ -19,6 +19,8 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
+
+from .target_residual_completion import ResidualCompletionConfig, parse_residual_completion_config
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +168,10 @@ class BlockExtensionConfig:
     inserted_block_mode: str = "ariadne"
     # Opt-in target-informed correction target for inserted blocks.
     target_shared_correction: TargetSharedCorrection | None = None
+    # Opt-in target-informed residual completion (ARIADNE proposal 1) for
+    # inserted blocks' c_proj projections. ``enabled=False`` (the default) is
+    # the standard ARIADNE path and does not touch any target-informed code.
+    target_residual_completion: ResidualCompletionConfig = field(default_factory=ResidualCompletionConfig)
     # Which blocks receive a component correction. ``inserted`` is the paper's
     # scope and the default. ``interleaved_once`` additionally repairs the
     # original block immediately above each insertion, which over the
@@ -219,7 +225,23 @@ def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
         )
 
 
+_MISPLACED_TOP_LEVEL_KEYS = (
+    "target_shared_correction",
+    "target_residual_completion",
+    "capture_target_residual_reference",
+)
+
+
 def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockExtensionConfig]:
+    misplaced = [key for key in _MISPLACED_TOP_LEVEL_KEYS if key in cfg]
+    if misplaced:
+        raise ValueError(
+            f"Found {misplaced} at the top level of the run config; a top-level key there has no "
+            "effect on block extension. Move each one under the nested "
+            f"'block_extension_params.<key>' location instead (e.g. "
+            f"'block_extension_params.{misplaced[0]}')."
+        )
+
     raw_params = cfg.get("block_extension_params", {})
     if raw_params is None:
         raw_params = {}
@@ -299,6 +321,24 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
                 f"is undefined for inserted_block_mode='{inserted_block_mode}'."
             )
 
+    target_residual_completion = parse_residual_completion_config(params.get("target_residual_completion", None))
+    if target_residual_completion.enabled:
+        # Mirrors target_shared_correction's gating: the option fits a real
+        # inserted block's correction and then completes it further, so it
+        # presupposes the same ordinary Shared-BRACE arm.
+        if skip_correction:
+            raise ValueError(
+                "block_extension_params.target_residual_completion requires skip_correction=false: "
+                "there is no fitted inserted-block correction to complete."
+            )
+        if str(params.get("lmc_mode", "independent")) != "shared":
+            raise ValueError("block_extension_params.target_residual_completion requires lmc_mode='shared'.")
+        if inserted_block_mode != "ariadne":
+            raise ValueError(
+                "block_extension_params.target_residual_completion fits a real inserted block and "
+                f"is undefined for inserted_block_mode='{inserted_block_mode}'."
+            )
+
     return enabled, BlockExtensionConfig(
         blocks_to_add=_as_optional_int(params.get("blocks_to_add", None)),
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
@@ -323,6 +363,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
         inserted_block_mode=inserted_block_mode,
         target_shared_correction=target_shared_correction,
+        target_residual_completion=target_residual_completion,
         correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
         insertion_target_mode=str(params.get("insertion_target_mode", "direct")),
