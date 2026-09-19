@@ -215,45 +215,165 @@ def _aligned(source, target):
     return result
 
 
-def capture_residual_references(source_base, source_ft, target_base, source_loader, target_loader, *, num_batches, seed, device):
+def capture_residual_references(
+    source_base,
+    source_ft,
+    target_base,
+    source_loader,
+    target_loader,
+    *,
+    num_batches,
+    seed,
+    device,
+    target_scope="inserted",
+):
+    return _capture_residual_references(
+        source_base,
+        source_ft,
+        target_base,
+        source_loader,
+        target_loader,
+        num_batches=num_batches,
+        seed=seed,
+        device=device,
+        target_scope=target_scope,
+    )
+
+
+def _capture_residual_references(
+    source_base,
+    source_ft,
+    target_base,
+    source_loader,
+    target_loader,
+    *,
+    num_batches,
+    seed,
+    device,
+    target_scope,
+):
+    """Capture native source banks and target-position banks.
+
+    The public function keeps the historical inserted-only signature.  The
+    all-position path deliberately captures the target model at every final
+    position, while retaining native source banks by original index.  The
+    realized extension layout is only known after BRACE runs; completion then
+    joins these banks by the layout's explicit ancestry instead of assuming an
+    odd/even depth pattern.
+    """
+    if target_scope not in {"inserted", "all"}:
+        raise ValueError("target_scope must be 'inserted' or 'all'")
     sb, tb, metadata = paired_calibration(source_loader, target_loader, num_batches=num_batches, seed=seed)
     depth = len(source_base.visual.transformer.resblocks)
     req = {str(i): (i, "boundary") for i in range(depth)}
     base = capture_tokens(source_base, sb, req, device)
     ft = capture_tokens(source_ft, sb, req, device)
-    target = capture_tokens(target_base, tb, {str(i): (2*i+1, "boundary") for i in range(depth)}, device)
+    target_depth = len(target_base.visual.transformer.resblocks)
+    positions = [2 * i + 1 for i in range(depth)] if target_scope == "inserted" else list(range(target_depth))
+    if not positions or max(positions) >= target_depth:
+        raise ValueError(
+            "Target model depth does not contain the requested target positions: "
+            f"scope={target_scope!r}, source_depth={depth}, target_depth={target_depth}."
+        )
+    target = capture_tokens(target_base, tb, {str(i): (i, "boundary") for i in positions}, device)
+
+    # Keep source banks by original index for the all-position path.  The
+    # inserted path also materializes the historical dictionaries immediately,
+    # preserving its byte-compatible downstream behavior.
+    source_base_outputs = {int(i): value for i, value in base.items()}
+    source_ft_outputs = {int(i): value for i, value in ft.items()}
+    target_outputs_by_position = {int(i): value for i, value in target.items()}
     desired, maps, target_outputs = {}, {}, {}
-    for i in range(depth):
-        targets = target.pop(str(i))
-        source_base_batches = _aligned(base.pop(str(i)), targets)
-        source_ft_batches = _aligned(ft.pop(str(i)), targets)
-        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
-        q = q.float()
-        desired[2*i+1] = [(f-b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
-        target_outputs[2*i+1] = targets
-        maps[2*i+1] = {"P": q, "source_mean": mu_s.float(), "target_mean": mu_t.float()}
-    return {"desired": desired, "target_base_outputs": target_outputs, "maps": maps, "calibration": metadata}
+    if target_scope == "inserted":
+        for i in range(depth):
+            position = 2 * i + 1
+            targets = target_outputs_by_position[position]
+            source_base_batches = _aligned(source_base_outputs[i], targets)
+            source_ft_batches = _aligned(source_ft_outputs[i], targets)
+            q, mu_s, mu_t = centered_rectangular_procrustes(
+                _rows(source_base_batches).double(), _rows(targets).double()
+            )
+            q = q.float()
+            desired[position] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+            target_outputs[position] = targets
+            maps[position] = {"P": q, "source_mean": mu_s.float(), "target_mean": mu_t.float()}
+    result = {
+        "desired": desired,
+        "target_base_outputs": target_outputs,
+        "maps": maps,
+        "calibration": metadata,
+    }
+    if target_scope == "all":
+        result.update(
+            {
+                "scope": target_scope,
+                "source_base_outputs": source_base_outputs,
+                "source_ft_outputs": source_ft_outputs,
+                "target_base_outputs_by_position": target_outputs_by_position,
+            }
+        )
+    return result
 
 
-def projection_transforms(prepared, layout):
+def projection_transforms(prepared, layout, *, target_scope="inserted"):
+    if target_scope not in {"inserted", "all"}:
+        raise ValueError("target_scope must be 'inserted' or 'all'")
     transforms = prepared.get("transforms_by_key", {})
     output = {}
-    for row in layout["inserted_blocks"]:
+    if target_scope == "inserted":
+        entries = layout.get("inserted_blocks")
+        if entries is None:
+            raise ValueError("Realized extension layout is missing inserted_blocks")
+    else:
+        entries = layout.get("final_blocks")
+        if entries is None:
+            raise ValueError("All target scope requires realized layout final_blocks")
+    expected_positions = {int(row["position"]) for row in entries}
+    if len(expected_positions) != len(entries):
+        raise ValueError("Realized extension layout contains duplicate target positions")
+    for row in entries:
         pos = int(row["position"])
         key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
         transform = transforms.get(key, transforms.get("visual." + key))
         if transform is None or transform.t_in is None or transform.t_out is None or transform.kind != "weight":
-            raise ValueError(f"Missing fitted c_proj transport at added block {pos}")
+            kind = row.get("block_kind", "inserted")
+            raise ValueError(f"Missing fitted c_proj transport at {kind} block position {pos}")
         output[pos] = {"t_in": transform.t_in.detach().float().cpu(), "t_out": transform.t_out.detach().float().cpu()}
+    if set(output) != expected_positions:
+        raise ValueError(
+            "Fitted c_proj transport positions do not exactly match realized target positions: "
+            f"expected={sorted(expected_positions)}, found={sorted(output)}"
+        )
     return output
 
 
 @torch.no_grad()
 def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device):
     """Fit all blocks at gamma=1, returning a separately scalable correction."""
-    entries = sorted(layout["inserted_blocks"], key=lambda row: row["position"])
-    if len(entries) != len(references["desired"]):
-        raise ValueError("Native references and realized inserted-block layout disagree")
+    if references.get("scope", "inserted") != config.target_scope:
+        raise ValueError(
+            "Native reference scope does not match residual completion config: "
+            f"references={references.get('scope', 'inserted')!r}, config={config.target_scope!r}"
+        )
+    if config.target_scope == "inserted":
+        entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
+        block_kind = {int(row["position"]): "inserted" for row in entries}
+        desired = references.get("desired", {})
+        target_outputs = references.get("target_base_outputs", {})
+        maps = references.get("maps", {})
+    else:
+        entries = sorted(layout.get("final_blocks", ()), key=lambda row: row["position"])
+        if not entries:
+            raise ValueError("All target scope requires non-empty realized layout final_blocks")
+        desired, target_outputs, maps = _materialize_all_scope_references(references, entries)
+        block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
+    expected_positions = {int(row["position"]) for row in entries}
+    for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps), ("transforms", transforms)):
+        if set(values) != expected_positions:
+            raise ValueError(
+                f"Residual completion {name} keys do not exactly match realized target positions: "
+                f"expected={sorted(expected_positions)}, found={sorted(values)}"
+            )
     meta = references["calibration"]
     if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
         raise ValueError("Cached reference images do not match this task's validation dataset")
@@ -270,7 +390,7 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
         target_model.load_state_dict(current_state, strict=True)
         for row in entries:
             pos = int(row["position"])
-            if pos != 2 * int(row["source_orig_idx"]) + 1:
+            if config.target_scope == "inserted" and pos != 2 * int(row["source_orig_idx"]) + 1:
                 raise ValueError("Realized insertion ancestry does not match captured references")
             key = f"visual.transformer.resblocks.{pos}.mlp.c_proj.weight"
             captured = capture_tokens(target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")}, device)
@@ -284,8 +404,10 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
                     raise ValueError("Unsupported non-diagonal target LayerScale")
                 effective_out = t_out * scale.detach().cpu().float().unsqueeze(0)
             stats = ResidualSufficientStatistics()
-            for h, out, desired, base_out in zip(captured["h"], captured["out"], references["desired"][pos], references["target_base_outputs"][pos], strict=True):
-                error = desired - (out - base_out)
+            for h, out, desired_batch, base_out in zip(
+                captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
+            ):
+                error = desired_batch - (out - base_out)
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), t_in, effective_out)
             correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
             transported = t_out.T @ correction @ t_in
@@ -313,10 +435,50 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             target_corrections[bias_key] = transported_bias
             current_state[bias_key] = current_state[bias_key] + transported_bias.to(current_state[bias_key])
             target_model.load_state_dict(current_state, strict=True)
-            diagnostics.append({"position": pos, "source_orig_idx": row["source_orig_idx"], **diag})
+            diagnostics.append(
+                {
+                    "scope": config.target_scope,
+                    "block_kind": block_kind[pos],
+                    "position": pos,
+                    "source_orig_idx": row["source_orig_idx"],
+                    **diag,
+                }
+            )
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return source_corrections, target_corrections, diagnostics
+
+
+def _materialize_all_scope_references(references, entries):
+    """Join native banks to every realized target position by explicit ancestry."""
+    source_base = references.get("source_base_outputs")
+    source_ft = references.get("source_ft_outputs")
+    target_by_position = references.get("target_base_outputs_by_position")
+    if source_base is None or source_ft is None or target_by_position is None:
+        raise ValueError("All target scope requires native source and position-specific target reference banks")
+    expected_positions = {int(row["position"]) for row in entries}
+    if set(target_by_position) != expected_positions:
+        raise ValueError(
+            "Position-specific target references do not exactly match realized target positions: "
+            f"expected={sorted(expected_positions)}, found={sorted(target_by_position)}"
+        )
+    desired, target_outputs, maps = {}, {}, {}
+    for row in entries:
+        pos = int(row["position"])
+        source_idx = int(row["source_orig_idx"])
+        if source_idx not in source_base or source_idx not in source_ft:
+            raise ValueError(f"Missing native source reference for ancestry index {source_idx} at target position {pos}")
+        targets = target_by_position[pos]
+        source_base_batches = _aligned(source_base[source_idx], targets)
+        source_ft_batches = _aligned(source_ft[source_idx], targets)
+        q, mu_s, mu_t = centered_rectangular_procrustes(
+            _rows(source_base_batches).double(), _rows(targets).double()
+        )
+        q = q.float()
+        desired[pos] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+        target_outputs[pos] = targets
+        maps[pos] = {"P": q, "source_mean": mu_s.float(), "target_mean": mu_t.float()}
+    return desired, target_outputs, maps
 
 
 def scale_completion(baseline, completion, strength):

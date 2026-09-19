@@ -2212,10 +2212,19 @@ def build_extension_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             original_positions[int(item["orig_idx"])] = position
 
     inserted_blocks: list[dict[str, int]] = []
+    final_blocks: list[dict[str, Any]] = []
     for position, item in enumerate(chain):
+        source_orig_idx = int(item["orig_idx"])
+        if bool(item.get("inserted", False)):
+            final_blocks.append(
+                {"position": position, "source_orig_idx": source_orig_idx, "block_kind": "inserted"}
+            )
+        else:
+            final_blocks.append(
+                {"position": position, "source_orig_idx": source_orig_idx, "block_kind": "original"}
+            )
         if not bool(item.get("inserted", False)):
             continue
-        source_orig_idx = int(item["orig_idx"])
         neighbour_orig_idx = int(item["neighbour_orig_idx"])
         inserted_blocks.append(
             {
@@ -2231,6 +2240,7 @@ def build_extension_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         "final_depth": len(chain),
         "original_positions": {idx: original_positions[idx] for idx in sorted(original_positions)},
         "inserted_blocks": tuple(inserted_blocks),
+        "final_blocks": tuple(final_blocks),
     }
 
 

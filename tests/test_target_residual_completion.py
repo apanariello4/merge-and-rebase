@@ -16,6 +16,8 @@ from merge_and_rebase.rebase.methods.theseus import _transport_weight
 def test_config_defaults_and_validation() -> None:
     cfg = parse_residual_completion_config({"enabled": True})
     assert cfg.enabled and cfg.num_batches == 10
+    assert cfg.target_scope == "inserted"
+    assert parse_residual_completion_config({"added_blocks": "all", "target_scope": "all"}).target_scope == "all"
     assert cfg.exact_form is True  # no proposal-1 result predates this fix; exact is the only sane default.
     assert parse_residual_completion_config({"num_batches": 1}).num_batches == 1
     assert parse_residual_completion_config({"exact_form": False}).exact_form is False
@@ -25,6 +27,8 @@ def test_config_defaults_and_validation() -> None:
         parse_residual_completion_config({"num_batches": 0})
     with pytest.raises(TypeError):
         parse_residual_completion_config({"exact_form": 1})
+    with pytest.raises(ValueError):
+        parse_residual_completion_config({"target_scope": "added"})
 
 
 def test_centered_rectangular_procrustes_and_backprojection() -> None:

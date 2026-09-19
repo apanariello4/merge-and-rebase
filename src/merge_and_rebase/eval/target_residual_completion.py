@@ -55,6 +55,10 @@ Tensor = torch.Tensor
 class ResidualCompletionConfig:
     enabled: bool = False
     added_blocks: str = "all"
+    # ``inserted`` is the Proposal-1 protocol used by existing campaigns.
+    # ``all`` is an opt-in ablation that completes every realized target block
+    # position, including original descendants, using its source ancestry.
+    target_scope: str = "inserted"
     component: str = "c_proj.weight"
     ridge_relative: float = 1e-3
     strength: float = 1.0
@@ -76,7 +80,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
     if not isinstance(value, Mapping):
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
-        "enabled", "added_blocks", "component", "ridge_relative", "strength", "num_batches", "exact_form",
+        "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
+        "exact_form",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -86,6 +91,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("enabled must be bool")
     if cfg.added_blocks != "all":
         raise ValueError("added_blocks must be 'all' for the initial all-inserted-block protocol")
+    if cfg.target_scope not in {"inserted", "all"}:
+        raise ValueError("target_scope must be 'inserted' or 'all'")
     if cfg.component != "c_proj.weight":
         raise ValueError("component must be 'c_proj.weight'")
     if isinstance(cfg.num_batches, bool) or not isinstance(cfg.num_batches, int) or cfg.num_batches <= 0:

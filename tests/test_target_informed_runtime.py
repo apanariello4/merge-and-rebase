@@ -126,6 +126,94 @@ def test_sequential_completion_changes_only_added_projections_and_restores_model
         torch.testing.assert_close(value, baseline_delta[key] + 0.5 * tgt.get(key, torch.zeros_like(value)))
 
 
+def test_all_scope_uses_realized_ancestry_and_updates_every_position_in_order():
+    torch.manual_seed(12)
+    source, target = Model(3, 2).eval(), Model(5, 4).eval()
+    source_ft = deepcopy(source)
+    with torch.no_grad():
+        source_ft.visual.transformer.resblocks[0].mlp.c_proj.weight.add_(0.1)
+        source_ft.visual.transformer.resblocks[1].mlp.c_proj.weight.sub_(0.08)
+    data = loader()
+    refs = capture_residual_references(
+        source, source_ft, target, data, data, num_batches=3, seed=0, device="cpu", target_scope="all"
+    )
+    layout = {
+        "final_blocks": tuple(
+            {"position": pos, "source_orig_idx": pos // 2, "block_kind": "inserted" if pos % 2 else "original"}
+            for pos in range(4)
+        )
+    }
+    transforms = {}
+    for pos in range(4):
+        key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
+        transforms[key] = SimpleNamespace(
+            kind="weight", t_in=torch.linalg.qr(torch.randn(10, 6)).Q.T, t_out=torch.linalg.qr(torch.randn(5, 3)).Q.T
+        )
+    prepared = {"transforms_by_key": transforms}
+    baseline_state = {k: v.clone() for k, v in target.state_dict().items()}
+    baseline_delta = {k: torch.zeros_like(v) for k, v in baseline_state.items()}
+    config = ResidualCompletionConfig(enabled=True, target_scope="all", ridge_relative=0.01)
+    maps = projection_transforms(prepared, layout, target_scope="all")
+    _src, completed, diagnostics = complete_residuals(
+        target, baseline_state, baseline_delta, refs, maps, layout, data, config=config, device="cpu"
+    )
+    assert [row["position"] for row in diagnostics] == [0, 1, 2, 3]
+    assert [row["block_kind"] for row in diagnostics] == ["original", "inserted", "original", "inserted"]
+    assert all(row["scope"] == "all" for row in diagnostics)
+    assert set(completed) >= {
+        f"visual.transformer.resblocks.{pos}.mlp.c_proj.{kind}"
+        for pos in range(4)
+        for kind in ("weight", "bias")
+    }
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, baseline_state[key], rtol=0, atol=0)
+
+
+def test_all_scope_is_deterministic_and_rejects_missing_position_transforms():
+    torch.manual_seed(12)
+    source, target = Model(3, 2).eval(), Model(5, 4).eval()
+    source_ft = deepcopy(source)
+    data = loader()
+    refs = capture_residual_references(
+        source, source_ft, target, data, data, num_batches=3, seed=7, device="cpu", target_scope="all"
+    )
+    layout = {
+        "final_blocks": tuple(
+            {"position": pos, "source_orig_idx": pos // 2, "block_kind": "inserted" if pos % 2 else "original"}
+            for pos in range(4)
+        )
+    }
+    def prepared_for(positions):
+        return {
+            "transforms_by_key": {
+                f"transformer.resblocks.{pos}.mlp.c_proj.weight": SimpleNamespace(
+                    kind="weight", t_in=torch.eye(6, 10), t_out=torch.eye(3, 5)
+                )
+                for pos in positions
+            }
+        }
+    with pytest.raises(ValueError, match="Missing fitted c_proj transport at original block position 0"):
+        projection_transforms(prepared_for([1, 2, 3]), layout, target_scope="all")
+    transforms = projection_transforms(prepared_for(range(4)), layout, target_scope="all")
+    state = {k: v.clone() for k, v in target.state_dict().items()}
+    delta = {k: torch.zeros_like(v) for k, v in state.items()}
+    config = ResidualCompletionConfig(enabled=True, target_scope="all", ridge_relative=0.05)
+    first = complete_residuals(target, state, delta, refs, transforms, layout, data, config=config, device="cpu")
+    second = complete_residuals(target, state, delta, refs, transforms, layout, data, config=config, device="cpu")
+    for a, b in zip(first[:2], second[:2], strict=True):
+        assert set(a) == set(b)
+        for key in a:
+            torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+    assert len(first[2]) == len(second[2])
+    for row_a, row_b in zip(first[2], second[2], strict=True):
+        assert set(row_a) == set(row_b)
+        for key in row_a:
+            if isinstance(row_a[key], torch.Tensor):
+                torch.testing.assert_close(row_a[key], row_b[key], rtol=0, atol=0)
+            else:
+                assert row_a[key] == row_b[key]
+
+
 def test_transform_lookup_and_missing_map():
     tin, tout = torch.randn(6, 10), torch.randn(3, 5)
     key = "transformer.resblocks.1.mlp.c_proj.weight"

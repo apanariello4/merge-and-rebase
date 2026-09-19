@@ -1247,6 +1247,7 @@ def _maybe_capture_target_residual_references(
         num_batches=config.num_batches,
         seed=seed,
         device=device,
+        target_scope=config.target_scope,
     )
 
 
@@ -1277,7 +1278,7 @@ def _maybe_complete_target_residual_task_vector(
     """
     if not config.enabled or references is None:
         return transported_delta, None
-    transforms = projection_transforms(prepared, layout)
+    transforms = projection_transforms(prepared, layout, target_scope=config.target_scope)
     _source_corrections, target_corrections, diagnostics = complete_residuals(
         target_model,
         target_base_sd,
