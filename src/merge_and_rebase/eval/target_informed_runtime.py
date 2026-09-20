@@ -457,24 +457,50 @@ def projection_transforms(prepared, layout, *, target_scope="inserted", family_a
 
 
 
-def _materialize_zero_bias(model, bias_key, current_state, out_features):
-    """Give a bias-free projection a zero bias so an intercept can be written.
-
-    The exact affine form needs somewhere to put its intercept, and a decoder's
-    mlp.down_proj has no bias parameter. This adds one, zero-initialised, so the
-    write below is a no-op change until the intercept is applied. The resulting
-    checkpoint carries a parameter stock Qwen does not have -- that is a real
-    consequence of choosing the exact form on this architecture, not a detail.
-    """
+def _materialize_zero_bias(model, bias_key, out_features):
+    """Add a zero bias to one bias-free projection. Returns True if it added one."""
     module_path = bias_key[: -len(".bias")]
     module = model
     for part in module_path.split("."):
         module = module[int(part)] if part.isdigit() else getattr(module, part)
-    if getattr(module, "bias", None) is None:
-        weight = module.weight
-        module.bias = nn.Parameter(torch.zeros(out_features, dtype=weight.dtype, device=weight.device))
-    current_state[bias_key] = torch.zeros(out_features, dtype=module.weight.dtype).cpu()
+    if getattr(module, "bias", None) is not None:
+        return False
+    weight = module.weight
+    module.bias = nn.Parameter(torch.zeros(out_features, dtype=weight.dtype, device=weight.device))
+    return True
 
+
+def materialize_missing_projection_biases(target_model, target_base_state, layout, *, family_adapter=None):
+    """Give the target's residual projections a zero bias, in model and state alike.
+
+    The exact affine form transports an intercept onto the projection's bias.
+    CLIP's mlp.c_proj has one; an HF decoder's mlp.down_proj does not, so there
+    is nowhere to put it. Adding a zero bias is behaviourally a no-op -- it
+    changes no output until an intercept is written -- but it has to happen
+    before completion runs and has to land in the base state dict too, so the
+    merged state, the restore inside completion, and the eval load all agree on
+    the model's shape. Doing it here rather than inside the solver is what keeps
+    that consistent: the solver snapshots and restores with strict=True.
+
+    Returns the keys it added, so a run can record that its checkpoint carries
+    parameters the stock architecture does not.
+    """
+    shim = _layout_for(family_adapter)
+    entries = layout.get("final_blocks") or layout.get("inserted_blocks") or ()
+    added = []
+    for row in entries:
+        pos = int(row["position"])
+        weight_key = shim.proj_key(pos, prefixed=True)
+        bias_key = f"{weight_key[: -len('.weight')]}.bias"
+        if bias_key in target_base_state:
+            continue
+        out_features = int(target_base_state[weight_key].shape[0])
+        _materialize_zero_bias(target_model, bias_key, out_features)
+        target_base_state[bias_key] = torch.zeros(
+            out_features, dtype=target_base_state[weight_key].dtype
+        )
+        added.append(bias_key)
+    return added
 
 @torch.no_grad()
 def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device, family_adapter=None):
@@ -567,7 +593,17 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
                 # 1.2-1.9, largest at the deepest layer), so the intercept is
                 # carrying real signal and cannot simply be discarded.
                 if config.missing_bias == "materialize":
-                    _materialize_zero_bias(target_model, bias_key, current_state, t_out.shape[1])
+                    # The caller is responsible for materializing these before
+                    # calling in: original_state is snapshotted above and
+                    # restored with strict=True, so a parameter added here would
+                    # make that restore fail (and would not survive into the
+                    # merge or the eval load either).
+                    raise RuntimeError(
+                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                        "before residual completion runs; call "
+                        "materialize_missing_projection_biases() on the target model and its "
+                        "base state dict first"
+                    )
                 elif config.missing_bias == "skip":
                     # Only reachable with exact_form=False, where the intercept
                     # is exactly zero (the parser refuses the other combination),

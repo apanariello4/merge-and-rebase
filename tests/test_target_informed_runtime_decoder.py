@@ -180,33 +180,54 @@ def test_capture_residual_references_runs_on_a_decoder_with_all_scope() -> None:
     assert refs, "no reference banks captured on the decoder path"
 
 
-def test_materialize_zero_bias_adds_a_writable_bias_to_a_bias_free_projection() -> None:
-    """Option 1: give a bias-free down_proj somewhere to put the intercept.
+def test_materialize_keeps_model_and_state_dict_in_agreement() -> None:
+    """Option 1, as a pre-pass: model and base state gain the bias together.
 
-    Qwen2.5 builds mlp.down_proj with bias=False, so the exact affine form has
-    no parameter to write its intercept to. Materializing a zero bias is exact
-    -- it changes nothing until the intercept is applied -- at the cost of a
-    checkpoint carrying a parameter the stock architecture lacks.
+    The first attempt materialized inside the solver, which snapshots
+    original_state before its loop and restores it with strict=True -- so the
+    model ended up with 28 biases the snapshot lacked and every exact-arm cell
+    died with "Missing key(s) in state_dict". Doing it up front, into the model
+    AND the base state, is what makes the strict restore survive.
     """
-    from merge_and_rebase.eval.target_informed_runtime import _materialize_zero_bias
+    from merge_and_rebase.eval.target_informed_runtime import materialize_missing_projection_biases
 
-    model = _Decoder()
-    key = "model.layers.1.mlp.down_proj.bias"
-    assert model.model.layers[1].mlp.down_proj.bias is None, "fixture should start bias-free"
+    model = _Decoder(depth=3)
+    base_state = {k: v.clone() for k, v in model.state_dict().items()}
+    layout = {"final_blocks": [{"position": i} for i in range(3)]}
+    assert not any(k.endswith("down_proj.bias") for k in base_state)
 
-    state: dict[str, torch.Tensor] = {}
-    _materialize_zero_bias(model, key, state, out_features=8)
+    added = materialize_missing_projection_biases(
+        model, base_state, layout, family_adapter=_Adapter()
+    )
+    assert len(added) == 3, added
 
-    bias = model.model.layers[1].mlp.down_proj.bias
-    assert bias is not None and bias.shape == (8,)
-    assert torch.allclose(bias, torch.zeros(8)), "materialized bias must start at zero"
-    assert key in state and torch.allclose(state[key], torch.zeros(8))
+    # the exact failure mode: a strict restore from a snapshot taken after
+    # materialization must now succeed
+    model.load_state_dict(base_state, strict=True)
+
+    for i in range(3):
+        bias = model.model.layers[i].mlp.down_proj.bias
+        assert bias is not None and torch.allclose(bias, torch.zeros_like(bias))
+
     # zero bias must leave the function unchanged
     ids = torch.randint(0, 32, (2, 5))
     with torch.no_grad():
-        before = _Decoder()
-        before.load_state_dict({k: v for k, v in model.state_dict().items() if "bias" not in k}, strict=False)
-    assert model(ids).shape == (2, 5, 8)
+        out = model(ids)
+    assert torch.isfinite(out).all()
+
+
+def test_materialize_is_idempotent_across_tasks() -> None:
+    """Re-running the pre-pass must not double-add or disturb existing biases."""
+    from merge_and_rebase.eval.target_informed_runtime import materialize_missing_projection_biases
+
+    model = _Decoder(depth=2)
+    base_state = {k: v.clone() for k, v in model.state_dict().items()}
+    layout = {"final_blocks": [{"position": i} for i in range(2)]}
+
+    first = materialize_missing_projection_biases(model, base_state, layout, family_adapter=_Adapter())
+    second = materialize_missing_projection_biases(model, base_state, layout, family_adapter=_Adapter())
+    assert len(first) == 2 and second == [], (first, second)
+    model.load_state_dict(base_state, strict=True)
 
 
 def test_skip_is_refused_when_the_intercept_is_nonzero() -> None:

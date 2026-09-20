@@ -74,6 +74,7 @@ from .print_utils import pretty_print_task_accuracies
 from .target_informed_runtime import (
     capture_residual_references,
     complete_residuals,
+    materialize_missing_projection_biases,
     projection_transforms,
     scale_completion,
 )
@@ -1098,6 +1099,7 @@ def main() -> None:
             )
         task_vector_norms: list[dict[str, float]] = []
         residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        materialized_bias_keys: set[str] = set()
         for idx, prepared_task in enumerate(prepared_tasks):
             corrected_delta = prepared_task.delta
             reference_delta = prepared_task.uncorrected_delta or corrected_delta
@@ -1193,6 +1195,21 @@ def main() -> None:
                         **shared_kwargs,
                         **transport_kwargs,
                     )
+                # missing_bias="materialize": give the target's down_proj a zero
+                # bias before completion runs, in the model and the base state
+                # together. A decoder has none, and the exact form needs one for
+                # its intercept; doing it here (not inside the solver) keeps the
+                # merged state, completion's strict restore, and the eval load
+                # all agreeing on the model's shape.
+                if residual_completion_cfg.enabled and residual_completion_cfg.missing_bias == "materialize":
+                    added_bias_keys = materialize_missing_projection_biases(
+                        target_llm.model, target_base_sd, prepared_task.extension_layout or {},
+                        family_adapter=family_adapter,
+                    )
+                    if added_bias_keys:
+                        materialized_bias_keys.update(added_bias_keys)
+                        print(f"  materialized {len(added_bias_keys)} zero projection bias(es) for the intercept")
+
                 # Proposal 1: complete the transported task vector before the
                 # passthrough keys are folded in. Only ever adds to the task
                 # vector, never to the target base weights; a disabled run gets
@@ -1278,6 +1295,8 @@ def main() -> None:
                 "target_scope": residual_completion_cfg.target_scope,
                 "strength": float(residual_completion_cfg.strength),
                 "diagnostics": residual_completion_diagnostics,
+                # Parameters this run added that stock Qwen does not have.
+                "materialized_bias_keys": sorted(materialized_bias_keys),
             },
         }
         print(
