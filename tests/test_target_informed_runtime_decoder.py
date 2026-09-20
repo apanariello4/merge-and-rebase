@@ -127,3 +127,54 @@ def test_vision_path_unchanged_when_no_adapter_is_passed() -> None:
     except AttributeError:
         return
     raise AssertionError("family_adapter=None unexpectedly handled a decoder model")
+
+
+def test_capture_residual_references_runs_on_a_decoder_with_all_scope() -> None:
+    """End-to-end reference capture for proposal 1 on an HF decoder.
+
+    target_scope='all' rather than 'inserted': the inserted scope derives target
+    positions as 2*i+1, valid only for a doubling resize. The LLM pair here is
+    24->28, where that formula runs past the target depth, so the all-block
+    scope is the one that applies.
+
+    The two loaders tokenize the same examples differently, as a real source and
+    target tokenizer would; pairing must recognise them as the same examples via
+    sample_ids rather than rejecting them for holding different tensors.
+    """
+    from torch.utils.data import DataLoader, Dataset
+
+    from merge_and_rebase.eval.target_informed_runtime import capture_residual_references
+
+    class _Texts(Dataset):
+        def __init__(self, n, offset):
+            self.n = n
+            self.offset = offset
+            # identity keys on the example, not on this "tokenization"
+            self.sample_ids = [f"ex{i}" for i in range(n)]
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, i):
+            g = torch.Generator().manual_seed(i + self.offset)
+            return {
+                "input_ids": torch.randint(0, 32, (5,), generator=g),
+                "attention_mask": torch.ones(5, dtype=torch.long),
+            }
+
+    def _collate(rows):
+        return {
+            "input_ids": torch.stack([r["input_ids"] for r in rows]),
+            "attention_mask": torch.stack([r["attention_mask"] for r in rows]),
+        }
+
+    src_loader = DataLoader(_Texts(4, 0), batch_size=2, shuffle=False, collate_fn=_collate)
+    tgt_loader = DataLoader(_Texts(4, 100), batch_size=2, shuffle=False, collate_fn=_collate)
+
+    refs = capture_residual_references(
+        _Decoder(depth=3), _Decoder(depth=3), _Decoder(depth=4),
+        src_loader, tgt_loader,
+        num_batches=2, seed=0, device="cpu",
+        target_scope="all", family_adapter=_Adapter(),
+    )
+    assert refs, "no reference banks captured on the decoder path"

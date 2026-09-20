@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from collections.abc import Iterable, Mapping
@@ -70,11 +71,25 @@ from .llm_common import (
     to_unit_acc,
 )
 from .print_utils import pretty_print_task_accuracies
+from .target_informed_runtime import (
+    capture_residual_references,
+    complete_residuals,
+    projection_transforms,
+    scale_completion,
+)
+from .target_residual_completion import ResidualCompletionConfig
 
 
 class _TokenizedPromptDataset(Dataset):
-    def __init__(self, features: list[dict[str, Any]]) -> None:
+    def __init__(self, features: list[dict[str, Any]], sample_ids: list[str] | None = None) -> None:
         self.features = features
+        # Identity of the underlying examples, not of this tokenization. The
+        # source and target calibration loaders tokenize the SAME texts with
+        # different tokenizers, so they are different objects holding different
+        # token ids; paired calibration has to recognise them as the same
+        # examples replayed under two preprocessors, which is exactly what it
+        # falls back to sample_ids for.
+        self.sample_ids = list(sample_ids) if sample_ids is not None else None
 
     def __len__(self) -> int:
         return len(self.features)
@@ -99,6 +114,11 @@ class _PreparedTaskDelta:
     # its direction. Keeping the uncorrected delta lets a run transport one and
     # normalize to the other, separating those two effects.
     uncorrected_delta: dict[str, torch.Tensor] | None = None
+    # Realized block chain from the resize, needed by residual completion to
+    # address inserted positions by ancestry instead of a depth pattern.
+    extension_layout: dict[str, Any] | None = None
+    # Proposal-1 native reference banks, captured before the resize.
+    residual_references: dict[str, Any] | None = None
 
 
 def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
@@ -167,6 +187,7 @@ def _prepare_resized_task_delta(
         ).delta
         del ref_base, ref_ft
 
+    extension_layout: dict[str, Any] = {}
     final_depth = run_block_extension_llm(
         source_base_model=source_base_model,
         source_ft_model=source_ft_model,
@@ -175,6 +196,7 @@ def _prepare_resized_task_delta(
         config=config,
         family_adapter=family_adapter,
         device=device,
+        layout_out=extension_layout,
     )
     if final_depth != target_layers_total:
         raise RuntimeError(
@@ -194,7 +216,84 @@ def _prepare_resized_task_delta(
         transport_keys=set(family_adapter.transportable_keys(source_base)),
         source_model=source_base_model,
         uncorrected_delta=uncorrected_delta,
+        extension_layout=extension_layout or None,
     )
+
+
+
+def _maybe_capture_target_residual_references(
+    *,
+    config: ResidualCompletionConfig,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    source_loader: Any,
+    target_loader: Any,
+    family_adapter: Any,
+    seed: int,
+    device: str,
+) -> dict[str, Any] | None:
+    """Capture proposal-1 native reference banks, or no-op when disabled.
+
+    Must run before the resize: these are the un-resized source model's own
+    boundary activations, paired against the pretrained target. Returns None
+    when disabled so callers can thread the result through unconditionally and
+    still get a byte-identical no-op.
+    """
+    if not config.enabled:
+        return None
+    return capture_residual_references(
+        source_base_model,
+        source_ft_model,
+        target_model,
+        source_loader,
+        target_loader,
+        num_batches=config.num_batches,
+        seed=seed,
+        device=device,
+        target_scope=config.target_scope,
+        family_adapter=family_adapter,
+    )
+
+
+def _maybe_complete_target_residual_task_vector(
+    *,
+    config: ResidualCompletionConfig,
+    references: dict[str, Any] | None,
+    prepared: Any,
+    layout: Mapping[str, Any] | None,
+    target_model: torch.nn.Module,
+    target_base_sd: Mapping[str, torch.Tensor],
+    transported_delta: dict[str, torch.Tensor],
+    target_loader: Any,
+    family_adapter: Any,
+    device: str,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
+    """Complete the transported task vector, or return it untouched.
+
+    Runs after transport is fitted and only ever adds to the task vector, never
+    to the target base weights. Disabled, or missing references/layout, returns
+    the same dict object so a caller hashing the delta sees no change.
+    """
+    if not config.enabled or references is None or not layout:
+        return transported_delta, None
+    transforms = projection_transforms(
+        prepared, layout, target_scope=config.target_scope, family_adapter=family_adapter
+    )
+    _source_corrections, target_corrections, diagnostics = complete_residuals(
+        target_model,
+        target_base_sd,
+        transported_delta,
+        references,
+        transforms,
+        layout,
+        target_loader,
+        config=config,
+        device=device,
+        family_adapter=family_adapter,
+    )
+    completed = scale_completion(transported_delta, target_corrections, config.strength)
+    return completed, diagnostics
 
 
 def _summarize_merged_delta(
@@ -250,7 +349,10 @@ def _build_text_calibration_loader(
     for i in range(len(prompt_list)):
         features.append({k: v[i] for k, v in enc.items()})
 
-    dataset = _TokenizedPromptDataset(features)
+    # Stable across processes: str.__hash__ is salted per interpreter, which
+    # would make these ids non-reproducible if they were ever persisted.
+    sample_ids = [f"{i}:{hashlib.sha1(t.encode()).hexdigest()[:12]}" for i, t in enumerate(prompt_list)]
+    dataset = _TokenizedPromptDataset(features, sample_ids=sample_ids)
 
     def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         feats = [{k: v for k, v in row.items() if k != "labels"} for row in batch]
@@ -530,6 +632,11 @@ def main() -> None:
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
+        # ARIADNE proposal 1 (target residual completion). Disabled by default,
+        # and resolve_block_extension_config already rejects it alongside
+        # skip_correction=true, so an enabled run always has a correction to
+        # complete.
+        residual_completion_cfg = block_extension_cfg.target_residual_completion
 
         source_depth = source_meta.num_hidden_layers if source_meta else 0
         target_depth = target_meta.num_hidden_layers if target_meta else 0
@@ -847,6 +954,28 @@ def main() -> None:
                 if family_adapter_for_ext is None:
                     raise ValueError("Block extension requires a family adapter but none was inferred.")
 
+                # Proposal 1: capture the native reference banks BEFORE the
+                # resize below mutates source_base_model_task/source_ft_model_task
+                # in place. These are the un-resized source's own boundary
+                # activations paired against the pretrained target, which is the
+                # information the completion later regresses against.
+                task_residual_references = _maybe_capture_target_residual_references(
+                    config=residual_completion_cfg,
+                    source_base_model=source_base_model_task,
+                    source_ft_model=source_ft_model_task,
+                    target_model=target_llm.model,
+                    source_loader=blockext_calib_loader,
+                    target_loader=_build_text_calibration_loader(
+                        tokenizer=target_llm.tokenizer,
+                        texts=_calibration().texts,
+                        batch_size=calib_batch_size,
+                        max_length=calib_max_length,
+                    ) if residual_completion_cfg.enabled else None,
+                    family_adapter=family_adapter_for_ext,
+                    seed=int(cfg.get("seed", 0)),
+                    device=device,
+                )
+
                 prepared_task = _prepare_resized_task_delta(
                     source_base_model=source_base_model_task,
                     source_ft_model=source_ft_model_task,
@@ -856,6 +985,15 @@ def main() -> None:
                     family_adapter=family_adapter_for_ext,
                     device=device,
                 )
+                prepared_task.residual_references = task_residual_references
+                if residual_completion_cfg.enabled:
+                    layout_desc = prepared_task.extension_layout or {}
+                    print(
+                        f"  residual completion armed: scope={residual_completion_cfg.target_scope} "
+                        f"strength={residual_completion_cfg.strength} "
+                        f"inserted={len(layout_desc.get('inserted_blocks', ()))} "
+                        f"final_blocks={len(layout_desc.get('final_blocks', ()))}"
+                    )
                 print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
                 # The resized ft model has already been absorbed into the delta;
                 # drop it before the eval below so it is not holding device
@@ -959,6 +1097,7 @@ def main() -> None:
                 f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
             )
         task_vector_norms: list[dict[str, float]] = []
+        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
         for idx, prepared_task in enumerate(prepared_tasks):
             corrected_delta = prepared_task.delta
             reference_delta = prepared_task.uncorrected_delta or corrected_delta
@@ -997,19 +1136,30 @@ def main() -> None:
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     if calib_n_batches is None:
                         transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
-                    if calib_n_batches is None:
-                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
-                    transported_body = method.transport(
-                        source_base=prepared_task.source_base,
-                        target_base=target_base_sd,
-                        delta=body_delta,
-                        strict=False,
+                    shared_kwargs = dict(
                         source_model=prepared_task.source_model,
                         target_model=target_llm.model,
                         source_dataloader=source_calib,
                         target_dataloader=target_calib,
                         family_adapter=family_adapter,
                         device=device,
+                    )
+                    # Residual completion needs the fitted transforms, so the
+                    # payload is built explicitly and handed to transport. When
+                    # completion is off, prepared stays None and transport fits
+                    # it internally exactly as before.
+                    fitted_prepared = (
+                        method.prepare(target_base=target_base_sd, delta=body_delta, **shared_kwargs, **transport_kwargs)
+                        if residual_completion_cfg.enabled
+                        else None
+                    )
+                    transported_body = method.transport(
+                        source_base=prepared_task.source_base,
+                        target_base=target_base_sd,
+                        delta=body_delta,
+                        strict=False,
+                        prepared=fitted_prepared,
+                        **shared_kwargs,
                         **transport_kwargs,
                     )
                 else:
@@ -1018,24 +1168,51 @@ def main() -> None:
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     if calib_n_batches is None:
                         transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
-                    if calib_n_batches is None:
-                        transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
-                    transported_body = method.transport(
-                        source_base=prepared_task.source_base,
-                        target_base=target_base_sd,
-                        delta=body_delta,
-                        strict=False,
+                    shared_kwargs = dict(
                         source_model=prepared_task.source_model,
                         target_model=target_llm.model,
                         source_dataloader=source_calib,
                         target_dataloader=target_calib,
                         source_recipe=causal_lm_recipe(device=device),
                         target_recipe=causal_lm_recipe(device=device),
-                        curvature_dataloader=None,
                         family_adapter=family_adapter,
                         device=device,
+                    )
+                    fitted_prepared = (
+                        method.prepare(target_base=target_base_sd, delta=body_delta, **shared_kwargs, **transport_kwargs)
+                        if residual_completion_cfg.enabled
+                        else None
+                    )
+                    transported_body = method.transport(
+                        source_base=prepared_task.source_base,
+                        target_base=target_base_sd,
+                        delta=body_delta,
+                        strict=False,
+                        prepared=fitted_prepared,
+                        curvature_dataloader=None,
+                        **shared_kwargs,
                         **transport_kwargs,
                     )
+                # Proposal 1: complete the transported task vector before the
+                # passthrough keys are folded in. Only ever adds to the task
+                # vector, never to the target base weights; a disabled run gets
+                # the same object back.
+                transported_body, completion_diagnostics = _maybe_complete_target_residual_task_vector(
+                    config=residual_completion_cfg,
+                    references=prepared_task.residual_references,
+                    prepared=fitted_prepared,
+                    layout=prepared_task.extension_layout,
+                    target_model=target_llm.model,
+                    target_base_sd=target_base_sd,
+                    transported_delta=dict(transported_body),
+                    target_loader=target_calib,
+                    family_adapter=family_adapter,
+                    device=device,
+                )
+                if completion_diagnostics is not None:
+                    residual_completion_diagnostics[str(label)] = completion_diagnostics
+                    print(f"  residual completion applied to {len(completion_diagnostics)} block(s)")
+
                 out = dict(transported_body)
                 skipped_passthrough: list[str] = []
                 for k, v in passthrough_delta.items():
@@ -1096,6 +1273,12 @@ def main() -> None:
             "transport_delta_source": delta_source,
             "delta_norm_match": norm_match or "none",
             "per_task": task_vector_norms,
+            "residual_completion": {
+                "enabled": bool(residual_completion_cfg.enabled),
+                "target_scope": residual_completion_cfg.target_scope,
+                "strength": float(residual_completion_cfg.strength),
+                "diagnostics": residual_completion_diagnostics,
+            },
         }
         print(
             f"\nMerged delta: keys={delta_stats['key_count']} "

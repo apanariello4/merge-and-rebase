@@ -151,8 +151,16 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
     source_batches, target_batches = [], []
     for a, b in zip(source, target, strict=True):
-        if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
-            raise ValueError("Calibration labels disagree for supposedly identical images")
+        # Vision batches are (images, labels) and the labels are model-agnostic,
+        # so they must match example for example. Text batches are mappings
+        # whose contents are tokenizer-specific by construction -- the same
+        # prompt yields different ids under the source and target tokenizers --
+        # so there is nothing comparable to assert here. The examples are
+        # already pinned: both Subsets index the same `order` into datasets
+        # whose _dataset_identity had to agree above.
+        if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)) and len(a) > 1 and len(b) > 1:
+            if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
+                raise ValueError("Calibration labels disagree for supposedly identical images")
         source_batches.append(a)
         target_batches.append(b)
     metadata = {
