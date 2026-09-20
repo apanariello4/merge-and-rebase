@@ -1,0 +1,67 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "it": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "bico",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 100,
+    "device_transform": "gpu"
+  },
+  "alpha_search": true,
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "bottom-top",
+    "extension_density": "spread",
+    "n_batches_act": 100,
+    "calibration_split": "val",
+    "dampening_factor": 1.0,
+    "skip_correction": false,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "ridge_identity": 100.0,
+    "target_residual_completion": {
+      "enabled": true,
+      "target_scope": "all",
+      "strength": 1.0,
+      "num_batches": 10
+    }
+  },
+  "eval_before_rebase": true,
+  "harness_tasks": [
+    "ifeval"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "online",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/frinaldi/merge-and-rebase/results/rebase/llm_ifeval_proposal1_20260920/bico_p1_ridge100_s1"
+  },
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": {
+      "values": [
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0
+      ]
+    }
+  }
+}
