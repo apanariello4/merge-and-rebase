@@ -163,10 +163,96 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
     return source_batches, target_batches, metadata
 
 
+# --- architecture abstraction -------------------------------------------------
+#
+# Proposal 1's solver is architecture-agnostic; only this orchestration layer
+# reached into CLIP's module tree. These two shims name the four things that
+# actually differ between a ViT and an HF decoder -- where the blocks live,
+# which projection writes the residual, how to run a batch, and what that
+# projection is called in the state dict -- so the same completion runs on both
+# without duplicating the orchestration. Vision behaviour is unchanged: passing
+# family_adapter=None selects the original CLIP paths verbatim.
+
+
+class _VisionLayout:
+    """CLIP ViT: the original, unchanged code paths."""
+
+    name = "vision"
+
+    def blocks(self, model):
+        return model.visual.transformer.resblocks
+
+    def block_count(self, model):
+        return len(model.visual.transformer.resblocks)
+
+    def proj_module(self, block):
+        inner = block.block if hasattr(block, "block") else block
+        return inner.mlp.c_proj
+
+    def block_module(self, block):
+        return block.block if hasattr(block, "block") else block
+
+    def forward(self, model, batch, device):
+        _encode_image(model, batch[0].to(device))
+
+    def batch_size(self, batch):
+        return len(batch[0])
+
+    def proj_key(self, pos, *, prefixed):
+        key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
+        return f"visual.{key}" if prefixed else key
+
+
+class _DecoderLayout:
+    """HF decoder: mlp.down_proj is the residual-writing projection, the
+    analogue of CLIP's mlp.c_proj (both are the block's final output map)."""
+
+    name = "decoder"
+
+    def __init__(self, family_adapter):
+        self.family_adapter = family_adapter
+
+    def blocks(self, model):
+        return self.family_adapter.transport_scope(model).layers
+
+    def block_count(self, model):
+        return self.family_adapter.block_count(model)
+
+    def proj_module(self, block):
+        return block.mlp.down_proj
+
+    def block_module(self, block):
+        return block
+
+    def forward(self, model, batch, device):
+        inputs = self.family_adapter.extract_calibration_batch(batch)
+        model(**{k: v.to(device) for k, v in inputs.items() if hasattr(v, "to")})
+
+    def batch_size(self, batch):
+        inputs = self.family_adapter.extract_calibration_batch(batch)
+        return int(inputs["input_ids"].shape[0])
+
+    def proj_key(self, pos, *, prefixed):
+        # The decoder state dict is already "model.layers.N..."; there is no
+        # second prefix the way vision has "visual.".
+        return f"model.layers.{pos}.mlp.down_proj.weight"
+
+
+def _layout_for(family_adapter):
+    return _VisionLayout() if family_adapter is None else _DecoderLayout(family_adapter)
+
+
 @torch.no_grad()
-def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device):
-    """Capture B,T,D tensors, releasing hooks and restoring placement on errors."""
-    blocks = model.visual.transformer.resblocks
+def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None):
+    """Capture B,T,D tensors, releasing hooks and restoring placement on errors.
+
+    family_adapter=None keeps the original CLIP paths; passing one selects the
+    HF-decoder equivalents (see _DecoderLayout). The "c_proj" capture kinds keep
+    their names on both paths -- on a decoder they resolve to mlp.down_proj,
+    which plays the same residual-writing role.
+    """
+    layout = _layout_for(family_adapter)
+    blocks = layout.blocks(model)
     training = model.training
     original_device = next(model.parameters()).device
     output = {key: [] for key in requests}
@@ -175,9 +261,8 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
     try:
         model.to(device).eval()
         for key, (index, kind) in requests.items():
-            block = blocks[index]
-            block = block.block if hasattr(block, "block") else block
-            module = block if kind == "boundary" else block.mlp.c_proj
+            block = layout.block_module(blocks[index])
+            module = block if kind == "boundary" else layout.proj_module(blocks[index])
             if kind not in {"boundary", "c_proj", "c_proj_input"}:
                 raise ValueError(f"Unknown capture kind {kind}")
             def hook(_m, inputs, value, *, name=key, capture_kind=kind):
@@ -188,9 +273,8 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
                 output[name].append(tokens.float().cpu().clone())
             handles.append(module.register_forward_hook(hook))
         for batch in batches:
-            images = batch[0]
-            current_batch[0] = len(images)
-            _encode_image(model, images.to(device))
+            current_batch[0] = layout.batch_size(batch)
+            layout.forward(model, batch, device)
         if any(len(values) != len(batches) for values in output.values()):
             raise RuntimeError("A requested activation hook did not fire exactly once per batch")
     finally:
@@ -226,6 +310,7 @@ def capture_residual_references(
     seed,
     device,
     target_scope="inserted",
+    family_adapter=None,
 ):
     return _capture_residual_references(
         source_base,
@@ -237,6 +322,7 @@ def capture_residual_references(
         seed=seed,
         device=device,
         target_scope=target_scope,
+        family_adapter=family_adapter,
     )
 
 
@@ -251,6 +337,7 @@ def _capture_residual_references(
     seed,
     device,
     target_scope,
+    family_adapter=None,
 ):
     """Capture native source banks and target-position banks.
 
@@ -264,18 +351,19 @@ def _capture_residual_references(
     if target_scope not in {"inserted", "all"}:
         raise ValueError("target_scope must be 'inserted' or 'all'")
     sb, tb, metadata = paired_calibration(source_loader, target_loader, num_batches=num_batches, seed=seed)
-    depth = len(source_base.visual.transformer.resblocks)
+    layout_shim = _layout_for(family_adapter)
+    depth = layout_shim.block_count(source_base)
     req = {str(i): (i, "boundary") for i in range(depth)}
-    base = capture_tokens(source_base, sb, req, device)
-    ft = capture_tokens(source_ft, sb, req, device)
-    target_depth = len(target_base.visual.transformer.resblocks)
+    base = capture_tokens(source_base, sb, req, device, family_adapter=family_adapter)
+    ft = capture_tokens(source_ft, sb, req, device, family_adapter=family_adapter)
+    target_depth = layout_shim.block_count(target_base)
     positions = [2 * i + 1 for i in range(depth)] if target_scope == "inserted" else list(range(target_depth))
     if not positions or max(positions) >= target_depth:
         raise ValueError(
             "Target model depth does not contain the requested target positions: "
             f"scope={target_scope!r}, source_depth={depth}, target_depth={target_depth}."
         )
-    target = capture_tokens(target_base, tb, {str(i): (i, "boundary") for i in positions}, device)
+    target = capture_tokens(target_base, tb, {str(i): (i, "boundary") for i in positions}, device, family_adapter=family_adapter)
 
     # Keep source banks by original index for the all-position path.  The
     # inserted path also materializes the historical dictionaries immediately,
@@ -315,7 +403,7 @@ def _capture_residual_references(
     return result
 
 
-def projection_transforms(prepared, layout, *, target_scope="inserted"):
+def projection_transforms(prepared, layout, *, target_scope="inserted", family_adapter=None):
     if target_scope not in {"inserted", "all"}:
         raise ValueError("target_scope must be 'inserted' or 'all'")
     transforms = prepared.get("transforms_by_key", {})
@@ -333,8 +421,9 @@ def projection_transforms(prepared, layout, *, target_scope="inserted"):
         raise ValueError("Realized extension layout contains duplicate target positions")
     for row in entries:
         pos = int(row["position"])
-        key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
-        transform = transforms.get(key, transforms.get("visual." + key))
+        shim = _layout_for(family_adapter)
+        key = shim.proj_key(pos, prefixed=False)
+        transform = transforms.get(key, transforms.get(shim.proj_key(pos, prefixed=True)))
         if transform is None or transform.t_in is None or transform.t_out is None or transform.kind != "weight":
             kind = row.get("block_kind", "inserted")
             raise ValueError(f"Missing fitted c_proj transport at {kind} block position {pos}")
@@ -348,7 +437,7 @@ def projection_transforms(prepared, layout, *, target_scope="inserted"):
 
 
 @torch.no_grad()
-def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device):
+def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device, family_adapter=None):
     """Fit all blocks at gamma=1, returning a separately scalable correction."""
     if references.get("scope", "inserted") != config.target_scope:
         raise ValueError(
@@ -392,10 +481,14 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             pos = int(row["position"])
             if config.target_scope == "inserted" and pos != 2 * int(row["source_orig_idx"]) + 1:
                 raise ValueError("Realized insertion ancestry does not match captured references")
-            key = f"visual.transformer.resblocks.{pos}.mlp.c_proj.weight"
-            captured = capture_tokens(target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")}, device)
+            shim = _layout_for(family_adapter)
+            key = shim.proj_key(pos, prefixed=True)
+            captured = capture_tokens(
+                target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
+                device, family_adapter=family_adapter,
+            )
             t_in, t_out = transforms[pos]["t_in"], transforms[pos]["t_out"]
-            block = target_model.visual.transformer.resblocks[pos]
+            block = shim.block_module(shim.blocks(target_model)[pos])
             scale_module = getattr(block, "ls_2", nn.Identity())
             effective_out = t_out
             if not isinstance(scale_module, nn.Identity):
