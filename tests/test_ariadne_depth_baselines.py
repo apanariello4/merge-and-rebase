@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.eval.block_extension import (
     BlockExtender,
     BlockExtensionConfig,
+    block_extension_protocol,
     build_extension_layout,
     resolve_block_extension_config,
     run_block_extension,
@@ -183,6 +184,80 @@ def test_block_extension_config_defaults_to_ariadne() -> None:
     _, cfg = resolve_block_extension_config({})
     assert cfg.inserted_block_mode == "ariadne"
     assert cfg.transport_activation_mode == "model"
+
+
+def test_residual_identity_plus_p1_is_an_explicit_exploratory_arm() -> None:
+    _, cfg = resolve_block_extension_config(
+        {
+            "block_extension_enabled": True,
+            "block_extension_params": {
+                "inserted_block_mode": "residual_identity",
+                "skip_correction": True,
+                "lmc_mode": "shared",
+                "target_residual_completion": {
+                    "enabled": True,
+                    "strength": 0.0,
+                },
+            },
+        }
+    )
+
+    semantics = block_extension_protocol(cfg)
+    assert semantics["label"] == "residual_identity_plus_proposal_1"
+    assert semantics["initialization"] == "residual_identity"
+    assert semantics["proposal"] == "target_residual_completion"
+    assert semantics["is_baseline"] is False
+    assert "not a baseline" in semantics["interpretation"]
+
+
+def test_residual_identity_plus_p1_requires_shared_lmc() -> None:
+    with pytest.raises(ValueError, match="lmc_mode='shared'"):
+        resolve_block_extension_config(
+            {
+                "block_extension_enabled": True,
+                "block_extension_params": {
+                    "inserted_block_mode": "residual_identity",
+                    "skip_correction": True,
+                    "lmc_mode": "independent",
+                    "target_residual_completion": {"enabled": True},
+                },
+            }
+        )
+
+
+def test_residual_identity_inert_plus_p1_is_rejected() -> None:
+    with pytest.raises(ValueError, match=r"residual_identity.*P1|identity initialization \+ P1"):
+        resolve_block_extension_config(
+            {
+                "block_extension_enabled": True,
+                "block_extension_params": {
+                    "inserted_block_mode": "residual_identity_inert",
+                    "skip_correction": True,
+                    "lmc_mode": "shared",
+                    "target_residual_completion": {"enabled": True},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("transport_activation_mode", "interpolate_neighbors"), ("insertion_target_mode", "residual")],
+)
+def test_residual_identity_plus_p1_rejects_ambiguous_transport_modes(field: str, value: str) -> None:
+    with pytest.raises(ValueError, match="residual_identity.*Proposal 1"):
+        resolve_block_extension_config(
+            {
+                "block_extension_enabled": True,
+                "block_extension_params": {
+                    "inserted_block_mode": "residual_identity",
+                    "skip_correction": True,
+                    "lmc_mode": "shared",
+                    field: value,
+                    "target_residual_completion": {"enabled": True},
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize("field", ["inserted_block_mode", "transport_activation_mode"])

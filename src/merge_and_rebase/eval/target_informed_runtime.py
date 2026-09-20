@@ -98,8 +98,20 @@ def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_
         raise ValueError("Target-informed BRACE requires bottom-top spread duplicate insertion")
     if block_cfg.blocks_to_add not in (None, source_depth):
         raise ValueError("blocks_to_add must match the depth-doubling protocol")
-    if block_cfg.lmc_mode != "shared" or block_cfg.skip_correction or block_cfg.inserted_block_mode != "ariadne":
-        raise ValueError("Target-informed methods extend the ordinary Shared BRACE arm")
+    identity_p1 = (
+        residual.enabled
+        and block_cfg.skip_correction
+        and block_cfg.inserted_block_mode == "residual_identity"
+    )
+    if block_cfg.lmc_mode != "shared":
+        raise ValueError("Target-informed methods require lmc_mode='shared'")
+    if not identity_p1 and (block_cfg.skip_correction or block_cfg.inserted_block_mode != "ariadne"):
+        raise ValueError(
+            "Target-informed methods extend the ordinary Shared BRACE arm, except for the explicit "
+            "residual_identity + Proposal-1 ablation"
+        )
+    if identity_p1 and shared.enabled:
+        raise ValueError("residual_identity + Proposal 1 cannot also enable target_shared_correction")
     if block_cfg.calibration_split != "val" or block_cfg.calibration_dataset is not None or block_cfg.calibration_task:
         raise ValueError("Target-informed references require task-local validation calibration")
     if block_cfg.transport_activation_mode != "model" or block_cfg.share_ft_refs:

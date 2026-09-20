@@ -193,6 +193,49 @@ class BlockExtensionConfig:
     show_progress: bool = True
 
 
+def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
+    """Describe the structural/P1 semantics of a resolved BRACE config.
+
+    ``residual_identity`` is a structural initialization, not a baseline once
+    target residual completion is enabled: Proposal 1 can populate the
+    inserted positions' task-vector projections after transport.  Keep this
+    distinction explicit in run summaries and diagnostics so the exploratory
+    arm cannot be mistaken for the untouched identity control.
+    """
+    proposal_1 = bool(config.target_residual_completion.enabled)
+    if proposal_1 and config.inserted_block_mode == "residual_identity":
+        return {
+            "label": "residual_identity_plus_proposal_1",
+            "initialization": "residual_identity",
+            "proposal": "target_residual_completion",
+            "is_baseline": False,
+            "interpretation": "identity initialization + P1; exploratory ablation, not a baseline",
+        }
+    if config.inserted_block_mode == "residual_identity":
+        return {
+            "label": "residual_identity_baseline",
+            "initialization": "residual_identity",
+            "proposal": None,
+            "is_baseline": True,
+            "interpretation": "zero-output residual-identity initialization without P1",
+        }
+    if proposal_1:
+        return {
+            "label": "ariadne_plus_proposal_1",
+            "initialization": "ariadne",
+            "proposal": "target_residual_completion",
+            "is_baseline": False,
+            "interpretation": "ARIADNE initialization + P1",
+        }
+    return {
+        "label": "ariadne",
+        "initialization": "ariadne",
+        "proposal": None,
+        "is_baseline": False,
+        "interpretation": "canonical ARIADNE correction",
+    }
+
+
 # Keys the campaign generators write into ``block_extension_params`` purely to
 # record provenance in the run summary. They are not knobs and are not read
 # here, so they must not trigger the unknown-key warning below.
@@ -335,20 +378,35 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
 
     target_residual_completion = parse_residual_completion_config(params.get("target_residual_completion", None))
     if target_residual_completion.enabled:
-        # Mirrors target_shared_correction's gating: the option fits a real
-        # inserted block's correction and then completes it further, so it
-        # presupposes the same ordinary Shared-BRACE arm.
-        if skip_correction:
+        # The ordinary arm completes a corrected ARIADNE insertion.  The one
+        # exploratory exception is explicit residual_identity + P1: the
+        # inserted block starts as an exact identity, and P1 is then allowed to
+        # populate its transported c_proj task-vector components.  The inert
+        # identity mode remains rejected because it intentionally removes the
+        # inserted task vector everywhere, making P1's interpretation
+        # ambiguous rather than a test of activation of empty depth.
+        identity_p1 = skip_correction and inserted_block_mode == "residual_identity"
+        if skip_correction and not identity_p1:
             raise ValueError(
-                "block_extension_params.target_residual_completion requires skip_correction=false: "
-                "there is no fitted inserted-block correction to complete."
+                "block_extension_params.target_residual_completion with skip_correction=true "
+                "requires inserted_block_mode='residual_identity': this is the explicit "
+                "identity initialization + P1 ablation."
             )
         if str(params.get("lmc_mode", "independent")) != "shared":
             raise ValueError("block_extension_params.target_residual_completion requires lmc_mode='shared'.")
-        if inserted_block_mode != "ariadne":
+        if not skip_correction and inserted_block_mode != "ariadne":
             raise ValueError(
                 "block_extension_params.target_residual_completion fits a real inserted block and "
                 f"is undefined for inserted_block_mode='{inserted_block_mode}'."
+            )
+        if identity_p1 and transport_activation_mode != "model":
+            raise ValueError(
+                "residual_identity + Proposal 1 requires transport_activation_mode='model': "
+                "interpolated-neighbor activations would confound the identity initialization ablation."
+            )
+        if identity_p1 and str(params.get("insertion_target_mode", "direct")) != "direct":
+            raise ValueError(
+                "residual_identity + Proposal 1 requires insertion_target_mode='direct'."
             )
 
     return enabled, BlockExtensionConfig(

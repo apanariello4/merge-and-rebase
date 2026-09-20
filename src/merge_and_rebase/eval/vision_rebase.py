@@ -62,6 +62,7 @@ from ..rebase.runtime import (
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .block_extension import (
+    block_extension_protocol,
     calibration_dataset_spec,
     resolve_block_extension_config,
     run_block_extension,
@@ -3265,6 +3266,7 @@ def main() -> None:
             "strict_diagnostics": {"missing": 0, "failures": 0, "wrong_shape": 0},
             "single_transport_calibration": single_transport_calibration_metadata,
             "brace_calibration": brace_calibration_metadata,
+            "block_extension_protocol": block_extension_protocol(block_extension_cfg),
             "base_construction": base_construction,
             "independent_endpoint_baseline": (
                 {

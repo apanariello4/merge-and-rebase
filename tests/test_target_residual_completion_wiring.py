@@ -28,6 +28,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from merge_and_rebase.eval.block_extension import resolve_block_extension_config, run_block_extension
 from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
 from merge_and_rebase.eval.vision_rebase import (
     _maybe_capture_target_residual_references,
@@ -39,6 +40,7 @@ from merge_and_rebase.eval.vision_rebase import (
 class Block(nn.Module):
     def __init__(self, width):
         super().__init__()
+        self.attn = _Attention(width)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(width, width * 2)), ("gelu", nn.GELU()),
             ("c_proj", nn.Linear(width * 2, width)),
@@ -46,7 +48,18 @@ class Block(nn.Module):
         self.ls_2 = nn.Identity()
 
     def forward(self, x):
-        return x + self.ls_2(self.mlp(x))
+        return x + self.attn(x) + self.ls_2(self.mlp(x))
+
+
+class _Attention(nn.Module):
+    """Minimal residual-writing attention stand-in for identity insertion."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.out_proj = nn.Linear(width, width)
+
+    def forward(self, x):
+        return self.out_proj(x)
 
 
 class Visual(nn.Module):
@@ -174,6 +187,82 @@ def test_disabled_is_a_pure_noop_and_never_calls_into_the_math():
     assert completed is baseline_delta
     assert diagnostics is None
     assert _state_dict_sha256(completed) == _state_dict_sha256(baseline_delta)
+
+
+def test_identity_initialization_p1_wires_capture_layout_transport_and_completion():
+    """The exploratory arm captures before identity extension and completes after transport.
+
+    This is intentionally a small mocked transport: the fitted projection maps
+    stand in for Theseus/BiCo, while the real reference capture, BRACE layout,
+    projection lookup, and completion code all run in their production order.
+    """
+    source, source_ft, target, data, _layout, _prepared, target_base_sd, baseline_delta = _fixture()
+    _, config = resolve_block_extension_config(
+        {
+            "block_extension_enabled": True,
+            "block_extension_params": {
+                "target_layers_total": 4,
+                "n_batches_act": 2,
+                "skip_correction": True,
+                "lmc_mode": "shared",
+                "inserted_block_mode": "residual_identity",
+                "target_residual_completion": {
+                    "enabled": True,
+                    "num_batches": 3,
+                    "ridge_relative": 0.05,
+                    "strength": 1.0,
+                },
+            },
+        }
+    )
+    references = _maybe_capture_target_residual_references(
+        config=config.target_residual_completion,
+        source_base_model=source,
+        source_ft_model=source_ft,
+        target_model=target,
+        source_loader=data,
+        target_loader=data,
+        seed=0,
+        device="cpu",
+    )
+    assert references is not None
+
+    layout = {}
+    run_block_extension(
+        source_base_model=source,
+        source_ft_model=source_ft,
+        calibration_loader=data,
+        target_layers_total=4,
+        config=config,
+        device="cpu",
+        layout_out=layout,
+    )
+    assert len(source.visual.transformer.resblocks) == 4
+    assert [row["position"] for row in layout["inserted_blocks"]] == [1, 3]
+
+    transforms = {}
+    for position in (1, 3):
+        transforms[f"transformer.resblocks.{position}.mlp.c_proj.weight"] = SimpleNamespace(
+            kind="weight",
+            t_in=torch.linalg.qr(torch.randn(10, 6)).Q.T,
+            t_out=torch.linalg.qr(torch.randn(5, 3)).Q.T,
+        )
+    prepared = {"transforms_by_key": transforms}
+    completed, diagnostics = _maybe_complete_target_residual_task_vector(
+        config=config.target_residual_completion,
+        references=references,
+        prepared=prepared,
+        layout=layout,
+        target_model=target,
+        target_base_sd=target_base_sd,
+        transported_delta=baseline_delta,
+        target_loader=data,
+        device="cpu",
+    )
+    assert diagnostics is not None and [row["position"] for row in diagnostics] == [1, 3]
+    changed = {key for key in baseline_delta if not torch.equal(completed[key], baseline_delta[key])}
+    assert changed
+    assert all("c_proj" in key for key in changed)
 
 
 def test_enabled_with_zero_strength_is_a_true_null_ablation():
