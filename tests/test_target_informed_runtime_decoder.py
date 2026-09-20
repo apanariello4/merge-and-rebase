@@ -178,3 +178,61 @@ def test_capture_residual_references_runs_on_a_decoder_with_all_scope() -> None:
         target_scope="all", family_adapter=_Adapter(),
     )
     assert refs, "no reference banks captured on the decoder path"
+
+
+def test_materialize_zero_bias_adds_a_writable_bias_to_a_bias_free_projection() -> None:
+    """Option 1: give a bias-free down_proj somewhere to put the intercept.
+
+    Qwen2.5 builds mlp.down_proj with bias=False, so the exact affine form has
+    no parameter to write its intercept to. Materializing a zero bias is exact
+    -- it changes nothing until the intercept is applied -- at the cost of a
+    checkpoint carrying a parameter the stock architecture lacks.
+    """
+    from merge_and_rebase.eval.target_informed_runtime import _materialize_zero_bias
+
+    model = _Decoder()
+    key = "model.layers.1.mlp.down_proj.bias"
+    assert model.model.layers[1].mlp.down_proj.bias is None, "fixture should start bias-free"
+
+    state: dict[str, torch.Tensor] = {}
+    _materialize_zero_bias(model, key, state, out_features=8)
+
+    bias = model.model.layers[1].mlp.down_proj.bias
+    assert bias is not None and bias.shape == (8,)
+    assert torch.allclose(bias, torch.zeros(8)), "materialized bias must start at zero"
+    assert key in state and torch.allclose(state[key], torch.zeros(8))
+    # zero bias must leave the function unchanged
+    ids = torch.randint(0, 32, (2, 5))
+    with torch.no_grad():
+        before = _Decoder()
+        before.load_state_dict({k: v for k, v in model.state_dict().items() if "bias" not in k}, strict=False)
+    assert model(ids).shape == (2, 5, 8)
+
+
+def test_skip_is_refused_when_the_intercept_is_nonzero() -> None:
+    """Option 2 is only sound where it drops nothing.
+
+    exact_form=False makes the intercept exactly zero, so skipping it is a true
+    no-op. The parser refuses skip+exact_form=True precisely so a centered-fit
+    weight is never applied without the centering it assumes.
+    """
+    from merge_and_rebase.eval.target_residual_completion import parse_residual_completion_config
+
+    ok = parse_residual_completion_config(
+        {"enabled": True, "missing_bias": "skip", "exact_form": False}
+    )
+    assert ok.missing_bias == "skip" and ok.exact_form is False
+
+    try:
+        parse_residual_completion_config({"enabled": True, "missing_bias": "skip", "exact_form": True})
+    except ValueError as exc:
+        assert "exact_form=false" in str(exc)
+        return
+    raise AssertionError("skip with the exact form must be refused, not silently accepted")
+
+
+def test_default_still_refuses_a_missing_bias() -> None:
+    """The default stays strict so vision cannot silently change behaviour."""
+    from merge_and_rebase.eval.target_residual_completion import parse_residual_completion_config
+
+    assert parse_residual_completion_config({"enabled": True}).missing_bias == "error"

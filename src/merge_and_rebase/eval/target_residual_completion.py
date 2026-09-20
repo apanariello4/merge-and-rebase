@@ -71,6 +71,19 @@ class ResidualCompletionConfig:
     # proposal-1 result has ever been produced under either setting, so there
     # is no historical default to preserve, and the exact form is the default.
     exact_form: bool = True
+    # What to do when the residual-writing projection has no bias parameter to
+    # receive the affine intercept. CLIP's mlp.c_proj always has one; HF decoder
+    # MLPs are bias-free (Qwen2.5 sets mlp_bias=False), so the exact form has
+    # nowhere to put it.
+    #   "error"       -- refuse (the default, and vision's only reachable path)
+    #   "materialize" -- add a zero bias to the target projection and write the
+    #                    intercept there; exact, at the cost of a checkpoint
+    #                    carrying a parameter stock Qwen does not have
+    #   "skip"        -- drop the intercept, allowed ONLY when it is exactly
+    #                    zero (exact_form=False). Dropping a fitted, nonzero
+    #                    intercept is refused: W is fitted on centered banks, so
+    #                    applying it without the intercept is not the same map.
+    missing_bias: str = "error"
 
 
 def parse_residual_completion_config(value: Mapping[str, Any] | None) -> ResidualCompletionConfig:
@@ -81,7 +94,7 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
         "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
-        "exact_form",
+        "exact_form", "missing_bias",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -111,6 +124,17 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise ValueError("strength must be >= 0")
     if not isinstance(cfg.exact_form, bool):
         raise TypeError("exact_form must be bool")
+    if cfg.missing_bias not in {"error", "materialize", "skip"}:
+        raise ValueError("missing_bias must be 'error', 'materialize' or 'skip'")
+    if cfg.missing_bias == "skip" and cfg.exact_form:
+        # The exact form fits a centered map and recovers a nonzero intercept;
+        # applying its weight without that intercept is a different map, not an
+        # approximation of it. Refused up front rather than at the write.
+        raise ValueError(
+            "missing_bias='skip' requires exact_form=false: the exact form fits a "
+            "nonzero intercept, and dropping it would apply a centered-fit weight "
+            "without the centering it assumes"
+        )
     return cfg
 
 

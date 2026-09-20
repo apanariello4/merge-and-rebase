@@ -444,6 +444,26 @@ def projection_transforms(prepared, layout, *, target_scope="inserted", family_a
     return output
 
 
+
+def _materialize_zero_bias(model, bias_key, current_state, out_features):
+    """Give a bias-free projection a zero bias so an intercept can be written.
+
+    The exact affine form needs somewhere to put its intercept, and a decoder's
+    mlp.down_proj has no bias parameter. This adds one, zero-initialised, so the
+    write below is a no-op change until the intercept is applied. The resulting
+    checkpoint carries a parameter stock Qwen does not have -- that is a real
+    consequence of choosing the exact form on this architecture, not a detail.
+    """
+    module_path = bias_key[: -len(".bias")]
+    module = model
+    for part in module_path.split("."):
+        module = module[int(part)] if part.isdigit() else getattr(module, part)
+    if getattr(module, "bias", None) is None:
+        weight = module.weight
+        module.bias = nn.Parameter(torch.zeros(out_features, dtype=weight.dtype, device=weight.device))
+    current_state[bias_key] = torch.zeros(out_features, dtype=module.weight.dtype).cpu()
+
+
 @torch.no_grad()
 def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device, family_adapter=None):
     """Fit all blocks at gamma=1, returning a separately scalable correction."""
@@ -526,9 +546,34 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             # reduced path stays numerically byte-identical to before this
             # change apart from the (always-present) zero bias key.
             bias_key = f"{key[: -len('.weight')]}.bias"
-            if bias_key not in current_state:
-                raise RuntimeError(f"Target model is missing the expected bias parameter {bias_key}")
             bias_correction = diag["bias_correction"]
+            if bias_key not in current_state:
+                # CLIP's mlp.c_proj always has a bias; HF decoder MLPs do not
+                # (Qwen2.5 sets mlp_bias=False), so on a decoder the exact form
+                # has nowhere to put its intercept. Measured on this pair the
+                # activation banks are strongly off-centre (||mean||/std about
+                # 1.2-1.9, largest at the deepest layer), so the intercept is
+                # carrying real signal and cannot simply be discarded.
+                if config.missing_bias == "materialize":
+                    _materialize_zero_bias(target_model, bias_key, current_state, t_out.shape[1])
+                elif config.missing_bias == "skip":
+                    # Only reachable with exact_form=False, where the intercept
+                    # is exactly zero (the parser refuses the other combination),
+                    # so nothing is being dropped.
+                    if torch.count_nonzero(bias_correction):
+                        raise RuntimeError(
+                            "missing_bias='skip' would discard a nonzero intercept at "
+                            f"{bias_key}; the weight was fitted on centered banks and is "
+                            "not valid without it"
+                        )
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"Target model is missing the expected bias parameter {bias_key}. "
+                        "Decoder MLP projections are bias-free; set "
+                        "target_residual_completion.missing_bias to 'materialize' "
+                        "(exact, adds the parameter) or 'skip' with exact_form=false."
+                    )
             transported_bias = t_out.T @ bias_correction.to(t_out)
             if transported_bias.shape != current_state[bias_key].shape or not torch.isfinite(transported_bias).all():
                 raise RuntimeError("Residual completion produced an invalid transported bias")
