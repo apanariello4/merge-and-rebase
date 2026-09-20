@@ -18,6 +18,7 @@ except Exception:
 from .block_extension import (
     BlockExtensionConfig,
     _deterministic_calibration_loader,
+    build_extension_layout,
     spread_anchor_schedule,
 )
 
@@ -80,6 +81,9 @@ class DecoderBlockExtender:
         self.verbose = bool(verbose)
         self.show_progress = bool(show_progress)
         self._component_ridge: dict[str, float] | None = None
+        # Realized block chain, set by the extend path; None when no extension
+        # ran (shrink, or depth already matching).
+        self.realized_layout: dict[str, Any] | None = None
 
     def _vprint(self, message: str) -> None:
         if self.verbose:
@@ -766,8 +770,12 @@ class DecoderBlockExtender:
             dup_base = deepcopy(orig_base[src_idx])
             dup_ft = deepcopy(orig_ft[src_idx])
 
+            # The neighbour an inserted block is initialized from is part of the
+            # realized layout: proposal-1 style completion addresses the pair of
+            # activation banks that bracket an inserted position, so it has to be
+            # recorded here rather than re-derived from a depth pattern later.
+            src_next = min(src_idx + 1, len(orig_base) - 1)
             if per_weight_mode == "cascade":
-                src_next = min(src_idx + 1, len(orig_base) - 1)
                 self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
                 self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
 
@@ -781,8 +789,9 @@ class DecoderBlockExtender:
                     insert_pos = i
             insert_pos += 1
 
-            chain_base.insert(insert_pos, {"mod": dup_base, "orig_idx": src_idx})
-            chain_ft.insert(insert_pos, {"mod": dup_ft, "orig_idx": src_idx})
+            inserted_meta = {"orig_idx": src_idx, "inserted": True, "neighbour_orig_idx": src_next}
+            chain_base.insert(insert_pos, {"mod": dup_base, **inserted_meta})
+            chain_ft.insert(insert_pos, {"mod": dup_ft, **inserted_meta})
 
             self._set_layers(self.model_base, [x["mod"] for x in chain_base])
             self._set_layers(self.model_ft, [x["mod"] for x in chain_ft])
@@ -838,6 +847,13 @@ class DecoderBlockExtender:
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
+        # Describe the realized chain with the same builder vision uses, so a
+        # consumer (e.g. residual completion) addresses inserted positions by
+        # recorded ancestry rather than assuming a doubling depth pattern --
+        # this extension is 24->28, not a doubling.
+        self.realized_layout = build_extension_layout(
+            [{k: v for k, v in item.items() if k != "mod"} for item in chain_base]
+        )
         self._vprint(f"per-weight extension completed. final_depth={final_depth}")
         return final_depth
 
@@ -1252,7 +1268,15 @@ def run_block_extension_llm(
     config: BlockExtensionConfig,
     family_adapter: Any,
     device: str | torch.device,
+    layout_out: dict[str, Any] | None = None,
 ) -> int:
+    """Resize the pair in place and return the realized depth.
+
+    ``layout_out``, when given, is updated with the realized block chain
+    (positions, which blocks were inserted, and the neighbour each was
+    initialized from). It is an out-parameter rather than a changed return
+    type so existing callers stay byte-identical.
+    """
     extender = DecoderBlockExtender(
         source_base_model,
         source_ft_model,
@@ -1262,7 +1286,7 @@ def run_block_extension_llm(
         show_progress=bool(config.show_progress),
     )
     resolved_target_layers_total = target_layers_total if target_layers_total is not None else config.target_layers_total
-    return extender.extend_and_calibrate(
+    final_depth = extender.extend_and_calibrate(
         loader=calibration_loader,
         n_batches=config.n_batches_act,
         strategy=config.extension_strategy,
@@ -1279,3 +1303,6 @@ def run_block_extension_llm(
         component_ridge=config.component_ridge,
         lmc_mode=str(config.lmc_mode),
     )
+    if layout_out is not None and extender.realized_layout is not None:
+        layout_out.update(extender.realized_layout)
+    return final_depth
