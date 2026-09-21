@@ -257,3 +257,37 @@ def test_default_still_refuses_a_missing_bias() -> None:
     from merge_and_rebase.eval.target_residual_completion import parse_residual_completion_config
 
     assert parse_residual_completion_config({"enabled": True}).missing_bias == "error"
+
+
+def test_scale_completion_needs_a_baseline_entry_for_a_materialized_bias() -> None:
+    """The failure that only appears at strength>0.
+
+    A materialized bias is a target parameter the task vector has no entry for:
+    transport produces the body weights only. scale_completion requires every
+    completion key to have a baseline to add to, and returns early at
+    strength=0 -- which is exactly why the strength=0 cells passed and the
+    strength=1 cells died on the same code.
+    """
+    from merge_and_rebase.eval.target_informed_runtime import scale_completion
+
+    baseline = {"model.layers.0.mlp.down_proj.weight": torch.zeros(4, 8)}
+    completion = {
+        "model.layers.0.mlp.down_proj.weight": torch.ones(4, 8),
+        "model.layers.0.mlp.down_proj.bias": torch.ones(4),
+    }
+
+    # strength=0 short-circuits and never validates the keys
+    assert scale_completion(baseline, completion, 0) == baseline
+
+    try:
+        scale_completion(baseline, completion, 1.0)
+    except ValueError as exc:
+        assert "down_proj.bias" in str(exc)
+    else:
+        raise AssertionError("a completion key with no baseline must be rejected")
+
+    # seeding the zero baseline is what makes the intercept landable
+    seeded = dict(baseline)
+    seeded["model.layers.0.mlp.down_proj.bias"] = torch.zeros(4)
+    out = scale_completion(seeded, completion, 1.0)
+    assert torch.allclose(out["model.layers.0.mlp.down_proj.bias"], torch.ones(4))

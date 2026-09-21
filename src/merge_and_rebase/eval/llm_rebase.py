@@ -269,6 +269,7 @@ def _maybe_complete_target_residual_task_vector(
     target_loader: Any,
     family_adapter: Any,
     device: str,
+    materialized_bias_keys: set[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
     """Complete the transported task vector, or return it untouched.
 
@@ -278,6 +279,17 @@ def _maybe_complete_target_residual_task_vector(
     """
     if not config.enabled or references is None or not layout:
         return transported_delta, None
+    # A materialized bias is a target parameter that did not exist before this
+    # run and is zero in the base, so the task vector has no entry for it --
+    # transport only produced the body weights. scale_completion requires every
+    # completion key to have a baseline to add to, so seed those zeros here.
+    # Without this the intercept has nowhere to land and the run dies at
+    # strength>0 (strength=0 returns early and never notices).
+    transported_delta = dict(transported_delta)
+    for bias_key in materialized_bias_keys or ():
+        if bias_key not in transported_delta and bias_key in target_base_sd:
+            transported_delta[bias_key] = torch.zeros_like(target_base_sd[bias_key])
+
     transforms = projection_transforms(
         prepared, layout, target_scope=config.target_scope, family_adapter=family_adapter
     )
@@ -1225,6 +1237,7 @@ def main() -> None:
                     target_loader=target_calib,
                     family_adapter=family_adapter,
                     device=device,
+                    materialized_bias_keys=materialized_bias_keys,
                 )
                 if completion_diagnostics is not None:
                     residual_completion_diagnostics[str(label)] = completion_diagnostics
