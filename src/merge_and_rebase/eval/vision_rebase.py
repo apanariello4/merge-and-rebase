@@ -1268,7 +1268,10 @@ def _maybe_complete_target_residual_task_vector(
     target_loader: Any,
     device: str,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
-    """Complete the transported task vector's inserted c_proj keys, or no-op.
+    """Complete the transported task vector's residual-writing keys, or no-op.
+
+    Which projections those are is ``config.components``: ``mlp.c_proj`` alone
+    by default, optionally ``attn.out_proj`` as well in ``direct_target`` mode.
 
     Runs after transport is fitted, using the already-fitted ``prepared``
     transforms; it only ever adds to the *task vector*, never the target base

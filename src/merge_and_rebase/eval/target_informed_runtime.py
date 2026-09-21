@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, SequentialSampler, Subset
 
@@ -38,6 +39,7 @@ from .target_residual_completion import (
     ResidualSufficientStatistics,
     centered_rectangular_procrustes,
     fit_joint_cproj_correction,
+    order_components,
 )
 
 
@@ -217,6 +219,14 @@ class _VisionLayout:
         inner = block.block if hasattr(block, "block") else block
         return inner.mlp.c_proj
 
+    def attn_module(self, block):
+        inner = block.block if hasattr(block, "block") else block
+        return inner.attn
+
+    def attn_proj_module(self, block):
+        inner = block.block if hasattr(block, "block") else block
+        return inner.attn.out_proj
+
     def block_module(self, block):
         return block.block if hasattr(block, "block") else block
 
@@ -229,6 +239,28 @@ class _VisionLayout:
     def proj_key(self, pos, *, prefixed):
         key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
         return f"visual.{key}" if prefixed else key
+
+    def attn_proj_key(self, pos, *, prefixed):
+        key = f"transformer.resblocks.{pos}.attn.out_proj.weight"
+        return f"visual.{key}" if prefixed else key
+
+    def component_key(self, pos, component, *, prefixed):
+        if component == "mlp.c_proj":
+            return self.proj_key(pos, prefixed=prefixed)
+        if component == "attn.out_proj":
+            return self.attn_proj_key(pos, prefixed=prefixed)
+        raise ValueError(f"Unsupported completion component {component!r}")
+
+    def component_scale_module(self, block, component):
+        """The LayerScale on this component's write into the residual stream.
+
+        ``ls_1`` scales the attention path and ``ls_2`` the MLP path; either may
+        be ``nn.Identity``. Both must enter the fit's output map, not be applied
+        afterwards.
+        """
+        inner = self.block_module(block)
+        name = "ls_2" if component == "mlp.c_proj" else "ls_1"
+        return getattr(inner, name, nn.Identity())
 
 
 class _DecoderLayout:
@@ -249,6 +281,17 @@ class _DecoderLayout:
     def proj_module(self, block):
         return block.mlp.down_proj
 
+    def attn_module(self, block):
+        return block.self_attn
+
+    def attn_proj_module(self, block):
+        """``self_attn.o_proj`` is the decoder analogue of CLIP's attn.out_proj.
+
+        Implemented for symmetry with the vision path and **untested on this
+        iteration**: no decoder campaign has run the two-component completion.
+        """
+        return block.self_attn.o_proj
+
     def block_module(self, block):
         return block
 
@@ -265,9 +308,101 @@ class _DecoderLayout:
         # second prefix the way vision has "visual.".
         return f"model.layers.{pos}.mlp.down_proj.weight"
 
+    def attn_proj_key(self, pos, *, prefixed):
+        return f"model.layers.{pos}.self_attn.o_proj.weight"
+
+    def component_key(self, pos, component, *, prefixed):
+        if component == "mlp.c_proj":
+            return self.proj_key(pos, prefixed=prefixed)
+        if component == "attn.out_proj":
+            return self.attn_proj_key(pos, prefixed=prefixed)
+        raise ValueError(f"Unsupported completion component {component!r}")
+
+    def component_scale_module(self, block, component):
+        """Decoder blocks carry no LayerScale; the write is unscaled."""
+        return nn.Identity()
+
 
 def _layout_for(family_adapter):
     return _VisionLayout() if family_adapter is None else _DecoderLayout(family_adapter)
+
+
+#: Capture kinds understood by ``capture_tokens``. The ``*_input`` kinds take the
+#: hooked module's input, the others its output.
+_CAPTURE_KINDS = frozenset({"boundary", "c_proj", "c_proj_input", "attn_proj", "attn_proj_input"})
+_INPUT_CAPTURE_KINDS = frozenset({"c_proj_input", "attn_proj_input"})
+_ATTN_CAPTURE_KINDS = frozenset({"attn_proj", "attn_proj_input"})
+
+#: Which capture kind supplies each component's regression features.
+COMPONENT_INPUT_KIND = {"attn.out_proj": "attn_proj_input", "mlp.c_proj": "c_proj_input"}
+
+
+def _mha_query_key_value(args, kwargs):
+    values = list(args[:3])
+    for position, name in enumerate(("query", "key", "value")):
+        if position >= len(values):
+            values.append(kwargs.get(name))
+    query, key, value = values[0], values[1], values[2]
+    if query is None:
+        raise ValueError("Could not recover the attention query from the captured call")
+    return query, key if key is not None else query, value if value is not None else query
+
+
+def _stock_mha_out_proj_input(module, args, kwargs):
+    """Rows that ``out_proj`` consumes inside a stock ``nn.MultiheadAttention``.
+
+    torch applies the output projection *functionally* inside
+    ``F.multi_head_attention_forward``, straight from ``out_proj.weight``, so the
+    ``out_proj`` submodule is never called and a forward hook on it never fires.
+    Rerunning the same attention with an identity output projection recovers
+    exactly the rows it would have consumed; the caller verifies that by pushing
+    them back through the real projection and comparing against the module's own
+    output, so this can never silently capture the wrong tensor.
+    """
+    query, key, value = _mha_query_key_value(args, kwargs)
+    batch_first = bool(getattr(module, "batch_first", False))
+    if batch_first:
+        query, key, value = (tensor.transpose(1, 0) for tensor in (query, key, value))
+    identity = torch.eye(module.embed_dim, dtype=query.dtype, device=query.device)
+    shared = {
+        "training": module.training,
+        "key_padding_mask": kwargs.get("key_padding_mask"),
+        "need_weights": False,
+        "attn_mask": kwargs.get("attn_mask"),
+    }
+    if module._qkv_same_embed_dim:
+        rows, _ = F.multi_head_attention_forward(
+            query, key, value, module.embed_dim, module.num_heads,
+            module.in_proj_weight, module.in_proj_bias,
+            module.bias_k, module.bias_v, module.add_zero_attn, module.dropout,
+            identity, None, **shared,
+        )
+    else:
+        rows, _ = F.multi_head_attention_forward(
+            query, key, value, module.embed_dim, module.num_heads,
+            None, module.in_proj_bias,
+            module.bias_k, module.bias_v, module.add_zero_attn, module.dropout,
+            identity, None,
+            use_separate_proj_weight=True,
+            q_proj_weight=module.q_proj_weight, k_proj_weight=module.k_proj_weight,
+            v_proj_weight=module.v_proj_weight, **shared,
+        )
+    return rows.transpose(1, 0) if batch_first else rows
+
+
+def _verify_recomputed_attention_input(module, rows, module_output):
+    """Push the recomputed rows back through the real projection and compare.
+
+    Cheap (one matmul against a full attention) and it turns any future change in
+    torch's attention internals into a loud failure instead of a wrong fit.
+    """
+    reference = module_output[0] if isinstance(module_output, tuple) else module_output
+    replayed = F.linear(rows, module.out_proj.weight, module.out_proj.bias)
+    if replayed.shape != reference.shape or not torch.allclose(replayed, reference, atol=1e-4, rtol=1e-4):
+        raise RuntimeError(
+            "Recovered attention rows do not reproduce the attention output through "
+            "out_proj; the captured features are not the ones the projection consumes"
+        )
 
 
 @torch.no_grad()
@@ -288,18 +423,44 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
     handles = []
     try:
         model.to(device).eval()
+
+        def store(name, tensor):
+            if isinstance(tensor, tuple):
+                tensor = tensor[0]
+            tokens = _to_tokens(tensor.detach(), batch_size=current_batch[0])
+            output[name].append(tokens.float().cpu().clone())
+
         for key, (index, kind) in requests.items():
-            block = layout.block_module(blocks[index])
-            module = block if kind == "boundary" else layout.proj_module(blocks[index])
-            if kind not in {"boundary", "c_proj", "c_proj_input"}:
+            if kind not in _CAPTURE_KINDS:
                 raise ValueError(f"Unknown capture kind {kind}")
-            def hook(_m, inputs, value, *, name=key, capture_kind=kind):
-                tensor = inputs[0] if capture_kind == "c_proj_input" else value
-                if isinstance(tensor, tuple):
-                    tensor = tensor[0]
-                tokens = _to_tokens(tensor.detach(), batch_size=current_batch[0])
-                output[name].append(tokens.float().cpu().clone())
-            handles.append(module.register_forward_hook(hook))
+            block = layout.block_module(blocks[index])
+            recompute = False
+            if kind == "boundary":
+                module = block
+            elif kind in _ATTN_CAPTURE_KINDS:
+                attention = layout.attn_module(blocks[index])
+                # A stock nn.MultiheadAttention applies out_proj functionally, so
+                # a hook on that submodule would never fire and the "fired once
+                # per batch" check below would reject the whole capture. Hook the
+                # attention itself and recover the projection's rows exactly.
+                recompute = isinstance(attention, nn.MultiheadAttention)
+                module = attention if recompute else layout.attn_proj_module(blocks[index])
+            else:
+                module = layout.proj_module(blocks[index])
+
+            if recompute:
+                def hook(mod, args, kwargs, value, *, name=key, capture_kind=kind):
+                    if capture_kind == "attn_proj_input":
+                        rows = _stock_mha_out_proj_input(mod, args, kwargs)
+                        _verify_recomputed_attention_input(mod, rows, value)
+                        store(name, rows)
+                    else:
+                        store(name, value)
+                handles.append(module.register_forward_hook(hook, with_kwargs=True))
+            else:
+                def hook(_m, inputs, value, *, name=key, capture_kind=kind):
+                    store(name, inputs[0] if capture_kind in _INPUT_CAPTURE_KINDS else value)
+                handles.append(module.register_forward_hook(hook))
         for batch in batches:
             current_batch[0] = layout.batch_size(batch)
             layout.forward(model, batch, device)
@@ -570,7 +731,12 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
         entries = sorted(layout.get("final_blocks", ()), key=lambda row: row["position"])
         if not entries:
             raise ValueError("All target scope requires non-empty realized layout final_blocks")
-        desired, target_outputs, maps = _materialize_all_scope_references(references, entries)
+        # The transport arm is deliberately left on the historical trajectory:
+        # its solve is defined against fitted (t_in, t_out) maps, and the config
+        # parser already refuses "interpolate" outside direct_target mode.
+        desired, target_outputs, maps, _coordinates = _materialize_all_scope_references(
+            references, entries, trajectory="step"
+        )
         block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
     expected_positions = {int(row["position"]) for row in entries}
     for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps), ("transforms", transforms)):
@@ -612,13 +778,21 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
                 if scale is None or scale.ndim != 1 or scale.shape[0] != t_out.shape[1]:
                     raise ValueError("Unsupported non-diagonal target LayerScale")
                 effective_out = t_out * scale.detach().cpu().float().unsqueeze(0)
-            stats = ResidualSufficientStatistics()
+            # The Gram accumulation and eigendecomposed solve are the
+            # expensive part (up to d_mlp x d_mlp, e.g. 4096x4096 on a
+            # ViT-L/14 target); run them on the model's device rather than
+            # CPU. Only the small fitted correction/bias tensors -- the same
+            # shape as c_proj.weight/bias -- are moved back to CPU right
+            # after, so every downstream line here is unchanged.
+            stats = ResidualSufficientStatistics(device=device)
             for h, out, desired_batch, base_out in zip(
                 captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
             ):
                 error = desired_batch - (out - base_out)
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), t_in, effective_out)
             correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+            correction = correction.cpu()
+            diag["bias_correction"] = diag["bias_correction"].cpu()
             transported = t_out.T @ correction @ t_in
             if transported.shape != current_state[key].shape or not torch.isfinite(transported).all():
                 raise RuntimeError("Residual completion produced an invalid transported projection")
@@ -765,11 +939,14 @@ def complete_residuals_direct(
         desired = references.get("desired", {})
         target_outputs = references.get("target_base_outputs", {})
         maps = references.get("maps", {})
+        coordinates = {int(row["position"]): float(row["source_orig_idx"]) for row in entries}
     else:
         entries = sorted(layout.get("final_blocks", ()), key=lambda row: row["position"])
         if not entries:
             raise ValueError("All target scope requires non-empty realized layout final_blocks")
-        desired, target_outputs, maps = _materialize_all_scope_references(references, entries)
+        desired, target_outputs, maps, coordinates = _materialize_all_scope_references(
+            references, entries, trajectory=config.target_trajectory
+        )
         block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
     expected_positions = {int(row["position"]) for row in entries}
     for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps)):
@@ -791,113 +968,147 @@ def complete_residuals_direct(
         # arm is that nothing but the fitted correction reaches the target.
         current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
         target_model.load_state_dict(current_state, strict=True)
+        components = order_components(config.components)
         for index, row in enumerate(entries):
             pos = int(row["position"])
             if config.target_scope == "inserted" and pos != 2 * int(row["source_orig_idx"]) + 1:
                 raise ValueError("Realized insertion ancestry does not match captured references")
             shim = _layout_for(family_adapter)
-            key = shim.proj_key(pos, prefixed=True)
-            captured = capture_tokens(
-                target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
-                device, family_adapter=family_adapter,
-            )
-            width = int(current_state[key].shape[0])
-            identity_out = torch.eye(width, dtype=torch.float32)
-            block = shim.block_module(shim.blocks(target_model)[pos])
-            scale_module = getattr(block, "ls_2", nn.Identity())
-            effective_out = identity_out
-            if not isinstance(scale_module, nn.Identity):
-                scale = getattr(scale_module, "gamma", None)
-                if scale is None or scale.ndim != 1 or scale.shape[0] != width:
-                    raise ValueError("Unsupported non-diagonal target LayerScale")
-                # diag(gamma): the residual stream receives gamma * c_proj(h),
-                # so the fit must predict through that scaling exactly as the
-                # transport-aware path folds it into t_out.
-                effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
-            stats = ResidualSufficientStatistics()
-            desired_sq = 0.0
-            effect_sq = 0.0
-            for h, out, desired_batch, base_out in zip(
-                captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
-            ):
-                effect = out - base_out
-                error = desired_batch - effect
-                desired_sq += float((desired_batch.double() ** 2).sum().item())
-                effect_sq += float((effect.double() ** 2).sum().item())
-                stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
-            if index == 0:
-                # E_j == D_j at the first fitted block: the temporary model is
-                # still the untouched target base there, so the current effect
-                # is identically zero. A nonzero effect here means a stale
-                # reference bank or a mutated base, not a small numerical drift.
-                if effect_sq > 1e-12 * max(desired_sq, 1.0):
-                    raise RuntimeError(
-                        "Direct completion started from a target model that is not the native "
-                        f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
-                    )
-            correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
-            # t_in = I and the write-side t_out = I: the fitted matrix already
-            # lives in target coordinates, so there is nothing to transport.
-            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
-                raise RuntimeError("Direct residual completion produced an invalid projection")
-            target_corrections[key] = correction
-            current_state[key] = current_state[key] + correction.to(current_state[key])
-            bias_key = f"{key[: -len('.weight')]}.bias"
-            bias_correction = diag["bias_correction"]
-            if bias_key not in current_state:
-                if config.missing_bias == "materialize":
-                    raise RuntimeError(
-                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
-                        "before residual completion runs; call "
-                        "materialize_missing_projection_biases() on the target model and its "
-                        "base state dict first"
-                    )
-                elif config.missing_bias == "skip":
-                    if torch.count_nonzero(bias_correction):
+            # Components are fitted in block-forward order and cascaded, never
+            # solved jointly. out_proj writes before the MLP, so mounting
+            # Delta_O moves the MLP's own input through ln_2 and GELU -- a
+            # nonlinearity no single linear system can absorb. Each component's
+            # capture below therefore *re-measures* the residual the previous
+            # one actually left, exactly as the cross-block cascade does.
+            block_rows: list[dict[str, Any]] = []
+            for component_index, component in enumerate(components):
+                key = shim.component_key(pos, component, prefixed=True)
+                captured = capture_tokens(
+                    target_model, batches,
+                    {"h": (pos, COMPONENT_INPUT_KIND[component]), "out": (pos, "boundary")},
+                    device, family_adapter=family_adapter,
+                )
+                width = int(current_state[key].shape[0])
+                identity_out = torch.eye(width, dtype=torch.float32)
+                scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
+                effective_out = identity_out
+                if not isinstance(scale_module, nn.Identity):
+                    scale = getattr(scale_module, "gamma", None)
+                    if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+                        raise ValueError("Unsupported non-diagonal target LayerScale")
+                    # diag(gamma): the residual stream receives gamma * proj(h),
+                    # so the fit must predict through that scaling exactly as the
+                    # transport-aware path folds it into t_out. ls_1 scales the
+                    # attention write, ls_2 the MLP write.
+                    effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+                # See the identical comment in complete_residuals(): the Gram
+                # accumulation and eigendecomposed solve are the expensive part,
+                # so they run on the model's device; the fitted correction/bias
+                # are moved back to CPU right after solve() below.
+                stats = ResidualSufficientStatistics(device=device)
+                desired_sq = 0.0
+                effect_sq = 0.0
+                for h, out, desired_batch, base_out in zip(
+                    captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
+                ):
+                    effect = out - base_out
+                    error = desired_batch - effect
+                    desired_sq += float((desired_batch.double() ** 2).sum().item())
+                    effect_sq += float((effect.double() ** 2).sum().item())
+                    stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+                if index == 0 and component_index == 0:
+                    # E_j == D_j at the very first fit: the temporary model is
+                    # still the untouched target base there, so the current effect
+                    # is identically zero. A nonzero effect here means a stale
+                    # reference bank or a mutated base, not a small numerical drift.
+                    if effect_sq > 1e-12 * max(desired_sq, 1.0):
                         raise RuntimeError(
-                            "missing_bias='skip' would discard a nonzero intercept at "
-                            f"{bias_key}; the weight was fitted on centered banks and is "
-                            "not valid without it"
+                            "Direct completion started from a target model that is not the native "
+                            f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
                         )
-                    continue
-                else:
-                    raise RuntimeError(
-                        f"Target model is missing the expected bias parameter {bias_key}. "
-                        "Decoder MLP projections are bias-free; set "
-                        "target_residual_completion.missing_bias to 'materialize' "
-                        "(exact, adds the parameter) or 'skip' with exact_form=false."
-                    )
-            bias_delta = bias_correction.to(current_state[bias_key])
-            if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
-                raise RuntimeError("Direct residual completion produced an invalid bias")
-            target_corrections[bias_key] = bias_correction
-            current_state[bias_key] = current_state[bias_key] + bias_delta
-            target_model.load_state_dict(current_state, strict=True)
-            desired_norm = desired_sq ** 0.5
-            diagnostics.append(
-                {
-                    "mode": "direct_target",
-                    "scope": config.target_scope,
-                    "block_kind": block_kind[pos],
-                    "position": pos,
-                    "source_orig_idx": row["source_orig_idx"],
-                    "desired_norm": desired_norm,
-                    "effect_before_norm": effect_sq ** 0.5,
-                    # r_j: the fraction of the desired local effect still
-                    # missing, before and after this block's correction. The
-                    # "after" value is exact rather than re-measured: c_proj is
-                    # the last operation writing into the residual stream in
-                    # this block and its input H_j does not depend on its own
-                    # weight, so mounting the correction changes the block
-                    # output by exactly gamma * (H_j dC^T + beta) -- the same
-                    # quantity the solver already evaluated. Pinned by
-                    # tests/test_direct_target_p1.py.
-                    "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
-                    "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                    "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
-                    **diag,
-                }
-            )
+                correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+                correction = correction.cpu()
+                diag["bias_correction"] = diag["bias_correction"].cpu()
+                if block_rows:
+                    # This capture happened after the previous component was
+                    # mounted, so its residual is that component's *true*
+                    # post-mount residual. For attn.out_proj the solver's own
+                    # residual_norm_after is only a linear prediction; this is
+                    # the measured one, and their ratio is the MLP knock-on.
+                    block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
+                # t_in = I and the write-side t_out = I: the fitted matrix already
+                # lives in target coordinates, so there is nothing to transport.
+                if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+                    raise RuntimeError("Direct residual completion produced an invalid projection")
+                target_corrections[key] = correction
+                current_state[key] = current_state[key] + correction.to(current_state[key])
+                bias_key = f"{key[: -len('.weight')]}.bias"
+                bias_correction = diag["bias_correction"]
+                skip_bias = False
+                if bias_key not in current_state:
+                    if config.missing_bias == "materialize":
+                        raise RuntimeError(
+                            f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                            "before residual completion runs; call "
+                            "materialize_missing_projection_biases() on the target model and its "
+                            "base state dict first"
+                        )
+                    elif config.missing_bias == "skip":
+                        if torch.count_nonzero(bias_correction):
+                            raise RuntimeError(
+                                "missing_bias='skip' would discard a nonzero intercept at "
+                                f"{bias_key}; the weight was fitted on centered banks and is "
+                                "not valid without it"
+                            )
+                        skip_bias = True
+                    else:
+                        raise RuntimeError(
+                            f"Target model is missing the expected bias parameter {bias_key}. "
+                            "Decoder MLP projections are bias-free; set "
+                            "target_residual_completion.missing_bias to 'materialize' "
+                            "(exact, adds the parameter) or 'skip' with exact_form=false."
+                        )
+                if not skip_bias:
+                    bias_delta = bias_correction.to(current_state[bias_key])
+                    if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+                        raise RuntimeError("Direct residual completion produced an invalid bias")
+                    target_corrections[bias_key] = bias_correction
+                    current_state[bias_key] = current_state[bias_key] + bias_delta
+                # Mounted before the next component captures, which is what makes
+                # the intra-block cascade real rather than two independent fits.
+                target_model.load_state_dict(current_state, strict=True)
+                desired_norm = desired_sq ** 0.5
+                block_rows.append(
+                    {
+                        "mode": "direct_target",
+                        "scope": config.target_scope,
+                        "component": component,
+                        "trajectory": config.target_trajectory,
+                        "target_coordinate": float(coordinates[pos]),
+                        "block_kind": block_kind[pos],
+                        "position": pos,
+                        "source_orig_idx": row["source_orig_idx"],
+                        "desired_norm": desired_norm,
+                        "effect_before_norm": effect_sq ** 0.5,
+                        # r_j: the fraction of the desired local effect still
+                        # missing, before and after this fit. For mlp.c_proj the
+                        # "after" value is exact rather than re-measured: it is
+                        # the last operation writing into the residual stream in
+                        # this block and its input H_j does not depend on its own
+                        # weight, so mounting the correction changes the block
+                        # output by exactly gamma * (H_j dC^T + beta) -- the same
+                        # quantity the solver already evaluated. That reasoning
+                        # does NOT hold for attn.out_proj, which is why its row
+                        # also carries measured_residual_norm_after. Pinned by
+                        # tests/test_direct_target_p1.py and
+                        # tests/test_direct_p1_trajectory_and_components.py.
+                        "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+                        "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                        "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                        **diag,
+                    }
+                )
+            diagnostics.extend(block_rows)
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return target_corrections, diagnostics
@@ -1259,8 +1470,51 @@ def capture_resized_joint_source_inputs(
     return updated
 
 
-def _materialize_all_scope_references(references, entries):
-    """Join native banks to every realized target position by explicit ancestry."""
+def _ancestry_groups(entries):
+    """Runs of consecutive realized positions sharing one source ancestor."""
+    groups: list[tuple[int, list]] = []
+    for row in entries:
+        source_idx = int(row["source_orig_idx"])
+        if groups and groups[-1][0] == source_idx:
+            groups[-1][1].append(row)
+        else:
+            groups.append((source_idx, [row]))
+    return groups
+
+
+def realized_source_coordinates(entries):
+    """Fractional source-depth coordinate of every realized target position.
+
+    A group of ``m`` consecutive positions realizing source block ``i`` splits
+    the step from source boundary ``i-1`` to boundary ``i`` into ``m`` equal
+    parts, so its ``t``-th member sits at ``i - 1 + (t + 1) / m``.  Two
+    consequences matter: the *last* member of every group lands exactly on the
+    integer ``i`` (which is where "step" and "interpolate" must agree), and a
+    group of size 1 is the integer itself, making the feature an exact no-op on
+    any layout that did not duplicate that block.
+
+    Derived from the realized layout's recorded ancestry, never from an assumed
+    doubling pattern.
+    """
+    coordinates = {}
+    for source_idx, rows in _ancestry_groups(entries):
+        size = len(rows)
+        for offset, row in enumerate(rows):
+            coordinates[int(row["position"])] = source_idx - 1 + (offset + 1) / size
+    return coordinates
+
+
+def _materialize_all_scope_references(references, entries, *, trajectory="step"):
+    """Join native banks to every realized target position by explicit ancestry.
+
+    ``trajectory="step"`` hands each position its ancestor's whole effect, the
+    historical protocol.  ``"interpolate"`` blends the two neighbouring source
+    effects by the position's fractional depth, so a position realizing the
+    first half of source block ``i`` is asked for half the step from ``i-1`` to
+    ``i`` rather than for all of it a block early.
+    """
+    if trajectory not in {"step", "interpolate"}:
+        raise ValueError("trajectory must be 'step' or 'interpolate'")
     source_base = references.get("source_base_outputs")
     source_ft = references.get("source_ft_outputs")
     target_by_position = references.get("target_base_outputs_by_position")
@@ -1272,6 +1526,7 @@ def _materialize_all_scope_references(references, entries):
             "Position-specific target references do not exactly match realized target positions: "
             f"expected={sorted(expected_positions)}, found={sorted(target_by_position)}"
         )
+    coordinates = realized_source_coordinates(entries)
     desired, target_outputs, maps = {}, {}, {}
     for row in entries:
         pos = int(row["position"])
@@ -1279,16 +1534,55 @@ def _materialize_all_scope_references(references, entries):
         if source_idx not in source_base or source_idx not in source_ft:
             raise ValueError(f"Missing native source reference for ancestry index {source_idx} at target position {pos}")
         targets = target_by_position[pos]
-        source_base_batches = _aligned(source_base[source_idx], targets)
-        source_ft_batches = _aligned(source_ft[source_idx], targets)
+        coordinate = coordinates[pos]
+        lower, upper = math.floor(coordinate), math.ceil(coordinate)
+
+        if trajectory == "step" or lower == upper:
+            # Integer coordinates are the last member of their ancestry group,
+            # where the two trajectories are the same target by construction.
+            # Taking the identical code path keeps them bitwise identical rather
+            # than merely close.
+            base_batches = _aligned(source_base[source_idx], targets)
+            ft_batches = _aligned(source_ft[source_idx], targets)
+            delta_batches = [f - b for b, f in zip(base_batches, ft_batches, strict=True)]
+        else:
+            weight = coordinate - lower
+            upper_base = _aligned(source_base[upper], targets)
+            upper_delta = [
+                f - b for b, f in zip(upper_base, _aligned(source_ft[upper], targets), strict=True)
+            ]
+            if lower < 0:
+                # Delta_{-1} = 0: no task effect exists before the first source
+                # block. Its *base* bank has no counterpart either -- nothing is
+                # captured before block 0 -- so the alignment bank is clamped to
+                # B_0^0. That leaves Q fitted half a step deep, the same
+                # mismatch "step" carries at every position, instead of against
+                # a bank that was never recorded.
+                lower_base, lower_delta = upper_base, [torch.zeros_like(b) for b in upper_base]
+            else:
+                lower_base = _aligned(source_base[lower], targets)
+                lower_delta = [
+                    f - b for b, f in zip(lower_base, _aligned(source_ft[lower], targets), strict=True)
+                ]
+            base_batches = [
+                (1.0 - weight) * low + weight * high
+                for low, high in zip(lower_base, upper_base, strict=True)
+            ]
+            delta_batches = [
+                (1.0 - weight) * low + weight * high
+                for low, high in zip(lower_delta, upper_delta, strict=True)
+            ]
+
+        # Q is fitted from whichever base bank the desired effect is expressed
+        # against, so the alignment always matches the delta being transported.
         q, mu_s, mu_t = centered_rectangular_procrustes(
-            _rows(source_base_batches).double(), _rows(targets).double()
+            _rows(base_batches).double(), _rows(targets).double()
         )
         q = q.float()
-        desired[pos] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+        desired[pos] = [delta @ q for delta in delta_batches]
         target_outputs[pos] = targets
         maps[pos] = {"P": q, "source_mean": mu_s.float(), "target_mean": mu_t.float()}
-    return desired, target_outputs, maps
+    return desired, target_outputs, maps, coordinates
 
 
 def scale_completion(baseline, completion, strength):

@@ -97,6 +97,42 @@ class ResidualCompletionConfig:
     #                           the identical, tested solve rather than a
     #                           second implementation of it.
     mode: str = "transport_residual"
+    # How a realized target position picks the source effect it is asked to
+    # reproduce.
+    #   "step"        -- every realized position takes its recorded ancestor's
+    #                    full effect D = (B_i^1 - B_i^0) Q. Where one source
+    #                    block is realized as several target blocks, each of
+    #                    them is asked for the whole of that block's effect.
+    #   "interpolate" -- blend neighbouring source effects by the position's
+    #                    fractional depth in the realized chain, so a position
+    #                    realizing "half of source block i" is asked for half
+    #                    the step from i-1 to i. Agrees with "step" exactly at
+    #                    the integer coordinates, i.e. at the last realized
+    #                    member of every ancestry group.
+    target_trajectory: str = "step"
+    # Which residual-writing projections the completion is allowed to fit.  A
+    # transformer block adds into the residual stream twice -- once from the
+    # attention output projection, once from the MLP output projection -- and
+    # the historical protocol corrected only the second.  Fitted in forward
+    # order, cascaded (never as one joint linear system: out_proj's change
+    # moves the MLP's own input through ln_2 and GELU, so the second fit has
+    # to *measure* that rather than linearize it).
+    components: tuple[str, ...] = ("mlp.c_proj",)
+
+
+#: Residual-writing projections, in the order a block executes them.
+COMPONENT_FORWARD_ORDER: tuple[str, ...] = ("attn.out_proj", "mlp.c_proj")
+_DEFAULT_COMPONENTS: tuple[str, ...] = ("mlp.c_proj",)
+
+
+def order_components(components) -> tuple[str, ...]:
+    """Return ``components`` in block-forward order.
+
+    The config names a *set* of write surfaces; the fit order is a property of
+    the architecture, not of how the config happened to list them.
+    """
+    selected = set(components)
+    return tuple(name for name in COMPONENT_FORWARD_ORDER if name in selected)
 
 
 def parse_residual_completion_config(value: Mapping[str, Any] | None) -> ResidualCompletionConfig:
@@ -107,12 +143,17 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
         "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
-        "exact_form", "missing_bias", "mode",
+        "exact_form", "missing_bias", "mode", "target_trajectory", "components",
     }
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"unknown target_residual_completion fields: {sorted(unknown)}")
-    cfg = ResidualCompletionConfig(**dict(value))
+    payload = dict(value)
+    # JSON gives a list; the dataclass is frozen and lands in asdict() output,
+    # so normalize to a tuple up front rather than leaving two shapes around.
+    if "components" in payload and isinstance(payload["components"], list):
+        payload["components"] = tuple(payload["components"])
+    cfg = ResidualCompletionConfig(**payload)
     if not isinstance(cfg.enabled, bool):
         raise TypeError("enabled must be bool")
     if cfg.added_blocks != "all":
@@ -139,6 +180,43 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("exact_form must be bool")
     if cfg.mode not in {"transport_residual", "direct_target"}:
         raise ValueError("mode must be 'transport_residual' or 'direct_target'")
+    if cfg.target_trajectory not in {"step", "interpolate"}:
+        raise ValueError("target_trajectory must be 'step' or 'interpolate'")
+    if cfg.target_trajectory == "interpolate":
+        # Both new write surfaces are direct-mode features; the transport arm's
+        # solve is defined against fitted (t_in, t_out) maps and is deliberately
+        # left exactly as it was.
+        if cfg.mode != "direct_target":
+            raise ValueError("target_trajectory='interpolate' requires mode='direct_target'")
+        if cfg.target_scope != "all":
+            # The inserted-only path consumes the precomputed references['desired']
+            # banks, which are built without ancestry-group structure, so there is
+            # no fractional depth to interpolate along. Refused rather than
+            # silently stepping.
+            raise ValueError("target_trajectory='interpolate' requires target_scope='all'")
+    components = cfg.components
+    if isinstance(components, str) or not isinstance(components, (list, tuple)):
+        raise ValueError("components must be a list of projection names")
+    components = tuple(components)
+    if not components:
+        raise ValueError("components must not be empty")
+    if len(set(components)) != len(components):
+        raise ValueError("components must not repeat a projection")
+    unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
+    if unsupported:
+        raise ValueError(
+            f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}"
+        )
+    if "mlp.c_proj" not in components:
+        # The MLP projection is the last write into the residual stream and the
+        # only one whose solver objective is exactly the post-mount residual;
+        # dropping it would leave the fit unanchored.
+        raise ValueError("components must contain 'mlp.c_proj'")
+    if order_components(components) != _DEFAULT_COMPONENTS and cfg.mode != "direct_target":
+        raise ValueError(
+            "components other than ['mlp.c_proj'] require mode='direct_target': the transport "
+            "arm would need fitted t_in/t_out maps for attn.out_proj, which are not produced"
+        )
     if cfg.missing_bias not in {"error", "materialize", "skip"}:
         raise ValueError("missing_bias must be 'error', 'materialize' or 'skip'")
     if cfg.missing_bias == "skip" and cfg.exact_form:
@@ -254,9 +332,18 @@ def _clamped_eigh_inverse(sym: Tensor, *, eps: float = 1e-12) -> tuple[Tensor, T
 
 
 class ResidualSufficientStatistics:
-    """Streaming statistics for the source-space Sylvester solve."""
+    """Streaming statistics for the source-space Sylvester solve.
 
-    def __init__(self) -> None:
+    ``device``, when given, moves every batch's inputs onto it before the
+    float64 Gram accumulation in ``update()``: the accumulated statistics
+    (and therefore ``solve()``'s ``eigh``/``linalg.solve``) then live on that
+    device instead of wherever the caller's activations happened to be. Left
+    ``None`` (the default), nothing moves, matching the historical CPU-only
+    behaviour exactly -- so every existing caller and test is unaffected.
+    """
+
+    def __init__(self, device: torch.device | str | None = None) -> None:
+        self.device = device
         self.s: Tensor | None = None
         self.g: Tensor | None = None
         self.b: Tensor | None = None
@@ -289,6 +376,11 @@ class ResidualSufficientStatistics:
         tensors = (h, e, t_out) if t_in is None else (h, e, t_in, t_out)
         if not all(torch.isfinite(x).all() for x in tensors):
             raise ValueError("solver inputs must be finite")
+        if self.device is not None:
+            h = h.to(self.device)
+            e = e.to(self.device)
+            t_in = None if t_in is None else t_in.to(self.device)
+            t_out = t_out.to(self.device)
         # C_target = t_out.T C_source t_in; X = Delta_C_source.T.
         a = h.to(torch.float64) if t_in is None else h.to(torch.float64) @ t_in.to(torch.float64).T
         lmat = t_out.to(torch.float64).T
