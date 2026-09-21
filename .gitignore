@@ -260,6 +260,8 @@ sbatch*
 /wandb
 /slurm-*.out
 docs/*.aux
+# LaTeX build output for the in-tree method write-ups; the .tex is the source.
+/docs/generated/
 
 # Local BRACE/ARIADNE research handoff and preserved pre-curation artifacts.
 /AGENTS.md

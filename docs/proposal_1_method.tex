@@ -1,0 +1,106 @@
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\title{Target-Informed Residual Completion\\\large Proposal 1: Method Description}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Method}
+\paragraph{Setting.}
+Let $\theta_s^0$ and $\theta_s^1$ denote source base and fine-tuned endpoints. ARIADNE first resizes both endpoints to a common target depth, producing $\bar\theta_s^0,\bar\theta_s^1$, and defines $\bar\tau_s=\bar\theta_s^1-\bar\theta_s^0$. A width-transport method, such as Theseus or BiCo, maps this update into the target parameterization, yielding $\tau_t$. The conventional final model is $\theta_t^1=\theta_t^0+\tau_t$, where $\theta_t^0$ is the untouched native target base.
+
+Proposal~1 is a training-free, target-informed completion of $\tau_t$. It does not change ARIADNE's structural or component-correction steps, modify $\theta_t^0$, or introduce a module at inference time. Its purpose is narrower: parameter transport may map an update into compatible target tensors without reproducing the source task's \emph{local functional effect}. Proposal~1 measures the missing effect and adds a calibrated correction to the transported task vector.
+
+\subsection{Paired calibration and Procrustes alignment}
+The source and target calibration loaders are paired deterministically: each source batch corresponds to the same examples as the target batch, and one finite set of batches is used for every reference bank. This allows the method to compare task-induced changes for matched examples rather than align unrelated activation distributions. For vision models with differing token grids, source tokens are interpolated to the target grid before row-wise comparison. A decoder-family adapter provides the analogous token and projection access for language models.
+
+Let $S_j\in\mathbb{R}^{n\times d_s}$ denote source-base boundary activations from the original source block ancestral to realized target position $j$, and let $T_j^0\in\mathbb{R}^{n\times d_t}$ denote native target-base boundary activations at $j$. Here, $n$ combines examples and token positions. We center both banks,
+\begin{equation}
+ \widetilde S_j=S_j-\mathbf{1}\mu_{S,j}^{\top},\qquad
+ \widetilde T_j^0=T_j^0-\mathbf{1}\mu_{T,j}^{\top},
+\end{equation}
+and compute the thin singular value decomposition
+\begin{equation}
+ \widetilde S_j^{\top}\widetilde T_j^0=U_j\Sigma_jV_j^{\top}.
+\end{equation}
+The centered rectangular Procrustes map is
+\begin{equation}
+ Q_j=U_jV_j^{\top}
+ =\arg\min_{Q\,\mathrm{orthogonal}}\|\widetilde S_jQ-\widetilde T_j^0\|_F^2.
+ \label{eq:procrustes}
+\end{equation}
+For unequal widths, $Q_j$ is a partial isometry: it supplies a least-squares orientation between represented directions, not an invertible correspondence or a family-global map. Centering removes constant offsets. Since Proposal~1 later transports a fine-tuned-minus-base activation difference, the fitted translation cancels and only $Q_j$ is used.
+
+\subsection{Desired effect and transported residual}
+The completion acts on the final MLP projection of selected target blocks: `c\_proj' in a ViT and the analogous `down\_proj' in a decoder. This projection writes the MLP contribution into the residual stream. Let $B_i^0,B_i^1$ be source base and fine-tuned boundary banks for ancestral source block $i$. We define the desired task-induced effect in target coordinates as
+\begin{equation}
+ D_j=(B_i^1-B_i^0)Q_j.
+ \label{eq:desired}
+\end{equation}
+These references are captured before source structural resizing. The native target bank is likewise captured before a transported vector is mounted.
+
+After ordinary transport, we run $\theta_t^0+\tau_t$ and collect its current boundary output $T_j^{\tau}$ and MLP input $H_j$. The effect already induced by the ordinary vector is $T_j^{\tau}-T_j^0$. Proposal~1 regresses only the remaining task effect,
+\begin{equation}
+ E_j=D_j-(T_j^{\tau}-T_j^0).
+ \label{eq:residual}
+\end{equation}
+Thus it does not reconstruct target-base activations. It repairs the part of the source fine-tuning effect that ordinary transport fails to produce at the selected target block.
+
+\subsection{Transport-aware closed-form completion}
+Let $t_{\mathrm{in},j}$ and $t_{\mathrm{out},j}$ be the input- and output-side maps already fitted by the transport method for this projection. Proposal~1 solves for a source-coordinate weight update $\Delta C_{s,j}$ and bias update $\beta_{s,j}$. With $A_j=H_jt_{\mathrm{in},j}^{\top}$ and $X_j=\Delta C_{s,j}^{\top}$, its exact affine ridge objective is
+\begin{equation}
+ \min_{X_j,\beta_{s,j}}
+ \left\|\left(A_jX_j+\mathbf{1}\beta_{s,j}^{\top}\right)t_{\mathrm{out},j}-E_j\right\|_F^2
+ +\lambda\|X_j\|_F^2.
+ \label{eq:completion}
+\end{equation}
+The output transport remains inside the objective because it is generally non-square and non-orthogonal; a free target-space correction would not respect the parameter transport. The implementation accumulates centered sufficient statistics ($A_j^\top A_j$, the transport Gram, cross terms, and first moments) over batches. It then solves the resulting Sylvester-form ridge system without materializing a Kronecker design matrix. The centered slope solve and affine intercept avoid assuming zero-mean activations. The intercept is constrained to the reachable output subspace of $t_{\mathrm{out},j}$, exactly as required when the transported bias is not free in target coordinates.
+
+The update and bias use the same transport convention as the ordinary projection:
+\begin{equation}
+ \Delta C_{t,j}=t_{\mathrm{out},j}^{\top}\Delta C_{s,j}t_{\mathrm{in},j},
+ \qquad \Delta b_{t,j}=t_{\mathrm{out},j}^{\top}\beta_{s,j}.
+\end{equation}
+There is no input-side contraction for a bias. A reduced uncentered, zero-intercept solve is retained only as an ablation: it is exact only under restrictive zero-mean and isometric-transport assumptions.
+
+\subsection{Algorithm}
+\noindent\fbox{\begin{minipage}{0.96\linewidth}
+\textbf{Algorithm 1: Target-Informed Residual Completion (Proposal 1)}
+
+\smallskip\textbf{Input:} source endpoints $(\theta_s^0,\theta_s^1)$; native target base $\theta_t^0$; paired calibration batches $\mathcal B$; ARIADNE resize; fitted transport $\mathcal T$; strength $\gamma$.
+
+\smallskip\textbf{Reference capture, before resize}
+\begin{enumerate}
+\item Collect source boundary banks $B_i^0,B_i^1$ for source blocks used by the eventual extension layout; collect native target banks $T_j^0$ at selected target positions.
+\item For each selected $j$, retrieve its recorded ancestral source block $i$, align token grids if needed, fit $Q_j$ with Eq.~\ref{eq:procrustes}, and store $D_j$ from Eq.~\ref{eq:desired}.
+\end{enumerate}
+\textbf{Ordinary pipeline}
+\begin{enumerate}
+\setcounter{enumi}{2}
+\item Apply ARIADNE to both source endpoints and form $\bar\tau_s$; fit transport and compute $\tau_t=\mathcal T(\bar\tau_s)$.
+\item Extract the fitted $(t_{\mathrm{in},j},t_{\mathrm{out},j})$ maps for every selected projection; initialize a temporary model with $\theta_t^0+\tau_t$.
+\end{enumerate}
+\textbf{Completion}
+\begin{enumerate}
+\setcounter{enumi}{4}
+\item For each selected target position $j$, in realized-layout order: (i) collect $H_j,T_j^{\tau}$; (ii) compute $E_j$ by Eq.~\ref{eq:residual}; (iii) solve Eq.~\ref{eq:completion}; and (iv) transport and add $(\Delta C_{t,j},\Delta b_{t,j})$ to the temporary vector and model.
+\item Return $\tau_t^{\mathrm{P1}}=\tau_t+\gamma\Delta\tau_{\mathrm{res}}$ and evaluate only $\theta_t^0+\tau_t^{\mathrm{P1}}$.
+\end{enumerate}
+\end{minipage}}
+
+\subsection{Scope and controls}
+The default scope completes realized inserted blocks. An optional all-block scope completes every realized target block, including original descendants, by consulting recorded ancestry rather than assuming a doubling pattern. With multiple positions, corrections are inserted sequentially into a temporary model, so later residuals include earlier repairs. The temporary state is restored after fitting; the output is solely a task-vector update.
+
+The completion is fit at unit strength and scaled only afterwards:
+\begin{equation}
+ \tau_t^{\mathrm{P1}}=\tau_t+\gamma\Delta\tau_{\mathrm{res}},
+ \qquad \theta_t^{\mathrm{P1}}=\theta_t^0+\tau_t^{\mathrm{P1}}.
+\end{equation}
+Hence $\gamma=0$ is an exact no-completion control, and $\gamma=1$ applies the full closed-form completion. Proposal~1 is an experimental post-transport correction, not a replacement for ARIADNE's activation-conserving depth-resize operator and not a claim that a single correction operator is shared across model families or tasks.
+\end{document}
