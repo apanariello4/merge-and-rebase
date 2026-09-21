@@ -25,10 +25,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.block_extension import resolve_block_extension_config, run_block_extension
+from merge_and_rebase.eval.block_extension import (
+    balanced_collapse_spans,
+    disjoint_collapse_schedule,
+    resolve_block_extension_config,
+    run_block_extension,
+    spread_anchor_schedule,
+)
 from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
 from merge_and_rebase.eval.vision_rebase import (
     _maybe_capture_target_residual_references,
@@ -265,20 +272,136 @@ def test_identity_initialization_p1_wires_capture_layout_transport_and_completio
     assert all("c_proj" in key for key in changed)
 
 
+# ---------------------------------------------------------------------------
+# A CLIP-shaped stand-in for the reduction direction.
+#
+# The extension tests above get away with a bare residual block because the
+# inserted-block path only ever touches ``mlp.c_proj`` and the block boundary.
+# The per-weight *shrink* path is different: it hooks ``ln_1``, ``attn``,
+# ``ln_2``, ``mlp.c_fc`` and ``mlp.c_proj`` on each collapsed span, patches the
+# attention's fused ``in_proj`` to capture Q/K/V, and reads ``visual.ln_post``
+# for the top span's output reference. A block missing any of those is not a
+# stand-in for a CLIP block at all, so the reduction test uses the full shape.
+# ---------------------------------------------------------------------------
+
+
+class _ClipAttn(nn.Module):
+    """Minimal stand-in for CLIP's MultiheadAttention with a fused in_proj."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.in_proj_weight = nn.Parameter(torch.randn(3 * width, width) * 0.1)
+        self.in_proj_bias = nn.Parameter(torch.zeros(3 * width))
+        self.out_proj = nn.Linear(width, width)
+
+    def forward(self, query, key=None, value=None, **kwargs):
+        del key, value, kwargs
+        q, k, v = F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+        weights = torch.softmax((q @ k.transpose(-2, -1)) * q.shape[-1] ** -0.5, dim=-1)
+        return self.out_proj(weights @ v)
+
+
+class _ClipMLP(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.c_fc = nn.Linear(width, width * 2)
+        self.c_proj = nn.Linear(width * 2, width)
+
+    def forward(self, x):
+        return self.c_proj(torch.nn.functional.gelu(self.c_fc(x)))
+
+
+class _ClipBlock(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(width)
+        self.attn = _ClipAttn(width)
+        self.ln_2 = nn.LayerNorm(width)
+        self.mlp = _ClipMLP(width)
+
+    def forward(self, x, attn_mask=None, **kwargs):
+        del attn_mask, kwargs
+        x = x + self.attn(self.ln_1(x))
+        return x + self.mlp(self.ln_2(x))
+
+
+class _ClipVisual(nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.input = nn.Linear(4, width)
+        self.transformer = nn.Module()
+        self.transformer.resblocks = nn.ModuleList([_ClipBlock(width) for _ in range(depth)])
+        self.ln_post = nn.LayerNorm(width)
+
+    def forward(self, images):
+        x = self.input(images)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return self.ln_post(x).mean(dim=1)
+
+
+class _ClipModel(nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.visual = _ClipVisual(width, depth)
+
+    def encode_image(self, x):
+        return self.visual(x)
+
+
+def _reduction_layout(*, collapse_schedule: str) -> dict:
+    """Run a 4 -> 2 reduction and return the realized layout."""
+    torch.manual_seed(7)
+    source = _ClipModel(3, 4).eval()
+    source_ft = deepcopy(source)
+    _, config = resolve_block_extension_config(
+        {
+            "block_extension_enabled": True,
+            "block_extension_params": {
+                "target_layers_total": 2,
+                "extension_strategy": "interpolate_per_weight",
+                "collapse_schedule": collapse_schedule,
+                "n_batches_act": 2,
+                "skip_correction": True,
+                "lmc_mode": "shared",
+            },
+        }
+    )
+    layout: dict = {}
+    run_block_extension(
+        source_base_model=source,
+        source_ft_model=source_ft,
+        calibration_loader=_loader(),
+        target_layers_total=2,
+        config=config,
+        device="cpu",
+        layout_out=layout,
+    )
+    return layout
+
+
 def test_reduction_p1_layout_uses_each_collapsed_span_end_boundary():
     """Reduction P1 is all-scope and records the c_proj span-end ancestry.
 
     The reduction has no inserted blocks.  A future target residual solve must
     therefore address every realized target block and use the collapsed span's
     output boundary rather than guessing an odd/even insertion position.
+
+    ``collapse_schedule='disjoint_spans'`` is set explicitly. Under the default
+    ``cascade`` schedule the second anchor falls inside the span the first
+    collapse already merged, so 4 -> 2 realizes ``(0,1,2)`` and ``(3,)``
+    instead of the two even spans; that schedule is kept as the default because
+    completed reduction campaigns were produced with it (see
+    ``balanced_collapse_spans``). The ancestry assertions below are about the
+    layout, so they are made against the partition that is actually balanced.
     """
     torch.manual_seed(7)
-    source = Model(3, 4).eval()
+    source = _ClipModel(3, 4).eval()
     source_ft = deepcopy(source)
     with torch.no_grad():
         source_ft.visual.transformer.resblocks[1].mlp.c_proj.weight.add_(0.15)
         source_ft.visual.transformer.resblocks[3].mlp.c_proj.weight.sub_(0.1)
-    target = Model(5, 2).eval()
+    target = _ClipModel(5, 2).eval()
     data = _loader()
     _, config = resolve_block_extension_config(
         {
@@ -286,6 +409,7 @@ def test_reduction_p1_layout_uses_each_collapsed_span_end_boundary():
             "block_extension_params": {
                 "target_layers_total": 2,
                 "extension_strategy": "interpolate_per_weight",
+                "collapse_schedule": "disjoint_spans",
                 "n_batches_act": 2,
                 "skip_correction": False,
                 "lmc_mode": "shared",
@@ -325,6 +449,7 @@ def test_reduction_p1_layout_uses_each_collapsed_span_end_boundary():
     assert [row["position"] for row in layout["final_blocks"]] == [0, 1]
     assert [row["source_orig_idx"] for row in layout["final_blocks"]] == [1, 3]
     assert [row["span_orig_idxs"] for row in layout["final_blocks"]] == [(0, 1), (2, 3)]
+    assert [row["block_kind"] for row in layout["final_blocks"]] == ["collapsed", "collapsed"]
 
     transforms = {}
     for position in (0, 1):
@@ -352,6 +477,36 @@ def test_reduction_p1_layout_uses_each_collapsed_span_end_boundary():
         "visual.transformer.resblocks.1.mlp.c_proj.weight",
         "visual.transformer.resblocks.1.mlp.c_proj.bias",
     }
+
+
+def test_default_collapse_schedule_is_unchanged_and_absorbs_into_the_first_span():
+    """The historical cascade schedule must keep its exact realized partition.
+
+    Every completed reduction campaign was produced with this schedule, so it
+    stays the default and is pinned here rather than left implicit. At 4 -> 2 a
+    later anchor lands inside the already-merged span, giving one span of three
+    and leaving the top block uncollapsed.
+    """
+    spans = [
+        row["span_orig_idxs"]
+        for row in _reduction_layout(collapse_schedule="cascade")["final_blocks"]
+    ]
+    assert spans == [(0, 1, 2), (3,)]
+
+
+def test_disjoint_spans_partition_is_balanced_at_the_real_reduction_depth():
+    """24 -> 12 must collapse into twelve even pairs, not [3, 2, ..., 2, 1]."""
+    assert [len(span) for span in balanced_collapse_spans(24, 12, "bottom-top")] == [2] * 12
+    assert disjoint_collapse_schedule(24, 12, "bottom-top") == list(range(0, 24, 2))
+    # The cascading default is what it is; recorded so the contrast is explicit.
+    cascade = [0, 1] + list(range(3, 23, 2))
+    assert spread_anchor_schedule(12, 23, "bottom-top") == cascade
+
+
+def test_disjoint_spans_refuses_random_insertion_order():
+    """A fixed disjoint partition has no meaningful 'random' ordering."""
+    with pytest.raises(ValueError, match="has no meaning for a fixed"):
+        balanced_collapse_spans(4, 2, "random")
 
 
 def test_enabled_with_zero_strength_is_a_true_null_ablation():

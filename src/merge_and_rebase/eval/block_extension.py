@@ -107,6 +107,73 @@ def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: st
     return anchors
 
 
+def balanced_collapse_spans(
+    curr_layers: int, final_depth: int, insertion_order: str
+) -> list[tuple[int, ...]]:
+    """Partition ``curr_layers`` blocks into ``final_depth`` contiguous spans.
+
+    This is the reduction-direction analogue of what
+    :func:`spread_anchor_schedule` does for insertion, and it exists because
+    the anchor schedule alone does not survive the reduction's own side
+    effects. Anchors there are spaced over the *original* chain, but each
+    collapse merges two entries, so a later anchor can land inside a span that
+    an earlier step already merged and absorb a further block into it. At
+    24 -> 12 that yields spans of sizes ``[3, 2, 2, ..., 2, 1]``: the bottom
+    span swallows three blocks and the top block is never collapsed at all --
+    precisely the pile-up at one end that ``spread`` was introduced to avoid.
+
+    Splitting the depth up front instead makes each span disjoint by
+    construction. Sizes are as equal as the depth allows, using the same
+    ``(i * n) // k`` run split as the insertion schedule, and
+    ``insertion_order`` decides which end any leftover blocks accumulate at.
+
+    This is opt-in (``collapse_schedule='disjoint_spans'``). The cascading
+    behaviour remains the default because every completed reduction campaign
+    was produced with it.
+    """
+    if final_depth <= 0 or curr_layers <= 0:
+        raise ValueError("balanced collapse spans need a positive depth")
+    if final_depth > curr_layers:
+        raise ValueError("cannot collapse into more spans than there are blocks")
+    if insertion_order not in {"bottom-top", "top-bottom"}:
+        raise ValueError(
+            "collapse_schedule='disjoint_spans' supports insertion_order "
+            "'bottom-top' or 'top-bottom'; 'random' has no meaning for a fixed "
+            f"disjoint partition. Got: {insertion_order}"
+        )
+    sizes = [
+        ((i + 1) * curr_layers) // final_depth - (i * curr_layers) // final_depth
+        for i in range(final_depth)
+    ]
+    if insertion_order == "top-bottom":
+        sizes = sizes[::-1]
+    spans: list[tuple[int, ...]] = []
+    start = 0
+    for size in sizes:
+        spans.append(tuple(range(start, start + size)))
+        start += size
+    return spans
+
+
+def disjoint_collapse_schedule(
+    curr_layers: int, n_to_remove: int, insertion_order: str
+) -> list[int]:
+    """Anchor sequence realizing :func:`balanced_collapse_spans`.
+
+    Each span is collapsed by repeatedly anchoring at its *first* original
+    index: the merge loop locates the chain entry containing that index and
+    absorbs the entry above it, so ``len(span) - 1`` repeats fold exactly that
+    span and nothing else. Steps are emitted bottom-top; because anchors are
+    original indices and merging one span never changes another span's
+    membership, the step order cannot affect the realized partition.
+    """
+    spans = balanced_collapse_spans(curr_layers, curr_layers - n_to_remove, insertion_order)
+    schedule: list[int] = []
+    for span in spans:
+        schedule.extend([span[0]] * (len(span) - 1))
+    return schedule
+
+
 @dataclass(frozen=True)
 class TargetSharedCorrection:
     """Blend the pretrained target block's activations into the correction target.
@@ -139,6 +206,12 @@ class BlockExtensionConfig:
     target_layers_total: int | None = None
     insertion_order: str = "bottom-top"
     extension_density: str = "spread"
+    # Reduction-direction only. "cascade" is the historical schedule, where a
+    # later anchor may fall inside an already-merged span and absorb another
+    # block into it; it is the default so completed shrink campaigns stay
+    # reproducible. "disjoint_spans" partitions the depth up front so every
+    # collapsed span is disjoint and evenly sized.
+    collapse_schedule: str = "cascade"
     extension_strategy: str = "interpolate_per_weight"
     dampening_factor: float = 1.0
     n_batches_act: int = 2
@@ -454,6 +527,8 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
             raise ValueError(f"{option_name} requires insertion_target_mode='direct'.")
         if str(params.get("insertion_order", "bottom-top")) != "bottom-top":
             raise ValueError(f"{option_name} requires insertion_order='bottom-top'.")
+        if str(params.get("collapse_schedule", "cascade")) not in {"cascade", "disjoint_spans"}:
+            raise ValueError("collapse_schedule must be 'cascade' or 'disjoint_spans'.")
         if str(params.get("extension_density", "spread")) not in {"spread", "spread_mod"}:
             raise ValueError(f"{option_name} requires spread extension density.")
         if str(params.get("extension_strategy", "interpolate_per_weight")) != "duplicate_per_weight":
@@ -501,6 +576,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
         insertion_order=str(params.get("insertion_order", "bottom-top")),
         extension_density=str(params.get("extension_density", "spread")),
+        collapse_schedule=str(params.get("collapse_schedule", "cascade")),
         extension_strategy=str(params.get("extension_strategy", "interpolate_per_weight")),
         dampening_factor=float(params.get("dampening_factor", 1.0)),
         n_batches_act=n_batches_act,
@@ -1673,6 +1749,7 @@ class BlockExtender:
         target_layers_total: int | None,
         insertion_order: str,
         extension_density: str,
+        collapse_schedule: str = "cascade",
         skip_correction: bool,
         skip_final_ln: bool,
         ridge_identity: float = 0.0,
@@ -1710,6 +1787,7 @@ class BlockExtender:
             target_layers_total=target_layers_total,
             insertion_order=insertion_order,
             extension_density=extension_density,
+            collapse_schedule=collapse_schedule,
             ridge_identity=ridge_identity,
             n_cascade_iters=n_cascade_iters,
             share_ft_refs=share_ft_refs,
@@ -1752,6 +1830,9 @@ class BlockExtender:
             k: v for k, v in common_kwargs.items()
             if k not in {"inserted_block_mode", "correction_scope", "target_shared_correction"}
         }
+        # The collapse schedule only exists for the reduction direction; the
+        # extension path has no spans to partition.
+        common_kwargs.pop("collapse_schedule", None)
         if strategy == "interpolate_per_weight":
             if n_needed < 0:
                 return self._shrink_per_weight(per_weight_mode="cascade", **shrink_kwargs)
@@ -2096,6 +2177,7 @@ class BlockExtender:
         target_layers_total: int | None,
         insertion_order: str,
         extension_density: str,
+        collapse_schedule: str = "cascade",
         ridge_identity: float = 0.0,
         per_weight_mode: str = "cascade",
         n_cascade_iters: int = 1,
@@ -2126,12 +2208,20 @@ class BlockExtender:
             return curr_layers
 
         n_to_remove = -n_needed
-        schedule = self._build_collapse_schedule(
-            curr_layers=curr_layers,
-            n_to_remove=n_to_remove,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
-        )
+        if collapse_schedule == "disjoint_spans":
+            schedule = disjoint_collapse_schedule(curr_layers, n_to_remove, insertion_order)
+        elif collapse_schedule == "cascade":
+            schedule = self._build_collapse_schedule(
+                curr_layers=curr_layers,
+                n_to_remove=n_to_remove,
+                insertion_order=insertion_order,
+                extension_density=extension_density,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported collapse_schedule '{collapse_schedule}'. "
+                "Expected 'cascade' or 'disjoint_spans'."
+            )
 
         logger.info("Block shrink planned collapses: %s", schedule)
         self._vprint(f"planned collapses: {schedule}")
@@ -2308,6 +2398,10 @@ class BlockExtender:
                     )
 
         final_depth = len(self.model_base.visual.transformer.resblocks)
+        # The extension path publishes its realized layout for downstream
+        # target-informed code; the reduction path must too, or a caller that
+        # passes ``layout_out`` silently receives an empty dict.
+        self.extension_layout = build_reduction_layout(chain_base)
         self.reference_inputs = {"base": {}, "ft": {}}
         reference_models.clear()
         if torch.cuda.is_available():
@@ -2384,9 +2478,62 @@ def build_extension_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         )
 
     return {
+        # Labelled explicitly so a consumer never has to infer the direction
+        # from "are there inserted blocks?". The reduction layout carries the
+        # same two keys with different values (see build_reduction_layout).
+        "direction": "extend",
+        "p1_source_ancestry": "inserted_position",
         "final_depth": len(chain),
         "original_positions": {idx: original_positions[idx] for idx in sorted(original_positions)},
         "inserted_blocks": tuple(inserted_blocks),
+        "final_blocks": tuple(final_blocks),
+    }
+
+
+def build_reduction_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe the realized block chain of a *reduced* model.
+
+    A reduction has no inserted blocks: every realized target position is a
+    collapsed span of one or more original source blocks. A target residual
+    solve therefore has to address every realized position (``target_scope
+    ='all'``) and cannot use the extension's ``2i+1`` insertion arithmetic,
+    which has no meaning here.
+
+    The recorded ancestry is the span's **last** original block. That is not a
+    convention chosen here: the collapsed block occupies the span's output
+    boundary in the residual stream, and ``_shrink_per_weight`` already fits
+    its correction against precisely that boundary (``span_end_idx``, and the
+    input of the block above it). Recording the span end keeps a later P1
+    solve reading the same boundary the structural correction was fitted at,
+    instead of guessing a position. The full span is kept in
+    ``span_orig_idxs`` so a consumer that needs the whole collapsed group --
+    to report compression, or to address the span's input boundary -- does not
+    have to reconstruct it.
+    """
+    final_blocks: list[dict[str, Any]] = []
+    original_positions: dict[int, int] = {}
+    for position, item in enumerate(chain):
+        span = tuple(int(index) for index in item["orig_idxs"])
+        if not span:
+            raise ValueError(f"reduction chain position {position} has an empty source span")
+        for index in span:
+            original_positions[index] = position
+        final_blocks.append(
+            {
+                "position": position,
+                "source_orig_idx": span[-1],
+                "span_orig_idxs": span,
+                "block_kind": "collapsed" if len(span) > 1 else "original",
+            }
+        )
+    return {
+        "direction": "shrink",
+        "p1_source_ancestry": "span_end_boundary",
+        "final_depth": len(chain),
+        # Many-to-one here, unlike the extension: every original block maps to
+        # the realized position of the span that absorbed it.
+        "original_positions": {idx: original_positions[idx] for idx in sorted(original_positions)},
+        "inserted_blocks": (),
         "final_blocks": tuple(final_blocks),
     }
 
@@ -2430,6 +2577,7 @@ def run_block_extension(
         target_layers_total=resolved_target_layers_total,
         insertion_order=config.insertion_order,
         extension_density=config.extension_density,
+        collapse_schedule=config.collapse_schedule,
         skip_correction=bool(config.skip_correction),
         skip_final_ln=bool(config.skip_final_ln),
         ridge_identity=float(config.ridge_identity),
