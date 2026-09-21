@@ -84,6 +84,19 @@ class ResidualCompletionConfig:
     #                    intercept is refused: W is fitted on centered banks, so
     #                    applying it without the intercept is not the same map.
     missing_bias: str = "error"
+    # Which functional-transfer path Proposal 1 takes.
+    #   "transport_residual" -- the historical path: complete the residual left
+    #                           by an already-transported task vector, solving
+    #                           in source coordinates through (t_in, t_out).
+    #   "direct_target"      -- the transport-free ablation: start from the
+    #                           native target base (no tau_t at all) and solve
+    #                           for the desired effect directly in target
+    #                           coordinates. Algebraically this is the same
+    #                           affine ridge with t_in = I and t_out carrying
+    #                           only the target's own LayerScale, so it reuses
+    #                           the identical, tested solve rather than a
+    #                           second implementation of it.
+    mode: str = "transport_residual"
 
 
 def parse_residual_completion_config(value: Mapping[str, Any] | None) -> ResidualCompletionConfig:
@@ -94,7 +107,7 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
         "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
-        "exact_form", "missing_bias",
+        "exact_form", "missing_bias", "mode",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -124,6 +137,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise ValueError("strength must be >= 0")
     if not isinstance(cfg.exact_form, bool):
         raise TypeError("exact_form must be bool")
+    if cfg.mode not in {"transport_residual", "direct_target"}:
+        raise ValueError("mode must be 'transport_residual' or 'direct_target'")
     if cfg.missing_bias not in {"error", "materialize", "skip"}:
         raise ValueError("missing_bias must be 'error', 'materialize' or 'skip'")
     if cfg.missing_bias == "skip" and cfg.exact_form:
@@ -135,6 +150,55 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
             "nonzero intercept, and dropping it would apply a centered-fit weight "
             "without the centering it assumes"
         )
+    return cfg
+
+
+@dataclass(frozen=True)
+class JointCorrectionConfig:
+    """Configuration for the frozen-map Option 3 blockwise correction.
+
+    ``source_weight`` weights the ordinary source ARIADNE reconstruction
+    objective and ``target_weight`` weights the target-space transported-effect
+    objective.  The transport maps are deliberately not configurable here:
+    Option 3 fits them in a preceding, ordinary transport pass and freezes
+    them for this solve.  ``enabled=False`` is the compatibility default and
+    has no effect until a caller explicitly opts into the joint path.
+    """
+
+    enabled: bool = False
+    source_weight: float = 1.0
+    target_weight: float = 1.0
+    ridge_relative: float = 1e-3
+
+
+def parse_joint_correction_config(value: Mapping[str, Any] | None) -> JointCorrectionConfig:
+    """Parse the narrow, explicit Option 3 configuration schema.
+
+    This parser intentionally rejects transport/seeding controls.  Those
+    belong to the transport method and changing them during the joint solve
+    would violate the frozen-map protocol.
+    """
+    if value is None:
+        return JointCorrectionConfig()
+    if not isinstance(value, Mapping):
+        raise TypeError("joint_blockwise_correction must be a mapping")
+    allowed = {"enabled", "source_weight", "target_weight", "ridge_relative"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"unknown joint_blockwise_correction fields: {sorted(unknown)}")
+    cfg = JointCorrectionConfig(**dict(value))
+    if not isinstance(cfg.enabled, bool):
+        raise TypeError("enabled must be bool")
+    for name in ("source_weight", "target_weight", "ridge_relative"):
+        number = getattr(cfg, name)
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)):
+            raise ValueError(f"{name} must be a finite real number")
+        if name == "ridge_relative" and number <= 0:
+            raise ValueError("ridge_relative must be > 0")
+        if name != "ridge_relative" and number < 0:
+            raise ValueError(f"{name} must be >= 0")
+    if cfg.source_weight == 0 and cfg.target_weight == 0:
+        raise ValueError("at least one joint objective weight must be positive")
     return cfg
 
 
@@ -203,17 +267,30 @@ class ResidualSufficientStatistics:
         self.m_source: int | None = None
         self.d_source: int | None = None
 
-    def update(self, h: Tensor, e: Tensor, t_in: Tensor, t_out: Tensor) -> None:
+    def update(self, h: Tensor, e: Tensor, t_in: Tensor | None, t_out: Tensor) -> None:
+        """Accumulate one batch.
+
+        ``t_in=None`` means an identity input map: the fitted weight then lives
+        in the *target* input coordinates of ``h`` itself and no input-side
+        reprojection happens.  This is the ``direct_target`` mode, where there
+        is no parameter transport to respect on the input side; it is spelled
+        as ``None`` rather than an explicit identity so that the ``d_mlp``-sized
+        identity matmul is never materialized (4096x4096 per batch on a
+        ViT-L/14 target).  The solve itself is unchanged -- with ``t_in = I``
+        the normal equations reduce exactly to ``A = H``.
+        """
         _check_rows(h, e, "h", "e")
-        if h.ndim != 2 or e.ndim != 2 or t_in.ndim != 2 or t_out.ndim != 2:
+        if h.ndim != 2 or e.ndim != 2 or t_out.ndim != 2 or (t_in is not None and t_in.ndim != 2):
             raise ValueError("activations and transport maps must be matrices")
-        if h.shape[1] != t_in.shape[1] or e.shape[1] != t_out.shape[1]:
+        if t_in is not None and h.shape[1] != t_in.shape[1]:
             raise ValueError("transport maps do not match target activation dimensions")
-        tensors = (h, e, t_in, t_out)
+        if e.shape[1] != t_out.shape[1]:
+            raise ValueError("transport maps do not match target activation dimensions")
+        tensors = (h, e, t_out) if t_in is None else (h, e, t_in, t_out)
         if not all(torch.isfinite(x).all() for x in tensors):
             raise ValueError("solver inputs must be finite")
         # C_target = t_out.T C_source t_in; X = Delta_C_source.T.
-        a = h.to(torch.float64) @ t_in.to(torch.float64).T
+        a = h.to(torch.float64) if t_in is None else h.to(torch.float64) @ t_in.to(torch.float64).T
         lmat = t_out.to(torch.float64).T
         er = e.to(torch.float64)
         s = a.T @ a
@@ -225,12 +302,13 @@ class ResidualSufficientStatistics:
             self.s, self.g, self.b = s, g, b
             self.sum_a, self.sum_e = sum_a, sum_e
             self.m_source, self.d_source = a.shape[1], lmat.shape[1]
-            self._t_in = t_in.detach().clone()
+            self._t_in = None if t_in is None else t_in.detach().clone()
             self._t_out = t_out.detach().clone()
         else:
             if (s.shape, g.shape, b.shape) != (self.s.shape, self.g.shape, self.b.shape):
                 raise ValueError("inconsistent source dimensions across updates")
-            if not torch.equal(t_in, self._t_in) or not torch.equal(t_out, self._t_out):
+            same_in = (t_in is None) == (self._t_in is None) and (t_in is None or torch.equal(t_in, self._t_in))
+            if not same_in or not torch.equal(t_out, self._t_out):
                 raise ValueError("transport maps must remain fixed across streaming updates")
             self.s += s
             self.b += b
@@ -336,3 +414,193 @@ def fit_cproj_residual(
     stats = ResidualSufficientStatistics()
     stats.update(h, e, t_in, t_out)
     return stats.solve(ridge_relative=ridge_relative, exact_form=exact_form)
+
+
+def fit_joint_cproj_correction(
+    source_h: Tensor,
+    source_target: Tensor,
+    target_h: Tensor,
+    target_effect_residual: Tensor,
+    t_in: Tensor,
+    t_out: Tensor,
+    *,
+    source_weight: float = 1.0,
+    target_weight: float = 1.0,
+    ridge_relative: float = 1e-3,
+    target_intercept: bool = True,
+) -> tuple[Tensor, dict[str, Any]]:
+    r"""Fit the frozen-map Option 3 c_proj correction in source coordinates.
+
+    The returned matrix is ``Delta_C_source``.  Given baseline ARIADNE source
+    features ``H_s`` and target-side features ``H_t``, the exact objective is
+
+    .. math::
+
+       \min_X w_s\|H_s X - Y_s\|_F^2
+       + w_t\| (H_t t_{in}^T)X t_{out} - E_t\|_F^2
+       + \lambda\|X\|_F^2,
+
+    where ``X = Delta_C_source.T``.  ``t_in`` and ``t_out`` are frozen maps
+    fitted on the baseline ARIADNE resize; they are never differentiated or
+    refit here.  The first term is the ordinary source reconstruction target,
+    while the second is the target transported-effect residual.  This is the
+    documented one-alternation Option 3 protocol, not Proposal 1's
+    post-transport task-vector completion.
+
+    The solve uses sufficient statistics and an exact eigendecomposed
+    blockwise solve of the true two-Gram normal operator, avoiding a
+    Kronecker design matrix (the source and target Gramians generally do not
+    commute).  The returned matrix is the weight correction and the
+    diagnostics contain ``bias_correction``, the shared source-coordinate
+    intercept ``beta``.  The affine objective is
+
+    .. math::
+
+       w_s\|H_s X + 1\beta^T - Y_s\|_F^2
+       + w_t\|(H_t T_{in}^T X + \beta^T)T_{out} - E_t\|_F^2
+       + \lambda\|X\|_F^2.
+
+    The intercept is deliberately *not* ridge-penalized, matching ARIADNE's
+    affine fit.  Internally it is an extra, unregularized feature column, so
+    the same output-eigendecomposition gives an exact joint solve rather than
+    fitting a weight and bias in separate stages.  ``beta`` is transported as
+    ``T_out.T @ beta`` by the caller, exactly like ``c_proj.bias`` in the
+    Theseus/BiCo transport convention.  ``target_intercept=False`` makes the
+    intercept source-only.  That variant is used when the fitted affine map is
+    applied to both source endpoints: its bias cancels from their task vector
+    and therefore cannot contribute to the target P1 term.
+    """
+    matrices = (source_h, source_target, target_h, target_effect_residual, t_in, t_out)
+    if any(not isinstance(x, torch.Tensor) or x.ndim != 2 for x in matrices):
+        raise ValueError("joint c_proj inputs must be rank-2 tensors")
+    if any(any(int(dim) == 0 for dim in x.shape) for x in matrices):
+        raise ValueError("joint c_proj inputs must have non-empty dimensions")
+    if source_h.shape[0] != source_target.shape[0]:
+        raise ValueError("source feature and target rows must match")
+    if target_h.shape[0] != target_effect_residual.shape[0]:
+        raise ValueError("target feature and residual rows must match")
+    if source_h.shape[1] != t_in.shape[0] or target_h.shape[1] != t_in.shape[1]:
+        raise ValueError("t_in must have shape [source_input, target_input]")
+    if source_target.shape[1] != t_out.shape[0] or target_effect_residual.shape[1] != t_out.shape[1]:
+        raise ValueError("t_out must have shape [source_output, target_output]")
+    if any(not torch.isfinite(x).all() for x in matrices):
+        raise ValueError("joint c_proj inputs must be finite")
+    for name, value in (("source_weight", source_weight), ("target_weight", target_weight), ("ridge_relative", ridge_relative)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be a finite real number")
+        if name == "ridge_relative" and value <= 0:
+            raise ValueError("ridge_relative must be > 0")
+        if name != "ridge_relative" and value < 0:
+            raise ValueError(f"{name} must be >= 0")
+    if source_weight == 0 and target_weight == 0:
+        raise ValueError("at least one joint objective weight must be positive")
+    if not isinstance(target_intercept, bool):
+        raise ValueError("target_intercept must be boolean")
+
+    hs = source_h.to(torch.float64)
+    ys = source_target.to(torch.float64)
+    # Pull target activations back into source input coordinates.  This is the
+    # same orientation used by ResidualSufficientStatistics.update.
+    at = target_h.to(torch.float64) @ t_in.to(torch.float64).T
+    et = target_effect_residual.to(torch.float64)
+    tout64 = t_out.to(torch.float64)
+
+    # Add one shared source-coordinate intercept feature.  For the target
+    # term this is also a source-coordinate intercept after the frozen input
+    # map: [A_t, 1] [X; beta] T_out.  The final row is excluded from the ridge
+    # matrix below; ARIADNE's affine bias is not regularized.
+    ones_s = torch.ones((hs.shape[0], 1), dtype=torch.float64)
+    ones_t = torch.ones((at.shape[0], 1), dtype=torch.float64)
+    hs_aug = torch.cat((hs, ones_s), dim=1)
+    target_bias_feature = ones_t if target_intercept else torch.zeros_like(ones_t)
+    at_aug = torch.cat((at, target_bias_feature), dim=1)
+    ss = (hs_aug.T @ hs_aug)
+    st = (at_aug.T @ at_aug)
+    gt = (tout64 @ tout64.T)
+    b = float(source_weight) * (hs_aug.T @ ys) + float(target_weight) * (at_aug.T @ et @ tout64.T)
+    ss = (ss + ss.T) * 0.5
+    st = (st + st.T) * 0.5
+    gt = (gt + gt.T) * 0.5
+
+    m_source = int(hs.shape[1])
+    d_source = int(gt.shape[0])
+    m_aug = m_source + 1
+    trace_scale = float(source_weight) * float(torch.trace(hs.T @ hs).item())
+    trace_scale += float(target_weight) * float(torch.trace(at.T @ at).item())
+    lam = float(ridge_relative) * trace_scale / max(1, m_source)
+
+    # The source and target terms have different output Gramians.  They cannot
+    # be collapsed into ``(ws*Ss+wt*St) X (ws*I+wt*Gt)``: that creates cross
+    # terms and is not the normal equation of the stated objective.  Since the
+    # target Gram is symmetric PSD, diagonalize it once.  For each frozen
+    # output eigendirection j, the true normal equation is the independent
+    # source-space system
+    #
+    #   (ws Ss + wt eig_j(St) + lambda R) y_j = (B U)_j,
+    #
+    # followed by X = Y U^T.  This is an exact blockwise closed-form solve and
+    # avoids materializing an (m*d) Kronecker matrix or relying on a
+    # convergence-dependent iterative solver.
+    # Always solve the augmented system, including when the activation banks
+    # themselves are zero.  The all-ones intercept column still carries a
+    # nonzero sufficient statistic and can exactly explain a constant target;
+    # short-circuiting on ``trace_scale`` would incorrectly force beta to zero.
+    eigvals, eigvecs = torch.linalg.eigh(gt)
+    eigvals = eigvals.clamp_min(0.0)
+    rhs = b @ eigvecs
+    ridge_mask = torch.zeros((m_aug, m_aug), dtype=torch.float64)
+    ridge_mask[:m_source, :m_source] = torch.eye(m_source, dtype=torch.float64)
+    y = torch.empty(m_aug, d_source, dtype=torch.float64)
+    source_gram = float(source_weight) * ss
+    target_gram = float(target_weight) * st
+    for j, eigval in enumerate(eigvals):
+        lhs = source_gram + float(eigval) * target_gram + lam * ridge_mask
+        lhs = (lhs + lhs.T) * 0.5
+        try:
+            y[:, j] = torch.linalg.solve(lhs, rhs[:, j])
+        except RuntimeError:
+            # A target-only solve with a rank-deficient T_out leaves some
+            # intercept directions unconstrained.  The minimum-norm
+            # pseudoinverse solution is the exact ridge objective minimizer
+            # and keeps that valid degenerate case finite.
+            y[:, j] = torch.linalg.pinv(lhs, hermitian=True) @ rhs[:, j]
+    z = y @ eigvecs.T
+    used_blocks = d_source
+    x = z[:m_source]
+    beta = z[m_source]
+    if not torch.isfinite(x).all() or not torch.isfinite(beta).all():
+        raise RuntimeError("joint c_proj frozen-map blockwise solve produced non-finite values")
+
+    def _objective(x_arg: Tensor, beta_arg: Tensor) -> float:
+        src_err = hs @ x_arg + beta_arg - ys
+        target_bias = beta_arg if target_intercept else torch.zeros_like(beta_arg)
+        tgt_err = (at @ x_arg + target_bias) @ tout64 - et
+        value = float(source_weight) * float((src_err * src_err).sum().item())
+        value += float(target_weight) * float((tgt_err * tgt_err).sum().item())
+        value += lam * float((x_arg * x_arg).sum().item())
+        return value
+
+    zero = torch.zeros_like(x)
+    zero_beta = torch.zeros_like(beta)
+    diagnostics = {
+        "objective_before": _objective(zero, zero_beta),
+        "objective_after": _objective(x, beta),
+        "source_reconstruction_before": float((ys * ys).sum().item()) ** 0.5,
+        "source_reconstruction_after": float(((hs @ x + beta - ys) ** 2).sum().item()) ** 0.5,
+        "target_effect_residual_before": float((et * et).sum().item()) ** 0.5,
+        "target_effect_residual_after": float(
+            (((at @ x + (beta if target_intercept else 0.0)) @ tout64 - et) ** 2).sum().item()
+        ) ** 0.5,
+        "ridge": lam,
+        "source_weight": float(source_weight),
+        "target_weight": float(target_weight),
+        "frozen_map": True,
+        "alternations": 1,
+        "solver": "blockwise_eigh",
+        "solver_blocks": used_blocks,
+        "bias_correction": beta.to(torch.float32),
+        "bias_norm": float(torch.linalg.norm(beta).item()),
+        "bias_regularized": False,
+        "target_intercept": target_intercept,
+    }
+    return x.T.to(torch.float32), diagnostics

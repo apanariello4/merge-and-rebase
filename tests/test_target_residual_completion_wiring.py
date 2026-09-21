@@ -265,6 +265,95 @@ def test_identity_initialization_p1_wires_capture_layout_transport_and_completio
     assert all("c_proj" in key for key in changed)
 
 
+def test_reduction_p1_layout_uses_each_collapsed_span_end_boundary():
+    """Reduction P1 is all-scope and records the c_proj span-end ancestry.
+
+    The reduction has no inserted blocks.  A future target residual solve must
+    therefore address every realized target block and use the collapsed span's
+    output boundary rather than guessing an odd/even insertion position.
+    """
+    torch.manual_seed(7)
+    source = Model(3, 4).eval()
+    source_ft = deepcopy(source)
+    with torch.no_grad():
+        source_ft.visual.transformer.resblocks[1].mlp.c_proj.weight.add_(0.15)
+        source_ft.visual.transformer.resblocks[3].mlp.c_proj.weight.sub_(0.1)
+    target = Model(5, 2).eval()
+    data = _loader()
+    _, config = resolve_block_extension_config(
+        {
+            "block_extension_enabled": True,
+            "block_extension_params": {
+                "target_layers_total": 2,
+                "extension_strategy": "interpolate_per_weight",
+                "n_batches_act": 2,
+                "skip_correction": False,
+                "lmc_mode": "shared",
+                "target_residual_completion": {
+                    "enabled": True,
+                    "target_scope": "all",
+                    "num_batches": 2,
+                    "ridge_relative": 0.01,
+                    "strength": 0.2,
+                },
+            },
+        }
+    )
+    references = _maybe_capture_target_residual_references(
+        config=config.target_residual_completion,
+        source_base_model=source,
+        source_ft_model=source_ft,
+        target_model=target,
+        source_loader=data,
+        target_loader=data,
+        seed=3,
+        device="cpu",
+    )
+    layout = {}
+    run_block_extension(
+        source_base_model=source,
+        source_ft_model=source_ft,
+        calibration_loader=data,
+        target_layers_total=2,
+        config=config,
+        device="cpu",
+        layout_out=layout,
+    )
+    assert layout["direction"] == "shrink"
+    assert layout["p1_source_ancestry"] == "span_end_boundary"
+    assert layout["inserted_blocks"] == ()
+    assert [row["position"] for row in layout["final_blocks"]] == [0, 1]
+    assert [row["source_orig_idx"] for row in layout["final_blocks"]] == [1, 3]
+    assert [row["span_orig_idxs"] for row in layout["final_blocks"]] == [(0, 1), (2, 3)]
+
+    transforms = {}
+    for position in (0, 1):
+        transforms[f"transformer.resblocks.{position}.mlp.c_proj.weight"] = SimpleNamespace(
+            kind="weight",
+            t_in=torch.linalg.qr(torch.randn(10, 6)).Q.T,
+            t_out=torch.linalg.qr(torch.randn(5, 3)).Q.T,
+        )
+    baseline_delta = {key: 0.02 * torch.randn_like(value) for key, value in target.state_dict().items()}
+    completed, diagnostics = _maybe_complete_target_residual_task_vector(
+        config=config.target_residual_completion,
+        references=references,
+        prepared={"transforms_by_key": transforms},
+        layout=layout,
+        target_model=target,
+        target_base_sd={key: value.clone() for key, value in target.state_dict().items()},
+        transported_delta=baseline_delta,
+        target_loader=data,
+        device="cpu",
+    )
+    assert diagnostics is not None and [row["source_orig_idx"] for row in diagnostics] == [1, 3]
+    assert {key for key in baseline_delta if not torch.equal(completed[key], baseline_delta[key])} == {
+        "visual.transformer.resblocks.0.mlp.c_proj.weight",
+        "visual.transformer.resblocks.0.mlp.c_proj.bias",
+        "visual.transformer.resblocks.1.mlp.c_proj.weight",
+        "visual.transformer.resblocks.1.mlp.c_proj.bias",
+    }
+
+
 def test_enabled_with_zero_strength_is_a_true_null_ablation():
     """gamma=1 fitting still runs, but strength=0.0 must reproduce baseline exactly."""
     config = ResidualCompletionConfig(enabled=True, ridge_relative=0.05, num_batches=3, strength=0.0)

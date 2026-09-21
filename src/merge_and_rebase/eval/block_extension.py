@@ -20,7 +20,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
-from .target_residual_completion import ResidualCompletionConfig, parse_residual_completion_config
+from .target_residual_completion import (
+    JointCorrectionConfig,
+    ResidualCompletionConfig,
+    parse_joint_correction_config,
+    parse_residual_completion_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +177,13 @@ class BlockExtensionConfig:
     # inserted blocks' c_proj projections. ``enabled=False`` (the default) is
     # the standard ARIADNE path and does not touch any target-informed code.
     target_residual_completion: ResidualCompletionConfig = field(default_factory=ResidualCompletionConfig)
+    # Opt-in Option 3 frozen-map joint source/target blockwise solve.  The
+    # default is disabled so historical ARIADNE and Proposal-1 runs are
+    # byte-compatible and do not allocate the additional activation banks.
+    joint_blockwise_correction: JointCorrectionConfig = field(default_factory=JointCorrectionConfig)
+    # Two-pass direct hybrid: fit frozen transport first, then refine the
+    # shared ARIADNE c_proj affine map with a P1 residual objective.
+    direct_p1_correction: JointCorrectionConfig = field(default_factory=JointCorrectionConfig)
     # Which blocks receive a component correction. ``inserted`` is the paper's
     # scope and the default. ``interleaved_once`` additionally repairs the
     # original block immediately above each insertion, which over the
@@ -203,6 +215,27 @@ def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
     arm cannot be mistaken for the untouched identity control.
     """
     proposal_1 = bool(config.target_residual_completion.enabled)
+    option_3 = bool(config.joint_blockwise_correction.enabled)
+    direct_p1 = bool(config.direct_p1_correction.enabled)
+    if direct_p1:
+        return {
+            "label": "ariadne_direct_p1_shared_correction",
+            "initialization": "ariadne",
+            "proposal": "direct_p1_shared_correction",
+            "is_baseline": False,
+            "interpretation": "second shared c_proj affine pass with frozen transport and P1 residual objective",
+        }
+    if option_3:
+        return {
+            "label": "ariadne_plus_joint_blockwise_option3",
+            "initialization": "ariadne",
+            "proposal": "joint_blockwise_option3",
+            "is_baseline": False,
+            "interpretation": (
+                "frozen-map one-alternation additive source/target c_proj solve; "
+                "transport maps remain fixed and corrections are mounted sequentially"
+            ),
+        }
     if proposal_1 and config.inserted_block_mode == "residual_identity":
         return {
             "label": "residual_identity_plus_proposal_1",
@@ -271,6 +304,8 @@ def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
 _MISPLACED_TOP_LEVEL_KEYS = (
     "target_shared_correction",
     "target_residual_completion",
+    "joint_blockwise_correction",
+    "direct_p1_correction",
     "capture_target_residual_reference",
 )
 
@@ -377,6 +412,58 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
             )
 
     target_residual_completion = parse_residual_completion_config(params.get("target_residual_completion", None))
+    joint_blockwise_correction = parse_joint_correction_config(
+        params.get("joint_blockwise_correction", None)
+    )
+    direct_p1_correction = parse_joint_correction_config(params.get("direct_p1_correction", None))
+    enabled_target_methods = sum(
+        int(flag)
+        for flag in (
+            target_residual_completion.enabled,
+            joint_blockwise_correction.enabled,
+            direct_p1_correction.enabled,
+        )
+    )
+    if enabled_target_methods > 1:
+        raise ValueError(
+            "target_residual_completion, joint_blockwise_correction, and direct_p1_correction are mutually exclusive; "
+            "enable one target-informed correction protocol per run."
+        )
+    for option_name, option_enabled in (
+        ("joint_blockwise_correction", joint_blockwise_correction.enabled),
+        ("direct_p1_correction", direct_p1_correction.enabled),
+    ):
+        if not option_enabled:
+            continue
+        if target_shared_correction is not None and target_shared_correction.active:
+            raise ValueError(
+                f"{option_name} and target_shared_correction are mutually exclusive; "
+                "change one target-informed factor at a time."
+            )
+        if skip_correction:
+            raise ValueError(f"{option_name} requires skip_correction=false.")
+        if str(params.get("lmc_mode", "independent")) != "shared":
+            raise ValueError(f"{option_name} requires lmc_mode='shared'.")
+        if inserted_block_mode != "ariadne":
+            raise ValueError(f"{option_name} requires inserted_block_mode='ariadne'.")
+        if correction_scope != "inserted":
+            raise ValueError(f"{option_name} currently requires correction_scope='inserted'.")
+        if transport_activation_mode != "model":
+            raise ValueError(f"{option_name} requires transport_activation_mode='model'.")
+        if str(params.get("insertion_target_mode", "direct")) != "direct":
+            raise ValueError(f"{option_name} requires insertion_target_mode='direct'.")
+        if str(params.get("insertion_order", "bottom-top")) != "bottom-top":
+            raise ValueError(f"{option_name} requires insertion_order='bottom-top'.")
+        if str(params.get("extension_density", "spread")) not in {"spread", "spread_mod"}:
+            raise ValueError(f"{option_name} requires spread extension density.")
+        if str(params.get("extension_strategy", "interpolate_per_weight")) != "duplicate_per_weight":
+            raise ValueError(f"{option_name} requires extension_strategy='duplicate_per_weight'.")
+        if str(params.get("calibration_split", "test")) != "val":
+            raise ValueError(f"{option_name} requires calibration_split='val'.")
+        if params.get("calibration_dataset") is not None or params.get("calibration_task") is not None:
+            raise ValueError(f"{option_name} requires task-local calibration data.")
+        if bool(params.get("share_ft_refs", False)):
+            raise ValueError(f"{option_name} requires share_ft_refs=false.")
     if target_residual_completion.enabled:
         # The ordinary arm completes a corrected ARIADNE insertion.  The one
         # exploratory exception is explicit residual_identity + P1: the
@@ -434,6 +521,8 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         inserted_block_mode=inserted_block_mode,
         target_shared_correction=target_shared_correction,
         target_residual_completion=target_residual_completion,
+        joint_blockwise_correction=joint_blockwise_correction,
+        direct_p1_correction=direct_p1_correction,
         correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
         insertion_target_mode=str(params.get("insertion_target_mode", "direct")),

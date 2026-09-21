@@ -8,6 +8,8 @@ from merge_and_rebase.eval.target_residual_completion import (
     backproject_target_rows,
     centered_rectangular_procrustes,
     fit_cproj_residual,
+    fit_joint_cproj_correction,
+    parse_joint_correction_config,
     parse_residual_completion_config,
 )
 from merge_and_rebase.rebase.methods.theseus import _transport_weight
@@ -29,6 +31,16 @@ def test_config_defaults_and_validation() -> None:
         parse_residual_completion_config({"exact_form": 1})
     with pytest.raises(ValueError):
         parse_residual_completion_config({"target_scope": "added"})
+
+
+def test_joint_correction_config_is_explicit_and_validated() -> None:
+    cfg = parse_joint_correction_config({"enabled": True, "source_weight": 2.0, "target_weight": 0.5})
+    assert cfg.enabled and cfg.source_weight == 2.0 and cfg.target_weight == 0.5
+    assert parse_joint_correction_config(None).enabled is False
+    with pytest.raises(ValueError, match="at least one"):
+        parse_joint_correction_config({"source_weight": 0.0, "target_weight": 0.0})
+    with pytest.raises(ValueError, match="unknown"):
+        parse_joint_correction_config({"transport_seed": 0})
 
 
 def test_centered_rectangular_procrustes_and_backprojection() -> None:
@@ -253,3 +265,60 @@ def test_transport_orientation_matches_theseus_weight_helper() -> None:
     t_out = torch.randn(3, 2)
     expected = _transport_weight(c, t_in, t_out, key="weight")
     assert torch.allclose(expected, t_out.T @ c @ t_in)
+
+
+def test_joint_frozen_map_solver_matches_explicit_objective() -> None:
+    """The one-alternation solver must minimize the stated source+target objective."""
+    torch.manual_seed(41)
+    ns, nt, si, ti, so, to = 7, 8, 3, 4, 2, 5
+    source_h = torch.randn(ns, si)
+    source_y = torch.randn(ns, so)
+    target_h = torch.randn(nt, ti)
+    target_e = torch.randn(nt, to)
+    t_in = torch.randn(si, ti)
+    t_out = torch.randn(so, to)
+    ws, wt, rho = 1.7, 0.6, 0.04
+    got, diag = fit_joint_cproj_correction(
+        source_h, source_y, target_h, target_e, t_in, t_out,
+        source_weight=ws, target_weight=wt, ridge_relative=rho,
+    )
+
+    # Independent explicit vectorized normal equations for the augmented
+    # Z=[X; beta], with no ridge on the final intercept row.
+    hs, ys = source_h.double(), source_y.double()
+    at = target_h.double() @ t_in.double().T
+    et, tout = target_e.double(), t_out.double()
+    hs_aug = torch.cat((hs, torch.ones(ns, 1, dtype=torch.float64)), dim=1)
+    at_aug = torch.cat((at, torch.ones(nt, 1, dtype=torch.float64)), dim=1)
+    columns = []
+    for i in range(si + 1):
+        for j in range(so):
+            basis = torch.zeros(si + 1, so, dtype=torch.float64)
+            basis[i, j] = 1.0
+            columns.append(torch.cat([(hs_aug @ basis).reshape(-1), (at_aug @ basis @ tout).reshape(-1)]))
+    design = torch.stack(columns, dim=1)
+    targets = torch.cat([ys.reshape(-1), et.reshape(-1)])
+    lam = rho * (ws * torch.trace(hs.T @ hs) + wt * torch.trace(at.T @ at)) / si
+    weights = torch.cat([
+        torch.full((ns * so,), ws, dtype=torch.float64),
+        torch.full((nt * to,), wt, dtype=torch.float64),
+    ])
+    ridge_mask = torch.zeros((si + 1) * so, dtype=torch.float64)
+    for i in range(si):
+        ridge_mask[i * so : (i + 1) * so] = 1.0
+    normal = design.T @ (weights[:, None] * design) + lam * torch.diag(ridge_mask)
+    rhs = design.T @ (weights * targets)
+    ref = torch.linalg.solve(normal, rhs).reshape(si + 1, so)
+    assert torch.allclose(got.double(), ref[:si].T, atol=3e-5, rtol=3e-5)
+    assert torch.allclose(diag["bias_correction"].double(), ref[si], atol=3e-5, rtol=3e-5)
+    assert diag["frozen_map"] is True
+    assert diag["alternations"] == 1
+    assert diag["objective_after"] < diag["objective_before"]
+
+
+def test_joint_solver_rejects_nonmatching_transport_shapes() -> None:
+    tensors = [torch.randn(4, 3), torch.randn(4, 2), torch.randn(5, 4), torch.randn(5, 3)]
+    with pytest.raises(ValueError, match="t_in"):
+        fit_joint_cproj_correction(
+            *tensors, torch.randn(2, 5), torch.randn(2, 3),
+        )

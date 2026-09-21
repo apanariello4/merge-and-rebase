@@ -21,6 +21,8 @@ from merge_and_rebase.eval.block_extension import resolve_block_extension_config
 _MISPLACED_KEYS = (
     "target_shared_correction",
     "target_residual_completion",
+    "joint_blockwise_correction",
+    "direct_p1_correction",
     "capture_target_residual_reference",
 )
 

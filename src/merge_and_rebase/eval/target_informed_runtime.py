@@ -33,9 +33,11 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 from ..rebase.methods.theseus import _interp_2d_tokens, _to_tokens
 from .block_extension import _encode_image
 from .target_residual_completion import (
+    JointCorrectionConfig,
     ResidualCompletionConfig,
     ResidualSufficientStatistics,
     centered_rectangular_procrustes,
+    fit_joint_cproj_correction,
 )
 
 
@@ -82,7 +84,9 @@ def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_
     from .target_residual_completion import parse_residual_completion_config
     shared = parse_target_shared_config(cfg.get("target_shared_correction"))
     residual = parse_residual_completion_config(cfg.get("target_residual_completion"))
-    active = shared.enabled or residual.enabled or bool(cfg.get("capture_target_residual_reference"))
+    joint = bool(block_cfg.joint_blockwise_correction.enabled)
+    direct_p1 = bool(block_cfg.direct_p1_correction.enabled)
+    active = shared.enabled or residual.enabled or joint or direct_p1 or bool(cfg.get("capture_target_residual_reference"))
     if not active:
         return
     if method_name not in {"theseus", "bico"}:
@@ -112,6 +116,10 @@ def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_
         )
     if identity_p1 and shared.enabled:
         raise ValueError("residual_identity + Proposal 1 cannot also enable target_shared_correction")
+    if joint and shared.enabled:
+        raise ValueError("Option 3 and target_shared_correction cannot be enabled together")
+    if direct_p1 and shared.enabled:
+        raise ValueError("Direct P1 correction and target_shared_correction cannot be enabled together")
     if block_cfg.calibration_split != "val" or block_cfg.calibration_dataset is not None or block_cfg.calibration_task:
         raise ValueError("Target-informed references require task-local validation calibration")
     if block_cfg.transport_activation_mode != "model" or block_cfg.share_ft_refs:
@@ -331,6 +339,7 @@ def capture_residual_references(
     device,
     target_scope="inserted",
     family_adapter=None,
+    capture_joint=False,
 ):
     return _capture_residual_references(
         source_base,
@@ -343,6 +352,7 @@ def capture_residual_references(
         device=device,
         target_scope=target_scope,
         family_adapter=family_adapter,
+        capture_joint=capture_joint,
     )
 
 
@@ -358,6 +368,7 @@ def _capture_residual_references(
     device,
     target_scope,
     family_adapter=None,
+    capture_joint=False,
 ):
     """Capture native source banks and target-position banks.
 
@@ -374,6 +385,10 @@ def _capture_residual_references(
     layout_shim = _layout_for(family_adapter)
     depth = layout_shim.block_count(source_base)
     req = {str(i): (i, "boundary") for i in range(depth)}
+    if capture_joint:
+        for i in range(depth):
+            req[f"{i}.c_proj_input"] = (i, "c_proj_input")
+            req[f"{i}.c_proj_output"] = (i, "c_proj")
     base = capture_tokens(source_base, sb, req, device, family_adapter=family_adapter)
     ft = capture_tokens(source_ft, sb, req, device, family_adapter=family_adapter)
     target_depth = layout_shim.block_count(target_base)
@@ -383,14 +398,37 @@ def _capture_residual_references(
             "Target model depth does not contain the requested target positions: "
             f"scope={target_scope!r}, source_depth={depth}, target_depth={target_depth}."
         )
-    target = capture_tokens(target_base, tb, {str(i): (i, "boundary") for i in positions}, device, family_adapter=family_adapter)
+    target_requests = {str(i): (i, "boundary") for i in positions}
+    if capture_joint:
+        for i in positions:
+            target_requests[f"{i}.c_proj_input"] = (i, "c_proj_input")
+            target_requests[f"{i}.c_proj_output"] = (i, "c_proj")
+    target = capture_tokens(target_base, tb, target_requests, device, family_adapter=family_adapter)
 
     # Keep source banks by original index for the all-position path.  The
     # inserted path also materializes the historical dictionaries immediately,
     # preserving its byte-compatible downstream behavior.
-    source_base_outputs = {int(i): value for i, value in base.items()}
-    source_ft_outputs = {int(i): value for i, value in ft.items()}
-    target_outputs_by_position = {int(i): value for i, value in target.items()}
+    source_base_outputs = {int(i): value for i, value in base.items() if i.isdigit()}
+    source_ft_outputs = {int(i): value for i, value in ft.items() if i.isdigit()}
+    source_base_cproj_inputs = {
+        int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_input")
+    } if capture_joint else {}
+    source_ft_cproj_inputs = {
+        int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_input")
+    } if capture_joint else {}
+    source_base_cproj_outputs = {
+        int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_output")
+    } if capture_joint else {}
+    source_ft_cproj_outputs = {
+        int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_output")
+    } if capture_joint else {}
+    target_outputs_by_position = {int(i): value for i, value in target.items() if i.isdigit()}
+    target_cproj_inputs_by_position = {
+        int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_input")
+    } if capture_joint else {}
+    target_cproj_outputs_by_position = {
+        int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_output")
+    } if capture_joint else {}
     desired, maps, target_outputs = {}, {}, {}
     if target_scope == "inserted":
         for i in range(depth):
@@ -411,6 +449,17 @@ def _capture_residual_references(
         "maps": maps,
         "calibration": metadata,
     }
+    if capture_joint:
+        result.update(
+            {
+                "source_base_cproj_inputs": source_base_cproj_inputs,
+                "source_ft_cproj_inputs": source_ft_cproj_inputs,
+                "source_base_cproj_outputs": source_base_cproj_outputs,
+                "source_ft_cproj_outputs": source_ft_cproj_outputs,
+                "target_cproj_inputs_by_position": target_cproj_inputs_by_position,
+                "target_cproj_outputs_by_position": target_cproj_outputs_by_position,
+            }
+        )
     if target_scope == "all":
         result.update(
             {
@@ -501,6 +550,7 @@ def materialize_missing_projection_biases(target_model, target_base_state, layou
         )
         added.append(bias_key)
     return added
+
 
 @torch.no_grad()
 def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device, family_adapter=None):
@@ -641,6 +691,572 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return source_corrections, target_corrections, diagnostics
+
+@torch.no_grad()
+def complete_residuals_direct(
+    target_model,
+    target_base_state,
+    references,
+    layout,
+    target_loader,
+    *,
+    config: ResidualCompletionConfig,
+    device,
+    family_adapter=None,
+):
+    """Transport-free Proposal 1: synthesize the whole target task vector.
+
+    ``complete_residuals`` completes the residual left over by an already
+    transported task vector.  This variant answers a different question: can
+    the desired local functional effect be written directly into the target's
+    residual-writing projections with **no parameter transport at all**?  The
+    temporary model therefore starts at the native target base
+    ``theta_t^0`` -- there is no ``tau_t`` -- and the accumulated correction is
+    the entire returned task vector.
+
+    Everything upstream of the solve is shared with the transport-aware path
+    and is used unchanged: the same paired calibration batches, the same
+    pre-resize source reference banks ``B_i^0, B_i^1``, the same centered
+    rectangular Procrustes map ``Q_j``, and therefore the same desired effect
+    ``D_j = (B_i^1 - B_i^0) Q_j``.  Only the coordinate system of the solve
+    differs.  With no transport there is no source coordinate system to
+    respect, so the affine ridge of Eq. 8-9 is solved directly in target
+    coordinates,
+
+        min_{Delta C_t, beta_t} || (H_j Delta C_t^T + 1 beta_t^T) - E_j ||_F^2
+                                + lam ||Delta C_t||_F^2,
+
+    which is exactly the transport-aware objective at ``t_in = I`` and
+    ``t_out = I``.  It is deliberately run through the *same*
+    ``ResidualSufficientStatistics`` solver rather than a second
+    implementation of the normal equations: ``t_in=None`` is the identity
+    input map (never materialized), and ``t_out`` carries only the target's
+    own LayerScale, exactly as in the transport-aware path.
+
+    The sequential cascade is preserved.  Blocks are fitted in realized-layout
+    order against a temporary model that already carries every previously
+    fitted correction, so
+
+        E_j = D_j - (T_j^cur - T_j^0)
+
+    and a later block only repairs the effect its predecessors did not already
+    produce.  At the first fitted block ``T_j^cur == T_j^0`` by construction,
+    so ``E_j == D_j`` exactly; that identity is asserted numerically rather
+    than assumed.
+
+    Returns ``(target_corrections, diagnostics)``.  The corrections are an
+    ordinary target-space task vector fitted at unit strength; ``config
+    .strength`` (gamma) is applied afterwards by ``scale_completion``, so
+    ``gamma=0`` reproduces the native target base exactly.  The target model is
+    restored to its entry state in a ``finally``; no hooks or modules survive.
+    """
+    if config.mode != "direct_target":
+        raise ValueError(
+            f"complete_residuals_direct requires mode='direct_target', got {config.mode!r}"
+        )
+    if references.get("scope", "inserted") != config.target_scope:
+        raise ValueError(
+            "Native reference scope does not match residual completion config: "
+            f"references={references.get('scope', 'inserted')!r}, config={config.target_scope!r}"
+        )
+    if config.target_scope == "inserted":
+        entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
+        block_kind = {int(row["position"]): "inserted" for row in entries}
+        desired = references.get("desired", {})
+        target_outputs = references.get("target_base_outputs", {})
+        maps = references.get("maps", {})
+    else:
+        entries = sorted(layout.get("final_blocks", ()), key=lambda row: row["position"])
+        if not entries:
+            raise ValueError("All target scope requires non-empty realized layout final_blocks")
+        desired, target_outputs, maps = _materialize_all_scope_references(references, entries)
+        block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
+    expected_positions = {int(row["position"]) for row in entries}
+    for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps)):
+        if set(values) != expected_positions:
+            raise ValueError(
+                f"Residual completion {name} keys do not exactly match realized target positions: "
+                f"expected={sorted(expected_positions)}, found={sorted(values)}"
+            )
+    meta = references["calibration"]
+    if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
+        raise ValueError("Cached reference images do not match this task's validation dataset")
+    batches = list(DataLoader(Subset(target_loader.dataset, meta["indices"]), batch_size=meta["batch_size"],
+                              shuffle=False, num_workers=0, collate_fn=target_loader.collate_fn))
+    original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    target_corrections, diagnostics = {}, []
+    try:
+        # No transported vector: the temporary model *is* the native target
+        # base. Asserted rather than assumed, because the whole claim of this
+        # arm is that nothing but the fitted correction reaches the target.
+        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        target_model.load_state_dict(current_state, strict=True)
+        for index, row in enumerate(entries):
+            pos = int(row["position"])
+            if config.target_scope == "inserted" and pos != 2 * int(row["source_orig_idx"]) + 1:
+                raise ValueError("Realized insertion ancestry does not match captured references")
+            shim = _layout_for(family_adapter)
+            key = shim.proj_key(pos, prefixed=True)
+            captured = capture_tokens(
+                target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
+                device, family_adapter=family_adapter,
+            )
+            width = int(current_state[key].shape[0])
+            identity_out = torch.eye(width, dtype=torch.float32)
+            block = shim.block_module(shim.blocks(target_model)[pos])
+            scale_module = getattr(block, "ls_2", nn.Identity())
+            effective_out = identity_out
+            if not isinstance(scale_module, nn.Identity):
+                scale = getattr(scale_module, "gamma", None)
+                if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+                    raise ValueError("Unsupported non-diagonal target LayerScale")
+                # diag(gamma): the residual stream receives gamma * c_proj(h),
+                # so the fit must predict through that scaling exactly as the
+                # transport-aware path folds it into t_out.
+                effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+            stats = ResidualSufficientStatistics()
+            desired_sq = 0.0
+            effect_sq = 0.0
+            for h, out, desired_batch, base_out in zip(
+                captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
+            ):
+                effect = out - base_out
+                error = desired_batch - effect
+                desired_sq += float((desired_batch.double() ** 2).sum().item())
+                effect_sq += float((effect.double() ** 2).sum().item())
+                stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+            if index == 0:
+                # E_j == D_j at the first fitted block: the temporary model is
+                # still the untouched target base there, so the current effect
+                # is identically zero. A nonzero effect here means a stale
+                # reference bank or a mutated base, not a small numerical drift.
+                if effect_sq > 1e-12 * max(desired_sq, 1.0):
+                    raise RuntimeError(
+                        "Direct completion started from a target model that is not the native "
+                        f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
+                    )
+            correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+            # t_in = I and the write-side t_out = I: the fitted matrix already
+            # lives in target coordinates, so there is nothing to transport.
+            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+                raise RuntimeError("Direct residual completion produced an invalid projection")
+            target_corrections[key] = correction
+            current_state[key] = current_state[key] + correction.to(current_state[key])
+            bias_key = f"{key[: -len('.weight')]}.bias"
+            bias_correction = diag["bias_correction"]
+            if bias_key not in current_state:
+                if config.missing_bias == "materialize":
+                    raise RuntimeError(
+                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                        "before residual completion runs; call "
+                        "materialize_missing_projection_biases() on the target model and its "
+                        "base state dict first"
+                    )
+                elif config.missing_bias == "skip":
+                    if torch.count_nonzero(bias_correction):
+                        raise RuntimeError(
+                            "missing_bias='skip' would discard a nonzero intercept at "
+                            f"{bias_key}; the weight was fitted on centered banks and is "
+                            "not valid without it"
+                        )
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"Target model is missing the expected bias parameter {bias_key}. "
+                        "Decoder MLP projections are bias-free; set "
+                        "target_residual_completion.missing_bias to 'materialize' "
+                        "(exact, adds the parameter) or 'skip' with exact_form=false."
+                    )
+            bias_delta = bias_correction.to(current_state[bias_key])
+            if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+                raise RuntimeError("Direct residual completion produced an invalid bias")
+            target_corrections[bias_key] = bias_correction
+            current_state[bias_key] = current_state[bias_key] + bias_delta
+            target_model.load_state_dict(current_state, strict=True)
+            desired_norm = desired_sq ** 0.5
+            diagnostics.append(
+                {
+                    "mode": "direct_target",
+                    "scope": config.target_scope,
+                    "block_kind": block_kind[pos],
+                    "position": pos,
+                    "source_orig_idx": row["source_orig_idx"],
+                    "desired_norm": desired_norm,
+                    "effect_before_norm": effect_sq ** 0.5,
+                    # r_j: the fraction of the desired local effect still
+                    # missing, before and after this block's correction. The
+                    # "after" value is exact rather than re-measured: c_proj is
+                    # the last operation writing into the residual stream in
+                    # this block and its input H_j does not depend on its own
+                    # weight, so mounting the correction changes the block
+                    # output by exactly gamma * (H_j dC^T + beta) -- the same
+                    # quantity the solver already evaluated. Pinned by
+                    # tests/test_direct_target_p1.py.
+                    "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+                    "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                    "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                    **diag,
+                }
+            )
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+    return target_corrections, diagnostics
+
+@torch.no_grad()
+def complete_joint_blockwise(
+    target_model,
+    target_base_state,
+    baseline_delta,
+    references,
+    transforms,
+    layout,
+    target_loader,
+    *,
+    config: JointCorrectionConfig,
+    device,
+    family_adapter=None,
+):
+    """Solve Option 3 once per realized block and return target-space deltas.
+
+    The source term penalizes disturbing the post-ARIADNE inserted block on
+    its actual resized-source inputs.  The target term fits the remaining
+    boundary-effect error after ordinary transport, using the same frozen
+    input/output maps. Corrections are mounted sequentially, so later blocks
+    observe earlier repairs. The target model is restored before returning;
+    only the returned task-vector dictionaries are consumed by the caller.
+    """
+    if not config.enabled:
+        return {}, {}, []
+    entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
+    # The caller passes the realized layout.  ``target_scope=all`` is not part
+    # of the initial Option-3 schema, but accepting final_blocks here keeps a
+    # future parser extension from silently selecting the wrong positions.
+    if getattr(config, "target_scope", "inserted") == "all":
+        entries = sorted(layout.get("final_blocks", ()), key=lambda row: row["position"])
+    if not entries:
+        raise ValueError("Joint blockwise correction requires a non-empty realized layout")
+    expected_positions = {int(row["position"]) for row in entries}
+    if set(transforms) != expected_positions:
+        raise ValueError(
+            "Joint blockwise transforms do not match realized positions: "
+            f"expected={sorted(expected_positions)}, found={sorted(transforms)}"
+        )
+    metadata = references.get("calibration")
+    if metadata is None or repr(_dataset_identity(target_loader.dataset)) != metadata["dataset_identity"]:
+        raise ValueError("Joint blockwise references do not match this task's validation dataset")
+    batches = list(
+        DataLoader(
+            Subset(target_loader.dataset, metadata["indices"]),
+            batch_size=metadata["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=target_loader.collate_fn,
+        )
+    )
+    source_h_by_position = references.get("resized_source_cproj_inputs_by_position", {})
+    target_base_outputs = references.get("target_base_outputs_by_position", {})
+    target_h_refs = references.get("target_cproj_inputs_by_position", {})
+    # Inserted-only capture stores the same target banks under the historical
+    # target_base_outputs key; normalize it here for one common implementation.
+    if not target_base_outputs:
+        target_base_outputs = references.get("target_base_outputs", {})
+    if not source_h_by_position or not target_h_refs:
+        raise ValueError("Joint blockwise references are missing c_proj activation banks")
+
+    original_state = {key: value.detach().cpu().clone() for key, value in target_model.state_dict().items()}
+    current_state = {key: value.detach().cpu().clone() for key, value in target_base_state.items()}
+    for key, delta in baseline_delta.items():
+        if key not in current_state or tuple(delta.shape) != tuple(current_state[key].shape):
+            raise ValueError(f"Baseline task vector is incompatible at {key}")
+        current_state[key] = current_state[key] + delta.to(current_state[key])
+    source_corrections, target_corrections, diagnostics = {}, {}, []
+    try:
+        target_model.load_state_dict(current_state, strict=True)
+        for row in entries:
+            pos = int(row["position"])
+            source_idx = int(row["source_orig_idx"])
+            transform = transforms[pos]
+            t_in, t_out = transform["t_in"], transform["t_out"]
+            key = _layout_for(family_adapter).proj_key(pos, prefixed=True)
+            captured = capture_tokens(
+                target_model,
+                batches,
+                {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
+                device,
+                family_adapter=family_adapter,
+            )
+            source_h_rows = _rows(source_h_by_position[pos])
+            # X is additive to the already-fitted ARIADNE/transport task
+            # vector.  A zero source target preserves the baseline source
+            # reconstruction and prevents double-counting the full FT-base
+            # effect in the joint objective.
+            source_y_rows = torch.zeros(
+                source_h_rows.shape[0], int(t_out.shape[0]), dtype=source_h_rows.dtype
+            )
+            desired_target_batches = references["desired"][pos]
+            target_effect_batches = [
+                desired - (current - native)
+                for desired, current, native in zip(
+                    desired_target_batches,
+                    captured["out"],
+                    target_base_outputs[pos],
+                    strict=True,
+                )
+            ]
+            target_h_rows = _rows(captured["h"])
+            target_effect_rows = _rows(target_effect_batches)
+            block = _layout_for(family_adapter).block_module(_layout_for(family_adapter).blocks(target_model)[pos])
+            scale_module = getattr(block, "ls_2", nn.Identity())
+            effective_out = t_out
+            if not isinstance(scale_module, nn.Identity):
+                scale = getattr(scale_module, "gamma", None)
+                if scale is None or scale.ndim != 1 or scale.shape[0] != t_out.shape[1]:
+                    raise ValueError("Unsupported non-diagonal target LayerScale")
+                effective_out = t_out * scale.detach().cpu().float().unsqueeze(0)
+            correction, diag = fit_joint_cproj_correction(
+                source_h_rows,
+                source_y_rows,
+                target_h_rows,
+                target_effect_rows,
+                t_in,
+                effective_out,
+                source_weight=config.source_weight,
+                target_weight=config.target_weight,
+                ridge_relative=config.ridge_relative,
+            )
+            transported = t_out.T @ correction @ t_in
+            if key not in current_state or tuple(transported.shape) != tuple(current_state[key].shape):
+                raise RuntimeError(f"Joint blockwise correction has invalid shape at {key}")
+            source_corrections[key] = correction
+            target_corrections[key] = transported
+            current_state[key] = current_state[key] + transported.to(current_state[key])
+
+            # The joint solve is affine in source coordinates.  Keep the
+            # intercept as a real c_proj.bias task-vector correction and push
+            # it through the same frozen output map as the weight.  Vision
+            # c_proj has a bias parameter; refusing a missing key prevents a
+            # fitted nonzero affine term from being silently discarded.
+            bias = diag.get("bias_correction")
+            if not isinstance(bias, torch.Tensor) or bias.ndim != 1:
+                raise RuntimeError("Joint blockwise solver did not return a source-coordinate bias correction")
+            bias_key = f"{key[:-len('.weight')]}.bias"
+            if bias_key not in current_state:
+                raise RuntimeError(
+                    "Joint blockwise affine correction requires a target c_proj.bias parameter; "
+                    f"missing {bias_key}"
+                )
+            transported_bias = t_out.T @ bias.to(t_out)
+            if tuple(transported_bias.shape) != tuple(current_state[bias_key].shape) or not torch.isfinite(transported_bias).all():
+                raise RuntimeError(f"Joint blockwise correction has invalid bias shape at {bias_key}")
+            source_corrections[bias_key] = bias
+            target_corrections[bias_key] = transported_bias
+            current_state[bias_key] = current_state[bias_key] + transported_bias.to(current_state[bias_key])
+            target_model.load_state_dict(current_state, strict=True)
+            diagnostics.append(
+                {
+                    "position": pos,
+                    "source_orig_idx": source_idx,
+                    "block_kind": row.get("block_kind", "inserted"),
+                    "bias_correction": bias,
+                    "transported_bias_correction": transported_bias,
+                    **diag,
+                }
+            )
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+    return source_corrections, target_corrections, diagnostics
+
+
+@torch.no_grad()
+def complete_direct_p1_shared_correction(
+    source_base_model,
+    source_ft_model,
+    target_model,
+    target_base_state,
+    baseline_delta,
+    references,
+    transforms,
+    layout,
+    source_loader,
+    target_loader,
+    *,
+    config: JointCorrectionConfig,
+    device,
+):
+    """Refine ARIADNE's shared c_proj maps with a frozen-map P1 objective.
+
+    For each inserted block, fit an additive output-affine map ``(B, c)``.
+    The source term reconstructs the original ARIADNE c_proj reference from
+    the current resized-base output. The target term makes the change induced
+    in the *shared* base/FT task vector explain the remaining P1 boundary
+    residual. Applying ``I+B, c`` to both endpoints preserves a shared affine
+    resize; ``c`` cancels from their task vector.
+    """
+    if not config.enabled:
+        return {}, []
+    entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
+    if not entries:
+        raise ValueError("Direct P1 correction requires inserted blocks")
+    expected = {int(row["position"]) for row in entries}
+    if set(transforms) != expected:
+        raise ValueError(f"Direct P1 transforms mismatch: expected={sorted(expected)}, found={sorted(transforms)}")
+    metadata = references.get("calibration")
+    if metadata is None:
+        raise ValueError("Direct P1 references are missing calibration metadata")
+    if repr(_dataset_identity(source_loader.dataset)) != metadata["dataset_identity"]:
+        raise ValueError("Direct P1 source calibration dataset mismatch")
+    if repr(_dataset_identity(target_loader.dataset)) != metadata["dataset_identity"]:
+        raise ValueError("Direct P1 target calibration dataset mismatch")
+
+    def _batches(loader):
+        return list(DataLoader(
+            Subset(loader.dataset, metadata["indices"]),
+            batch_size=metadata["batch_size"], shuffle=False, num_workers=0,
+            collate_fn=loader.collate_fn,
+        ))
+
+    source_batches, target_batches = _batches(source_loader), _batches(target_loader)
+    native_source_outputs = references.get("source_base_cproj_outputs", {})
+    native_target_outputs = references.get("target_base_outputs_by_position", {}) or references.get("target_base_outputs", {})
+    if not native_source_outputs or not native_target_outputs:
+        raise ValueError("Direct P1 references are missing source c_proj or target boundary banks")
+
+    shim = _layout_for(None)
+    source_base_original = {key: value.detach().cpu().clone() for key, value in source_base_model.state_dict().items()}
+    source_ft_original = {key: value.detach().cpu().clone() for key, value in source_ft_model.state_dict().items()}
+    target_original = {key: value.detach().cpu().clone() for key, value in target_model.state_dict().items()}
+    target_state = {key: value.detach().cpu().clone() for key, value in target_base_state.items()}
+    for key, delta in baseline_delta.items():
+        target_state[key] = target_state[key] + delta.to(target_state[key])
+    target_corrections: dict[str, torch.Tensor] = {}
+    diagnostics: list[dict[str, Any]] = []
+    try:
+        target_model.load_state_dict(target_state, strict=True)
+        for row in entries:
+            pos, source_idx = int(row["position"]), int(row["source_orig_idx"])
+            t_in, t_out = transforms[pos]["t_in"], transforms[pos]["t_out"]
+            source_capture = capture_tokens(
+                source_base_model, source_batches, {"out": (pos, "c_proj")}, device
+            )["out"]
+            current_source = source_capture
+            reference_source = _aligned(native_source_outputs[source_idx], source_capture)
+            source_rows = _rows(current_source)
+            source_residual = _rows([
+                reference - current
+                for current, reference in zip(current_source, reference_source, strict=True)
+            ])
+
+            source_base_block = shim.block_module(shim.blocks(source_base_model)[pos])
+            source_ft_block = shim.block_module(shim.blocks(source_ft_model)[pos])
+            delta_weight = (source_ft_block.mlp.c_proj.weight - source_base_block.mlp.c_proj.weight).detach().cpu().float()
+            delta_bias = (source_ft_block.mlp.c_proj.bias - source_base_block.mlp.c_proj.bias).detach().cpu().float()
+
+            captured_target = capture_tokens(
+                target_model, target_batches,
+                {"h": (pos, "c_proj_input"), "boundary": (pos, "boundary")},
+                device,
+            )
+            desired_batches = references["desired"][pos]
+            target_residual_batches = [
+                desired - (current - native)
+                for desired, current, native in zip(
+                    desired_batches, captured_target["boundary"], native_target_outputs[pos], strict=True
+                )
+            ]
+            h_target = _rows(captured_target["h"])
+            z_target = (h_target @ t_in.T) @ delta_weight.T + delta_bias
+            target_residual = _rows(target_residual_batches)
+
+            target_block = shim.block_module(shim.blocks(target_model)[pos])
+            scale_module = getattr(target_block, "ls_2", nn.Identity())
+            effective_out = t_out
+            if not isinstance(scale_module, nn.Identity):
+                scale = getattr(scale_module, "gamma", None)
+                if scale is None or scale.ndim != 1 or scale.shape[0] != t_out.shape[1]:
+                    raise ValueError("Unsupported non-diagonal target LayerScale")
+                effective_out = t_out * scale.detach().cpu().float().unsqueeze(0)
+
+            identity = torch.eye(z_target.shape[1], dtype=z_target.dtype)
+            correction, diag = fit_joint_cproj_correction(
+                source_rows, source_residual, z_target, target_residual,
+                identity, effective_out,
+                source_weight=config.source_weight,
+                target_weight=config.target_weight,
+                ridge_relative=config.ridge_relative,
+                target_intercept=False,
+            )
+            shared_bias = diag["bias_correction"]
+            affine = torch.eye(correction.shape[0], dtype=correction.dtype) + correction
+            for block in (source_base_block, source_ft_block):
+                projection = block.mlp.c_proj
+                weight = projection.weight.detach().cpu().float()
+                bias = projection.bias.detach().cpu().float()
+                projection.weight.copy_((affine @ weight).to(projection.weight))
+                projection.bias.copy_((affine @ bias + shared_bias).to(projection.bias))
+
+            delta_weight_change = correction @ delta_weight
+            delta_bias_change = correction @ delta_bias
+            weight_key = shim.proj_key(pos, prefixed=True)
+            bias_key = f"{weight_key[:-len('.weight')]}.bias"
+            transported_weight = t_out.T @ delta_weight_change @ t_in
+            transported_bias = t_out.T @ delta_bias_change
+            target_corrections[weight_key] = transported_weight
+            target_corrections[bias_key] = transported_bias
+            target_state[weight_key] = target_state[weight_key] + transported_weight.to(target_state[weight_key])
+            target_state[bias_key] = target_state[bias_key] + transported_bias.to(target_state[bias_key])
+            target_model.load_state_dict(target_state, strict=True)
+            diagnostics.append({
+                "position": pos,
+                "source_orig_idx": source_idx,
+                "shared_affine_bias_norm": float(torch.linalg.norm(shared_bias)),
+                "task_bias_change_norm": float(torch.linalg.norm(delta_bias_change)),
+                **{key: value for key, value in diag.items() if key != "bias_correction"},
+            })
+    finally:
+        source_base_model.load_state_dict(source_base_original, strict=True)
+        source_ft_model.load_state_dict(source_ft_original, strict=True)
+        target_model.load_state_dict(target_original, strict=True)
+    return target_corrections, diagnostics
+
+
+@torch.no_grad()
+def capture_resized_joint_source_inputs(
+    source_model,
+    source_loader,
+    references,
+    layout,
+    *,
+    device,
+    family_adapter=None,
+):
+    """Attach actual post-ARIADNE inserted-block inputs to joint references.
+
+    Option 3's source penalty is evaluated where its additive correction will
+    act.  Native ancestor inputs are useful provenance, but are not a faithful
+    substitute after structural insertion and upstream ARIADNE corrections.
+    """
+    metadata = references.get("calibration")
+    if metadata is None or repr(_dataset_identity(source_loader.dataset)) != metadata["dataset_identity"]:
+        raise ValueError("Joint source capture does not match the paired calibration dataset")
+    entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
+    if not entries:
+        raise ValueError("Joint source capture requires inserted blocks in the realized layout")
+    batches = list(
+        DataLoader(
+            Subset(source_loader.dataset, metadata["indices"]),
+            batch_size=metadata["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=source_loader.collate_fn,
+        )
+    )
+    requests = {str(int(row["position"])): (int(row["position"]), "c_proj_input") for row in entries}
+    captured = capture_tokens(source_model, batches, requests, device, family_adapter=family_adapter)
+    updated = dict(references)
+    updated["resized_source_cproj_inputs_by_position"] = {
+        int(position): bank for position, bank in captured.items()
+    }
+    return updated
 
 
 def _materialize_all_scope_references(references, entries):
