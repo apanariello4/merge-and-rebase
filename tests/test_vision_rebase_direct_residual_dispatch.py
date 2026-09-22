@@ -1,0 +1,241 @@
+"""Tests for method="direct_residual"'s top-level dispatch in vision_rebase.py.
+
+Direct Residual bypasses ARIADNE's config gates entirely: it must never call
+`resolve_block_extension_config`/`get_method` (it is not in the rebase method
+registry -- see `rebase/registry.py` -- and its own config schema has no
+overlap with `resolve_block_extension_config`'s ARIADNE-shaped one). These
+tests confirm that structural guarantee by monkeypatching those two functions
+to raise, then confirming a `method="direct_residual"` run reaches a *later*
+config-validation error instead of the monkeypatched one.
+
+`vision_rebase.main()` cannot be run end-to-end offline (it downloads/builds
+real OpenCLIP models), so every test here drives `main()` only up to the
+first config-validation failure that precedes model construction -- the same
+"fail fast" checks the plan requires -- following the "no network past this
+point" constraint documented in CLAUDE.md ("Offline compute"). This mirrors
+`tests/test_direct_target_p1.py` and `tests/test_direct_residual_fit.py`'s
+synthetic-model fixture convention for the one test that does need to run
+Direct Residual's actual capture/fit pipeline (`_run_direct_residual_fit`).
+"""
+
+from __future__ import annotations
+
+import json
+from collections import OrderedDict
+
+import pytest
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from merge_and_rebase.eval import vision_rebase
+from merge_and_rebase.eval.direct_residual import DirectResidualConfig
+from merge_and_rebase.eval.vision_rebase import _run_direct_residual_fit
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+
+
+def _run_main_with_cfg(monkeypatch, tmp_path, cfg: dict) -> Exception:
+    """Invoke vision_rebase.main() with `cfg` written to a temp config file.
+
+    Returns the raised exception (every cfg used here is expected to fail
+    before any network/model-download step).
+    """
+    cfg = dict(cfg)
+    cfg.setdefault("logging", {"local_log_dir": str(tmp_path / "logs")})
+    config_path = tmp_path / "cfg.json"
+    config_path.write_text(json.dumps(cfg))
+    monkeypatch.setattr("sys.argv", ["vision_rebase", "--config", str(config_path)])
+    with pytest.raises(Exception) as excinfo:
+        vision_rebase.main()
+    return excinfo.value
+
+
+def test_direct_residual_never_calls_ariadne_config_gates(monkeypatch, tmp_path):
+    def _boom(*args, **kwargs):
+        raise AssertionError("resolve_block_extension_config must not be called for method='direct_residual'")
+
+    def _boom_get_method(*args, **kwargs):
+        raise AssertionError("get_method must not be called for method='direct_residual'")
+
+    monkeypatch.setattr(vision_rebase, "resolve_block_extension_config", _boom)
+    monkeypatch.setattr(vision_rebase, "get_method", _boom_get_method)
+
+    exc = _run_main_with_cfg(monkeypatch, tmp_path, {"method": "direct_residual"})
+
+    # Neither monkeypatched guard fired; execution instead reached the next
+    # real validation error further down main() (missing tuned checkpoints),
+    # proving direct_residual's dispatch never touches either function.
+    assert "resolve_block_extension_config must not be called" not in str(exc)
+    assert "get_method must not be called" not in str(exc)
+    assert "tuned checkpoints" in str(exc)
+
+
+def test_invalid_ariadne_only_option_is_inert_for_direct_residual(monkeypatch, tmp_path):
+    """An ARIADNE-only config field that would normally be rejected is simply
+    never read for method="direct_residual", since resolve_block_extension_config
+    is never invoked on cfg at all -- not even with a filtered/sanitized cfg.
+    """
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("resolve_block_extension_config must not be called for method='direct_residual'")
+
+    monkeypatch.setattr(vision_rebase, "resolve_block_extension_config", _boom)
+
+    exc = _run_main_with_cfg(
+        monkeypatch,
+        tmp_path,
+        {
+            "method": "direct_residual",
+            # Nonsense ARIADNE-only knob: would raise inside
+            # resolve_block_extension_config if it were ever parsed.
+            "block_extension_params": {"this_field_does_not_exist": 123},
+        },
+    )
+    assert "resolve_block_extension_config must not be called" not in str(exc)
+    assert "tuned checkpoints" in str(exc)
+
+
+def test_direct_residual_method_object_has_no_registry_entry():
+    from merge_and_rebase.rebase.registry import list_methods
+
+    assert "direct_residual" not in list_methods()
+
+
+# ---- _run_direct_residual_fit: the real capture -> desired-effect -> fit ->
+# scale pipeline used by both vision_rebase.py's per-task and
+# merge_in_source_then_fit dispatch branches. Fixture duplicated from
+# tests/test_direct_residual_fit.py per this suite's no-cross-test-import
+# convention. ----
+
+
+class _Attention(torch.nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.out_proj = torch.nn.Linear(width, width)
+
+    def forward(self, x):
+        return self.out_proj(x)
+
+
+class _Block(torch.nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.attn = _Attention(width)
+        self.mlp = torch.nn.Sequential(
+            OrderedDict(
+                [
+                    ("c_fc", torch.nn.Linear(width, width * 2)),
+                    ("gelu", torch.nn.GELU()),
+                    ("c_proj", torch.nn.Linear(width * 2, width)),
+                ]
+            )
+        )
+        self.ls_2 = torch.nn.Identity()
+
+    def forward(self, x):
+        return x + self.attn(x) + self.ls_2(self.mlp(x))
+
+
+class _Visual(torch.nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.input = torch.nn.Linear(4, width)
+        self.transformer = torch.nn.Module()
+        self.transformer.resblocks = torch.nn.ModuleList([_Block(width) for _ in range(depth)])
+
+    def forward(self, images):
+        x = self.input(images)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return x.mean(dim=1)
+
+
+class _Model(torch.nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.visual = _Visual(width, depth)
+
+    def encode_image(self, x):
+        return self.visual(x)
+
+
+def _loader(n=6, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    images = torch.randn(n, 5, 4, generator=generator)
+    return DataLoader(TensorDataset(images, torch.arange(n)), batch_size=2, shuffle=False)
+
+
+def _tuned_copy(model, seed, scale=0.2):
+    from copy import deepcopy
+
+    tuned = deepcopy(model)
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for block in tuned.visual.transformer.resblocks:
+            block.mlp.c_proj.weight.add_(scale * torch.randn_like(block.mlp.c_proj.weight))
+            block.attn.out_proj.weight.add_(scale * torch.randn_like(block.attn.out_proj.weight))
+    return tuned
+
+
+def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
+    torch.manual_seed(11)
+    source_base = _Model(5, 2).eval()
+    source_ft = _tuned_copy(source_base, seed=12)
+    target_base = _Model(5, 4).eval()
+    data = _loader(seed=13)
+    pairing = DiscreteLayerPairing.compute(source_depth=2, target_depth=4)
+    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
+    config = DirectResidualConfig(num_batches=3, ridge_relative=0.05, strength=1.0)
+
+    delta, timing, diagnostics = _run_direct_residual_fit(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        target_model=target_base,
+        target_base_sd=target_base_sd,
+        source_loader=data,
+        target_loader=data,
+        pairing=pairing,
+        config=config,
+        device="cpu",
+    )
+
+    assert delta  # nonzero strength -> a nonempty correction dict
+    assert all(key.endswith(("c_proj.weight", "c_proj.bias", "out_proj.weight", "out_proj.bias")) for key in delta)
+    assert set(timing) == {"alignment_calibration", "correction_fit"}
+    for bracket in ("alignment_calibration", "correction_fit"):
+        seconds_key = f"{bracket}_seconds"
+        memory_key = f"{bracket}_peak_memory_bytes"
+        assert set(timing[bracket]) == {seconds_key, memory_key}
+        assert isinstance(timing[bracket][seconds_key], float)
+        assert timing[bracket][seconds_key] >= 0.0
+        assert isinstance(timing[bracket][memory_key], float)
+    assert isinstance(diagnostics, list) and diagnostics
+    # target_base is restored to its pristine state by fit_direct_residual's
+    # try/finally (see direct_residual.py); the model handed back must be
+    # bit-identical to the state before the fit ran.
+    for key, value in target_base_sd.items():
+        assert torch.equal(dict(target_base.state_dict())[key], value)
+
+
+def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
+    torch.manual_seed(21)
+    source_base = _Model(5, 2).eval()
+    source_ft = _tuned_copy(source_base, seed=22)
+    target_base = _Model(5, 2).eval()
+    data = _loader(seed=23)
+    pairing = DiscreteLayerPairing.compute(source_depth=2, target_depth=2)
+    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
+    config = DirectResidualConfig(num_batches=3, ridge_relative=0.05, strength=0.0)
+
+    delta, _timing, _diagnostics = _run_direct_residual_fit(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        target_model=target_base,
+        target_base_sd=target_base_sd,
+        source_loader=data,
+        target_loader=data,
+        pairing=pairing,
+        config=config,
+        device="cpu",
+    )
+
+    assert delta == {}

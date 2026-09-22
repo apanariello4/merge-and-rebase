@@ -679,6 +679,7 @@ def _capture_residual_references(
 
 
 def projection_transforms(prepared, layout, *, target_scope="inserted", family_adapter=None):
+    _validate_target_informed_layout(layout, target_scope=target_scope)
     if target_scope not in {"inserted", "all"}:
         raise ValueError("target_scope must be 'inserted' or 'all'")
     transforms = prepared.get("transforms_by_key", {})
@@ -711,6 +712,52 @@ def projection_transforms(prepared, layout, *, target_scope="inserted", family_a
     return output
 
 
+def _validate_target_informed_layout(layout, *, target_scope, target_trajectory=None):
+    """Validate the layout contract before a target-informed solve consumes it.
+
+    Extension layouts historically use ``inserted_blocks`` and the odd-position
+    ancestry convention.  Reduction layouts have no inserted positions: every
+    final target block represents a collapsed source span and its
+    ``source_orig_idx`` is the span-end boundary.  Keeping this check at the
+    runtime boundary prevents a shrink run from silently falling through an
+    extension-only scope or trajectory.
+
+    Layouts produced before the explicit ``direction`` field was added are
+    treated as extension layouts for backwards compatibility with cached test
+    fixtures and old direct-target caches.
+    """
+    direction = str(layout.get("direction", "extend"))
+    if direction not in {"extend", "shrink"}:
+        raise ValueError(
+            "Target-informed completion requires layout.direction to be 'extend' or 'shrink'; "
+            f"got {direction!r}"
+        )
+    if direction != "shrink":
+        return
+    if target_scope != "all":
+        raise ValueError(
+            "Shrink direct_target completion requires target_scope='all': a reduction has no "
+            "inserted blocks to address"
+        )
+    if target_trajectory is not None and target_trajectory != "step":
+        raise ValueError(
+            "Shrink direct_target completion currently requires target_trajectory='step'; "
+            "interpolate has no span-aware reduction semantics"
+        )
+    entries = layout.get("final_blocks")
+    if entries is None:
+        raise ValueError("Shrink direct_target completion requires realized layout final_blocks")
+    for row in entries:
+        span = row.get("span_orig_idxs")
+        if not span:
+            raise ValueError(
+                "Shrink direct_target layout entries must record non-empty span_orig_idxs"
+            )
+        if int(row.get("source_orig_idx", -1)) != int(span[-1]):
+            raise ValueError(
+                "Shrink direct_target layout source_orig_idx must equal the span's terminal "
+                "source boundary"
+            )
 
 def _materialize_zero_bias(model, bias_key, out_features):
     """Add a zero bias to one bias-free projection. Returns True if it added one."""
@@ -739,12 +786,13 @@ def materialize_missing_projection_biases(
     the model's shape. Doing it here rather than inside the solver is what keeps
     that consistent: the solver snapshots and restores with strict=True.
 
-    ``components`` must list every projection the completion will actually fit,
-    i.e. ``ResidualCompletionConfig.components``. The default is the historical
-    single-component set, so existing callers are unchanged; the two-component
-    direct arm has to pass its own, because an HF decoder's self_attn.o_proj is
-    bias-free too (Qwen2/2.5 set ``attention_bias`` only on q/k/v) and the fit
-    would otherwise die at the o_proj intercept with the exact form.
+    ``components`` defaults to the historical MLP-only behaviour. Direct mode
+    can also fit ``attn.out_proj``, whose decoder analogue (``self_attn.o_proj``)
+    is exactly as bias-free as ``down_proj`` -- the caller must pass
+    ``order_components(config.components)`` when a run's completion config
+    requests more than the default, or completion raises
+    "missing_bias='materialize' requires ... to exist on the target" for the
+    write surface this function never touched.
 
     Returns the keys it added, so a run can record that its checkpoint carries
     parameters the stock architecture does not.
@@ -848,7 +896,11 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             ):
                 error = desired_batch - (out - base_out)
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), t_in, effective_out)
-            correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+            correction, diag = stats.solve(
+                ridge_relative=config.ridge_relative,
+                ridge_estimator=config.ridge_estimator,
+                exact_form=config.exact_form,
+            )
             correction = correction.cpu()
             diag["bias_correction"] = diag["bias_correction"].cpu()
             transported = t_out.T @ correction @ t_in
@@ -926,6 +978,376 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
     return source_corrections, target_corrections, diagnostics
 
 @torch.no_grad()
+def _fit_direct_target_position(
+    target_model,
+    current_state: dict[str, torch.Tensor],
+    pos: int,
+    source_coordinate: float,
+    desired_batches: list,
+    target_output_batches: list,
+    batches: list,
+    components: tuple,
+    config,
+    device,
+    family_adapter=None,
+    *,
+    assert_pristine_effect: bool = False,
+    mask_padding: bool = False,
+) -> tuple[dict, list]:
+    """Fit one target position's residual-writing components (Part A extraction).
+
+    This is the per-position solver body ``complete_residuals_direct`` has
+    always executed, pulled out unchanged so a caller with a wholly different
+    notion of "which source coordinate feeds this position" -- ARIADNE's
+    ancestry row (``row["source_orig_idx"]``) or Direct Residual's flat
+    ``DiscreteLayerPairing`` entry -- can share the identical, tested solve.
+    Nothing here inspects a realized-extension layout, an ``entries`` list, or
+    a ``block_kind``: those stay with whichever caller actually has them.
+    ``source_coordinate`` is carried only into the returned diagnostics (as a
+    plain float, generic across both callers' provenance schemes); it plays no
+    role in the fit itself, exactly as ``row["source_orig_idx"]`` did not in
+    the code this was extracted from.
+
+    ``current_state`` and ``target_model`` are mutated in place: each
+    component's fitted correction is folded into ``current_state`` before the
+    next component is captured, and ``target_model`` is reloaded from it
+    whenever ``config.cascade_order != "independent"`` -- the same mount
+    timing ``complete_residuals_direct`` has always used, whether the cascade
+    crosses component boundaries within one position or (via the caller
+    re-invoking this function) block boundaries across positions.
+    ``assert_pristine_effect=True`` raises if the very first component's
+    measured pre-fit effect is nonzero; pass it only when ``target_model`` is
+    known to still be at its untouched base entering this call.
+
+    Returns ``(position_corrections, block_rows)``.  ``position_corrections``
+    holds only this position's fitted weight/bias keys, in target coordinates
+    at unit strength.  ``block_rows`` mirrors the historical per-component
+    diagnostic dict shape *minus* the ARIADNE-only fields (``scope``,
+    ``trajectory``, ``target_coordinate``, ``block_kind``, ``source_orig_idx``)
+    that only ``complete_residuals_direct`` has to offer; it carries
+    ``source_coordinate`` instead, and the caller is responsible for adding
+    back whatever provenance fields its own diagnostic contract promises.
+    """
+    shim = _layout_for(family_adapter)
+    position_corrections: dict[str, torch.Tensor] = {}
+    block_rows: list[dict[str, Any]] = []
+    for component_index, component in enumerate(components):
+        key = shim.component_key(pos, component, prefixed=True)
+        captured = capture_tokens(
+            target_model, batches,
+            {"h": (pos, COMPONENT_INPUT_KIND[component]), "out": (pos, "boundary")},
+            device, family_adapter=family_adapter, mask_padding=mask_padding,
+        )
+        width = int(current_state[key].shape[0])
+        identity_out = torch.eye(width, dtype=torch.float32)
+        scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
+        effective_out = identity_out
+        if not isinstance(scale_module, nn.Identity):
+            scale = getattr(scale_module, "gamma", None)
+            if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+                raise ValueError("Unsupported non-diagonal target LayerScale")
+            # diag(gamma): the residual stream receives gamma * proj(h), so the
+            # fit must predict through that scaling exactly as the
+            # transport-aware path folds it into t_out. ls_1 scales the
+            # attention write, ls_2 the MLP write.
+            effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+        # See the identical comment in complete_residuals(): the Gram
+        # accumulation and eigendecomposed solve are the expensive part, so
+        # they run on the model's device; the fitted correction/bias are moved
+        # back to CPU right after solve() below.
+        stats = ResidualSufficientStatistics(device=device)
+        desired_sq = 0.0
+        effect_sq = 0.0
+        for h, out, desired_batch, base_out in zip(
+            captured["h"], captured["out"], desired_batches, target_output_batches, strict=True
+        ):
+            effect = out - base_out
+            error = desired_batch - effect
+            desired_sq += float((desired_batch.double() ** 2).sum().item())
+            effect_sq += float((effect.double() ** 2).sum().item())
+            stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+        if assert_pristine_effect and component_index == 0:
+            # E_j == D_j at the very first fit: the temporary model is still
+            # the untouched target base there, so the current effect is
+            # identically zero. A nonzero effect here means a stale reference
+            # bank or a mutated base, not a small numerical drift.
+            if effect_sq > 1e-12 * max(desired_sq, 1.0):
+                raise RuntimeError(
+                    "Direct completion started from a target model that is not the native "
+                    f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
+                )
+        correction, diag = stats.solve(
+            ridge_relative=config.ridge_relative,
+            ridge_estimator=config.ridge_estimator,
+            exact_form=config.exact_form,
+        )
+        correction = correction.cpu()
+        diag["bias_correction"] = diag["bias_correction"].cpu()
+        if block_rows:
+            # This capture happened after the previous component was mounted,
+            # so its residual is that component's *true* post-mount residual.
+            # For attn.out_proj the solver's own residual_norm_after is only a
+            # linear prediction; this is the measured one.
+            block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
+        if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+            raise RuntimeError("Direct residual completion produced an invalid projection")
+        position_corrections[key] = correction
+        current_state[key] = current_state[key] + correction.to(current_state[key])
+        bias_key = f"{key[: -len('.weight')]}.bias"
+        bias_correction = diag["bias_correction"]
+        skip_bias = False
+        if bias_key not in current_state:
+            if config.missing_bias == "materialize":
+                raise RuntimeError(
+                    f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                    "before residual completion runs; call "
+                    "materialize_missing_projection_biases() on the target model and its "
+                    "base state dict first"
+                )
+            elif config.missing_bias == "skip":
+                if torch.count_nonzero(bias_correction):
+                    raise RuntimeError(
+                        "missing_bias='skip' would discard a nonzero intercept at "
+                        f"{bias_key}; the weight was fitted on centered banks and is "
+                        "not valid without it"
+                    )
+                skip_bias = True
+            else:
+                raise RuntimeError(
+                    f"Target model is missing the expected bias parameter {bias_key}. "
+                    "Decoder MLP projections are bias-free; set "
+                    "target_residual_completion.missing_bias to 'materialize' "
+                    "(exact, adds the parameter) or 'skip' with exact_form=false."
+                )
+        if not skip_bias:
+            bias_delta = bias_correction.to(current_state[bias_key])
+            if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+                raise RuntimeError("Direct residual completion produced an invalid bias")
+            position_corrections[bias_key] = bias_correction
+            current_state[bias_key] = current_state[bias_key] + bias_delta
+        # Mounted before the next component captures, which is what makes the
+        # intra-block cascade real rather than two independent fits.
+        # cascade_order="independent" deliberately skips the mount: the model
+        # stays at the pristine base for every fit, so each block sees
+        # E_j == D_j and no correction can move another's target.
+        if config.cascade_order != "independent":
+            target_model.load_state_dict(current_state, strict=True)
+        desired_norm = desired_sq ** 0.5
+        block_rows.append(
+            {
+                "mode": "direct_target",
+                "component": component,
+                "position": pos,
+                "source_coordinate": float(source_coordinate),
+                "desired_norm": desired_norm,
+                "effect_before_norm": effect_sq ** 0.5,
+                # r_j: the fraction of the desired local effect still missing,
+                # before and after this fit. See the identical comment this
+                # was extracted from in complete_residuals_direct's history
+                # (git blame) for why mlp.c_proj's "after" value is exact
+                # while attn.out_proj's needs the measured re-capture above.
+                "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+                "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                **diag,
+            }
+        )
+    return position_corrections, block_rows
+
+
+@torch.no_grad()
+def _fit_all_positions_independent(
+    target_model,
+    current_state: dict[str, torch.Tensor],
+    positions: list[int],
+    source_coordinates: dict[int, float],
+    desired_batches: dict[int, list],
+    target_output_batches: dict[int, list],
+    batches: list,
+    components: tuple,
+    config,
+    device,
+    family_adapter=None,
+    *,
+    mask_padding: bool = False,
+) -> dict[int, tuple[dict, list]]:
+    """Fit every ``(position, component)`` pair for ``cascade_order='independent'``
+    from ONE shared target forward sweep instead of one sweep per pair.
+
+    Under ``cascade_order="independent"`` the target model is never mutated
+    between fits -- the only mount site
+    (``if config.cascade_order != "independent": target_model.load_state_dict(...)``
+    in ``_fit_direct_target_position``) is unconditionally skipped, both across
+    positions and across components within one position. Every ``(position,
+    component)`` pair therefore observes the identical, pristine
+    ``target_model`` state that ``current_state`` already describes, which
+    makes ``_fit_direct_target_position``'s per-pair ``capture_tokens`` calls
+    (one full calibration sweep each, up to ``len(positions) *
+    len(components)`` of them) redundant: they all capture from the same
+    model. This function captures once and reuses the banks for every solve.
+
+    ``capture_tokens`` already accepts a combined ``requests`` dict spanning
+    many ``(position, kind)`` pairs and turns it into one set of hooks fired
+    by one sweep over ``batches`` (see its docstring/implementation); nothing
+    below it needed to change; this function is only a restructuring of the
+    *caller* side. One ``"out"`` (boundary) request is registered per
+    position, shared by every component at that position -- the block's own
+    boundary output does not depend on which component's input is being
+    fitted -- and one ``"h"`` request per ``(position, component)`` pair for
+    that component's regression features
+    (``COMPONENT_INPUT_KIND[component]``).
+
+    Per-``(position, component)`` solving is otherwise byte-identical to
+    ``_fit_direct_target_position``'s independent-mode body: same
+    ``ResidualSufficientStatistics`` online accumulation (already a streaming
+    accumulator; nothing here changes how it accumulates, only how many
+    forward sweeps feed it), same ridge solve, same ``missing_bias`` handling,
+    same ``block_rows`` diagnostic fields -- including the (under independent
+    mode, vacuous but historically populated) ``measured_residual_norm_after``
+    field on every component but the position's last: since nothing is ever
+    mounted, that field is simply the next component's own pre-fit residual,
+    identical in both the old per-pair-capture path and this one.
+
+    The pristine-effect assertion is strengthened relative to
+    ``_fit_direct_target_position``: that function can only assert it for
+    ``component_index == 0`` of whichever position the caller nominates as
+    "first" (a real cascade only ever *starts* pristine). Under true
+    independent semantics there is no privileged "first" position -- every
+    ``(position, component)`` pair sees the pristine base -- so this function
+    asserts it unconditionally for all of them. This is a strictly stronger
+    correctness check with no effect on the fitted values themselves: it can
+    only ever raise on a bug (a stale reference bank or a mutated base), never
+    change a number that was going to be returned.
+
+    Intra-position "replay" (the user's brief step 6, mounting attn.out_proj
+    locally before fitting mlp.c_proj) is deliberately NOT implemented: under
+    independent mode there is no intra-position mount to replay in the first
+    place (the same skipped-mount conditional gates it), so there is no
+    sequential attention->MLP effect for a replay to preserve. Building it
+    would change independent-mode's numerics, not merely speed it up.
+
+    Returns ``{position: (position_corrections, block_rows)}``, matching what
+    ``len(positions)`` separate ``_fit_direct_target_position`` calls would
+    each have returned for the identical inputs.
+    """
+    if config.cascade_order != "independent":
+        raise ValueError("_fit_all_positions_independent requires cascade_order='independent'")
+    shim = _layout_for(family_adapter)
+    requests: dict[str, tuple[int, str]] = {}
+    for pos in positions:
+        requests[f"{pos}.out"] = (pos, "boundary")
+        for component in components:
+            requests[f"{pos}.{component}.h"] = (pos, COMPONENT_INPUT_KIND[component])
+    captured = capture_tokens(
+        target_model, batches, requests, device, family_adapter=family_adapter, mask_padding=mask_padding
+    )
+
+    results: dict[int, tuple[dict, list]] = {}
+    for pos in positions:
+        out_batches = captured[f"{pos}.out"]
+        position_corrections: dict[str, torch.Tensor] = {}
+        block_rows: list[dict[str, Any]] = []
+        for component in components:
+            key = shim.component_key(pos, component, prefixed=True)
+            h_batches = captured[f"{pos}.{component}.h"]
+            width = int(current_state[key].shape[0])
+            identity_out = torch.eye(width, dtype=torch.float32)
+            scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
+            effective_out = identity_out
+            if not isinstance(scale_module, nn.Identity):
+                scale = getattr(scale_module, "gamma", None)
+                if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+                    raise ValueError("Unsupported non-diagonal target LayerScale")
+                effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+            stats = ResidualSufficientStatistics(device=device)
+            desired_sq = 0.0
+            effect_sq = 0.0
+            for h, out, desired_batch, base_out in zip(
+                h_batches, out_batches, desired_batches[pos], target_output_batches[pos], strict=True
+            ):
+                effect = out - base_out
+                error = desired_batch - effect
+                desired_sq += float((desired_batch.double() ** 2).sum().item())
+                effect_sq += float((effect.double() ** 2).sum().item())
+                stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+            # See the docstring: under independent mode this holds for every
+            # (position, component) pair, not only a historically-first one.
+            if effect_sq > 1e-12 * max(desired_sq, 1.0):
+                raise RuntimeError(
+                    "Direct completion started from a target model that is not the native "
+                    f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
+                )
+            correction, diag = stats.solve(
+                ridge_relative=config.ridge_relative,
+                ridge_estimator=config.ridge_estimator,
+                exact_form=config.exact_form,
+            )
+            correction = correction.cpu()
+            diag["bias_correction"] = diag["bias_correction"].cpu()
+            if block_rows:
+                # Same bookkeeping as _fit_direct_target_position: the previous
+                # component's row records this component's own pre-fit residual
+                # under its historical name. Under independent mode nothing
+                # mounted in between, so this is not a "post-mount" measurement
+                # -- see the docstring -- but it is the identical value the old
+                # per-pair-capture path would have recorded.
+                block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
+            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+                raise RuntimeError("Direct residual completion produced an invalid projection")
+            position_corrections[key] = correction
+            current_state[key] = current_state[key] + correction.to(current_state[key])
+            bias_key = f"{key[: -len('.weight')]}.bias"
+            bias_correction = diag["bias_correction"]
+            skip_bias = False
+            if bias_key not in current_state:
+                if config.missing_bias == "materialize":
+                    raise RuntimeError(
+                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                        "before residual completion runs; call "
+                        "materialize_missing_projection_biases() on the target model and its "
+                        "base state dict first"
+                    )
+                elif config.missing_bias == "skip":
+                    if torch.count_nonzero(bias_correction):
+                        raise RuntimeError(
+                            "missing_bias='skip' would discard a nonzero intercept at "
+                            f"{bias_key}; the weight was fitted on centered banks and is "
+                            "not valid without it"
+                        )
+                    skip_bias = True
+                else:
+                    raise RuntimeError(
+                        f"Target model is missing the expected bias parameter {bias_key}. "
+                        "Decoder MLP projections are bias-free; set "
+                        "target_residual_completion.missing_bias to 'materialize' "
+                        "(exact, adds the parameter) or 'skip' with exact_form=false."
+                    )
+            if not skip_bias:
+                bias_delta = bias_correction.to(current_state[bias_key])
+                if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+                    raise RuntimeError("Direct residual completion produced an invalid bias")
+                position_corrections[bias_key] = bias_correction
+                current_state[bias_key] = current_state[bias_key] + bias_delta
+            desired_norm = desired_sq ** 0.5
+            block_rows.append(
+                {
+                    "mode": "direct_target",
+                    "component": component,
+                    "position": pos,
+                    "source_coordinate": float(source_coordinates[pos]),
+                    "desired_norm": desired_norm,
+                    "effect_before_norm": effect_sq ** 0.5,
+                    "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+                    "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                    "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                    **diag,
+                }
+            )
+        results[pos] = (position_corrections, block_rows)
+    return results
+
+
+@torch.no_grad()
 def complete_residuals_direct(
     target_model,
     target_base_state,
@@ -987,6 +1409,11 @@ def complete_residuals_direct(
         raise ValueError(
             f"complete_residuals_direct requires mode='direct_target', got {config.mode!r}"
         )
+    _validate_target_informed_layout(
+        layout,
+        target_scope=config.target_scope,
+        target_trajectory=config.target_trajectory,
+    )
     if references.get("scope", "inserted") != config.target_scope:
         raise ValueError(
             "Native reference scope does not match residual completion config: "
@@ -1033,150 +1460,77 @@ def complete_residuals_direct(
         current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
         target_model.load_state_dict(current_state, strict=True)
         components = order_components(config.components)
-        for index, row in enumerate(entries):
+        for row in entries:
             pos = int(row["position"])
             if config.target_scope == "inserted" and pos != 2 * int(row["source_orig_idx"]) + 1:
                 raise ValueError("Realized insertion ancestry does not match captured references")
-            shim = _layout_for(family_adapter)
-            # Components are fitted in block-forward order and cascaded, never
-            # solved jointly. out_proj writes before the MLP, so mounting
-            # Delta_O moves the MLP's own input through ln_2 and GELU -- a
-            # nonlinearity no single linear system can absorb. Each component's
-            # capture below therefore *re-measures* the residual the previous
-            # one actually left, exactly as the cross-block cascade does.
-            block_rows: list[dict[str, Any]] = []
-            for component_index, component in enumerate(components):
-                key = shim.component_key(pos, component, prefixed=True)
-                captured = capture_tokens(
-                    target_model, batches,
-                    {"h": (pos, COMPONENT_INPUT_KIND[component]), "out": (pos, "boundary")},
-                    device, family_adapter=family_adapter,
+        if config.cascade_order == "independent":
+            # No cascade means no ordering constraint and no privileged
+            # "first" position: the target model is never mutated between
+            # fits (see _fit_all_positions_independent's docstring), so every
+            # position's fit observes the same pristine base a per-position
+            # loop would redundantly re-capture from scratch every time. Fit
+            # all (position, component) pairs from one shared forward sweep
+            # instead of up to len(entries) * len(components) of them.
+            positions = [int(row["position"]) for row in entries]
+            fitted = _fit_all_positions_independent(
+                target_model,
+                current_state,
+                positions,
+                coordinates,
+                desired,
+                target_outputs,
+                batches,
+                components,
+                config,
+                device,
+                family_adapter=family_adapter,
+                mask_padding=bool(meta.get("mask_padding", False)),
+            )
+            entry_by_position = {int(row["position"]): row for row in entries}
+            position_block_rows = [(pos, fitted[pos][0], fitted[pos][1]) for pos in positions]
+        else:
+            position_block_rows = []
+            for index, row in enumerate(entries):
+                pos = int(row["position"])
+                # Components are fitted in block-forward order and cascaded, never
+                # solved jointly. out_proj writes before the MLP, so mounting
+                # Delta_O moves the MLP's own input through ln_2 and GELU -- a
+                # nonlinearity no single linear system can absorb. Each component's
+                # capture therefore *re-measures* the residual the previous one
+                # actually left, exactly as the cross-block cascade does. The
+                # per-position solve itself (capture -> Gram accumulation -> ridge
+                # solve -> mount) is shared, unchanged, with Direct Residual's own
+                # caller (`direct_residual.fit_direct_residual`) via Part A's
+                # `_fit_direct_target_position`; only the ARIADNE-specific
+                # provenance bookkeeping below (scope/trajectory/block_kind/
+                # source_orig_idx) stays local to this function.
+                position_corrections, block_rows = _fit_direct_target_position(
+                    target_model,
+                    current_state,
+                    pos,
+                    coordinates[pos],
+                    desired[pos],
+                    target_outputs[pos],
+                    batches,
+                    components,
+                    config,
+                    device,
+                    family_adapter=family_adapter,
+                    assert_pristine_effect=(index == 0),
                     mask_padding=bool(meta.get("mask_padding", False)),
                 )
-                width = int(current_state[key].shape[0])
-                identity_out = torch.eye(width, dtype=torch.float32)
-                scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
-                effective_out = identity_out
-                if not isinstance(scale_module, nn.Identity):
-                    scale = getattr(scale_module, "gamma", None)
-                    if scale is None or scale.ndim != 1 or scale.shape[0] != width:
-                        raise ValueError("Unsupported non-diagonal target LayerScale")
-                    # diag(gamma): the residual stream receives gamma * proj(h),
-                    # so the fit must predict through that scaling exactly as the
-                    # transport-aware path folds it into t_out. ls_1 scales the
-                    # attention write, ls_2 the MLP write.
-                    effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
-                # See the identical comment in complete_residuals(): the Gram
-                # accumulation and eigendecomposed solve are the expensive part,
-                # so they run on the model's device; the fitted correction/bias
-                # are moved back to CPU right after solve() below.
-                stats = ResidualSufficientStatistics(device=device)
-                desired_sq = 0.0
-                effect_sq = 0.0
-                for h, out, desired_batch, base_out in zip(
-                    captured["h"], captured["out"], desired[pos], target_outputs[pos], strict=True
-                ):
-                    effect = out - base_out
-                    error = desired_batch - effect
-                    desired_sq += float((desired_batch.double() ** 2).sum().item())
-                    effect_sq += float((effect.double() ** 2).sum().item())
-                    stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
-                if index == 0 and component_index == 0:
-                    # E_j == D_j at the very first fit: the temporary model is
-                    # still the untouched target base there, so the current effect
-                    # is identically zero. A nonzero effect here means a stale
-                    # reference bank or a mutated base, not a small numerical drift.
-                    if effect_sq > 1e-12 * max(desired_sq, 1.0):
-                        raise RuntimeError(
-                            "Direct completion started from a target model that is not the native "
-                            f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
-                        )
-                correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
-                correction = correction.cpu()
-                diag["bias_correction"] = diag["bias_correction"].cpu()
-                if block_rows:
-                    # This capture happened after the previous component was
-                    # mounted, so its residual is that component's *true*
-                    # post-mount residual. For attn.out_proj the solver's own
-                    # residual_norm_after is only a linear prediction; this is
-                    # the measured one, and their ratio is the MLP knock-on.
-                    block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
-                # t_in = I and the write-side t_out = I: the fitted matrix already
-                # lives in target coordinates, so there is nothing to transport.
-                if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
-                    raise RuntimeError("Direct residual completion produced an invalid projection")
-                target_corrections[key] = correction
-                current_state[key] = current_state[key] + correction.to(current_state[key])
-                bias_key = f"{key[: -len('.weight')]}.bias"
-                bias_correction = diag["bias_correction"]
-                skip_bias = False
-                if bias_key not in current_state:
-                    if config.missing_bias == "materialize":
-                        raise RuntimeError(
-                            f"missing_bias='materialize' requires {bias_key} to exist on the target "
-                            "before residual completion runs; call "
-                            "materialize_missing_projection_biases() on the target model and its "
-                            "base state dict first"
-                        )
-                    elif config.missing_bias == "skip":
-                        if torch.count_nonzero(bias_correction):
-                            raise RuntimeError(
-                                "missing_bias='skip' would discard a nonzero intercept at "
-                                f"{bias_key}; the weight was fitted on centered banks and is "
-                                "not valid without it"
-                            )
-                        skip_bias = True
-                    else:
-                        raise RuntimeError(
-                            f"Target model is missing the expected bias parameter {bias_key}. "
-                            "Decoder MLP projections are bias-free; set "
-                            "target_residual_completion.missing_bias to 'materialize' "
-                            "(exact, adds the parameter) or 'skip' with exact_form=false."
-                        )
-                if not skip_bias:
-                    bias_delta = bias_correction.to(current_state[bias_key])
-                    if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
-                        raise RuntimeError("Direct residual completion produced an invalid bias")
-                    target_corrections[bias_key] = bias_correction
-                    current_state[bias_key] = current_state[bias_key] + bias_delta
-                # Mounted before the next component captures, which is what makes
-                # the intra-block cascade real rather than two independent fits.
-                # cascade_order="independent" deliberately skips the mount: the
-                # model stays at the pristine base for every fit, so each block
-                # sees E_j == D_j and no correction can move another's target.
-                if config.cascade_order != "independent":
-                    target_model.load_state_dict(current_state, strict=True)
-                desired_norm = desired_sq ** 0.5
-                block_rows.append(
-                    {
-                        "mode": "direct_target",
-                        "scope": config.target_scope,
-                        "component": component,
-                        "trajectory": config.target_trajectory,
-                        "target_coordinate": float(coordinates[pos]),
-                        "block_kind": block_kind[pos],
-                        "position": pos,
-                        "source_orig_idx": row["source_orig_idx"],
-                        "desired_norm": desired_norm,
-                        "effect_before_norm": effect_sq ** 0.5,
-                        # r_j: the fraction of the desired local effect still
-                        # missing, before and after this fit. For mlp.c_proj the
-                        # "after" value is exact rather than re-measured: it is
-                        # the last operation writing into the residual stream in
-                        # this block and its input H_j does not depend on its own
-                        # weight, so mounting the correction changes the block
-                        # output by exactly gamma * (H_j dC^T + beta) -- the same
-                        # quantity the solver already evaluated. That reasoning
-                        # does NOT hold for attn.out_proj, which is why its row
-                        # also carries measured_residual_norm_after. Pinned by
-                        # tests/test_direct_target_p1.py and
-                        # tests/test_direct_p1_trajectory_and_components.py.
-                        "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
-                        "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                        "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
-                        **diag,
-                    }
-                )
+                position_block_rows.append((pos, position_corrections, block_rows))
+            entry_by_position = {int(row["position"]): row for row in entries}
+        for pos, position_corrections, block_rows in position_block_rows:
+            row = entry_by_position[pos]
+            target_corrections.update(position_corrections)
+            for block_row in block_rows:
+                block_row["scope"] = config.target_scope
+                block_row["trajectory"] = config.target_trajectory
+                block_row["target_coordinate"] = block_row.pop("source_coordinate")
+                block_row["block_kind"] = block_kind[pos]
+                block_row["source_orig_idx"] = row["source_orig_idx"]
             diagnostics.extend(block_rows)
     finally:
         target_model.load_state_dict(original_state, strict=True)

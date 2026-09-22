@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -54,6 +55,7 @@ from ..merge.registry import list_methods as list_merge_methods
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
+from ..rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
 from ..rebase.methods.theseus import InterpolatedBlockActivations
 from ..rebase.runtime import (
     format_rebase_method_label,
@@ -62,6 +64,7 @@ from ..rebase.runtime import (
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .block_extension import (
+    BlockExtensionConfig,
     block_extension_protocol,
     calibration_dataset_spec,
     resolve_block_extension_config,
@@ -69,6 +72,13 @@ from .block_extension import (
     select_loader,
 )
 from .datasets.vision8_14_20 import SUITES
+from .direct_residual import (
+    DirectResidualConfig,
+    capture_paired_boundary_activations,
+    compute_desired_effects,
+    fit_direct_residual,
+    parse_direct_residual_config,
+)
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
 from .target_informed_runtime import (
@@ -81,7 +91,11 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import JointCorrectionConfig, ResidualCompletionConfig
+from .target_residual_completion import (
+    JointCorrectionConfig,
+    ResidualCompletionConfig,
+    validate_residual_completion_depth_direction,
+)
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
 
@@ -1404,6 +1418,93 @@ def _maybe_complete_direct_p1_task_vector(
     return completed, diagnostics
 
 
+def _run_direct_residual_fit(
+    *,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    target_base_sd: dict[str, torch.Tensor],
+    source_loader: Any,
+    target_loader: Any,
+    pairing: DiscreteLayerPairing,
+    config: DirectResidualConfig,
+    device: str,
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]]]:
+    """Run Direct Residual's capture -> desired-effect -> fit -> scale pipeline once.
+
+    Mirrors the exact ``torch.cuda.reset_peak_memory_stats()`` /
+    ``torch.cuda.synchronize()`` / ``torch.cuda.max_memory_allocated()`` /
+    ``time.perf_counter()`` idiom the existing ``transport_timings`` bracket
+    uses, split into two brackets: one around alignment/capture
+    (``capture_paired_boundary_activations`` + ``compute_desired_effects``,
+    the "calibration" half) and one around the ridge solve itself
+    (``fit_direct_residual``). ``theta_j_corrected = theta_j_native +
+    strength * correction_j`` is applied here (not inside
+    ``fit_direct_residual``, which always fits at unit strength) so that
+    ``strength=0`` is an exact native-target-base control, matching
+    ``target_informed_runtime.scale_completion``'s ``gamma=0`` contract --
+    replicated directly rather than called through ``scale_completion``
+    itself, since that helper requires every corrected key to already be
+    present in its ``baseline`` argument, and Direct Residual's baseline is
+    the empty ``transported_delta={}`` (there is no transport step to have
+    populated it).
+
+    Returns ``(scaled_delta, timing, diagnostics)`` where ``timing`` has
+    ``"alignment_calibration"``/``"correction_fit"`` sub-dicts, each shaped
+    like a ``transport_timings[task]`` entry.
+    """
+    if torch.cuda.is_available() and device != "cpu":
+        torch.cuda.reset_peak_memory_stats()
+    alignment_started = time.perf_counter()
+    captured = capture_paired_boundary_activations(
+        source_base_model,
+        source_ft_model,
+        target_model,
+        source_loader,
+        target_loader,
+        pairing,
+        num_batches=config.num_batches,
+        seed=config.seed,
+        device=device,
+    )
+    desired = compute_desired_effects(captured, pairing)
+    if torch.cuda.is_available() and device != "cpu":
+        torch.cuda.synchronize()
+        alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
+    else:
+        alignment_peak_memory_bytes = 0.0
+    alignment_timing = {
+        "alignment_calibration_seconds": time.perf_counter() - alignment_started,
+        "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
+    }
+
+    if torch.cuda.is_available() and device != "cpu":
+        torch.cuda.reset_peak_memory_stats()
+    fit_started = time.perf_counter()
+    target_corrections, diagnostics = fit_direct_residual(
+        target_model,
+        target_base_sd,
+        captured,
+        desired,
+        pairing,
+        config=config,
+        device=device,
+    )
+    if torch.cuda.is_available() and device != "cpu":
+        torch.cuda.synchronize()
+        fit_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
+    else:
+        fit_peak_memory_bytes = 0.0
+    fit_timing = {
+        "correction_fit_seconds": time.perf_counter() - fit_started,
+        "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
+    }
+
+    strength = float(config.strength)
+    scaled_delta = (
+        {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
+    )
+    return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics
 
 
 def main() -> None:
@@ -1545,13 +1646,63 @@ def main() -> None:
             cfg["block_extension_enabled"] = True
 
         method_name, method_params = resolve_rebase_method_config(cfg)
-        method = get_method(method_name)
+        # Direct Residual is deliberately NOT registered in the rebase method
+        # registry (rebase/registry.py): it needs whole model objects and
+        # dataloaders for paired activation capture, not a state-dict-delta
+        # transport() call, so `get_method` would raise KeyError for it. It
+        # also must never let `resolve_block_extension_config(cfg)` run over
+        # `cfg` -- ARIADNE's config gates have no business accepting or
+        # rejecting a Direct Residual config, since Direct Residual never
+        # reaches a single ARIADNE code path. See the module docstring of
+        # `direct_residual.py` and tests/test_vision_rebase_direct_residual_dispatch.py.
+        direct_residual_like = method_name == "direct_residual"
+        if direct_residual_like:
+            method = SimpleNamespace(name=method_name)
+            block_extension_enabled = False
+            block_extension_cfg = BlockExtensionConfig()
+            # Direct Residual's own config schema is narrower than, and
+            # independent of, `method_params` (which historically carries
+            # per-transport-method kwargs consumed by `method.transport()` --
+            # a call Direct Residual never makes). A dedicated top-level key
+            # keeps that separation explicit rather than overloading
+            # `method_params`'s existing per-method dispatch conventions.
+            direct_residual_cfg = parse_direct_residual_config(cfg.get("direct_residual_params"))
+        else:
+            method = get_method(method_name)
+            block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
+            direct_residual_cfg = None
         method_label = format_rebase_method_label(method_name, method_params)
-        block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
         theseus_like_method = method_name in {"theseus", "theseus_reference"}
         blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
         transfusion_mode = method_name == "transfusion"
         bico_mode = method_name in ("bico", "bico_gradin")
+        # "ariadne" (default) preserves every existing behavior: the
+        # block-extension prestep resizes the source model's depth via
+        # ARIADNE's insertion/collapse machinery. "discrete_index_match" is
+        # the faithful BiCo/THESEUS structural-resize control: it reindexes
+        # the source model to the target depth via the flat, closed-form
+        # `DiscreteLayerPairing` instead, with no interpolation, no
+        # correction fit, and no ancestry bookkeeping. Resolved here, once,
+        # so an unknown value fails fast rather than surfacing deep in the
+        # per-task loop.
+        depth_alignment_mode = str(cfg.get("depth_alignment", "ariadne")).strip().lower()
+        if depth_alignment_mode not in {"ariadne", "discrete_index_match"}:
+            raise ValueError("depth_alignment must be one of: ariadne, discrete_index_match")
+        if (
+            direct_residual_like
+            and direct_residual_cfg.merge_mode == "merge_in_source_then_fit"
+            and str(cfg.get("alpha_selection", "shared")).strip().lower() != "shared"
+        ):
+            # Mirrors the shared-alpha requirement _resolve_merge_mode_config
+            # already enforces for merge_then_brace_then_transport: once every
+            # task's transported delta collapses to the SAME once-fitted
+            # correction, a per-task alpha search is degenerate (it would just
+            # search the same objective under a different name per task).
+            raise ValueError(
+                "direct_residual merge_mode='merge_in_source_then_fit' requires alpha_selection='shared': "
+                "the fit is performed once, on the merged source pair, and produces one correction shared "
+                "by every task -- a per-task alpha search over an identical delta is not meaningful."
+            )
         eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
         block_extension_eval_requested = bool(eval_before_rebase)
         block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
@@ -1645,6 +1796,23 @@ def main() -> None:
             raise ValueError("alpha_selection must be one of: shared, per_task")
 
         merge_mode, merge_method_name, merge_params, global_alpha_search = _resolve_merge_mode_config(cfg, alpha_selection)
+        if direct_residual_like and merge_mode in _SINGLE_TRANSPORT_MODES:
+            # merge_then_rebase / brace_merge_then_transport / merge_then_brace_then_transport
+            # all end by calling method.transport() once on a merged direction
+            # (see the merge-mode dispatch after the per-task loop). Direct
+            # Residual has no such method object to call -- it is not in the
+            # rebase method registry at all (see the method-dispatch comment
+            # above) -- and its own once-only merge path is
+            # `direct_residual_params.merge_mode='merge_in_source_then_fit'`,
+            # which is independent of this top-level `merge_mode` key. Reject
+            # the combination early rather than failing later with an
+            # unhelpful AttributeError.
+            raise ValueError(
+                f"method='direct_residual' does not support merge_mode='{merge_mode}': Direct Residual has no "
+                "transport() call for the merge-mode dispatch to invoke. Use merge_mode='none' (optionally with "
+                "direct_residual_params.merge_mode='merge_in_source_then_fit' for a once-only merged fit) or "
+                "merge_mode='rebase_then_merge'/'brace_transport_then_merge' for per-task fits merged afterward."
+            )
 
         base_construction = str(cfg.get("base_construction", "per_task")).strip().lower()
         if base_construction not in _BASE_CONSTRUCTION_MODES:
@@ -1720,9 +1888,38 @@ def main() -> None:
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
-        run_block_extension_prestep = bool(
-            blockext_like_method and block_extension_enabled and source_depth != target_depth
+        validate_residual_completion_depth_direction(
+            block_extension_cfg.target_residual_completion,
+            source_depth=source_depth,
+            target_depth=target_depth,
         )
+        run_block_extension_prestep = bool(
+            blockext_like_method
+            and block_extension_enabled
+            and depth_alignment_mode == "ariadne"
+            and source_depth != target_depth
+        )
+        run_discrete_layer_match_prestep = bool(
+            blockext_like_method and depth_alignment_mode == "discrete_index_match" and source_depth != target_depth
+        )
+        # Direct-target P1 can write into a native target model at equal depth;
+        # in that case it uses an identity layout instead of an ARIADNE resize.
+        run_same_depth_direct_target = bool(
+            blockext_like_method
+            and block_extension_enabled
+            and source_depth == target_depth
+            and block_extension_cfg.target_residual_completion.enabled
+            and block_extension_cfg.target_residual_completion.mode == "direct_target"
+        )
+        if depth_alignment_mode == "discrete_index_match" and (
+            block_extension_cfg.target_residual_completion.enabled
+            or block_extension_cfg.joint_blockwise_correction.enabled
+            or block_extension_cfg.direct_p1_correction.enabled
+        ):
+            raise ValueError(
+                "depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "
+                "joint_blockwise_correction, and direct_p1_correction."
+            )
         if (
             block_extension_cfg.joint_blockwise_correction.enabled
             or block_extension_cfg.direct_p1_correction.enabled
@@ -1903,6 +2100,7 @@ def main() -> None:
         residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
         joint_blockwise_diagnostics: dict[str, list[dict[str, Any]]] = {}
         direct_p1_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        direct_residual_diagnostics: dict[str, list[dict[str, Any]]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -1936,7 +2134,8 @@ def main() -> None:
                 target_cfg=target_cfg,
                 use_humanized_classnames=use_humanized_classnames,
                 need_source_loaders=bool(
-                    (theseus_like_method or transfusion_mode or bico_mode) and task not in native_tasks
+                    (theseus_like_method or transfusion_mode or bico_mode or direct_residual_like)
+                    and task not in native_tasks
                 ),
             )
             task_context_by_name[task] = task_ctx
@@ -1974,6 +2173,98 @@ def main() -> None:
         task_block_extension_prestep = bool(
             run_block_extension_prestep and merge_mode != "merge_then_brace_then_transport"
         )
+        # Same merge_mode-aware guard as task_block_extension_prestep above:
+        # merge_then_brace_then_transport merges deltas on the native source
+        # base first and only then runs its own once-only structural step
+        # (see the merge_then_brace_then_transport branch further below), so
+        # neither prestep fires per-task under that merge mode.
+        task_discrete_layer_match_prestep = bool(
+            run_discrete_layer_match_prestep and merge_mode != "merge_then_brace_then_transport"
+        )
+        # Timing/memory brackets (wandb-visible), parallel to transport_timings:
+        # alignment_calibration_timings covers whatever depth/width-alignment
+        # step runs before any correction is fitted (build_discrete_indexed_model
+        # for the discrete-index-match control, or capture_paired_boundary_activations
+        # for Direct Residual); correction_fit_timings covers fit_direct_residual
+        # only. Both dicts default to {} and are always present in final_summary,
+        # even for methods/paths that never populate them, so downstream JSON
+        # parsing is uniform across every method.
+        alignment_calibration_timings: dict[str, dict[str, float]] = {}
+        correction_fit_timings: dict[str, dict[str, float]] = {}
+
+        # merge_in_source_then_fit (a DirectResidualConfig field, distinct
+        # from the top-level `merge_mode` cfg key): merge every task's native
+        # source-base-relative delta ONCE, before the per-task loop, then
+        # capture/fit Direct Residual's correction ONCE against that merged
+        # source pair. The per-task loop below reuses this single cached
+        # correction for every task instead of re-fitting -- it is the same
+        # transported_delta for every task, exactly as
+        # merge_then_brace_then_transport reuses one merged/transported model
+        # across tasks (see that branch further below for the analogous
+        # native-source merge-then-structural-step pattern this mirrors).
+        direct_residual_merged_correction: dict[str, torch.Tensor] | None = None
+        direct_residual_merged_timing: dict[str, dict[str, float]] | None = None
+        if direct_residual_like and direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
+            merge_in_source_tasks = [t for t in tasks if t not in native_tasks]
+            merge_in_source_deltas: list[dict[str, torch.Tensor]] = []
+            merge_in_source_weights: list[float] = []
+            for idx, t in enumerate(tasks):
+                if t in native_tasks:
+                    continue
+                ckpt_path = str(tuned_by_task[t])
+                sd = load_ckpt(ckpt_path)
+                aligned = align_to_base_keys(sd, source_base_sd)
+                if not aligned:
+                    raise ValueError(
+                        f"No tensors from tuned checkpoint aligned to source base keys for task '{t}': {ckpt_path}."
+                    )
+                tuned_sd = to_cpu_fp32(aligned)
+                delta = TaskVector.from_checkpoints(
+                    source_base_sd, tuned_sd, strict=False, key_filter=_visual_only_filter
+                ).delta
+                merge_in_source_deltas.append(delta)
+                merge_in_source_weights.append(merge_weights[idx])
+            if not merge_in_source_tasks:
+                raise ValueError("direct_residual merge_in_source_then_fit requires at least one non-native task.")
+            merged_direction = _merge_direction(
+                base_sd=source_base_sd,
+                deltas=merge_in_source_deltas,
+                merge_method_name=merge_method_name,
+                weights=merge_in_source_weights,
+                merge_params=merge_params,
+            )
+            source_base_model_merged = deepcopy(clf_source.model)
+            source_ft_model_merged = deepcopy(clf_source.model)
+            load_into_model(source_base_model_merged, source_base_sd, strict=True)
+            load_into_model(
+                source_ft_model_merged,
+                axpy_state_dict(source_base_sd, merged_direction, alpha=1.0),
+                strict=True,
+            )
+            # Direct Residual has no dedicated calibration-dataset config
+            # field of its own (unlike block_extension_cfg's calibration_dataset):
+            # the once-only merged fit has no single "task" to draw loaders
+            # from, so it falls back to the first contributing task's train
+            # loaders, mirroring the existing calibration-loader fallback
+            # pattern (`calibration_loader = ...; if None: select_loader(...)`)
+            # used elsewhere in this function when no dedicated loader is set.
+            merged_calibration_task_ctx = task_context_by_name[merge_in_source_tasks[0]]
+            direct_residual_pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+            direct_residual_merged_correction, direct_residual_merged_timing, direct_residual_merged_diag = (
+                _run_direct_residual_fit(
+                    source_base_model=source_base_model_merged,
+                    source_ft_model=source_ft_model_merged,
+                    target_model=clf_target.model,
+                    target_base_sd=target_base_sd,
+                    source_loader=merged_calibration_task_ctx.source_loaders.train,
+                    target_loader=merged_calibration_task_ctx.loaders.train,
+                    pairing=direct_residual_pairing,
+                    config=direct_residual_cfg,
+                    device=device,
+                )
+            )
+            for t in merge_in_source_tasks:
+                direct_residual_diagnostics[t] = direct_residual_merged_diag
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -1994,10 +2285,17 @@ def main() -> None:
             task_joint_target_loader: Any = None
             task_direct_p1_references: dict[str, Any] | None = None
             task_direct_p1_target_loader: Any = None
+            task_source_activation_plan: InterpolatedBlockActivations | None = None
+            task_extension_layout: dict[str, Any] = {}
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
-            if blockext_like_method and (task_block_extension_prestep or block_extension_eval_enabled):
+            if blockext_like_method and (
+                task_block_extension_prestep
+                or task_discrete_layer_match_prestep
+                or run_same_depth_direct_target
+                or block_extension_eval_enabled
+            ):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
                 load_into_model(source_base_model_task, source_base_sd, strict=True)
@@ -2305,6 +2603,72 @@ def main() -> None:
                     f"  {task}: block extension preprocess completed "
                     f"(source_depth={source_depth} -> {final_depth}, delta_keys={len(task_delta)})."
                 )
+            elif run_same_depth_direct_target:
+                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Same-depth direct-target P1 requires source models and calibration loaders.")
+                calibration_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=source_loaders.train,
+                    test_loader=source_loaders.test,
+                    val_loader=source_loaders.val,
+                )
+                task_residual_target_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=loaders.train,
+                    test_loader=loaders.test,
+                    val_loader=loaders.val,
+                )
+                task_residual_references = _maybe_capture_target_residual_references(
+                    config=block_extension_cfg.target_residual_completion,
+                    source_base_model=source_base_model_task,
+                    source_ft_model=source_ft_model_task,
+                    target_model=clf_target.model,
+                    source_loader=calibration_loader,
+                    target_loader=task_residual_target_loader,
+                    seed=int(cfg.get("seed", 42)),
+                    device=device,
+                )
+                task_extension_layout = {
+                    "direction": "extend",
+                    "final_blocks": [
+                        {
+                            "position": pos,
+                            "source_orig_idx": pos,
+                            "span_orig_idxs": [pos],
+                            "block_kind": "original",
+                        }
+                        for pos in range(target_depth)
+                    ],
+                    "inserted_blocks": [],
+                }
+                recorded_extension_layout = dict(task_extension_layout)
+            elif task_discrete_layer_match_prestep:
+                if source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Discrete layer match expected initialized source task models.")
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.reset_peak_memory_stats()
+                alignment_started = time.perf_counter()
+                pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+                source_base_model_task = build_discrete_indexed_model(source_base_model_task, pairing)
+                source_ft_model_task = build_discrete_indexed_model(source_ft_model_task, pairing)
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.synchronize()
+                    alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
+                else:
+                    alignment_peak_memory_bytes = 0.0
+                alignment_calibration_timings[task] = {
+                    "alignment_calibration_seconds": time.perf_counter() - alignment_started,
+                    "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
+                }
+                task_source_base_sd = to_cpu_fp32(source_base_model_task.state_dict())
+                task_source_ft_sd = to_cpu_fp32(source_ft_model_task.state_dict())
+                task_delta = TaskVector.from_checkpoints(
+                    task_source_base_sd, task_source_ft_sd, strict=True, key_filter=_visual_only_filter
+                ).delta
+                print(
+                    f"  {task}: discrete layer match reindex completed "
+                    f"(source_depth={source_depth} -> {target_depth}, delta_keys={len(task_delta)})."
+                )
             elif block_extension_eval_enabled and block_extension_eval_rows:
                 last_row = block_extension_eval_rows[-1]
                 print(
@@ -2323,7 +2687,7 @@ def main() -> None:
             if source_only:
                 continue
 
-            if not task_block_extension_prestep:
+            if not task_block_extension_prestep and not task_discrete_layer_match_prestep:
                 if transfusion_mode:
                     if transfusion_prepared is None:
                         transfusion_prepared = method.prepare(
@@ -2387,7 +2751,18 @@ def main() -> None:
                 n_keys = len(tuned_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
-            print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
+            direct_target_p1 = bool(
+                (task_block_extension_prestep or run_same_depth_direct_target)
+                and block_extension_cfg.target_residual_completion.enabled
+                and block_extension_cfg.target_residual_completion.mode == "direct_target"
+            )
+            if direct_target_p1:
+                print(
+                    f"\n--- Direct-target P1 for '{task}' "
+                    "(parameter transport skipped) ---"
+                )
+            else:
+                print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if merge_mode not in _SINGLE_TRANSPORT_MODES:
                 if torch.cuda.is_available() and device != "cpu":
                     torch.cuda.reset_peak_memory_stats()
@@ -2399,12 +2774,8 @@ def main() -> None:
                 # all without parameter transport, so invoking the transport
                 # fit and then discarding its output would only burn GPU hours
                 # and blur the claim.
-                direct_target_p1 = bool(
-                    task_block_extension_prestep
-                    and block_extension_cfg.target_residual_completion.enabled
-                    and block_extension_cfg.target_residual_completion.mode == "direct_target"
-                )
-                prepared = None if direct_target_p1 else _build_rebase_prepared(
+                bypass_ordinary_transport = direct_target_p1 or direct_residual_like
+                prepared = None if bypass_ordinary_transport else _build_rebase_prepared(
                     method_name=method_name,
                     method=method,
                     method_params=method_params,
@@ -2415,7 +2786,7 @@ def main() -> None:
                     grad_num_batches=grad_num_batches,
                     theseus_like_method=theseus_like_method,
                     bico_mode=bico_mode,
-                    run_block_extension_prestep=task_block_extension_prestep,
+                    run_block_extension_prestep=task_block_extension_prestep or task_discrete_layer_match_prestep,
                     clf_source=clf_source,
                     clf_target=clf_target,
                     classnames=classnames,
@@ -2439,7 +2810,7 @@ def main() -> None:
                     peak_memory_bytes = 0.0
 
                 transport_started = time.perf_counter()
-                transported_delta = {} if direct_target_p1 else method.transport(
+                transported_delta = {} if bypass_ordinary_transport else method.transport(
                     source_base=task_source_base_sd,
                     target_base=target_base_sd,
                     delta=task_delta,
@@ -2455,13 +2826,64 @@ def main() -> None:
                     "peak_memory_allocated_bytes": peak_memory_bytes,
                 }
 
-                if task_block_extension_prestep and block_extension_cfg.target_residual_completion.enabled:
-                    # ARIADNE proposal 1: complete the just-transported task
-                    # vector's inserted c_proj keys. Runs after transport is
-                    # fitted; never touches the target base weights. Gated on
-                    # ``task_block_extension_prestep`` too so ``task_extension_layout``
-                    # (only assigned inside that prestep) is never read stale
-                    # or undefined.
+                if direct_residual_like:
+                    # Direct Residual never resizes anything: capture must run
+                    # against the NATIVE, un-resized source models, never a
+                    # block-extended reference from elsewhere in this function
+                    # (source_base_model_task/source_ft_model_task are only
+                    # ever populated when blockext_like_method is True, which
+                    # is never the case for direct_residual_like -- see the
+                    # method-dispatch resolution above -- so freshly building
+                    # native copies here, rather than reusing those variables,
+                    # is both correct and the only option).
+                    pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+                    if direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
+                        if direct_residual_merged_correction is None or direct_residual_merged_timing is None:
+                            raise RuntimeError(
+                                "Direct Residual merge_in_source_then_fit correction was not precomputed "
+                                "before the per-task loop."
+                            )
+                        transported_delta = dict(direct_residual_merged_correction)
+                        alignment_calibration_timings[task] = dict(direct_residual_merged_timing["alignment_calibration"])
+                        correction_fit_timings[task] = dict(direct_residual_merged_timing["correction_fit"])
+                    else:
+                        source_base_model_native = deepcopy(clf_source.model)
+                        source_ft_model_native = deepcopy(clf_source.model)
+                        load_into_model(source_base_model_native, source_base_sd, strict=True)
+                        load_into_model(source_ft_model_native, source_base_sd, strict=True)
+                        load_into_model(source_ft_model_native, load_ckpt(str(tuned_by_task[task])), strict=False)
+                        direct_residual_source_loader = select_loader(
+                            "train",
+                            train_loader=source_loaders.train,
+                            test_loader=source_loaders.test,
+                            val_loader=source_loaders.val,
+                        )
+                        direct_residual_target_loader = select_loader(
+                            "train",
+                            train_loader=loaders.train,
+                            test_loader=loaders.test,
+                            val_loader=loaders.val,
+                        )
+                        transported_delta, direct_residual_timing, task_direct_residual_diag = _run_direct_residual_fit(
+                            source_base_model=source_base_model_native,
+                            source_ft_model=source_ft_model_native,
+                            target_model=clf_target.model,
+                            target_base_sd=target_base_sd,
+                            source_loader=direct_residual_source_loader,
+                            target_loader=direct_residual_target_loader,
+                            pairing=pairing,
+                            config=direct_residual_cfg,
+                            device=device,
+                        )
+                        alignment_calibration_timings[task] = direct_residual_timing["alignment_calibration"]
+                        correction_fit_timings[task] = direct_residual_timing["correction_fit"]
+                        direct_residual_diagnostics[task] = task_direct_residual_diag
+
+                if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
+                    # Proposal 1 completes the transported task vector's
+                    # residual projections. In the same-depth direct-target
+                    # path, references and the identity layout are prepared
+                    # separately; both cases leave the target base unchanged.
                     transported_delta, task_residual_diagnostics = _maybe_complete_target_residual_task_vector(
                         config=block_extension_cfg.target_residual_completion,
                         references=task_residual_references,
@@ -3599,6 +4021,25 @@ def main() -> None:
             "all_task_source_lmc": all_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
+            # Always present (default {}) regardless of method/path, so a
+            # downstream summary-JSON parser can read these keys uniformly
+            # across every method, not only depth_alignment='discrete_index_match'
+            # or method='direct_residual' runs.
+            "alignment_calibration_timings": alignment_calibration_timings,
+            "correction_fit_timings": correction_fit_timings,
+            "direct_residual": (
+                {
+                    "config": asdict(direct_residual_cfg),
+                    "diagnostics_by_task": direct_residual_diagnostics,
+                }
+                if direct_residual_like
+                else None
+            ),
+            # Reports whichever depth-alignment mode was active for a Theseus-/
+            # BiCo-like method; always present so a downstream parser can rely
+            # on the key, even though the default "ariadne" path never touches
+            # anything new added by this change.
+            "depth_alignment": depth_alignment_mode,
             "target_residual_completion": (
                 {
                     "config": asdict(block_extension_cfg.target_residual_completion),

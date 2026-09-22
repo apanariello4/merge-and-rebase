@@ -288,6 +288,11 @@ def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
     arm cannot be mistaken for the untouched identity control.
     """
     proposal_1 = bool(config.target_residual_completion.enabled)
+    layout_only_direct_target = bool(
+        proposal_1
+        and config.target_residual_completion.mode == "direct_target"
+        and config.skip_correction
+    )
     option_3 = bool(config.joint_blockwise_correction.enabled)
     direct_p1 = bool(config.direct_p1_correction.enabled)
     if direct_p1:
@@ -307,6 +312,18 @@ def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
             "interpretation": (
                 "frozen-map one-alternation additive source/target c_proj solve; "
                 "transport maps remain fixed and corrections are mounted sequentially"
+            ),
+        }
+    if layout_only_direct_target:
+        return {
+            "label": "direct_target_layout_only",
+            "initialization": "layout_only",
+            "proposal": "target_residual_completion",
+            "is_baseline": False,
+            "interpretation": (
+                "transport-free P1 with structural correction skipped: the realized "
+                "extension/reduction layout addresses native source references, while "
+                "the fitted target-space correction is the entire task vector"
             ),
         }
     if proposal_1 and config.inserted_block_mode == "residual_identity":
@@ -547,14 +564,21 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         # identity mode remains rejected because it intentionally removes the
         # inserted task vector everywhere, making P1's interpretation
         # ambiguous rather than a test of activation of empty depth.
-        identity_p1 = skip_correction and inserted_block_mode == "residual_identity"
-        if skip_correction and not identity_p1:
+        direct_layout_only = (
+            skip_correction and target_residual_completion.mode == "direct_target"
+        )
+        identity_p1 = (
+            skip_correction
+            and inserted_block_mode == "residual_identity"
+            and not direct_layout_only
+        )
+        if skip_correction and not (identity_p1 or direct_layout_only):
             raise ValueError(
                 "block_extension_params.target_residual_completion with skip_correction=true "
-                "requires inserted_block_mode='residual_identity': this is the explicit "
-                "identity initialization + P1 ablation."
+                "requires mode='direct_target' (layout-only P1) or "
+                "inserted_block_mode='residual_identity' (the identity initialization + P1 ablation)."
             )
-        if str(params.get("lmc_mode", "independent")) != "shared":
+        if not direct_layout_only and str(params.get("lmc_mode", "independent")) != "shared":
             raise ValueError("block_extension_params.target_residual_completion requires lmc_mode='shared'.")
         if not skip_correction and inserted_block_mode != "ariadne":
             raise ValueError(

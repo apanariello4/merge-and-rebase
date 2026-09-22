@@ -23,6 +23,7 @@ q/k/v, no LayerScale -- and a genuine width-up, depth-up rebase (8 -> 12 wide,
 from __future__ import annotations
 
 import math
+import hashlib
 
 import pytest
 import torch
@@ -990,3 +991,154 @@ def test_masked_direct_completion_fits_on_real_rows_only():
         results[mask_padding] = corrections
     key = next(iter(results[True]))
     assert not torch.allclose(results[True][key], results[False][key])
+
+
+# --------------------------------------------------------------------------
+# 5. cascade_order: "top_bottom" is not a third setting
+# --------------------------------------------------------------------------
+
+
+def _digest(corrections):
+    sha = hashlib.sha256()
+    for key in sorted(corrections):
+        sha.update(key.encode())
+        sha.update(corrections[key].detach().numpy().tobytes())
+    return sha.hexdigest()
+
+
+def _cascade_fixture():
+    """The fixture these cascade pins were written against on the other branch.
+
+    Two source blocks realized as four target positions, only the source
+    down_proj weights perturbed, and the MLP bias already materialized.
+    """
+    torch.manual_seed(11)
+    source = _Decoder(depth=2).eval()
+    source_ft = _Decoder(depth=2).eval()
+    source_ft.load_state_dict(source.state_dict())
+    with torch.no_grad():
+        source_ft.model.layers[0].mlp.down_proj.weight.add_(0.2)
+        source_ft.model.layers[1].mlp.down_proj.weight.sub_(0.15)
+    target = _Decoder(width=10, inter=20, depth=4).eval()
+    data = _loader()
+    config = ResidualCompletionConfig(
+        enabled=True, mode="direct_target", target_scope="all", ridge_relative=0.05,
+        num_batches=2, missing_bias="materialize",
+    )
+    references = capture_residual_references(
+        source, source_ft, target, data, data,
+        num_batches=config.num_batches, seed=0, device="cpu",
+        target_scope="all", family_adapter=_Adapter(),
+    )
+    layout = {
+        "final_blocks": tuple(
+            {"position": p, "source_orig_idx": p // 2,
+             "block_kind": "inserted" if p % 2 else "original"}
+            for p in range(4)
+        ),
+        "inserted_blocks": (),
+    }
+    target_base_sd = {k: v.clone() for k, v in target.state_dict().items()}
+    added = materialize_missing_projection_biases(target, target_base_sd, layout, family_adapter=_Adapter())
+    assert added, "the decoder fixture must need bias materialization, or this is not the real path"
+    return config, references, layout, target, target_base_sd, data
+
+
+def _fit_with_order(order):
+    config, references, layout, target, base, data = _cascade_fixture()
+    config = ResidualCompletionConfig(**{**config.__dict__, "cascade_order": order})
+    corrections, diagnostics = complete_residuals_direct(
+        target, base, references, layout, data,
+        config=config, device="cpu", family_adapter=_Adapter(),
+    )
+    return _digest(corrections), {r["position"]: r["relative_residual_before"] for r in diagnostics}
+
+
+def test_top_bottom_is_byte_identical_to_independent():
+    """Reversing the visit order gives the uncoupled fit, not a different coupling.
+
+    The option reads as though fitting deepest-first lets later fits invalidate
+    what earlier ones assumed. It cannot: a correction mounted at block k changes
+    activations only *above* k, and block j's capture -- its projection input and
+    its own boundary -- depends only on blocks <= j. So deepest-first leaves every
+    block measuring a pristine upstream, which is exactly what `independent`
+    produces by never mounting at all.
+
+    Pinned at hash level because the two settings look different in a config, and
+    a campaign that grids both spends real compute reproducing one cell in
+    another. A genuinely different coupling would need a re-measured second
+    sweep, not a reversed order.
+    """
+    top_digest, top_before = _fit_with_order("top_bottom")
+    ind_digest, ind_before = _fit_with_order("independent")
+    assert top_digest == ind_digest
+    for position, value in top_before.items():
+        assert value == pytest.approx(1.0, abs=1e-4), position
+        assert ind_before[position] == pytest.approx(1.0, abs=1e-4), position
+
+
+def test_bottom_top_really_does_couple():
+    """Negative control: the default order must not collapse to the uncoupled fit."""
+    bottom_digest, bottom_before = _fit_with_order("bottom_top")
+    ind_digest, _ = _fit_with_order("independent")
+    assert bottom_digest != ind_digest, "the sequential cascade has stopped coupling anything"
+    assert [p for p, v in bottom_before.items() if abs(v - 1.0) > 1e-4], "the cascade is inert"
+
+
+# --------------------------------------------------------------------------
+# 6. materialize_missing_projection_biases must cover every requested write
+#    surface, not only mlp.c_proj
+# --------------------------------------------------------------------------
+
+
+def _fresh_target_and_layout():
+    """A target model + layout with no bias materialized yet.
+
+    Deliberately not `_cascade_fixture()`: that helper already materializes the MLP
+    bias as part of its own setup (and asserts on it), so calling the
+    materializer again on its output would find the key already present and
+    report nothing added -- exactly the false pass that would have hidden
+    this bug.
+    """
+    target = _Decoder(width=10, inter=20, depth=4).eval()
+    base = {k: v.clone() for k, v in target.state_dict().items()}
+    layout = {
+        "final_blocks": tuple(
+            {"position": p, "source_orig_idx": p // 2,
+             "block_kind": "inserted" if p % 2 else "original"}
+            for p in range(4)
+        ),
+        "inserted_blocks": (),
+    }
+    return target, base, layout
+
+
+def test_bias_materialization_defaults_to_mlp_only():
+    """The historical, single-write-surface behaviour must be unchanged."""
+    target, base, layout = _fresh_target_and_layout()
+    added = materialize_missing_projection_biases(target, base, layout, family_adapter=_Adapter())
+    assert added and all("mlp.down_proj" in key for key in added)
+    assert not any("self_attn" in key for key in added)
+
+
+def test_bias_materialization_covers_attn_out_proj_when_requested():
+    """Regression test: components=[attn.out_proj, mlp.c_proj] left o_proj bias-free.
+
+    materialize_missing_projection_biases only ever materialized the MLP
+    projection's bias. With both write surfaces enabled, completion tried to
+    write an intercept onto `self_attn.o_proj.bias` and found it did not exist
+    -- caught when a real campaign cell (components=["attn.out_proj",
+    "mlp.c_proj"]) actually exercised the combination and raised
+    "missing_bias='materialize' requires ... o_proj.bias to exist".
+    """
+    target, base, layout = _fresh_target_and_layout()
+    added = materialize_missing_projection_biases(
+        target, base, layout, family_adapter=_Adapter(),
+        components=("attn.out_proj", "mlp.c_proj"),
+    )
+    down_proj_keys = {k for k in added if "mlp.down_proj" in k}
+    o_proj_keys = {k for k in added if "self_attn.o_proj" in k}
+    assert down_proj_keys, "the MLP write surface must still get its bias"
+    assert o_proj_keys, "the attention write surface must also get its bias"
+    for key in down_proj_keys | o_proj_keys:
+        assert key in base and torch.count_nonzero(base[key]) == 0

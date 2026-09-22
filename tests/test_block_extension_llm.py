@@ -464,6 +464,42 @@ def test_legacy_reverse_mode_is_rejected(monkeypatch):
 
 
 class TestRunBlockExtensionLLM:
+    def test_shrink_publishes_reduction_layout(self):
+        """A decoder reduction exposes span ancestry for direct-target P1."""
+        model_base = DummyDecoderModel(n_layers=4, dim=8, intermediate=16)
+        model_ft = DummyDecoderModel(n_layers=4, dim=8, intermediate=16)
+        adapter = DummyFamilyAdapter()
+        loader = _make_calibration_loader(vocab=100, batch_size=2, seq_len=6, n_batches=1)
+        config = BlockExtensionConfig(
+            extension_strategy="interpolate_per_weight",
+            target_layers_total=2,
+            skip_correction=True,
+            n_batches_act=1,
+            verbose=False,
+            show_progress=False,
+        )
+        layout: dict = {}
+        final_depth = run_block_extension_llm(
+            source_base_model=model_base,
+            source_ft_model=model_ft,
+            calibration_loader=loader,
+            target_layers_total=2,
+            config=config,
+            family_adapter=adapter,
+            device="cpu",
+            layout_out=layout,
+        )
+
+        assert final_depth == 2
+        assert len(model_base.model.layers) == 2
+        assert layout["direction"] == "shrink"
+        assert layout["p1_source_ancestry"] == "span_end_boundary"
+        assert layout["inserted_blocks"] == ()
+        assert layout["final_depth"] == 2
+        assert [row["position"] for row in layout["final_blocks"]] == [0, 1]
+        assert [row["source_orig_idx"] for row in layout["final_blocks"]] == [2, 3]
+        assert [row["span_orig_idxs"] for row in layout["final_blocks"]] == [(0, 1, 2), (3,)]
+
     def test_run_entrypoint(self):
         model_base = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)
         model_ft = DummyDecoderModel(n_layers=3, dim=16, intermediate=32)

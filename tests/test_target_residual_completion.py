@@ -11,6 +11,7 @@ from merge_and_rebase.eval.target_residual_completion import (
     fit_joint_cproj_correction,
     parse_joint_correction_config,
     parse_residual_completion_config,
+    validate_residual_completion_depth_direction,
 )
 from merge_and_rebase.rebase.methods.theseus import _transport_weight
 
@@ -19,6 +20,8 @@ def test_config_defaults_and_validation() -> None:
     cfg = parse_residual_completion_config({"enabled": True})
     assert cfg.enabled and cfg.num_batches == 10
     assert cfg.target_scope == "inserted"
+    assert cfg.ridge_estimator == "fixed_relative"
+    assert parse_residual_completion_config({"ridge_estimator": "empirical_bayes"}).ridge_estimator == "empirical_bayes"
     assert parse_residual_completion_config({"added_blocks": "all", "target_scope": "all"}).target_scope == "all"
     assert cfg.exact_form is True  # no proposal-1 result predates this fix; exact is the only sane default.
     assert parse_residual_completion_config({"num_batches": 1}).num_batches == 1
@@ -31,6 +34,77 @@ def test_config_defaults_and_validation() -> None:
         parse_residual_completion_config({"exact_form": 1})
     with pytest.raises(ValueError):
         parse_residual_completion_config({"target_scope": "added"})
+    with pytest.raises(ValueError):
+        parse_residual_completion_config({"ridge_estimator": "automatic"})
+
+
+def test_empirical_bayes_ridge_matches_component_specific_relative_ridge() -> None:
+    torch.manual_seed(29)
+    h = torch.randn(17, 7)
+    e = torch.randn(17, 5)
+    tin = torch.randn(3, 7)
+    tout = torch.randn(2, 5)
+    stats = ResidualSufficientStatistics()
+    stats.update(h, e, tin, tout)
+
+    automatic, automatic_diag = stats.solve(
+        ridge_relative=123.0,
+        ridge_estimator="empirical_bayes",
+        exact_form=True,
+    )
+    expected_relative = 3.0 / 16.0
+    fixed, fixed_diag = stats.solve(ridge_relative=expected_relative, exact_form=True)
+
+    assert torch.allclose(automatic, fixed, atol=1e-6, rtol=1e-5)
+    assert automatic_diag["ridge"] == pytest.approx(fixed_diag["ridge"])
+    assert automatic_diag["ridge_estimator"] == "empirical_bayes"
+    assert automatic_diag["configured_ridge_relative"] == 123.0
+    assert automatic_diag["effective_ridge_relative"] == pytest.approx(expected_relative)
+
+
+def test_direct_target_shrink_depth_preflight_rejects_extension_semantics() -> None:
+    inserted = parse_residual_completion_config(
+        {"enabled": True, "mode": "direct_target", "target_scope": "inserted"}
+    )
+    with pytest.raises(ValueError, match="requires target_scope='all'"):
+        validate_residual_completion_depth_direction(
+            inserted, source_depth=24, target_depth=12
+        )
+
+    interpolated = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "interpolate",
+        }
+    )
+    with pytest.raises(ValueError, match="requires target_trajectory='step'"):
+        validate_residual_completion_depth_direction(
+            interpolated, source_depth=24, target_depth=12
+        )
+
+
+def test_direct_target_depth_preflight_accepts_step_shrink_and_extensions() -> None:
+    shrink = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "step",
+        }
+    )
+    validate_residual_completion_depth_direction(shrink, source_depth=24, target_depth=12)
+
+    extension = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "interpolate",
+        }
+    )
+    validate_residual_completion_depth_direction(extension, source_depth=12, target_depth=24)
 
 
 def test_joint_correction_config_is_explicit_and_validated() -> None:
@@ -322,3 +396,30 @@ def test_joint_solver_rejects_nonmatching_transport_shapes() -> None:
         fit_joint_cproj_correction(
             *tensors, torch.randn(2, 5), torch.randn(2, 3),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="reproduces only across devices")
+def test_reduced_form_solve_does_not_crash_on_a_non_cpu_device():
+    """exact_form=False must not hard-code a CPU zero tensor.
+
+    ResidualSufficientStatistics.solve()'s reduced-form branch built `beta`
+    (and `beta0`, and the trace_sc==0 branch's `x`) with a bare
+    ``torch.zeros(...)``, which defaults to CPU regardless of the device the
+    caller actually ran on. On device_transform="gpu" (the LLM path's own
+    setting) that produced ``t_out64.T @ beta`` mixing a CUDA tensor with a
+    CPU one inside `_residual_sq`, crashing every reduced-form (exact_form=
+    False, missing_bias="skip") fit -- caught only once an LLM campaign
+    actually exercised that combination on a real GPU node; the CPU-only test
+    suite could not have reproduced it, which is why this test is itself
+    GPU-gated rather than device-agnostic.
+    """
+    device = torch.device("cuda")
+    generator = torch.Generator().manual_seed(0)
+    h = torch.randn(16, 5, generator=generator).to(device)
+    e = torch.randn(16, 3, generator=generator).to(device)
+    t_out = torch.eye(3, device=device)
+    stats = ResidualSufficientStatistics()
+    stats.update(h, e, None, t_out)
+    weight, diag = stats.solve(ridge_relative=0.1, exact_form=False)
+    assert weight.device.type == "cuda"
+    assert diag["bias_correction"].isfinite().all()
