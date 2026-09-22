@@ -1,0 +1,194 @@
+"""Synthetic-scale correctness tests for `direct_residual.fit_direct_residual`.
+
+Covers extend, shrink and same-arch depth pairings against tiny CLIP-shaped
+synthetic models (the same fixture pattern `tests/test_direct_target_p1.py`
+uses, duplicated per this suite's no-cross-test-import convention).
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from copy import deepcopy
+
+import pytest
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from merge_and_rebase.eval.direct_residual import (
+    DirectResidualConfig,
+    capture_paired_boundary_activations,
+    compute_desired_effects,
+    fit_direct_residual,
+)
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+
+
+class _Attention(torch.nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.out_proj = torch.nn.Linear(width, width)
+
+    def forward(self, x):
+        return self.out_proj(x)
+
+
+class _Block(torch.nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.attn = _Attention(width)
+        self.mlp = torch.nn.Sequential(
+            OrderedDict(
+                [
+                    ("c_fc", torch.nn.Linear(width, width * 2)),
+                    ("gelu", torch.nn.GELU()),
+                    ("c_proj", torch.nn.Linear(width * 2, width)),
+                ]
+            )
+        )
+        self.ls_2 = torch.nn.Identity()
+
+    def forward(self, x):
+        return x + self.attn(x) + self.ls_2(self.mlp(x))
+
+
+class _Visual(torch.nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.input = torch.nn.Linear(4, width)
+        self.transformer = torch.nn.Module()
+        self.transformer.resblocks = torch.nn.ModuleList([_Block(width) for _ in range(depth)])
+
+    def forward(self, images):
+        x = self.input(images)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return x.mean(dim=1)
+
+
+class _Model(torch.nn.Module):
+    def __init__(self, width, depth):
+        super().__init__()
+        self.visual = _Visual(width, depth)
+
+    def encode_image(self, x):
+        return self.visual(x)
+
+
+def _loader(n=6, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    images = torch.randn(n, 5, 4, generator=generator)
+    return DataLoader(TensorDataset(images, torch.arange(n)), batch_size=2, shuffle=False)
+
+
+def _tuned_copy(model, seed, scale=0.2):
+    tuned = deepcopy(model)
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for block in tuned.visual.transformer.resblocks:
+            block.mlp.c_proj.weight.add_(scale * torch.randn_like(block.mlp.c_proj.weight))
+            block.attn.out_proj.weight.add_(scale * torch.randn_like(block.attn.out_proj.weight))
+    return tuned
+
+
+def _setup(source_depth, target_depth, width=5, seed=11):
+    torch.manual_seed(seed)
+    source_base = _Model(width, source_depth).eval()
+    target_base = _Model(width, target_depth).eval()
+    source_ft = _tuned_copy(source_base, seed + 1)
+    data = _loader(seed=seed + 2)
+    pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
+    return source_base, source_ft, target_base, data, pairing, target_base_sd
+
+
+def _fit(source_depth, target_depth, config=None, **setup_kwargs):
+    source_base, source_ft, target_base, data, pairing, target_base_sd = _setup(
+        source_depth, target_depth, **setup_kwargs
+    )
+    config = config or DirectResidualConfig(num_batches=3, ridge_relative=0.05)
+    captured = capture_paired_boundary_activations(
+        source_base,
+        source_ft,
+        target_base,
+        data,
+        data,
+        pairing,
+        num_batches=config.num_batches,
+        seed=config.seed,
+        device="cpu",
+    )
+    desired = compute_desired_effects(captured, pairing)
+    corrections, diagnostics = fit_direct_residual(
+        target_base,
+        target_base_sd,
+        captured,
+        desired,
+        pairing,
+        config=config,
+        device="cpu",
+    )
+    return corrections, diagnostics, target_base, target_base_sd
+
+
+REGIMES = [
+    pytest.param(2, 4, id="extend"),
+    pytest.param(4, 2, id="shrink"),
+    pytest.param(3, 3, id="same_arch"),
+]
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_relative_residual_before_is_always_one(source_depth, target_depth):
+    """Direct Residual is always 'independent' by construction: no cascade
+    mounts a correction before the next position's fit, so every position
+    sees E_j == D_j exactly (relative_residual_before == 1.0), not just the
+    first one -- unlike ARIADNE's target_scope='all' path, which can only
+    guarantee this for its very first fitted position."""
+    _corrections, diagnostics, _model, _sd = _fit(source_depth, target_depth)
+    for row in diagnostics:
+        assert row["relative_residual_before"] == pytest.approx(1.0, rel=1e-4), row["position"]
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_strength_zero_reproduces_native_target_base_exactly(source_depth, target_depth):
+    """scale_completion(gamma=0) is a full state-dict no-op; prove the fitted
+    corrections never touch anything outside their own weight/bias keys by
+    diffing the FULL state dict, not a components whitelist."""
+    corrections, _diagnostics, target_model, target_base_sd = _fit(source_depth, target_depth)
+    from merge_and_rebase.eval.target_informed_runtime import scale_completion
+
+    completed_at_zero = scale_completion(target_base_sd, corrections, 0)
+    assert set(completed_at_zero) == set(target_base_sd)
+    for key, value in target_base_sd.items():
+        assert torch.equal(completed_at_zero[key], value), key
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_target_corrections_only_touch_configured_components(source_depth, target_depth):
+    corrections, _diagnostics, _model, target_base_sd = _fit(source_depth, target_depth)
+    for key in corrections:
+        assert (".mlp.c_proj." in key) or (".attn.out_proj." in key), key
+        assert corrections[key].shape == target_base_sd[key].shape
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_target_model_is_restored_after_fit(source_depth, target_depth):
+    source_base, source_ft, target_base, data, pairing, target_base_sd = _setup(source_depth, target_depth)
+    config = DirectResidualConfig(num_batches=3, ridge_relative=0.05)
+    captured = capture_paired_boundary_activations(
+        source_base,
+        source_ft,
+        target_base,
+        data,
+        data,
+        pairing,
+        num_batches=config.num_batches,
+        seed=config.seed,
+        device="cpu",
+    )
+    desired = compute_desired_effects(captured, pairing)
+    pre_state = {k: v.clone() for k, v in target_base.state_dict().items()}
+    fit_direct_residual(target_base, target_base_sd, captured, desired, pairing, config=config, device="cpu")
+    post_state = target_base.state_dict()
+    for key, value in pre_state.items():
+        assert torch.equal(post_state[key], value), key
