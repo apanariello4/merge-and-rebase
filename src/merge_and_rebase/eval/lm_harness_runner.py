@@ -114,6 +114,7 @@ def run(
     batch_size: str = "auto",
     limit: int | None = None,
     samples: dict[str, list[int]] | None = None,
+    apply_chat_template: bool = False,
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -133,6 +134,13 @@ def run(
     samples : Optional explicit doc indices to score per task. Used to keep
         the scored docs disjoint from the calibration slice carved out of
         the same task (see `data.llm_calibration`).
+    apply_chat_template : Wrap each prompt in the tokenizer's chat template.
+        Off by default, because turning it on changes the prompt every task
+        sees and so is not comparable with any run made without it. It exists
+        for the `*_instruct` task variants, whose `gen_prefix` assumes an
+        assistant turn to continue and which score 0 without one. Both the
+        source and the target tokenizer must carry a chat template; Qwen2.5
+        base checkpoints do.
 
     Returns
     -------
@@ -187,6 +195,7 @@ def run(
                     device=device,
                     limit=limit,
                     confirm_run_unsafe_code=confirm_run_unsafe_code,
+                    apply_chat_template=apply_chat_template,
                     **_samples_for(samples, group_tasks),
                 )
             except TypeError:
@@ -199,6 +208,7 @@ def run(
                     device=device,
                     limit=limit,
                     confirm_run_unsafe_code=confirm_run_unsafe_code,
+                    apply_chat_template=apply_chat_template,
                     **_samples_for(samples, group_tasks),
                 )
             out.update(_extract_metrics(results))

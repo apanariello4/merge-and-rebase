@@ -1,0 +1,79 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "it": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 100,
+    "device_transform": "gpu"
+  },
+  "alpha_search": true,
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "bottom-top",
+    "extension_density": "spread",
+    "n_batches_act": 100,
+    "calibration_split": "val",
+    "dampening_factor": 1.0,
+    "skip_correction": false,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "ridge_identity": 100.0,
+    "target_residual_completion": {
+      "enabled": true,
+      "mode": "direct_target",
+      "target_scope": "all",
+      "strength": 1.0,
+      "num_batches": 100,
+      "exact_form": true,
+      "missing_bias": "materialize",
+      "ridge_relative": 0.001,
+      "mask_padding": true
+    }
+  },
+  "eval_before_rebase": false,
+  "harness_tasks": [
+    "ifeval"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 448,
+  "seed": 0,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_calibfix_20260922/ifeval_maskgen_rho1e-3_s1"
+  },
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": {
+      "values": [
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0
+      ]
+    }
+  },
+  "_derived_from": "configs/sweeps/p1direct_rho_20260922/direct_rho1e-3_s1.json",
+  "align_with_gen_response": {
+    "max_new_tokens": 256,
+    "batch_size": 16,
+    "cache_path": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_calibfix_20260922/_gen_cache/ifeval_qwen0.5b_it_seed0_mnt256.json"
+  }
+}

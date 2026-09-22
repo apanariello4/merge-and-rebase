@@ -1,0 +1,53 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "tv": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {},
+  "alpha_search": false,
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "bottom-top",
+    "extension_density": "spread",
+    "n_batches_act": 100,
+    "calibration_split": "val",
+    "dampening_factor": 1.0,
+    "skip_correction": false,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "ridge_identity": 100.0,
+    "target_residual_completion": {
+      "enabled": true,
+      "mode": "direct_target",
+      "target_scope": "all",
+      "strength": 0.0,
+      "num_batches": 100,
+      "exact_form": true,
+      "missing_bias": "materialize",
+      "ridge_relative": 0.001
+    }
+  },
+  "eval_before_rebase": false,
+  "harness_tasks": [
+    "ifeval"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
+  "seed": 0,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_2arm_20260922/instruct_gamma0_control"
+  },
+  "alpha": 1.0
+}

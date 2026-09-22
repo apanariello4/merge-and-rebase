@@ -264,3 +264,71 @@ def test_score_by_task_empty_results() -> None:
     from merge_and_rebase.eval.lm_harness_runner import score_by_task
 
     assert score_by_task({}, ["gsm8k"]) == 0.0
+
+
+def test_harness_apply_chat_template_defaults_off(monkeypatch) -> None:
+    """Chat templating is opt-in.
+
+    Turning it on rewrites every prompt the harness builds, so a run made with
+    it is not comparable to one made without it. Any caller that does not ask
+    for it must get the historical prompts back unchanged.
+    """
+    calls: list[dict] = []
+
+    def _fake_simple_evaluate(**kwargs):
+        calls.append(kwargs)
+
+        class _R:
+            def get(self, key, default=None):
+                if key == "results":
+                    return {t: {"acc,none": 1.0} for t in kwargs["tasks"]}
+                return default
+
+        return _R()
+
+    _install_fake_lm_eval(monkeypatch, _fake_simple_evaluate)
+
+    import torch.nn as nn
+
+    from merge_and_rebase.eval.lm_harness_runner import run
+
+    run(tasks=["gsm8k"], model=nn.Module(), tokenizer=None)
+    assert calls[0]["apply_chat_template"] is False
+
+
+def test_harness_apply_chat_template_forwarded(monkeypatch) -> None:
+    """...and reaches lm-eval when it is asked for.
+
+    The `*_instruct` task variants score 0 without it: their `gen_prefix` is an
+    assistant turn to be continued, and with no chat template there is no turn.
+    """
+    calls: list[dict] = []
+
+    def _fake_simple_evaluate(**kwargs):
+        calls.append(kwargs)
+
+        class _R:
+            def get(self, key, default=None):
+                if key == "results":
+                    return {t: {"pass@1,none": 0.5} for t in kwargs["tasks"]}
+                return default
+
+        return _R()
+
+    _install_fake_lm_eval(monkeypatch, _fake_simple_evaluate)
+
+    import torch.nn as nn
+
+    from merge_and_rebase.eval.lm_harness_runner import run
+
+    run(
+        tasks=["humaneval_instruct", "mbpp_instruct"],
+        model=nn.Module(),
+        tokenizer=None,
+        num_fewshot={"humaneval_instruct": 0, "mbpp_instruct": 3},
+        apply_chat_template=True,
+    )
+
+    # One call per few-shot group, and the flag reaches every one of them.
+    assert len(calls) == 2
+    assert all(c["apply_chat_template"] is True for c in calls)

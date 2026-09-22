@@ -706,3 +706,287 @@ def test_transport_mode_does_not_reach_the_direct_solver():
             device="cpu",
             materialized_bias_keys=set(),
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. Building the tuned body from its own config
+#
+# A tuned body is normally the same architecture as its base, so building it as a
+# deepcopy of the source and overwriting the weights is right. It stops being right
+# when the checkpoint carries its own config: every parameter shape still matches, so
+# the load succeeds and nothing downstream complains, but the tuned weights then run
+# under the SOURCE's positional geometry and every captured activation is wrong.
+#
+# This is not hypothetical. Qwen ships every Math model with rope_theta=1e4 /
+# max_position_embeddings=4096 and every general model with rope_theta=1e6, so the
+# general-base + Math-tuned pairing -- the only one that isolates the *math* task
+# vector rather than an instruct one -- lands exactly on it.
+# ---------------------------------------------------------------------------
+
+
+class _Cfg:
+    """Stand-in for an HF PretrainedConfig: attribute access is all that is used."""
+
+    def __init__(self, **kw):
+        self.model_type = kw.pop("model_type", "qwen2")
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _ModelWithConfig(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+def _patch_autoconfig(monkeypatch, mapping):
+    """Route AutoConfig.from_pretrained to a dict of ref -> config (or raise)."""
+    import transformers
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(ref, **_kw):
+            if ref not in mapping:
+                raise OSError(f"no config for {ref!r}")
+            return mapping[ref]
+
+    monkeypatch.setattr(transformers, "AutoConfig", _AutoConfig)
+
+
+def test_matching_configs_report_no_mismatch(monkeypatch):
+    """The no-op guarantee: an ordinary base/instruct pair keeps the deepcopy path."""
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    shared = dict(rope_theta=1000000.0, max_position_embeddings=32768)
+    _patch_autoconfig(monkeypatch, {"org/Instruct": _Cfg(**shared)})
+    source = _ModelWithConfig(_Cfg(**shared))
+
+    assert _tuned_config_mismatch("org/Instruct", source) == {}
+
+
+def test_rope_theta_difference_is_detected(monkeypatch):
+    """The real case: Qwen Math (1e4) against a general base (1e6)."""
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {
+        "Qwen/Qwen2.5-Math-1.5B": _Cfg(rope_theta=10000.0, max_position_embeddings=4096),
+    })
+    source = _ModelWithConfig(_Cfg(rope_theta=1000000.0, max_position_embeddings=131072))
+
+    mismatch = _tuned_config_mismatch("Qwen/Qwen2.5-Math-1.5B", source)
+
+    assert set(mismatch) == {"rope_theta", "max_position_embeddings"}
+    assert mismatch["rope_theta"] == {"source": 1000000.0, "tuned": 10000.0}
+    # Carried along for the record once something real already fired.
+    assert mismatch["max_position_embeddings"] == {"source": 131072, "tuned": 4096}
+
+
+def test_rope_normalized_into_rope_scaling_is_still_detected(monkeypatch):
+    """transformers>=5 drops the flat rope_theta and nests it under rope_scaling.
+
+    Measured on this install: Qwen2.5-1.5B reports rope_theta=<absent> and
+    rope_scaling={'rope_theta': 1e6, 'rope_type': 'default'}. A guard watching only
+    the field the JSON config names would compare None to None and wave the Math
+    pairing through, silently running its weights under the wrong geometry.
+    """
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {
+        "Qwen/Qwen2.5-Math-1.5B": _Cfg(rope_scaling={"rope_theta": 10000, "rope_type": "default"}),
+    })
+    source = _ModelWithConfig(_Cfg(rope_scaling={"rope_theta": 1000000.0, "rope_type": "default"}))
+
+    mismatch = _tuned_config_mismatch("Qwen/Qwen2.5-Math-1.5B", source)
+
+    assert "rope_scaling" in mismatch, "normalized rope_theta went undetected"
+
+
+def test_context_length_alone_is_not_a_mismatch(monkeypatch):
+    """max_position_embeddings must NOT trigger a rebuild on its own.
+
+    Real base/tuned pairs disagree about declared context length -- Qwen2.5-1.5B
+    says 131072 and Qwen2.5-1.5B-Instruct says 32768 -- while being exactly the
+    ordinary same-architecture pairing the deepcopy path is built for. Treating it
+    as a mismatch would rebuild every instruct arm, and would make the guard REFUSE
+    every existing theseus/bico config that pairs those two.
+    """
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {
+        "Qwen/Qwen2.5-1.5B-Instruct": _Cfg(rope_theta=1000000.0, max_position_embeddings=32768),
+    })
+    source = _ModelWithConfig(_Cfg(rope_theta=1000000.0, max_position_embeddings=131072))
+
+    assert _tuned_config_mismatch("Qwen/Qwen2.5-1.5B-Instruct", source) == {}
+
+
+def test_bare_state_dict_refs_are_never_treated_as_config_carrying(monkeypatch):
+    """A .pt/.safetensors checkpoint is weights FOR the source architecture.
+
+    It has no config of its own to disagree with, so it must keep the historical
+    deepcopy path even if AutoConfig would happen to resolve the string.
+    """
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {"x.safetensors": _Cfg(rope_theta=1.0)})
+    source = _ModelWithConfig(_Cfg(rope_theta=1000000.0))
+
+    for ref in ("x.pt", "x.bin", "x.safetensors", "x.ckpt", "x.pth"):
+        assert _tuned_config_mismatch(ref, source) == {}
+
+
+def test_unreadable_config_falls_back_to_the_deepcopy_path(monkeypatch):
+    """A PEFT adapter dir or anything AutoConfig cannot read must not break.
+
+    "No detectable mismatch" is the safe answer: it preserves every ref shape that
+    worked before this check existed.
+    """
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {})  # every lookup raises
+    source = _ModelWithConfig(_Cfg(rope_theta=1000000.0))
+
+    assert _tuned_config_mismatch("org/some-adapter", source) == {}
+
+
+def test_config_without_model_type_is_ignored(monkeypatch):
+    """AutoConfig can return something shapeless; only a real model config counts."""
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {"org/weird": _Cfg(model_type=None, rope_theta=1.0)})
+    source = _ModelWithConfig(_Cfg(rope_theta=1000000.0))
+
+    assert _tuned_config_mismatch("org/weird", source) == {}
+
+
+def test_source_without_a_config_is_ignored(monkeypatch):
+    """Bare nn.Modules (the test decoders here) have no .config to compare against."""
+    from merge_and_rebase.eval.llm_rebase import _tuned_config_mismatch
+
+    _patch_autoconfig(monkeypatch, {"org/tuned": _Cfg(rope_theta=10000.0)})
+
+    assert _tuned_config_mismatch("org/tuned", _Decoder(depth=2)) == {}
+
+
+def test_every_behavioural_key_is_shape_invisible():
+    """Each watched key must be one a state-dict load CANNOT catch.
+
+    That is the whole justification for the check: if a mismatch showed up as a shape
+    error we would not need it. A key that changes parameter shapes does not belong
+    here -- it would be caught anyway, and listing it would imply false coverage.
+    """
+    from merge_and_rebase.eval.llm_rebase import _BEHAVIOURAL_CONFIG_KEYS
+
+    shape_bearing = {
+        "hidden_size", "intermediate_size", "num_hidden_layers", "vocab_size",
+        "num_attention_heads", "num_key_value_heads",
+    }
+    assert not (set(_BEHAVIOURAL_CONFIG_KEYS) & shape_bearing)
+    assert "rope_theta" in _BEHAVIOURAL_CONFIG_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Padding mask: text batches are right-padded to a fixed length, and without
+# mask_padding every pad position becomes a fitted row.
+# ---------------------------------------------------------------------------
+
+_LENGTHS = (3, 5, 2, 4, 5, 1)
+
+
+class _PaddedTexts(_Texts):
+    """Right-padded like the real calibration loader: example i has lengths[i] real tokens."""
+
+    def __init__(self, *, offset=0, lengths=_LENGTHS):
+        super().__init__(n=len(lengths), offset=offset)
+        self.lengths = lengths
+
+    def __getitem__(self, i):
+        row = super().__getitem__(i)
+        mask = torch.zeros(self.seq, dtype=torch.long)
+        mask[: self.lengths[i]] = 1
+        row["input_ids"] = row["input_ids"] * mask
+        row["attention_mask"] = mask
+        return row
+
+
+def _padded_loader(offset=0, batch_size=2, lengths=_LENGTHS):
+    return DataLoader(
+        _PaddedTexts(offset=offset, lengths=lengths), batch_size=batch_size, shuffle=False, collate_fn=_collate
+    )
+
+
+def _padded_references(source, source_ft, target, config, adapter, *, target_lengths=_LENGTHS):
+    return capture_residual_references(
+        source, source_ft, target,
+        _padded_loader(offset=0), _padded_loader(offset=100, lengths=target_lengths),
+        num_batches=config.num_batches, seed=0, device="cpu",
+        target_scope=config.target_scope, family_adapter=adapter, mask_padding=config.mask_padding,
+    )
+
+
+def test_mask_padding_defaults_off_and_is_validated():
+    assert parse_residual_completion_config({"enabled": True}).mask_padding is False
+    assert parse_residual_completion_config({"enabled": True, "mask_padding": True}).mask_padding is True
+    with pytest.raises(TypeError, match="mask_padding must be bool"):
+        parse_residual_completion_config({"enabled": True, "mask_padding": "yes"})
+
+
+def test_capture_keeps_only_real_tokens_when_masked():
+    model = _Decoder(depth=2)
+    batches = list(_padded_loader(batch_size=3))
+    unmasked = capture_tokens(model, batches, {"b": (1, "boundary")}, "cpu", family_adapter=_Adapter())
+    masked = capture_tokens(
+        model, batches, {"b": (1, "boundary")}, "cpu", family_adapter=_Adapter(), mask_padding=True
+    )
+    assert unmasked["b"][0].shape[:2] == (3, 5)
+    assert masked["b"][0].shape[:2] == (1, sum(_LENGTHS[:3]))
+    assert masked["b"][1].shape[:2] == (1, sum(_LENGTHS[3:]))
+    # The surviving rows are exactly the real positions, in order.
+    mask = batches[0]["attention_mask"].bool()
+    torch.testing.assert_close(masked["b"][0][0], unmasked["b"][0][mask])
+
+
+def test_masked_references_record_real_and_padded_row_counts():
+    adapter = _Adapter()
+    source, source_ft, target, _sd, _layout = _fixture()
+    config = _config(mask_padding=True, num_batches=3)
+    refs = _padded_references(source, source_ft, target, config, adapter)
+    meta = refs["calibration"]
+    assert meta["mask_padding"] is True
+    assert meta["real_rows"] == sum(_LENGTHS)
+    assert meta["padded_rows"] == len(_LENGTHS) * 5
+    for bank in refs["target_base_outputs_by_position"].values():
+        assert sum(b.shape[1] for b in bank) == sum(_LENGTHS)
+
+
+def test_masked_references_refuse_mismatched_real_token_counts():
+    """Two tokenizers splitting the text differently cannot be paired row for row."""
+    adapter = _Adapter()
+    source, source_ft, target, _sd, _layout = _fixture()
+    config = _config(mask_padding=True, num_batches=3)
+    shifted = (4, 5, 2, 4, 5, 1)
+    with pytest.raises(ValueError, match="same real-token counts"):
+        _padded_references(source, source_ft, target, config, adapter, target_lengths=shifted)
+
+
+def test_masked_direct_completion_fits_on_real_rows_only():
+    """The solver consumes the packed banks, and pad rows no longer move the fit."""
+    adapter = _Adapter()
+    results = {}
+    for mask_padding in (False, True):
+        source, source_ft, target, target_base_sd, layout = _fixture()
+        config = _config(mask_padding=mask_padding, num_batches=3)
+        materialize_missing_projection_biases(
+            target, target_base_sd, layout, family_adapter=adapter, components=config.components
+        )
+        refs = _padded_references(source, source_ft, target, config, adapter)
+        corrections, diagnostics = complete_residuals_direct(
+            target, target_base_sd, refs, layout, _padded_loader(offset=100),
+            config=config, device="cpu", family_adapter=adapter,
+        )
+        assert diagnostics and abs(diagnostics[0]["relative_residual_before"] - 1.0) < 1e-4
+        for row in diagnostics:
+            assert row["residual_norm_after"] < row["residual_norm_before"]
+        results[mask_padding] = corrections
+    key = next(iter(results[True]))
+    assert not torch.allclose(results[True][key], results[False][key])

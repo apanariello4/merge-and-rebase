@@ -1,0 +1,79 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-Coder-1.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-3B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "tv": "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {
+    "num_batches": 116
+  },
+  "alpha_search": true,
+  "block_extension_enabled": true,
+  "block_extension_params": {
+    "extension_strategy": "duplicate_per_weight",
+    "insertion_order": "bottom-top",
+    "extension_density": "spread",
+    "n_batches_act": 40,
+    "calibration_split": "val",
+    "dampening_factor": 1.0,
+    "skip_correction": false,
+    "n_cascade_iters": 1,
+    "lmc_mode": "shared",
+    "ridge_identity": 100.0,
+    "target_residual_completion": {
+      "enabled": true,
+      "mode": "direct_target",
+      "target_scope": "all",
+      "strength": 1.0,
+      "num_batches": 116,
+      "exact_form": true,
+      "missing_bias": "materialize",
+      "ridge_relative": 0.001
+    },
+    "calibration_dataset": {
+      "path": "google-research-datasets/mbpp",
+      "name": "full",
+      "split": "train+validation",
+      "text_column": "code"
+    }
+  },
+  "eval_before_rebase": false,
+  "harness_tasks": [
+    "humaneval",
+    "mbpp"
+  ],
+  "harness_num_fewshot": {
+    "humaneval": 0,
+    "mbpp": 3
+  },
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 128,
+  "seed": 0,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_code_20260922/code_rho1e-3_s1"
+  },
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": {
+      "values": [
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        2,
+        4
+      ]
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "model_name_or_path": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "harness_tasks": [
+    "humaneval_instruct",
+    "mbpp_instruct"
+  ],
+  "harness_num_fewshot": {
+    "humaneval_instruct": 0,
+    "mbpp_instruct": 3
+  },
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "run_name": "oracle2_coder1p5b_it_instructfmt",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_code_20260922/oracle2_coder1p5b_it_instructfmt"
+  }
+}

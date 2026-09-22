@@ -165,3 +165,26 @@ class Qwen3DecoderAdapter(HfDecoderAdapter):
     # which have no Qwen2 counterpart. They're intentionally excluded from
     # _DECODER_TRANSPORTABLE_SUFFIXES, so they're simply left untouched (passthrough)
     # rather than transported.
+
+
+class Gemma3DecoderAdapter(HfDecoderAdapter):
+    name: str = "gemma3"
+    # Text-only Gemma 3 checkpoints (270m, 1b) report "gemma3_text"; the
+    # multimodal ones report "gemma3" and wrap the same decoder.
+    _MODEL_TYPES = frozenset({"gemma3_text", "gemma3"})
+    # Gemma 3 adds four per-block norms on top of the Qwen2 layout:
+    # "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+    # and per-head QK-RMSNorm ("self_attn.q_norm.weight" / "k_norm.weight").
+    # As with Qwen3's q_norm/k_norm they're absent from
+    # _DECODER_TRANSPORTABLE_SUFFIXES and fall through to passthrough rather
+    # than being transported.
+    #
+    # Two more Gemma 3 quirks that the shared adapter already handles, noted
+    # here because neither holds on Qwen2/Llama:
+    #   - head_dim (256) is not hidden_size // num_attention_heads, so
+    #     metadata() must read cfg.head_dim -- which it does, preferring the
+    #     config value and only deriving as a fallback.
+    #   - blocks alternate sliding/full attention on a 5:1 pattern keyed by
+    #     position. The depth resize keeps config.layer_types authoritative and
+    #     reassigns each block's attention_type; see
+    #     eval/block_extension_llm.py::_resolve_layer_types.

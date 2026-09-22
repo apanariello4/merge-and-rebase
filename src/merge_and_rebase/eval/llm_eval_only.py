@@ -138,6 +138,7 @@ def main() -> None:
             batch_size=str(cfg.get("harness_batch_size", "auto")),
             limit=cfg.get("harness_limit", None),
             samples=harness_samples,
+            apply_chat_template=bool(cfg.get("harness_apply_chat_template", False)),
         )
         print("\n=== Harness results ===")
         for name, value in harness_results.items():

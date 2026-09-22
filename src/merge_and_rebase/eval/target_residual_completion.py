@@ -152,6 +152,18 @@ class ResidualCompletionConfig:
     # passthrough key is shape-incompatible and already dropped, so this is
     # close to a no-op there; it bites on a same-width, depth-only rebase.
     direct_passthrough: bool = False
+    # Decoder/LLM path only. Text calibration batches are padded to
+    # calibration_max_length, and the hooks capture every position, so without
+    # this the banks carry one row per pad token -- measured at 76% of rows on
+    # the IFEval prompts (median 41 tokens padded to 192) and 54% on GSM8K
+    # questions. Those rows are the pad/EOS token repeated after the end of the
+    # text, a state the model never reaches at eval time, and they dominate the
+    # Procrustes fit, the Gram behind the ridge scale, and D_j.
+    #   False (default) -- historical behaviour, kept so campaigns already in
+    #                      flight stay comparable.
+    #   True            -- keep only rows whose attention_mask is 1. Vision
+    #                      batches carry no mask, so it is a no-op there.
+    mask_padding: bool = False
 
 
 #: Residual-writing projections, in the order a block executes them.
@@ -180,6 +192,7 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         "exact_form", "missing_bias", "mode", "target_trajectory", "components",
         "cascade_order",
         "direct_passthrough",
+        "mask_padding",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -259,6 +272,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise TypeError("direct_passthrough must be bool")
     if cfg.direct_passthrough and cfg.mode != "direct_target":
         raise ValueError("direct_passthrough=true requires mode='direct_target'")
+    if not isinstance(cfg.mask_padding, bool):
+        raise TypeError("mask_padding must be bool")
     if cfg.missing_bias not in {"error", "materialize", "skip"}:
         raise ValueError("missing_bias must be 'error', 'materialize' or 'skip'")
     if cfg.missing_bias == "skip" and cfg.exact_form:

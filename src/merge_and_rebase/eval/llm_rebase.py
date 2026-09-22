@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from collections.abc import Iterable, Mapping
 from copy import copy, deepcopy
@@ -33,7 +34,7 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.llm_calibration import resolve_calibration_texts
+from ..data.llm_calibration import append_generated_responses, resolve_calibration_texts
 from ..data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
@@ -223,6 +224,76 @@ def _prepare_resized_task_delta(
 
 
 
+#: Config fields that change a model's forward pass while leaving every parameter
+#: shape untouched. A state-dict load cannot detect a disagreement in any of them,
+#: so pairing a base and a tuned body that differ here silently runs one of the two
+#: under the wrong positional geometry. Qwen ships every Math model with
+#: rope_theta=1e4/max_pos=4096 and every general model with rope_theta=1e6, so the
+#: general-base + Math-tuned pairing needed to isolate the *math* task vector lands
+#: exactly on this trap.
+_BEHAVIOURAL_CONFIG_KEYS = (
+    # transformers>=5 normalizes rope_theta into rope_scaling and drops the flat
+    # attribute, so BOTH spellings must be watched: on this install
+    # Qwen2.5-1.5B reports rope_theta=<absent> and
+    # rope_scaling={'rope_theta': 1e6, ...}. Watching only the field the JSON
+    # config names would compare None to None and pass the mismatch through.
+    "rope_theta",
+    "rope_scaling",
+    "sliding_window",
+    "use_sliding_window",
+    "attention_bias",
+)
+
+#: Deliberately NOT a trigger. Declared context length does not change the forward
+#: pass for sequences inside both limits, and legitimate base/tuned pairs disagree
+#: about it -- Qwen2.5-1.5B declares 131072 while Qwen2.5-1.5B-Instruct declares
+#: 32768. Treating it as a mismatch would rebuild (and, outside direct_target,
+#: refuse) every ordinary instruct pairing. It is reported for information only.
+_INFORMATIONAL_CONFIG_KEYS = ("max_position_embeddings",)
+
+
+def _tuned_config_mismatch(ckpt_ref: str, source_model: torch.nn.Module) -> dict[str, Any]:
+    """Behavioural config fields where the tuned checkpoint disagrees with the source.
+
+    Returns ``{}`` for refs that carry no config of their own -- bare state dicts and
+    PEFT adapters are weights *for the source architecture* by construction, so they
+    cannot disagree with it. Only a dense HF reference (hub id or local directory with
+    a ``config.json``) can, and only then is it worth building it separately.
+
+    Never raises: an unreadable config means "no detectable mismatch", which preserves
+    the historical deepcopy path for every ref shape that worked before.
+    """
+    if not isinstance(ckpt_ref, str) or ckpt_ref.endswith((".pt", ".bin", ".safetensors", ".ckpt", ".pth")):
+        return {}
+    try:
+        from transformers import AutoConfig
+
+        tuned_config = AutoConfig.from_pretrained(ckpt_ref, trust_remote_code=False)
+    except Exception:
+        return {}
+    if getattr(tuned_config, "model_type", None) is None:
+        return {}
+    source_config = getattr(source_model, "config", None)
+    if source_config is None:
+        return {}
+    mismatch: dict[str, Any] = {}
+    for key in _BEHAVIOURAL_CONFIG_KEYS:
+        base_value = getattr(source_config, key, None)
+        tuned_value = getattr(tuned_config, key, None)
+        if base_value != tuned_value:
+            mismatch[key] = {"source": base_value, "tuned": tuned_value}
+    if not mismatch:
+        # Informational fields alone never trigger a rebuild; reporting them when
+        # nothing else differs would fire on ordinary instruct pairs.
+        return {}
+    for key in _INFORMATIONAL_CONFIG_KEYS:
+        base_value = getattr(source_config, key, None)
+        tuned_value = getattr(tuned_config, key, None)
+        if base_value != tuned_value:
+            mismatch[key] = {"source": base_value, "tuned": tuned_value}
+    return mismatch
+
+
 def _maybe_capture_target_residual_references(
     *,
     config: ResidualCompletionConfig,
@@ -255,6 +326,7 @@ def _maybe_capture_target_residual_references(
         device=device,
         target_scope=config.target_scope,
         family_adapter=family_adapter,
+        mask_padding=config.mask_padding,
     )
 
 
@@ -411,6 +483,108 @@ def _summarize_merged_delta(
         "merged_delta_norm": delta_norm,
         "merged_delta_rel_norm": (delta_norm / base_norm) if base_norm > 0.0 else 0.0,
     }
+
+
+_GEN_RESPONSE_KEYS = frozenset(
+    {"enabled", "model", "max_new_tokens", "batch_size", "apply_chat_template", "cache_path"}
+)
+
+
+def _parse_gen_response_cfg(raw: Any, *, default_chat_template: bool) -> dict[str, Any] | None:
+    """Normalize ``config['align_with_gen_response']``; None means off.
+
+    Accepts ``true`` or a mapping with optional ``model`` (a tuned-body ref;
+    defaults to the only tuned body), ``max_new_tokens`` (256), ``batch_size``
+    (8), ``apply_chat_template`` (defaults to ``harness_apply_chat_template``,
+    so generation sees prompts the way eval renders them) and ``cache_path``
+    (a JSON file reused across runs with identical inputs).
+    """
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("align_with_gen_response must be a bool or a mapping.")
+    unknown = set(raw) - _GEN_RESPONSE_KEYS
+    if unknown:
+        raise ValueError(f"unknown align_with_gen_response fields: {sorted(unknown)}")
+    if not bool(raw.get("enabled", True)):
+        return None
+    return {
+        "model": None if raw.get("model") is None else str(raw["model"]),
+        "max_new_tokens": int(raw.get("max_new_tokens", 256)),
+        "batch_size": int(raw.get("batch_size", 8)),
+        "apply_chat_template": bool(raw.get("apply_chat_template", default_chat_template)),
+        "cache_path": None if raw.get("cache_path") is None else str(raw["cache_path"]),
+    }
+
+
+def _generate_calibration_responses(
+    texts: list[str],
+    *,
+    gen_cfg: Mapping[str, Any],
+    tuned_refs: list[str],
+    build_cfg: TextBuildConfig,
+    device: str,
+) -> tuple[list[str], dict[str, Any]]:
+    """Append the source fine-tune's greedy responses to the calibration prompts.
+
+    The generator is built from the tuned ref itself, so a tuned body with its
+    own config (Qwen-Math's rope_theta) generates under its own geometry. The
+    result replaces the calibration text for every consumer -- block extension,
+    transport and Proposal 1 alike -- so all fits see the same corpus.
+    """
+    ref = gen_cfg.get("model")
+    if ref is None:
+        if len(set(tuned_refs)) != 1:
+            raise ValueError(
+                "align_with_gen_response needs 'model' when there is more than one tuned body; "
+                f"got {sorted(set(tuned_refs))}."
+            )
+        ref = tuned_refs[0]
+    identity = {
+        "model": ref,
+        "dtype": build_cfg.dtype,
+        "max_new_tokens": gen_cfg["max_new_tokens"],
+        "apply_chat_template": gen_cfg["apply_chat_template"],
+        "prompts_sha1": hashlib.sha1("\x00".join(texts).encode()).hexdigest(),
+    }
+    cache_path = gen_cfg.get("cache_path")
+    if cache_path and Path(cache_path).is_file():
+        cached = load_json(cache_path)
+        if cached.get("identity") == identity:
+            print(f"  calibration responses loaded from {cache_path}")
+            return list(cached["texts"]), {**cached["stats"], "model": ref, "cached": True}
+        print(f"  calibration response cache at {cache_path} does not match this run; regenerating")
+    print(f"  generating calibration responses with {ref} (max_new_tokens={gen_cfg['max_new_tokens']})")
+    generator = TextLM.build(dataclass_replace(build_cfg, model_name_or_path=str(ref)))
+    try:
+        out, stats = append_generated_responses(
+            texts,
+            model=generator.model,
+            tokenizer=generator.tokenizer,
+            max_new_tokens=gen_cfg["max_new_tokens"],
+            batch_size=gen_cfg["batch_size"],
+            apply_chat_template=gen_cfg["apply_chat_template"],
+            device=device,
+        )
+    finally:
+        del generator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    print(
+        f"  generated {stats['n']} responses, mean {stats['mean_response_tokens']:.0f} tokens, "
+        f"{stats['hit_max_new_tokens']} hit max_new_tokens"
+    )
+    if cache_path:
+        # Sweep cells sharing one cache start together; write-then-rename so a
+        # sibling never reads a half-written file.
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w") as fh:
+            json.dump({"identity": identity, "texts": out, "stats": stats}, fh)
+        os.replace(tmp_path, cache_path)
+    return out, {**stats, "model": ref, "cached": False}
 
 
 def _build_text_calibration_loader(
@@ -803,6 +977,7 @@ def main() -> None:
             else (harness_tasks_raw or [])
         )
         harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
+        harness_apply_chat_template = bool(cfg.get("harness_apply_chat_template", False))
         harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
         harness_limit = cfg.get("harness_limit", None)
 
@@ -840,6 +1015,7 @@ def main() -> None:
                 tokenizer=source_llm.tokenizer,
                 device=device,
                 num_fewshot=harness_num_fewshot,
+                apply_chat_template=harness_apply_chat_template,
                 batch_size=harness_batch_size,
                 limit=harness_limit,
                 samples=harness_samples,
@@ -897,6 +1073,11 @@ def main() -> None:
         # Compute per-task source deltas
         print("\nComputing task deltas...")
         prepared_tasks: list[_PreparedTaskDelta] = []
+        # Per task: the behavioural config fields where the tuned body disagreed with
+        # the source and was therefore built from its own config. Recorded because it
+        # changes what the captured source activations mean, and a reader cannot infer
+        # it from the config alone.
+        tuned_config_overrides: dict[str, dict[str, Any]] = {}
 
         tp_keys = None
         full_fp_keys = None
@@ -958,6 +1139,14 @@ def main() -> None:
         # index the task registry, which is far too expensive to pay for on a
         # run that never collects activations at all.
         _calibration_cache: list[Any] = []
+        gen_response_cfg = _parse_gen_response_cfg(
+            cfg.get("align_with_gen_response", None),
+            default_chat_template=harness_apply_chat_template,
+        )
+        calibration_report: dict[str, Any] = {
+            "include_target": bool(cfg.get("calibration_include_target", False)),
+            "align_with_gen_response": gen_response_cfg,
+        }
 
         def _calibration() -> Any:
             if not _calibration_cache:
@@ -971,8 +1160,34 @@ def main() -> None:
                     harness_tasks=list(harness_tasks_resolved),
                     n_sequences=max(1, n_calib_batches) * calib_batch_size,
                     seed=int(cfg.get("seed", 0)),
+                    include_target=bool(cfg.get("calibration_include_target", False)),
                 )
-                print(f"Calibration corpus: {resolved.describe()}")
+                if gen_response_cfg is not None:
+                    resolved.texts, gen_stats = _generate_calibration_responses(
+                        resolved.texts,
+                        gen_cfg=gen_response_cfg,
+                        tuned_refs=tuned_ref_list,
+                        build_cfg=source_build_cfg,
+                        device=device,
+                    )
+                    resolved.source += " + generated responses"
+                    calibration_report["generation"] = gen_stats
+                lengths = [len(source_llm.tokenizer(t)["input_ids"]) for t in resolved.texts]
+                calibration_report.update(
+                    source=resolved.source,
+                    n_texts=len(resolved.texts),
+                    max_length=calib_max_length,
+                    median_tokens=float(sorted(lengths)[len(lengths) // 2]),
+                    truncated=int(sum(n > calib_max_length for n in lengths)),
+                    real_token_fraction=float(
+                        sum(min(n, calib_max_length) for n in lengths) / (calib_max_length * len(lengths))
+                    ),
+                )
+                print(
+                    f"Calibration corpus: {resolved.describe()} | median {calibration_report['median_tokens']:.0f} "
+                    f"tokens, {calibration_report['truncated']} truncated at {calib_max_length}, "
+                    f"{calibration_report['real_token_fraction']:.1%} of padded positions are real"
+                )
                 _calibration_cache.append(resolved)
             return _calibration_cache[0]
 
@@ -1041,18 +1256,66 @@ def main() -> None:
                 # own copy is resized to the target depth before transport.
                 # Keep that depth-matched source model alive below.
                 source_base_model_task = deepcopy(source_llm.model)
-                source_ft_model_task = deepcopy(source_llm.model)
 
-                # Load tuned checkpoint into ft model
-                aligned = load_aligned_tuned_from_ref(
-                    ckpt_ref=ckpt_ref,
-                    base_sd=source_base_sd,
-                    build_cfg=source_build_cfg,
-                    model=source_ft_model_task,
-                    prefer_lora_view=False,
-                )
-                tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
-                load_into_model(source_ft_model_task, tuned_sd, strict=False)
+                # A tuned body is normally the same architecture as the source with
+                # different weights, so a deepcopy of the source carrying the tuned
+                # state dict is exactly right. It stops being right when the tuned
+                # checkpoint has its own config: the deepcopy keeps the *source's*
+                # config, so the tuned weights run under the source's positional
+                # geometry. Shapes match either way, so nothing downstream notices.
+                config_mismatch = _tuned_config_mismatch(str(ckpt_ref), source_llm.model)
+                if config_mismatch:
+                    if not (residual_completion_cfg.enabled and residual_completion_cfg.mode == "direct_target"):
+                        # The direct arm regresses on the two source models'
+                        # *activations* and drops the parameter delta with the
+                        # passthrough keys, so a heterogeneous pair is meaningful
+                        # there. Transport instead moves theta_ft - theta_base
+                        # itself, which presumes the two are related by a small
+                        # finetune -- not true across a config change. Refuse
+                        # rather than produce a plausible number for a broken premise.
+                        raise ValueError(
+                            f"Tuned body {ckpt_ref!r} has its own config, differing from the source at "
+                            f"{sorted(config_mismatch)}. Building it from the source's config would run "
+                            "its weights under the wrong positional geometry, and transporting a "
+                            "parameter delta across a config change is not defined. Only "
+                            "target_residual_completion.mode='direct_target' supports this pairing, "
+                            "because it uses activations alone."
+                        )
+                    tuned_config_overrides[str(task_label)] = config_mismatch
+                    # Built from the tuned ref, so it carries its own config; the
+                    # source's device/dtype/arch are preserved via source_build_cfg.
+                    source_ft_model_task = TextLM.build(
+                        dataclass_replace(source_build_cfg, model_name_or_path=str(ckpt_ref))
+                    ).model
+                    ft_sd = source_ft_model_task.state_dict()
+                    incompatible = [
+                        k for k, v in source_base_sd.items()
+                        if k not in ft_sd or tuple(ft_sd[k].shape) != tuple(v.shape)
+                    ]
+                    if incompatible:
+                        raise ValueError(
+                            f"Tuned body {ckpt_ref!r} is not shape-compatible with the source base at "
+                            f"{len(incompatible)} keys (sample={incompatible[:5]}); the task vector "
+                            "would be silently truncated to the intersection."
+                        )
+                    changed = ", ".join(
+                        "{}: {} -> {}".format(key, value["source"], value["tuned"])
+                        for key, value in sorted(config_mismatch.items())
+                    )
+                    print(f"  tuned body built from its own config ({changed})")
+                else:
+                    source_ft_model_task = deepcopy(source_llm.model)
+
+                    # Load tuned checkpoint into ft model
+                    aligned = load_aligned_tuned_from_ref(
+                        ckpt_ref=ckpt_ref,
+                        base_sd=source_base_sd,
+                        build_cfg=source_build_cfg,
+                        model=source_ft_model_task,
+                        prefer_lora_view=False,
+                    )
+                    tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
+                    load_into_model(source_ft_model_task, tuned_sd, strict=False)
 
                 family_adapter_for_ext = target_family or source_family
                 if family_adapter_for_ext is None:
@@ -1233,6 +1496,7 @@ def main() -> None:
             )
         task_vector_norms: list[dict[str, float]] = []
         residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        residual_calibration_rows: dict[str, dict[str, Any]] = {}
         materialized_bias_keys: set[str] = set()
         dropped_passthrough_keys: set[str] = set()
         for idx, prepared_task in enumerate(prepared_tasks):
@@ -1380,6 +1644,16 @@ def main() -> None:
                 )
                 if completion_diagnostics is not None:
                     residual_completion_diagnostics[str(label)] = completion_diagnostics
+                    calib_meta = (prepared_task.residual_references or {}).get("calibration") or {}
+                    if calib_meta.get("mask_padding"):
+                        residual_calibration_rows[str(label)] = {
+                            "real_rows": calib_meta.get("real_rows"),
+                            "padded_rows": calib_meta.get("padded_rows"),
+                        }
+                        print(
+                            f"  padding masked: {calib_meta.get('real_rows')} real of "
+                            f"{calib_meta.get('padded_rows')} captured rows per bank"
+                        )
                     print(f"  residual completion applied to {len(completion_diagnostics)} block(s)")
                 elif direct_target_p1:
                     # On the transport arm a skipped completion still leaves a
@@ -1464,6 +1738,15 @@ def main() -> None:
             "transport_delta_source": delta_source,
             "delta_norm_match": norm_match or "none",
             "per_task": task_vector_norms,
+            # Non-empty when a tuned body carried its own config and was built from it
+            # rather than from the source's. Its activations then reflect the geometry
+            # it was trained with, which is the point -- but the pair is heterogeneous
+            # and the reader should know.
+            "tuned_config_overrides": tuned_config_overrides,
+            # What text the activation banks were built from: prompts only, with
+            # dataset targets, or with generated responses, plus how much of each
+            # padded batch was real text.
+            "calibration": calibration_report,
             "residual_completion": {
                 "enabled": bool(residual_completion_cfg.enabled),
                 # Which arm actually ran. Recorded because the two answer
@@ -1481,6 +1764,10 @@ def main() -> None:
                 "target_trajectory": residual_completion_cfg.target_trajectory,
                 "components": list(residual_completion_cfg.components),
                 "cascade_order": residual_completion_cfg.cascade_order,
+                # Whether pad positions were dropped from the P1 banks, and how
+                # many rows survived per task (None when not masked).
+                "mask_padding": bool(residual_completion_cfg.mask_padding),
+                "calibration_rows": residual_calibration_rows or None,
                 # Whether the direct arm carried the non-transportable source
                 # keys or dropped them; see the comment at the drop site. None on
                 # the transport arm, which always folds them in.
@@ -1554,6 +1841,7 @@ def main() -> None:
                         tokenizer=target_llm.tokenizer,
                         device=device,
                         num_fewshot=harness_num_fewshot,
+                        apply_chat_template=harness_apply_chat_template,
                         batch_size=harness_batch_size,
                         limit=harness_limit,
                         samples=harness_samples,

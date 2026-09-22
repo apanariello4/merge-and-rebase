@@ -236,6 +236,10 @@ class _VisionLayout:
     def batch_size(self, batch):
         return len(batch[0])
 
+    def token_mask(self, batch):
+        """Image batches have no padding: every token is a real patch."""
+        return None
+
     def proj_key(self, pos, *, prefixed):
         key = f"transformer.resblocks.{pos}.mlp.c_proj.weight"
         return f"visual.{key}" if prefixed else key
@@ -302,6 +306,11 @@ class _DecoderLayout:
     def batch_size(self, batch):
         inputs = self.family_adapter.extract_calibration_batch(batch)
         return int(inputs["input_ids"].shape[0])
+
+    def token_mask(self, batch):
+        """Boolean ``[B, T]`` of real (non-pad) positions, or None if unmasked."""
+        mask = self.family_adapter.extract_calibration_batch(batch).get("attention_mask")
+        return None if mask is None else mask.bool()
 
     def proj_key(self, pos, *, prefixed):
         # The decoder state dict is already "model.layers.N..."; there is no
@@ -406,13 +415,18 @@ def _verify_recomputed_attention_input(module, rows, module_output):
 
 
 @torch.no_grad()
-def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None):
+def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None, mask_padding=False):
     """Capture B,T,D tensors, releasing hooks and restoring placement on errors.
 
     family_adapter=None keeps the original CLIP paths; passing one selects the
     HF-decoder equivalents (see _DecoderLayout). The "c_proj" capture kinds keep
     their names on both paths -- on a decoder they resolve to mlp.down_proj,
     which plays the same residual-writing role.
+
+    mask_padding=True drops the batch's pad positions and stores each batch as
+    ``[1, N_real, D]``. Every consumer flattens rows with ``reshape(-1, D)``, so
+    the packed shape is transparent to them; pairing across two models then
+    requires both to see the same real-token count, which the caller checks.
     """
     layout = _layout_for(family_adapter)
     blocks = layout.blocks(model)
@@ -420,6 +434,7 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
     original_device = next(model.parameters()).device
     output = {key: [] for key in requests}
     current_batch = [0]
+    current_mask = [None]
     handles = []
     try:
         model.to(device).eval()
@@ -428,6 +443,14 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
             if isinstance(tensor, tuple):
                 tensor = tensor[0]
             tokens = _to_tokens(tensor.detach(), batch_size=current_batch[0])
+            mask = current_mask[0]
+            if mask is not None:
+                if tuple(mask.shape) != tuple(tokens.shape[:2]):
+                    raise RuntimeError(
+                        f"Padding mask {tuple(mask.shape)} does not match captured tokens "
+                        f"{tuple(tokens.shape[:2])}"
+                    )
+                tokens = tokens[mask.to(tokens.device)].unsqueeze(0)
             output[name].append(tokens.float().cpu().clone())
 
         for key, (index, kind) in requests.items():
@@ -463,6 +486,7 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
                 handles.append(module.register_forward_hook(hook))
         for batch in batches:
             current_batch[0] = layout.batch_size(batch)
+            current_mask[0] = layout.token_mask(batch) if mask_padding else None
             layout.forward(model, batch, device)
         if any(len(values) != len(batches) for values in output.values()):
             raise RuntimeError("A requested activation hook did not fire exactly once per batch")
@@ -501,6 +525,7 @@ def capture_residual_references(
     target_scope="inserted",
     family_adapter=None,
     capture_joint=False,
+    mask_padding=False,
 ):
     return _capture_residual_references(
         source_base,
@@ -514,6 +539,7 @@ def capture_residual_references(
         target_scope=target_scope,
         family_adapter=family_adapter,
         capture_joint=capture_joint,
+        mask_padding=mask_padding,
     )
 
 
@@ -530,6 +556,7 @@ def _capture_residual_references(
     target_scope,
     family_adapter=None,
     capture_joint=False,
+    mask_padding=False,
 ):
     """Capture native source banks and target-position banks.
 
@@ -550,8 +577,9 @@ def _capture_residual_references(
         for i in range(depth):
             req[f"{i}.c_proj_input"] = (i, "c_proj_input")
             req[f"{i}.c_proj_output"] = (i, "c_proj")
-    base = capture_tokens(source_base, sb, req, device, family_adapter=family_adapter)
-    ft = capture_tokens(source_ft, sb, req, device, family_adapter=family_adapter)
+    capture = dict(family_adapter=family_adapter, mask_padding=mask_padding)
+    base = capture_tokens(source_base, sb, req, device, **capture)
+    ft = capture_tokens(source_ft, sb, req, device, **capture)
     target_depth = layout_shim.block_count(target_base)
     positions = [2 * i + 1 for i in range(depth)] if target_scope == "inserted" else list(range(target_depth))
     if not positions or max(positions) >= target_depth:
@@ -564,7 +592,24 @@ def _capture_residual_references(
         for i in positions:
             target_requests[f"{i}.c_proj_input"] = (i, "c_proj_input")
             target_requests[f"{i}.c_proj_output"] = (i, "c_proj")
-    target = capture_tokens(target_base, tb, target_requests, device, family_adapter=family_adapter)
+    target = capture_tokens(target_base, tb, target_requests, device, **capture)
+    metadata["mask_padding"] = bool(mask_padding)
+    if mask_padding:
+        # Packed rows are paired row for row, so both sides must keep the same
+        # real tokens. With a shared tokenizer they do; with two different
+        # tokenizers the counts differ and _aligned would silently interpolate
+        # across example boundaries, so refuse instead.
+        source_counts = [int(b.shape[1]) for b in base["0"]]
+        target_counts = [int(b.shape[1]) for b in target[str(positions[0])]]
+        if source_counts != target_counts:
+            raise ValueError(
+                "mask_padding=True needs source and target to tokenize the calibration text to "
+                f"the same real-token counts per batch; got source={source_counts[:4]}... "
+                f"target={target_counts[:4]}... (different tokenizers?)"
+            )
+        masks = [layout_shim.token_mask(batch) for batch in tb]
+        metadata["real_rows"] = sum(target_counts)
+        metadata["padded_rows"] = sum(int(m.numel()) for m in masks if m is not None)
 
     # Keep source banks by original index for the all-position path.  The
     # inserted path also materializes the historical dictionaries immediately,
@@ -780,6 +825,7 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             captured = capture_tokens(
                 target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
                 device, family_adapter=family_adapter,
+                mask_padding=bool(meta.get("mask_padding", False)),
             )
             t_in, t_out = transforms[pos]["t_in"], transforms[pos]["t_out"]
             block = shim.block_module(shim.blocks(target_model)[pos])
@@ -1005,6 +1051,7 @@ def complete_residuals_direct(
                     target_model, batches,
                     {"h": (pos, COMPONENT_INPUT_KIND[component]), "out": (pos, "boundary")},
                     device, family_adapter=family_adapter,
+                    mask_padding=bool(meta.get("mask_padding", False)),
                 )
                 width = int(current_state[key].shape[0])
                 identity_out = torch.eye(width, dtype=torch.float32)

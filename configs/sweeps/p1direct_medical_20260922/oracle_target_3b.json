@@ -1,0 +1,20 @@
+{
+  "model_name_or_path": "Qwen/Qwen2.5-3B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "harness_tasks": [
+    "medqa_4options",
+    "medmcqa"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 8,
+  "harness_limit": null,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "run_name": "oracle_target_3b",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_medical_20260922/oracle_target_3b"
+  }
+}

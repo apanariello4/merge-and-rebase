@@ -1,0 +1,19 @@
+{
+  "model_name_or_path": "Qwen/Qwen2.5-Math-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "harness_tasks": [
+    "minerva_math500"
+  ],
+  "harness_num_fewshot": 4,
+  "harness_batch_size": 4,
+  "harness_limit": null,
+  "device": "cuda",
+  "dtype": "bf16",
+  "logging": {
+    "use_wandb": false,
+    "mode": "offline",
+    "run_name": "src_math1p5b_math500",
+    "local_log_dir": "/leonardo_scratch/large/userexternal/gsalici0/merge-and-rebase/results/rebase/llm_p1direct_baselines_20260922/src_math1p5b_math500"
+  }
+}

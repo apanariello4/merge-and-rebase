@@ -79,6 +79,7 @@ def resolve_calibration_texts(
     harness_tasks: Sequence[str] | None = None,
     n_sequences: int,
     seed: int = 0,
+    include_target: bool = False,
 ) -> CalibrationTexts:
     """Resolve the calibration corpus for an LLM run.
 
@@ -86,7 +87,10 @@ def resolve_calibration_texts(
     ----------
     prompts : Explicit prompt bank from `config['calibration_prompts']`.
     calibration_dataset : HF dataset path, or a spec mapping with `path` and
-        optional `name`/`split`/`text_column`.
+        optional `name`/`split`/`text_column`/`text_template`. A
+        `text_template` such as ``"{question}\n{answer}"`` is formatted per row
+        with the row's columns, so a dataset's reference responses can join the
+        prompt; it replaces `text_column`.
     calibration_split : Split to calibrate on. For an lm-harness source this
         selects the held-out slice ("val"/"validation") rather than a split
         that has to exist upstream, so it also works for single-split tasks.
@@ -95,9 +99,19 @@ def resolve_calibration_texts(
         (`n_batches * batch_size`). The calibration slice is sized to cover
         this where the source allows it.
     seed : Seed for the deterministic calibration/eval partition.
+    include_target : lm-harness source only. Append each doc's reference
+        target (`doc_to_target`, joined with the task's `target_delimiter`) to
+        its rendered prompt, so the banks include the positions where the task
+        answer is written. Refused for tasks whose target is not text.
     """
     if n_sequences <= 0:
         raise ValueError("n_sequences must be > 0.")
+
+    if include_target and (prompts or calibration_dataset is not None or not harness_tasks):
+        raise ValueError(
+            "calibration_include_target applies only to lm-harness calibration; for an HF "
+            "calibration_dataset use its text_template to add the response column."
+        )
 
     if prompts:
         return CalibrationTexts(
@@ -117,6 +131,7 @@ def resolve_calibration_texts(
             calibration_split=calibration_split,
             n_sequences=n_sequences,
             seed=seed,
+            include_target=include_target,
         )
 
     raise ValueError(
@@ -146,12 +161,34 @@ def _from_hf_dataset(
     name = spec.get("name", spec.get("config", None))
     split = str(spec.get("split", calibration_split))
     text_column = spec.get("text_column", None)
+    text_template = spec.get("text_template", None)
+    if text_template is not None and text_column is not None:
+        raise ValueError("calibration_dataset takes text_column or text_template, not both.")
 
     ds = (
         datasets.load_dataset(str(path), str(name), split=split)
         if name
         else datasets.load_dataset(str(path), split=split)
     )
+
+    if text_template is not None:
+        import string
+
+        fields = {name for _, name, _, _ in string.Formatter().parse(str(text_template)) if name}
+        missing = sorted(fields - set(ds.column_names))
+        if missing:
+            raise ValueError(
+                f"text_template references columns {missing} not in calibration_dataset {path!r} "
+                f"(columns: {ds.column_names})."
+            )
+        texts = []
+        for row in ds:
+            value = str(text_template).format(**{k: row[k] for k in fields})
+            if value.strip():
+                texts.append(value)
+            if len(texts) >= n_sequences:
+                break
+        return CalibrationTexts(texts, source=f"{path}[{split}] template {text_template!r}")
 
     column = text_column or _pick_text_column(ds.column_names)
     if column is None:
@@ -185,6 +222,7 @@ def _from_harness_tasks(
     calibration_split: str,
     n_sequences: int,
     seed: int,
+    include_target: bool = False,
 ) -> CalibrationTexts:
     from lm_eval.tasks import TaskManager
 
@@ -220,8 +258,23 @@ def _from_harness_tasks(
 
         for i in calib_idx:
             rendered = task.doc_to_text(docs[i])
-            if isinstance(rendered, str) and rendered.strip():
-                texts.append(rendered)
+            if not (isinstance(rendered, str) and rendered.strip()):
+                continue
+            if include_target:
+                target = task.doc_to_target(docs[i])
+                if isinstance(target, list) and len(target) == 1:
+                    target = target[0]
+                if not isinstance(target, str) or not target.strip():
+                    # IFEval has no reference response at all; multiple-choice
+                    # tasks return a choice index. Neither is text to append.
+                    raise ValueError(
+                        f"lm-harness task {task_name!r} has no text reference target "
+                        f"(doc_to_target returned {type(target).__name__}); use "
+                        "align_with_gen_response or a calibration_dataset instead."
+                    )
+                delimiter = getattr(getattr(task, "config", None), "target_delimiter", " ")
+                rendered = f"{rendered}{delimiter if delimiter is not None else ' '}{target}"
+            texts.append(rendered)
 
     if not texts:
         raise ValueError(
@@ -232,7 +285,7 @@ def _from_harness_tasks(
     split_label = "holdout" if wants_holdout else str(calibration_split)
     return CalibrationTexts(
         texts,
-        source=f"lm-harness {'+'.join(tasks)}[{split_label}]",
+        source=f"lm-harness {'+'.join(tasks)}[{split_label}]" + ("+target" if include_target else ""),
         eval_samples=eval_samples,
     )
 
@@ -252,3 +305,90 @@ def _task_docs(task: Any) -> Sequence[Any]:
         # Task has neither test nor validation docs; lm-eval could not score it
         # either, so there is no index space to stay disjoint from.
         return []
+
+
+def _chat_prompt(tokenizer: Any, prompt: str) -> str:
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+    )
+
+
+def append_generated_responses(
+    texts: Sequence[str],
+    *,
+    model: Any,
+    tokenizer: Any,
+    max_new_tokens: int = 256,
+    batch_size: int = 8,
+    max_prompt_length: int | None = None,
+    apply_chat_template: bool = False,
+    device: str = "cuda",
+) -> tuple[list[str], dict[str, Any]]:
+    """Extend each calibration prompt with the model's own greedy response.
+
+    The source fine-tune's effect on an instruct or reasoning task shows up
+    while it *writes* the answer, and a prompt-only bank reaches that only at
+    the last prompt token. Teacher-forcing the generated response puts those
+    positions in the bank; D_j = B^1 - B^0 still compares both source models on
+    the same text, so the text only has to be representative, not correct.
+
+    Generation is greedy and left-padded (the pad side the fit never sees:
+    the returned strings are re-tokenized by the calibration loader). With
+    ``apply_chat_template`` the prompt is wrapped in the tokenizer's chat
+    template both for generation and in the returned text, so it must match
+    how the harness renders prompts at eval time.
+
+    Returns ``(texts, stats)``; ``stats`` carries response-length figures for
+    the run summary.
+    """
+    import torch
+
+    if max_new_tokens <= 0:
+        raise ValueError("align_with_gen_response.max_new_tokens must be > 0.")
+    prompts = [_chat_prompt(tokenizer, t) if apply_chat_template else str(t) for t in texts]
+    original_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    training = model.training
+    original_device = next(model.parameters()).device
+    out_texts: list[str] = []
+    lengths: list[int] = []
+    hit_limit = 0
+    try:
+        model.to(device).eval()
+        for start in range(0, len(prompts), max(1, int(batch_size))):
+            chunk = prompts[start : start + max(1, int(batch_size))]
+            enc = tokenizer(
+                chunk,
+                return_tensors="pt",
+                padding=True,
+                truncation=max_prompt_length is not None,
+                max_length=max_prompt_length,
+                # A chat template already carries its own BOS/role tokens.
+                add_special_tokens=not apply_chat_template,
+            ).to(device)
+            with torch.no_grad():
+                generated = model.generate(
+                    **enc,
+                    max_new_tokens=int(max_new_tokens),
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            new_tokens = generated[:, enc["input_ids"].shape[1] :]
+            for prompt, row in zip(chunk, new_tokens):
+                real = row[row != tokenizer.pad_token_id]
+                lengths.append(int(real.numel()))
+                hit_limit += int(real.numel() >= int(max_new_tokens))
+                out_texts.append(prompt + tokenizer.decode(real, skip_special_tokens=True))
+    finally:
+        tokenizer.padding_side = original_side
+        model.to(original_device).train(training)
+    stats = {
+        "n": len(out_texts),
+        "max_new_tokens": int(max_new_tokens),
+        "mean_response_tokens": (sum(lengths) / len(lengths)) if lengths else 0.0,
+        "hit_max_new_tokens": hit_limit,
+        "apply_chat_template": bool(apply_chat_template),
+    }
+    return out_texts, stats
