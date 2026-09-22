@@ -1586,6 +1586,54 @@ def main() -> None:
             for task_name, acc in best_harness_results.items():
                 print(f"  {task_name}: {acc:.4f}")
 
+            # Optional held-out test slice. The alpha search above selects on
+            # `harness_samples`; selecting and reporting on the same documents
+            # makes the reported number the maximum over the alpha grid on that
+            # slice, which is biased upward and -- on a small slice -- by more
+            # than the effects being compared. When `harness_test_samples` is
+            # configured, the winning alpha is re-scored once on those disjoint
+            # documents and that is the number to quote. Costs one extra pass,
+            # not one per alpha.
+            harness_test_results: dict[str, float] | None = None
+            test_samples_cfg = cfg.get("harness_test_samples", None)
+            if test_samples_cfg is not None:
+                if not isinstance(test_samples_cfg, dict):
+                    raise ValueError("config['harness_test_samples'] must map task names to index lists.")
+                test_samples = {}
+                for task_name, indices in test_samples_cfg.items():
+                    if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
+                        raise ValueError(
+                            "config['harness_test_samples'] values must be lists of non-negative indices."
+                        )
+                    test_samples[str(task_name)] = list(indices)
+                overlap = {
+                    t: sorted(set(test_samples.get(t, ())) & set((harness_samples or {}).get(t, ())))
+                    for t in test_samples
+                }
+                leaking = {t: v for t, v in overlap.items() if v}
+                if leaking:
+                    raise ValueError(
+                        "harness_test_samples overlaps the alpha-search slice for "
+                        f"{ {t: len(v) for t, v in leaking.items()} }; the reported number would be "
+                        "selected on documents it is scored on."
+                    )
+                scaled = {k: v * best_alpha for k, v in merged_delta.items()}
+                load_into_model(target_llm.model, apply_delta(target_base_sd, scaled), strict=False)
+                print(f"\nScoring held-out test slice at alpha={best_alpha:.3f}...")
+                harness_test_results = run_harness(
+                    tasks=list(harness_tasks_resolved),
+                    model=target_llm.model,
+                    tokenizer=target_llm.tokenizer,
+                    device=device,
+                    num_fewshot=harness_num_fewshot,
+                    batch_size=harness_batch_size,
+                    limit=None,
+                    samples=test_samples,
+                )
+                print("=== Harness results (held-out test slice) ===")
+                for task_name, acc in harness_test_results.items():
+                    print(f"  {task_name}: {acc:.4f}")
+
             if cfg.get("save_merged", None) is not None:
                 scaled = {k: v * best_alpha for k, v in merged_delta.items()}
                 best_sd = apply_delta(target_base_sd, scaled)
@@ -1600,6 +1648,12 @@ def main() -> None:
                     "best_alpha": best_alpha,
                     "backend": "lm_harness",
                     "harness_results": best_harness_results,
+                    # Selected on the search slice; quote harness_results_test
+                    # instead whenever it is present.
+                    "harness_results_test": harness_test_results,
+                    "harness_test_sample_counts": (
+                        {t: len(v) for t, v in test_samples.items()} if harness_test_results else None
+                    ),
                     "harness_results_before_rebase": baseline_harness_results,
                     "before_rebase_model": (
                         "extended_source_base" if run_block_extension_prestep else "source_base"
