@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any
 
 import torch.nn as nn
@@ -150,6 +151,12 @@ def run(
 
     _check_samples_conflict(limit, samples)
 
+    # humaneval/mbpp (and similar) set `unsafe_code: true` and lm-eval refuses
+    # to run them unless explicitly confirmed, since scoring executes
+    # model-generated code. Opt in via HF_ALLOW_CODE_EVAL=1 (the standard
+    # lm-eval-harness/human-eval convention) rather than defaulting this on.
+    confirm_run_unsafe_code = os.environ.get("HF_ALLOW_CODE_EVAL") == "1"
+
     model.eval()
     if hasattr(model, "to"):
         model.to(device)
@@ -179,6 +186,7 @@ def run(
                     batch_size=batch_size,
                     device=device,
                     limit=limit,
+                    confirm_run_unsafe_code=confirm_run_unsafe_code,
                     **_samples_for(samples, group_tasks),
                 )
             except TypeError:
@@ -190,6 +198,7 @@ def run(
                     batch_size=batch_size,
                     device=device,
                     limit=limit,
+                    confirm_run_unsafe_code=confirm_run_unsafe_code,
                     **_samples_for(samples, group_tasks),
                 )
             out.update(_extract_metrics(results))

@@ -680,7 +680,9 @@ def _materialize_zero_bias(model, bias_key, out_features):
     return True
 
 
-def materialize_missing_projection_biases(target_model, target_base_state, layout, *, family_adapter=None):
+def materialize_missing_projection_biases(
+    target_model, target_base_state, layout, *, family_adapter=None, components=("mlp.c_proj",)
+):
     """Give the target's residual projections a zero bias, in model and state alike.
 
     The exact affine form transports an intercept onto the projection's bias.
@@ -692,6 +694,13 @@ def materialize_missing_projection_biases(target_model, target_base_state, layou
     the model's shape. Doing it here rather than inside the solver is what keeps
     that consistent: the solver snapshots and restores with strict=True.
 
+    ``components`` must list every projection the completion will actually fit,
+    i.e. ``ResidualCompletionConfig.components``. The default is the historical
+    single-component set, so existing callers are unchanged; the two-component
+    direct arm has to pass its own, because an HF decoder's self_attn.o_proj is
+    bias-free too (Qwen2/2.5 set ``attention_bias`` only on q/k/v) and the fit
+    would otherwise die at the o_proj intercept with the exact form.
+
     Returns the keys it added, so a run can record that its checkpoint carries
     parameters the stock architecture does not.
     """
@@ -700,16 +709,17 @@ def materialize_missing_projection_biases(target_model, target_base_state, layou
     added = []
     for row in entries:
         pos = int(row["position"])
-        weight_key = shim.proj_key(pos, prefixed=True)
-        bias_key = f"{weight_key[: -len('.weight')]}.bias"
-        if bias_key in target_base_state:
-            continue
-        out_features = int(target_base_state[weight_key].shape[0])
-        _materialize_zero_bias(target_model, bias_key, out_features)
-        target_base_state[bias_key] = torch.zeros(
-            out_features, dtype=target_base_state[weight_key].dtype
-        )
-        added.append(bias_key)
+        for component in order_components(components):
+            weight_key = shim.component_key(pos, component, prefixed=True)
+            bias_key = f"{weight_key[: -len('.weight')]}.bias"
+            if bias_key in target_base_state:
+                continue
+            out_features = int(target_base_state[weight_key].shape[0])
+            _materialize_zero_bias(target_model, bias_key, out_features)
+            target_base_state[bias_key] = torch.zeros(
+                out_features, dtype=target_base_state[weight_key].dtype
+            )
+            added.append(bias_key)
     return added
 
 
