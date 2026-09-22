@@ -16,6 +16,8 @@ analogue for.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 from torch import nn
@@ -27,6 +29,7 @@ from merge_and_rebase.eval.llm_rebase import (
 from merge_and_rebase.eval.target_informed_runtime import (
     capture_residual_references,
     capture_tokens,
+    complete_residuals_direct,
     materialize_missing_projection_biases,
 )
 from merge_and_rebase.eval.target_residual_completion import (
@@ -335,3 +338,57 @@ def test_disabled_completion_returns_the_delta_untouched():
     config = ResidualCompletionConfig(**{**config.__dict__, "enabled": False})
     delta, diagnostics, skipped = _run(config, references, layout, target, base, data)
     assert delta == {} and diagnostics is None and skipped == []
+
+
+# --------------------------------------------------------------------------
+# 5. cascade_order: "top_bottom" is not a third setting
+# --------------------------------------------------------------------------
+
+
+def _digest(corrections):
+    sha = hashlib.sha256()
+    for key in sorted(corrections):
+        sha.update(key.encode())
+        sha.update(corrections[key].detach().numpy().tobytes())
+    return sha.hexdigest()
+
+
+def _fit_with_order(order):
+    config, references, layout, target, base, data = _fixture()
+    config = ResidualCompletionConfig(**{**config.__dict__, "cascade_order": order})
+    corrections, diagnostics = complete_residuals_direct(
+        target, base, references, layout, data,
+        config=config, device="cpu", family_adapter=_Adapter(),
+    )
+    return _digest(corrections), {r["position"]: r["relative_residual_before"] for r in diagnostics}
+
+
+def test_top_bottom_is_byte_identical_to_independent():
+    """Reversing the visit order gives the uncoupled fit, not a different coupling.
+
+    The option reads as though fitting deepest-first lets later fits invalidate
+    what earlier ones assumed. It cannot: a correction mounted at block k changes
+    activations only *above* k, and block j's capture -- its projection input and
+    its own boundary -- depends only on blocks <= j. So deepest-first leaves every
+    block measuring a pristine upstream, which is exactly what `independent`
+    produces by never mounting at all.
+
+    Pinned at hash level because the two settings look different in a config, and
+    a campaign that grids both spends real compute reproducing one cell in
+    another. A genuinely different coupling would need a re-measured second
+    sweep, not a reversed order.
+    """
+    top_digest, top_before = _fit_with_order("top_bottom")
+    ind_digest, ind_before = _fit_with_order("independent")
+    assert top_digest == ind_digest
+    for position, value in top_before.items():
+        assert value == pytest.approx(1.0, abs=1e-4), position
+        assert ind_before[position] == pytest.approx(1.0, abs=1e-4), position
+
+
+def test_bottom_top_really_does_couple():
+    """Negative control: the default order must not collapse to the uncoupled fit."""
+    bottom_digest, bottom_before = _fit_with_order("bottom_top")
+    ind_digest, _ = _fit_with_order("independent")
+    assert bottom_digest != ind_digest, "the sequential cascade has stopped coupling anything"
+    assert [p for p, v in bottom_before.items() if abs(v - 1.0) > 1e-4], "the cascade is inert"
