@@ -79,7 +79,11 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import ResidualCompletionConfig, order_components
+from .target_residual_completion import (
+    ResidualCompletionConfig,
+    order_components,
+    validate_residual_completion_depth_direction,
+)
 
 
 class _TokenizedPromptDataset(Dataset):
@@ -733,6 +737,11 @@ def main() -> None:
 
         source_depth = source_meta.num_hidden_layers if source_meta else 0
         target_depth = target_meta.num_hidden_layers if target_meta else 0
+        validate_residual_completion_depth_direction(
+            residual_completion_cfg,
+            source_depth=source_depth,
+            target_depth=target_depth,
+        )
         depth_mismatch = source_depth != target_depth
         check_pair(
             method_name,

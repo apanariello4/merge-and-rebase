@@ -175,6 +175,33 @@ def order_components(components) -> tuple[str, ...]:
     return tuple(name for name in COMPONENT_FORWARD_ORDER if name in selected)
 
 
+def validate_residual_completion_depth_direction(
+    config: ResidualCompletionConfig,
+    *,
+    source_depth: int,
+    target_depth: int,
+) -> None:
+    """Fail early when direct-target shrink uses extension-only semantics.
+
+    Reference capture happens before the realized reduction layout exists and
+    can hold many gigabytes of activations.  Depth is already known at that
+    point, so reject invalid shrink scopes and trajectories before doing that
+    work.  The layout-level validator remains authoritative for span ancestry.
+    """
+    if not config.enabled or config.mode != "direct_target" or source_depth <= target_depth:
+        return
+    if config.target_scope != "all":
+        raise ValueError(
+            "Shrink direct_target completion requires target_scope='all': a reduction has no "
+            "inserted blocks to address"
+        )
+    if config.target_trajectory != "step":
+        raise ValueError(
+            "Shrink direct_target completion currently requires target_trajectory='step'; "
+            "interpolate has no span-aware reduction semantics"
+        )
+
+
 def parse_residual_completion_config(value: Mapping[str, Any] | None) -> ResidualCompletionConfig:
     """Parse and validate the narrow proposal-1 configuration schema."""
     if value is None:

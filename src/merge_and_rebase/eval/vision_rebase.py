@@ -91,7 +91,11 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import JointCorrectionConfig, ResidualCompletionConfig
+from .target_residual_completion import (
+    JointCorrectionConfig,
+    ResidualCompletionConfig,
+    validate_residual_completion_depth_direction,
+)
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
 
@@ -1884,6 +1888,11 @@ def main() -> None:
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
+        validate_residual_completion_depth_direction(
+            block_extension_cfg.target_residual_completion,
+            source_depth=source_depth,
+            target_depth=target_depth,
+        )
         run_block_extension_prestep = bool(
             blockext_like_method
             and block_extension_enabled
@@ -1893,21 +1902,23 @@ def main() -> None:
         run_discrete_layer_match_prestep = bool(
             blockext_like_method and depth_alignment_mode == "discrete_index_match" and source_depth != target_depth
         )
+        # Direct-target P1 can write into a native target model at equal depth;
+        # in that case it uses an identity layout instead of an ARIADNE resize.
+        run_same_depth_direct_target = bool(
+            blockext_like_method
+            and block_extension_enabled
+            and source_depth == target_depth
+            and block_extension_cfg.target_residual_completion.enabled
+            and block_extension_cfg.target_residual_completion.mode == "direct_target"
+        )
         if depth_alignment_mode == "discrete_index_match" and (
             block_extension_cfg.target_residual_completion.enabled
             or block_extension_cfg.joint_blockwise_correction.enabled
             or block_extension_cfg.direct_p1_correction.enabled
         ):
-            # These ARIADNE-only correction mechanisms regress each inserted
-            # block's projections against a realized-extension ancestry map
-            # (which source block(s) a given position descends from). A
-            # discrete-index-matched model has no such ancestry: every
-            # position is a verbatim copy of exactly one source block, so
-            # there is nothing for these corrections to mean here.
             raise ValueError(
                 "depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "
-                "joint_blockwise_correction, and direct_p1_correction: these ARIADNE-only corrections have "
-                "no meaning on a discrete-index-aligned model."
+                "joint_blockwise_correction, and direct_p1_correction."
             )
         if (
             block_extension_cfg.joint_blockwise_correction.enabled
@@ -2274,21 +2285,16 @@ def main() -> None:
             task_joint_target_loader: Any = None
             task_direct_p1_references: dict[str, Any] | None = None
             task_direct_p1_target_loader: Any = None
-            # Only the ARIADNE block-extension branch below ever builds a real
-            # plan (transport_activation_mode="interpolate_neighbors"); every
-            # other path -- discrete_layer_match, or no prestep at all because
-            # source_depth==target_depth -- has no realized extension layout to
-            # derive one from, and `None` is _resolve_source_activation_plan's
-            # own return value for "use ordinary model activations" (the
-            # default `transport_activation_mode="model"`). Must be set here,
-            # once per task, since the block-extension branch only assigns it
-            # conditionally.
             task_source_activation_plan: InterpolatedBlockActivations | None = None
+            task_extension_layout: dict[str, Any] = {}
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
             if blockext_like_method and (
-                task_block_extension_prestep or task_discrete_layer_match_prestep or block_extension_eval_enabled
+                task_block_extension_prestep
+                or task_discrete_layer_match_prestep
+                or run_same_depth_direct_target
+                or block_extension_eval_enabled
             ):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
@@ -2597,14 +2603,46 @@ def main() -> None:
                     f"  {task}: block extension preprocess completed "
                     f"(source_depth={source_depth} -> {final_depth}, delta_keys={len(task_delta)})."
                 )
+            elif run_same_depth_direct_target:
+                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Same-depth direct-target P1 requires source models and calibration loaders.")
+                calibration_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=source_loaders.train,
+                    test_loader=source_loaders.test,
+                    val_loader=source_loaders.val,
+                )
+                task_residual_target_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=loaders.train,
+                    test_loader=loaders.test,
+                    val_loader=loaders.val,
+                )
+                task_residual_references = _maybe_capture_target_residual_references(
+                    config=block_extension_cfg.target_residual_completion,
+                    source_base_model=source_base_model_task,
+                    source_ft_model=source_ft_model_task,
+                    target_model=clf_target.model,
+                    source_loader=calibration_loader,
+                    target_loader=task_residual_target_loader,
+                    seed=int(cfg.get("seed", 42)),
+                    device=device,
+                )
+                task_extension_layout = {
+                    "direction": "extend",
+                    "final_blocks": [
+                        {
+                            "position": pos,
+                            "source_orig_idx": pos,
+                            "span_orig_idxs": [pos],
+                            "block_kind": "original",
+                        }
+                        for pos in range(target_depth)
+                    ],
+                    "inserted_blocks": [],
+                }
+                recorded_extension_layout = dict(task_extension_layout)
             elif task_discrete_layer_match_prestep:
-                # Faithful BiCo/THESEUS structural-resize control: reindex
-                # source_base_model_task/source_ft_model_task from source_depth
-                # to target_depth via the flat DiscreteLayerPairing, in place
-                # of ARIADNE's insertion/collapse machinery. Same pairing for
-                # both endpoints, so task_delta below is still a verbatim
-                # base/ft difference at every target position -- there is no
-                # interpolation or correction fit for a task vector to pick up.
                 if source_base_model_task is None or source_ft_model_task is None:
                     raise RuntimeError("Discrete layer match expected initialized source task models.")
                 if torch.cuda.is_available() and device != "cpu":
@@ -2622,13 +2660,10 @@ def main() -> None:
                     "alignment_calibration_seconds": time.perf_counter() - alignment_started,
                     "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
                 }
-                task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
-                task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
+                task_source_base_sd = to_cpu_fp32(source_base_model_task.state_dict())
+                task_source_ft_sd = to_cpu_fp32(source_ft_model_task.state_dict())
                 task_delta = TaskVector.from_checkpoints(
-                    task_source_base_sd,
-                    task_source_ft_sd,
-                    strict=True,
-                    key_filter=_visual_only_filter,
+                    task_source_base_sd, task_source_ft_sd, strict=True, key_filter=_visual_only_filter
                 ).delta
                 print(
                     f"  {task}: discrete layer match reindex completed "
@@ -2716,7 +2751,18 @@ def main() -> None:
                 n_keys = len(tuned_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
-            print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
+            direct_target_p1 = bool(
+                (task_block_extension_prestep or run_same_depth_direct_target)
+                and block_extension_cfg.target_residual_completion.enabled
+                and block_extension_cfg.target_residual_completion.mode == "direct_target"
+            )
+            if direct_target_p1:
+                print(
+                    f"\n--- Direct-target P1 for '{task}' "
+                    "(parameter transport skipped) ---"
+                )
+            else:
+                print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if merge_mode not in _SINGLE_TRANSPORT_MODES:
                 if torch.cuda.is_available() and device != "cpu":
                     torch.cuda.reset_peak_memory_stats()
@@ -2728,20 +2774,6 @@ def main() -> None:
                 # all without parameter transport, so invoking the transport
                 # fit and then discarding its output would only burn GPU hours
                 # and blur the claim.
-                direct_target_p1 = bool(
-                    task_block_extension_prestep
-                    and block_extension_cfg.target_residual_completion.enabled
-                    and block_extension_cfg.target_residual_completion.mode == "direct_target"
-                )
-                # Direct Residual is a second transport-free arm, structurally
-                # identical in spirit to direct_target_p1 (ARIADNE Proposal 1's
-                # own transport-free ablation): neither ordinary prepare/transport
-                # step means anything for it, so it is folded into the same
-                # bypass condition that already skips _build_rebase_prepared /
-                # method.transport() for direct_target_p1. Direct Residual's own
-                # capture/fit runs separately below, after transport_timings is
-                # recorded (near-zero, by the same convention direct_target_p1
-                # already establishes for a transport-free arm).
                 bypass_ordinary_transport = direct_target_p1 or direct_residual_like
                 prepared = None if bypass_ordinary_transport else _build_rebase_prepared(
                     method_name=method_name,
@@ -2847,13 +2879,11 @@ def main() -> None:
                         correction_fit_timings[task] = direct_residual_timing["correction_fit"]
                         direct_residual_diagnostics[task] = task_direct_residual_diag
 
-                if task_block_extension_prestep and block_extension_cfg.target_residual_completion.enabled:
-                    # ARIADNE proposal 1: complete the just-transported task
-                    # vector's inserted c_proj keys. Runs after transport is
-                    # fitted; never touches the target base weights. Gated on
-                    # ``task_block_extension_prestep`` too so ``task_extension_layout``
-                    # (only assigned inside that prestep) is never read stale
-                    # or undefined.
+                if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
+                    # Proposal 1 completes the transported task vector's
+                    # residual projections. In the same-depth direct-target
+                    # path, references and the identity layout are prepared
+                    # separately; both cases leave the target base unchanged.
                     transported_delta, task_residual_diagnostics = _maybe_complete_target_residual_task_vector(
                         config=block_extension_cfg.target_residual_completion,
                         references=task_residual_references,

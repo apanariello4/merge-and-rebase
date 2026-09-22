@@ -634,6 +634,7 @@ def _capture_residual_references(
 
 
 def projection_transforms(prepared, layout, *, target_scope="inserted", family_adapter=None):
+    _validate_target_informed_layout(layout, target_scope=target_scope)
     if target_scope not in {"inserted", "all"}:
         raise ValueError("target_scope must be 'inserted' or 'all'")
     transforms = prepared.get("transforms_by_key", {})
@@ -666,6 +667,52 @@ def projection_transforms(prepared, layout, *, target_scope="inserted", family_a
     return output
 
 
+def _validate_target_informed_layout(layout, *, target_scope, target_trajectory=None):
+    """Validate the layout contract before a target-informed solve consumes it.
+
+    Extension layouts historically use ``inserted_blocks`` and the odd-position
+    ancestry convention.  Reduction layouts have no inserted positions: every
+    final target block represents a collapsed source span and its
+    ``source_orig_idx`` is the span-end boundary.  Keeping this check at the
+    runtime boundary prevents a shrink run from silently falling through an
+    extension-only scope or trajectory.
+
+    Layouts produced before the explicit ``direction`` field was added are
+    treated as extension layouts for backwards compatibility with cached test
+    fixtures and old direct-target caches.
+    """
+    direction = str(layout.get("direction", "extend"))
+    if direction not in {"extend", "shrink"}:
+        raise ValueError(
+            "Target-informed completion requires layout.direction to be 'extend' or 'shrink'; "
+            f"got {direction!r}"
+        )
+    if direction != "shrink":
+        return
+    if target_scope != "all":
+        raise ValueError(
+            "Shrink direct_target completion requires target_scope='all': a reduction has no "
+            "inserted blocks to address"
+        )
+    if target_trajectory is not None and target_trajectory != "step":
+        raise ValueError(
+            "Shrink direct_target completion currently requires target_trajectory='step'; "
+            "interpolate has no span-aware reduction semantics"
+        )
+    entries = layout.get("final_blocks")
+    if entries is None:
+        raise ValueError("Shrink direct_target completion requires realized layout final_blocks")
+    for row in entries:
+        span = row.get("span_orig_idxs")
+        if not span:
+            raise ValueError(
+                "Shrink direct_target layout entries must record non-empty span_orig_idxs"
+            )
+        if int(row.get("source_orig_idx", -1)) != int(span[-1]):
+            raise ValueError(
+                "Shrink direct_target layout source_orig_idx must equal the span's terminal "
+                "source boundary"
+            )
 
 def _materialize_zero_bias(model, bias_key, out_features):
     """Add a zero bias to one bias-free projection. Returns True if it added one."""
@@ -1311,6 +1358,11 @@ def complete_residuals_direct(
         raise ValueError(
             f"complete_residuals_direct requires mode='direct_target', got {config.mode!r}"
         )
+    _validate_target_informed_layout(
+        layout,
+        target_scope=config.target_scope,
+        target_trajectory=config.target_trajectory,
+    )
     if references.get("scope", "inserted") != config.target_scope:
         raise ValueError(
             "Native reference scope does not match residual completion config: "
