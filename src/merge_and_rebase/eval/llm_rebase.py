@@ -79,7 +79,7 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import ResidualCompletionConfig
+from .target_residual_completion import ResidualCompletionConfig, order_components
 
 
 class _TokenizedPromptDataset(Dataset):
@@ -1254,6 +1254,7 @@ def main() -> None:
                     added_bias_keys = materialize_missing_projection_biases(
                         target_llm.model, target_base_sd, prepared_task.extension_layout or {},
                         family_adapter=family_adapter,
+                        components=order_components(residual_completion_cfg.components),
                     )
                     if added_bias_keys:
                         materialized_bias_keys.update(added_bias_keys)
@@ -1380,6 +1381,7 @@ def main() -> None:
                     added_bias_keys = materialize_missing_projection_biases(
                         target_llm.model, target_base_sd, prepared_task.extension_layout or {},
                         family_adapter=family_adapter,
+                        components=order_components(residual_completion_cfg.components),
                     )
                     if added_bias_keys:
                         materialized_bias_keys.update(added_bias_keys)

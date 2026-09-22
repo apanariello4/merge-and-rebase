@@ -322,3 +322,30 @@ def test_joint_solver_rejects_nonmatching_transport_shapes() -> None:
         fit_joint_cproj_correction(
             *tensors, torch.randn(2, 5), torch.randn(2, 3),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="reproduces only across devices")
+def test_reduced_form_solve_does_not_crash_on_a_non_cpu_device():
+    """exact_form=False must not hard-code a CPU zero tensor.
+
+    ResidualSufficientStatistics.solve()'s reduced-form branch built `beta`
+    (and `beta0`, and the trace_sc==0 branch's `x`) with a bare
+    ``torch.zeros(...)``, which defaults to CPU regardless of the device the
+    caller actually ran on. On device_transform="gpu" (the LLM path's own
+    setting) that produced ``t_out64.T @ beta`` mixing a CUDA tensor with a
+    CPU one inside `_residual_sq`, crashing every reduced-form (exact_form=
+    False, missing_bias="skip") fit -- caught only once an LLM campaign
+    actually exercised that combination on a real GPU node; the CPU-only test
+    suite could not have reproduced it, which is why this test is itself
+    GPU-gated rather than device-agnostic.
+    """
+    device = torch.device("cuda")
+    generator = torch.Generator().manual_seed(0)
+    h = torch.randn(16, 5, generator=generator).to(device)
+    e = torch.randn(16, 3, generator=generator).to(device)
+    t_out = torch.eye(3, device=device)
+    stats = ResidualSufficientStatistics()
+    stats.update(h, e, None, t_out)
+    weight, diag = stats.solve(ridge_relative=0.1, exact_form=False)
+    assert weight.device.type == "cuda"
+    assert diag["bias_correction"].isfinite().all()

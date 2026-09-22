@@ -392,3 +392,62 @@ def test_bottom_top_really_does_couple():
     ind_digest, _ = _fit_with_order("independent")
     assert bottom_digest != ind_digest, "the sequential cascade has stopped coupling anything"
     assert [p for p, v in bottom_before.items() if abs(v - 1.0) > 1e-4], "the cascade is inert"
+
+
+# --------------------------------------------------------------------------
+# 6. materialize_missing_projection_biases must cover every requested write
+#    surface, not only mlp.c_proj
+# --------------------------------------------------------------------------
+
+
+def _fresh_target_and_layout():
+    """A target model + layout with no bias materialized yet.
+
+    Deliberately not `_fixture()`: that helper already materializes the MLP
+    bias as part of its own setup (and asserts on it), so calling the
+    materializer again on its output would find the key already present and
+    report nothing added -- exactly the false pass that would have hidden
+    this bug.
+    """
+    target = _Decoder(width=10, inter=20, depth=4).eval()
+    base = {k: v.clone() for k, v in target.state_dict().items()}
+    layout = {
+        "final_blocks": tuple(
+            {"position": p, "source_orig_idx": p // 2,
+             "block_kind": "inserted" if p % 2 else "original"}
+            for p in range(4)
+        ),
+        "inserted_blocks": (),
+    }
+    return target, base, layout
+
+
+def test_bias_materialization_defaults_to_mlp_only():
+    """The historical, single-write-surface behaviour must be unchanged."""
+    target, base, layout = _fresh_target_and_layout()
+    added = materialize_missing_projection_biases(target, base, layout, family_adapter=_Adapter())
+    assert added and all("mlp.down_proj" in key for key in added)
+    assert not any("self_attn" in key for key in added)
+
+
+def test_bias_materialization_covers_attn_out_proj_when_requested():
+    """Regression test: components=[attn.out_proj, mlp.c_proj] left o_proj bias-free.
+
+    materialize_missing_projection_biases only ever materialized the MLP
+    projection's bias. With both write surfaces enabled, completion tried to
+    write an intercept onto `self_attn.o_proj.bias` and found it did not exist
+    -- caught when a real campaign cell (components=["attn.out_proj",
+    "mlp.c_proj"]) actually exercised the combination and raised
+    "missing_bias='materialize' requires ... o_proj.bias to exist".
+    """
+    target, base, layout = _fresh_target_and_layout()
+    added = materialize_missing_projection_biases(
+        target, base, layout, family_adapter=_Adapter(),
+        components=("attn.out_proj", "mlp.c_proj"),
+    )
+    down_proj_keys = {k for k in added if "mlp.down_proj" in k}
+    o_proj_keys = {k for k in added if "self_attn.o_proj" in k}
+    assert down_proj_keys, "the MLP write surface must still get its bias"
+    assert o_proj_keys, "the attention write surface must also get its bias"
+    for key in down_proj_keys | o_proj_keys:
+        assert key in base and torch.count_nonzero(base[key]) == 0

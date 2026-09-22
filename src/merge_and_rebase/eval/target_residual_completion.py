@@ -500,7 +500,7 @@ class ResidualSufficientStatistics:
         eg, ug, g_inv = _clamped_eigh_inverse(g)
 
         if trace_sc == 0.0 or trace_g == 0.0:
-            x = torch.zeros(self.m_source, self.d_source, dtype=torch.float64)
+            x = torch.zeros(self.m_source, self.d_source, dtype=torch.float64, device=t_out64.device)
         else:
             denom = es[:, None] * eg[None, :] + lam
             rhs = us.T @ bc @ ug
@@ -510,7 +510,12 @@ class ResidualSufficientStatistics:
         if exact_form:
             beta = g_inv @ (t_out64 @ mu_e - g @ (x.T @ mu_a))
         else:
-            beta = torch.zeros(self.d_source, dtype=torch.float64)
+            # Bare torch.zeros defaults to CPU. t_out64/x/mu_a are on whatever
+            # device the caller ran on (CUDA for device_transform="gpu"), and
+            # _residual_sq below does t_out64.T @ beta -- a CPU/CUDA mismatch
+            # that only reduced-form (exact_form=False) fits reach, since the
+            # exact-form branch derives beta from GPU tensors already.
+            beta = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
 
         residual_sq = self._residual_sq(x, beta, t_out64, mu_a, mu_e)
 
@@ -519,7 +524,7 @@ class ResidualSufficientStatistics:
         if exact_form:
             beta0 = g_inv @ (t_out64 @ mu_e - g @ (x0.T @ mu_a))
         else:
-            beta0 = torch.zeros(self.d_source, dtype=torch.float64)
+            beta0 = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
         best_possible_sq = self._residual_sq(x0, beta0, t_out64, mu_a, mu_e)
         reachable_sq = max(0.0, self.sum_e2 - best_possible_sq)
         unreachable_sq = best_possible_sq
