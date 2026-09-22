@@ -9,6 +9,11 @@ has to fill in, and ``llm_rebase``'s own mode branch, which must reach
 completion with an empty transported task vector or the arm is not
 transport-free at all.
 
+It also covers the two decoder-only knobs the arm grew when the two
+independent implementations of it were merged: ``direct_passthrough``, which
+decides whether the non-transportable remainder is folded in or dropped, and
+``cascade_order``, which decides how (or whether) the per-block fits couple.
+
 The models here are deliberately tiny stand-ins with Qwen's structural
 properties -- bias-free ``mlp.down_proj`` and ``self_attn.o_proj``, biased
 q/k/v, no LayerScale -- and a genuine width-up, depth-up rebase (8 -> 12 wide,
@@ -31,7 +36,10 @@ from merge_and_rebase.eval.target_informed_runtime import (
     materialize_missing_projection_biases,
     scale_completion,
 )
-from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
+from merge_and_rebase.eval.target_residual_completion import (
+    ResidualCompletionConfig,
+    parse_residual_completion_config,
+)
 
 VOCAB = 32
 
@@ -485,3 +493,216 @@ def test_llm_helper_returns_a_task_vector_with_no_transported_keys():
         for suffix in ("weight", "bias")
     }
     assert any(torch.count_nonzero(v) > 0 for v in completed.values())
+
+
+# ---------------------------------------------------------------------------
+# 5. The cascade_order ablation
+#
+# The ablation shipped without tests. What makes it meaningful is a measurable
+# difference in how the per-block fits couple, so that is what these pin:
+# `independent` breaks the coupling entirely, `top_bottom` reverses it, and the
+# default keeps the historical order.
+# ---------------------------------------------------------------------------
+
+
+def _diagnostics_for(cascade_order, **overrides):
+    source, source_ft, target, target_base_sd, layout = _fixture()
+    adapter = _Adapter()
+    config = _config(cascade_order=cascade_order, **overrides)
+    materialize_missing_projection_biases(
+        target, target_base_sd, layout, family_adapter=adapter, components=config.components
+    )
+    references = _references(source, source_ft, target, config, adapter)
+    corrections, diagnostics = complete_residuals_direct(
+        target, target_base_sd, references, layout, _loader(offset=100),
+        config=config, device="cpu", family_adapter=adapter,
+    )
+    return corrections, diagnostics
+
+
+def test_cascade_order_default_visits_blocks_bottom_up():
+    _corrections, diagnostics = _diagnostics_for("bottom_top")
+    assert [row["position"] for row in diagnostics] == [0, 1, 2, 3]
+
+
+def test_cascade_order_top_bottom_visits_blocks_deepest_first():
+    """Only the coupling direction changes; every block is still fitted once."""
+    _corrections, diagnostics = _diagnostics_for("top_bottom")
+    assert [row["position"] for row in diagnostics] == [3, 2, 1, 0]
+    # The first block visited still sees the untouched base, which is what keeps
+    # the `index == 0` assertion inside the solver valid under reversal.
+    assert diagnostics[0]["effect_before_norm"] == pytest.approx(0.0, abs=1e-6)
+    assert diagnostics[0]["relative_residual_before"] == pytest.approx(1.0, rel=1e-4)
+
+
+def test_cascade_order_independent_leaves_every_block_seeing_the_base():
+    """No mount between fits, so E_j == D_j everywhere -- that is the whole point.
+
+    Under a real cascade only the first block reports an untouched base; the
+    rest inherit whatever upstream corrections left behind (measured above 1.0
+    in practice). `independent` must flatten that to 1.0 for all of them.
+    """
+    _corrections, diagnostics = _diagnostics_for("independent")
+    for row in diagnostics:
+        assert row["effect_before_norm"] == pytest.approx(0.0, abs=1e-6), row["position"]
+        assert row["relative_residual_before"] == pytest.approx(1.0, rel=1e-4), row["position"]
+    # And the fit still has to improve on its own objective everywhere.
+    for row in diagnostics:
+        assert row["residual_norm_after"] < row["residual_norm_before"], row["position"]
+
+
+def test_cascade_order_changes_the_fitted_correction():
+    """If the three orders produced the same weights the ablation would be vacuous."""
+    bottom_top, _ = _diagnostics_for("bottom_top")
+    independent, _ = _diagnostics_for("independent")
+    assert set(bottom_top) == set(independent)
+    key = "model.layers.3.mlp.down_proj.weight"
+    assert not torch.allclose(bottom_top[key], independent[key], atol=1e-6), (
+        "the deepest block is the one furthest downstream of the cascade; if its "
+        "correction is unchanged, the coupling is not doing anything"
+    )
+
+
+def test_cascade_order_is_validated():
+    assert ResidualCompletionConfig().cascade_order == "bottom_top"
+    for name in ("bottom_top", "top_bottom", "independent"):
+        assert parse_residual_completion_config(
+            {"enabled": True, "mode": "direct_target", "cascade_order": name}
+        ).cascade_order == name
+    with pytest.raises(ValueError, match="cascade_order must be"):
+        parse_residual_completion_config({"enabled": True, "cascade_order": "sideways"})
+
+
+# ---------------------------------------------------------------------------
+# 6. The passthrough decision
+#
+# Decoder-only: that path splits a task vector into a transportable body and a
+# remainder (embeddings, per-layer norms, lm_head) which vision has no analogue
+# for. The policy is three-way -- transport folds, direct drops by default, and
+# direct_passthrough=true opts back into folding -- so it is pinned directly
+# rather than through a full run.
+# ---------------------------------------------------------------------------
+
+
+def test_direct_passthrough_defaults_off_and_requires_direct_mode():
+    assert ResidualCompletionConfig().direct_passthrough is False
+    assert parse_residual_completion_config({"enabled": True}).direct_passthrough is False
+    cfg = parse_residual_completion_config(
+        {"enabled": True, "mode": "direct_target", "direct_passthrough": True}
+    )
+    assert cfg.direct_passthrough is True
+    with pytest.raises(ValueError, match="direct_passthrough=true requires"):
+        parse_residual_completion_config({"enabled": True, "direct_passthrough": True})
+
+
+def _passthrough_pair(base):
+    """A shape-compatible passthrough key and a shape-incompatible one."""
+    compatible = "model.embed_tokens.weight"
+    return {
+        compatible: torch.ones_like(base[compatible]),
+        "model.layers.0.self_attn.q_proj.weight": torch.ones(3, 3),
+    }
+
+
+def test_passthrough_is_dropped_when_not_carried():
+    from merge_and_rebase.eval.llm_rebase import _apply_passthrough_delta
+
+    _s, _sf, _t, target_base_sd, _layout = _fixture()
+    passthrough = _passthrough_pair(target_base_sd)
+
+    out, skipped, dropped = _apply_passthrough_delta(
+        {}, passthrough, target_base_sd, carry=False
+    )
+
+    assert out == {}
+    assert skipped == [], "nothing is even considered for shape when the policy is drop"
+    assert dropped == set(passthrough)
+
+
+def test_passthrough_is_folded_when_carried():
+    from merge_and_rebase.eval.llm_rebase import _apply_passthrough_delta
+
+    _s, _sf, _t, target_base_sd, _layout = _fixture()
+    passthrough = _passthrough_pair(target_base_sd)
+
+    out, skipped, dropped = _apply_passthrough_delta(
+        {}, passthrough, target_base_sd, carry=True
+    )
+
+    assert "model.embed_tokens.weight" in out
+    torch.testing.assert_close(
+        out["model.embed_tokens.weight"], torch.ones_like(target_base_sd["model.embed_tokens.weight"])
+    )
+    # The shape-incompatible key is reported, not silently swallowed.
+    assert skipped == ["model.layers.0.self_attn.q_proj.weight"]
+    assert dropped == set()
+
+
+def test_passthrough_does_not_overwrite_the_fitted_correction():
+    """The body is written first; a passthrough key must not clobber a fitted one."""
+    from merge_and_rebase.eval.llm_rebase import _apply_passthrough_delta
+
+    _s, _sf, _t, target_base_sd, _layout = _fixture()
+    key = "model.layers.0.mlp.down_proj.weight"
+    fitted = torch.full_like(target_base_sd[key], 0.5)
+
+    out, _skipped, _dropped = _apply_passthrough_delta(
+        {key: fitted}, {}, target_base_sd, carry=True
+    )
+
+    torch.testing.assert_close(out[key], fitted)
+
+
+def test_disabled_completion_returns_the_delta_untouched():
+    """A disabled config is a no-op on both arms, direct mode included."""
+    from merge_and_rebase.eval.llm_rebase import _maybe_complete_target_residual_task_vector
+
+    delta = {"model.layers.0.mlp.down_proj.weight": torch.zeros(2, 2)}
+    completed, diagnostics = _maybe_complete_target_residual_task_vector(
+        config=_config(enabled=False),
+        references={"calibration": {}},
+        prepared=None,
+        layout={"final_blocks": [{"position": 0, "source_orig_idx": 0}]},
+        target_model=None,
+        target_base_sd={},
+        transported_delta=delta,
+        target_loader=None,
+        family_adapter=None,
+        device="cpu",
+        materialized_bias_keys=set(),
+    )
+    assert completed is delta, "a disabled run must return the same object, not a copy"
+    assert diagnostics is None
+
+
+def test_transport_mode_does_not_reach_the_direct_solver():
+    """The mode branch must actually select; both arms sharing one helper is the risk.
+
+    `transport_residual` needs fitted (t_in, t_out) maps, which `prepared=None`
+    cannot supply. If the mode branch were ever deleted, this config would fall
+    through to the transport-free solver and quietly succeed.
+    """
+    from merge_and_rebase.eval.llm_rebase import _maybe_complete_target_residual_task_vector
+
+    source, source_ft, target, target_base_sd, layout = _fixture()
+    adapter = _Adapter()
+    config = _config(mode="transport_residual")
+    materialize_missing_projection_biases(
+        target, target_base_sd, layout, family_adapter=adapter, components=config.components
+    )
+    references = _references(source, source_ft, target, config, adapter)
+
+    with pytest.raises((AttributeError, TypeError, ValueError, KeyError)):
+        _maybe_complete_target_residual_task_vector(
+            config=config,
+            references=references,
+            prepared=None,
+            layout=layout,
+            target_model=target,
+            target_base_sd=target_base_sd,
+            transported_delta={},
+            target_loader=_loader(offset=100),
+            family_adapter=adapter,
+            device="cpu",
+            materialized_bias_keys=set(),
+        )

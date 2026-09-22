@@ -344,6 +344,42 @@ def _maybe_complete_target_residual_task_vector(
     return completed, diagnostics
 
 
+def _apply_passthrough_delta(
+    out: dict[str, torch.Tensor],
+    passthrough_delta: Mapping[str, torch.Tensor],
+    target_base_sd: Mapping[str, torch.Tensor],
+    *,
+    carry: bool,
+) -> tuple[dict[str, torch.Tensor], list[str], set[str]]:
+    """Fold the non-transportable remainder into the task vector, or drop it.
+
+    The decoder path splits a task vector into a transportable body and a
+    remainder -- embeddings, per-layer norms, lm_head -- that no transport
+    touches. Vision has no such split, so this policy is decoder-only.
+
+    ``carry=True`` folds in every shape-compatible key verbatim; that is what
+    the transport arm has always done, and it is what ``direct_passthrough``
+    opts back into. ``carry=False`` drops the remainder entirely, which is the
+    transport-free arm's default: those keys are raw *source* parameters, so
+    folding them in would put source weights into the target, the fitted
+    correction would stop being the whole task vector, and ``strength=0`` would
+    stop being an exact native-target-base control.
+
+    Returns ``(out, skipped, dropped)`` -- ``skipped`` naming the keys that were
+    carried but whose target shape did not match, and ``dropped`` the keys the
+    drop policy discarded. Exactly one of the two is ever non-empty.
+    """
+    if not carry:
+        return out, [], set(passthrough_delta)
+    skipped: list[str] = []
+    for key, value in passthrough_delta.items():
+        if key in target_base_sd and tuple(value.shape) == tuple(target_base_sd[key].shape):
+            out[key] = value.to(dtype=target_base_sd[key].dtype, device="cpu")
+        else:
+            skipped.append(key)
+    return out, skipped, set()
+
+
 def _summarize_merged_delta(
     merged_delta: dict[str, torch.Tensor],
     target_base: dict[str, torch.Tensor],
@@ -1160,33 +1196,44 @@ def main() -> None:
         # and a fixed alpha cannot distinguish scale from direction.
         norm_match = cfg.get("delta_norm_match", None)
         norm_match = str(norm_match).strip().lower() if norm_match is not None else None
-        if norm_match not in {None, "none", "uncorrected"}:
-            raise ValueError(
-                f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
-            )
-        if norm_match == "uncorrected" and residual_completion_cfg.mode == "direct_target":
-            # The match rescales the transported vector to the *source* task
-            # vector's norm, which presupposes a transported vector. The direct
-            # arm's correction is fitted natively in target coordinates and is
-            # not a rescaled image of anything on the source, so the ratio has
-            # no meaning and would silently override the fitted strength.
-            raise ValueError(
-                "delta_norm_match='uncorrected' is not defined for "
-                "target_residual_completion.mode='direct_target': there is no transported "
-                "task vector to match the source norm against"
-            )
-        task_vector_norms: list[dict[str, float]] = []
-        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
-        materialized_bias_keys: set[str] = set()
         # Proposal-1 transport-free ablation. THESEUS/BiCo are neither fitted
         # nor applied: the question this arm asks is whether the desired local
         # functional effect can be written into the target with no parameter
         # transport at all, so fitting a transport and discarding it would both
         # burn the GPU hours the arm exists to save and blur the claim.
         direct_target_p1 = bool(
-            residual_completion_cfg.enabled
-            and residual_completion_cfg.mode == "direct_target"
+            residual_completion_cfg.enabled and residual_completion_cfg.mode == "direct_target"
         )
+        if residual_completion_cfg.enabled and residual_completion_cfg.mode not in {
+            "transport_residual", "direct_target"
+        }:
+            # complete_residuals() does not inspect config.mode; only the direct
+            # solver does. An unhandled mode would silently run a different
+            # method and report a plausible number for it.
+            raise ValueError(
+                f"target_residual_completion.mode={residual_completion_cfg.mode!r} is not "
+                "implemented on the LLM path."
+            )
+        if norm_match not in {None, "none", "uncorrected"}:
+            raise ValueError(
+                f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
+            )
+        if direct_target_p1 and norm_match == "uncorrected":
+            # The rescale multiplies the whole delta by
+            # ||reference_delta restricted to transport_keys|| / ||transported||.
+            # In direct mode the delta is the fitted correction, which is not a
+            # transported image of the source task vector and is far smaller, so
+            # the ratio is a large arbitrary number that would silently blow the
+            # correction up. Refused rather than special-cased.
+            raise ValueError(
+                "delta_norm_match='uncorrected' is incompatible with "
+                "target_residual_completion.mode='direct_target': the direct arm's task vector is "
+                "the fitted correction, not a transported source vector, so matching its norm to "
+                "the source delta has no meaning and would rescale it by an arbitrary factor"
+            )
+        task_vector_norms: list[dict[str, float]] = []
+        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        materialized_bias_keys: set[str] = set()
         dropped_passthrough_keys: set[str] = set()
         for idx, prepared_task in enumerate(prepared_tasks):
             corrected_delta = prepared_task.delta
@@ -1334,32 +1381,36 @@ def main() -> None:
                 if completion_diagnostics is not None:
                     residual_completion_diagnostics[str(label)] = completion_diagnostics
                     print(f"  residual completion applied to {len(completion_diagnostics)} block(s)")
+                elif direct_target_p1:
+                    # On the transport arm a skipped completion still leaves a
+                    # transported vector behind, so the run remains meaningful.
+                    # Here it leaves an empty delta: the pre-step ran but
+                    # captured no reference banks or no realized layout, so the
+                    # arm measured nothing. Say so, rather than failing later on
+                    # the zero-delta gate with a message about transport.
+                    raise RuntimeError(
+                        "mode='direct_target' produced no completion: the block-extension "
+                        "pre-step captured no reference banks or no realized layout. The run "
+                        "would measure the untouched target base."
+                    )
 
-                out = dict(transported_body)
-                skipped_passthrough: list[str] = []
-                if direct_target_p1:
-                    # Decision, recorded because it changes what the arm
-                    # measures: the transport-free arm drops the passthrough
-                    # keys entirely. They are raw *source* parameters (embeddings,
-                    # lm_head, norms) copied across untransported, so folding
-                    # them in would put source weights into the target and the
-                    # arm would no longer be transport-free -- the fitted
-                    # correction would stop being the whole task vector, and
-                    # strength=0 would stop being an exact native-target-base
-                    # control. Vision has no analogue because its passthrough
-                    # set is empty.
-                    dropped_passthrough_keys.update(passthrough_delta)
-                    if passthrough_delta:
-                        print(
-                            f"  dropped {len(passthrough_delta)} passthrough keys (direct_target is "
-                            "transport-free: nothing but the fitted correction reaches the target)"
-                        )
-                else:
-                    for k, v in passthrough_delta.items():
-                        if k in target_base_sd and tuple(v.shape) == tuple(target_base_sd[k].shape):
-                            out[k] = v.to(dtype=target_base_sd[k].dtype, device="cpu")
-                        else:
-                            skipped_passthrough.append(k)
+                # The transport-free arm drops the passthrough remainder by
+                # default; direct_passthrough=true opts back into folding it in,
+                # at the cost of the arm no longer being strictly transport-free
+                # and gamma=0 no longer reproducing the native base. Both facts
+                # reach the run summary rather than being left to be inferred.
+                out, skipped_passthrough, dropped = _apply_passthrough_delta(
+                    dict(transported_body),
+                    passthrough_delta,
+                    target_base_sd,
+                    carry=not direct_target_p1 or residual_completion_cfg.direct_passthrough,
+                )
+                dropped_passthrough_keys.update(dropped)
+                if dropped:
+                    print(
+                        f"  dropped {len(dropped)} passthrough keys (direct_target is "
+                        "transport-free: nothing but the fitted correction reaches the target)"
+                    )
                 transported = out
                 if skipped_passthrough:
                     print(
@@ -1416,19 +1467,31 @@ def main() -> None:
             "residual_completion": {
                 "enabled": bool(residual_completion_cfg.enabled),
                 # Which arm actually ran. Recorded because the two answer
-                # different questions and a config alone no longer tells them
-                # apart at read time.
+                # different questions, because a config alone no longer tells
+                # them apart at read time, and because the summary otherwise
+                # advertises `method` (theseus/bico) even when direct mode never
+                # fitted or applied it, which would read as a transport run.
                 "mode": residual_completion_cfg.mode,
+                "parameter_transport": "none" if direct_target_p1 else method_name,
+                "transport_fitted": not direct_target_p1,
                 "target_scope": residual_completion_cfg.target_scope,
                 "strength": float(residual_completion_cfg.strength),
                 "exact_form": bool(residual_completion_cfg.exact_form),
                 "missing_bias": residual_completion_cfg.missing_bias,
                 "target_trajectory": residual_completion_cfg.target_trajectory,
                 "components": list(residual_completion_cfg.components),
-                "transport_fitted": not direct_target_p1,
-                # direct_target drops the non-transportable source keys instead
-                # of folding them in; see the comment at the drop site.
-                "passthrough_policy": "dropped" if direct_target_p1 else "folded",
+                "cascade_order": residual_completion_cfg.cascade_order,
+                # Whether the direct arm carried the non-transportable source
+                # keys or dropped them; see the comment at the drop site. None on
+                # the transport arm, which always folds them in.
+                "direct_passthrough": (
+                    bool(residual_completion_cfg.direct_passthrough) if direct_target_p1 else None
+                ),
+                "passthrough_policy": (
+                    ("folded" if residual_completion_cfg.direct_passthrough else "dropped")
+                    if direct_target_p1
+                    else "folded"
+                ),
                 "dropped_passthrough_key_count": len(dropped_passthrough_keys),
                 "diagnostics": residual_completion_diagnostics,
                 # Parameters this run added that stock Qwen does not have.
@@ -1442,14 +1505,14 @@ def main() -> None:
             f"rel_norm={delta_stats['merged_delta_rel_norm']:.6f}"
         )
         if delta_stats["nonzero_key_count"] == 0:
-            if direct_target_p1 and residual_completion_cfg.strength == 0:
-                # Deliberate: gamma=0 on the transport-free arm *is* the
-                # native-target-base control, and an identically zero task
-                # vector is what that control looks like. Every alpha scores the
-                # same untouched target, which is the point.
+            if direct_target_p1 and float(residual_completion_cfg.strength) == 0.0:
+                # gamma=0 in direct mode is the exact native-target-base control:
+                # the fit still runs and reports diagnostics, and an identically
+                # zero delta is the intended result, not the silent-zero-transport
+                # failure this gate exists to catch.
                 print(
-                    "Merged delta is identically zero: direct_target at strength=0, the exact "
-                    "native-target-base control. Every alpha will score the untouched target."
+                    "  merged delta is identically zero, as expected for the direct-mode "
+                    "gamma=0 native-target-base control"
                 )
             else:
                 raise RuntimeError(

@@ -260,6 +260,11 @@ sbatch*
 /wandb
 /slurm-*.out
 docs/*.aux
+# Run summaries copied into the tree for analysis, and any results directory a
+# driver creates here by mistake. Neither belongs in Git.
+/results/
+/smoke_rho_sweep/
+/direct_p1_scope_all_gamma1_eurosat.json
 # LaTeX build output for the in-tree method write-ups; the .tex is the source.
 /docs/generated/
 

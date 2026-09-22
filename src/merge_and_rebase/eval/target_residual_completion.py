@@ -118,6 +118,40 @@ class ResidualCompletionConfig:
     # moves the MLP's own input through ln_2 and GELU, so the second fit has
     # to *measure* that rather than linearize it).
     components: tuple[str, ...] = ("mlp.c_proj",)
+    # The order the sequential cascade visits realized target positions.
+    #   "bottom_top" -- ascending position (the historical, default order). Each
+    #                   block is fitted after every block upstream of it is
+    #                   final, so its measured input H_j is the one the finished
+    #                   model will actually feed it.
+    #   "top_bottom" -- descending position. A block is then fitted before its
+    #                   upstream neighbours change, so later fits invalidate the
+    #                   input distribution earlier ones were fitted against.
+    #   "independent" -- no cascade at all. Every block is fitted against the
+    #                    pristine target base, so E_j == D_j for all j and the
+    #                    corrections cannot interfere with each other's targets.
+    #                    Order is irrelevant here by construction.
+    # This is an ablation of how load-bearing the cascade coupling is: measured
+    # `relative_residual_before` runs *above* 1.0 for most non-first blocks
+    # (median ~1.06-1.08), i.e. upstream corrections leave downstream blocks a
+    # harder target than the untouched base would, so the coupling is not
+    # obviously helping and its direction is worth testing.
+    cascade_order: str = "bottom_top"
+    # Decoder/LLM path only. That path splits a task vector into a transportable
+    # "body" and a ``passthrough`` remainder (embeddings, per-layer norms,
+    # lm_head) which it folds in verbatim after completion. Vision has no such
+    # split, so `direct_target` there is exactly ``theta_t^0 + gamma * dtau``.
+    #   False (default) -- same contract on the decoder: the fitted correction
+    #                      is the entire task vector, so gamma=0 is an exact
+    #                      native-target-base control.
+    #   True            -- also carry the shape-compatible passthrough keys, so
+    #                      the arm differs from the transport arm only in how
+    #                      the body is built. The arm is then not strictly
+    #                      transport-free and gamma=0 no longer reproduces the
+    #                      native base; both are recorded in the run summary.
+    # For a width-changing pair (Qwen 0.5B->1.5B, 896->1536 hidden) almost every
+    # passthrough key is shape-incompatible and already dropped, so this is
+    # close to a no-op there; it bites on a same-width, depth-only rebase.
+    direct_passthrough: bool = False
 
 
 #: Residual-writing projections, in the order a block executes them.
@@ -144,6 +178,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
     allowed = {
         "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
         "exact_form", "missing_bias", "mode", "target_trajectory", "components",
+        "cascade_order",
+        "direct_passthrough",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -182,6 +218,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise ValueError("mode must be 'transport_residual' or 'direct_target'")
     if cfg.target_trajectory not in {"step", "interpolate"}:
         raise ValueError("target_trajectory must be 'step' or 'interpolate'")
+    if cfg.cascade_order not in {"bottom_top", "top_bottom", "independent"}:
+        raise ValueError("cascade_order must be 'bottom_top', 'top_bottom' or 'independent'")
     if cfg.target_trajectory == "interpolate":
         # Both new write surfaces are direct-mode features; the transport arm's
         # solve is defined against fitted (t_in, t_out) maps and is deliberately
@@ -217,6 +255,10 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
             "components other than ['mlp.c_proj'] require mode='direct_target': the transport "
             "arm would need fitted t_in/t_out maps for attn.out_proj, which are not produced"
         )
+    if not isinstance(cfg.direct_passthrough, bool):
+        raise TypeError("direct_passthrough must be bool")
+    if cfg.direct_passthrough and cfg.mode != "direct_target":
+        raise ValueError("direct_passthrough=true requires mode='direct_target'")
     if cfg.missing_bias not in {"error", "materialize", "skip"}:
         raise ValueError("missing_bias must be 'error', 'materialize' or 'skip'")
     if cfg.missing_bias == "skip" and cfg.exact_form:
