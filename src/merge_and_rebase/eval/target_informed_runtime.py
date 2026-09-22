@@ -739,6 +739,8 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
         )
         block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
     expected_positions = {int(row["position"]) for row in entries}
+    if config.cascade_order == "top_bottom":
+        entries = list(reversed(entries))
     for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps), ("transforms", transforms)):
         if set(values) != expected_positions:
             raise ValueError(
@@ -852,7 +854,8 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             source_corrections[bias_key] = bias_correction
             target_corrections[bias_key] = transported_bias
             current_state[bias_key] = current_state[bias_key] + transported_bias.to(current_state[bias_key])
-            target_model.load_state_dict(current_state, strict=True)
+            if config.cascade_order != "independent":
+                target_model.load_state_dict(current_state, strict=True)
             diagnostics.append(
                 {
                     "scope": config.target_scope,
@@ -948,6 +951,11 @@ def complete_residuals_direct(
             references, entries, trajectory=config.target_trajectory
         )
         block_kind = {int(row["position"]): str(row.get("block_kind", "unknown")) for row in entries}
+    if config.cascade_order == "top_bottom":
+        # Fit deepest-first. The E_j == D_j assertion below keys off `index == 0`
+        # (whichever position is visited first still sees the untouched base),
+        # so it stays valid; only the coupling direction changes.
+        entries = list(reversed(entries))
     expected_positions = {int(row["position"]) for row in entries}
     for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps)):
         if set(values) != expected_positions:
@@ -1076,7 +1084,11 @@ def complete_residuals_direct(
                     current_state[bias_key] = current_state[bias_key] + bias_delta
                 # Mounted before the next component captures, which is what makes
                 # the intra-block cascade real rather than two independent fits.
-                target_model.load_state_dict(current_state, strict=True)
+                # cascade_order="independent" deliberately skips the mount: the
+                # model stays at the pristine base for every fit, so each block
+                # sees E_j == D_j and no correction can move another's target.
+                if config.cascade_order != "independent":
+                    target_model.load_state_dict(current_state, strict=True)
                 desired_norm = desired_sq ** 0.5
                 block_rows.append(
                     {
