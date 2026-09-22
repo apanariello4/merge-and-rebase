@@ -121,6 +121,42 @@ def test_theseus_keeps_raw_source_fallback_without_block_extension() -> None:
     assert prepared["seed"] == 17
 
 
+def test_same_architecture_prepare_accepts_no_source_activation_plan() -> None:
+    """The ordinary equal-depth path intentionally supplies no BRACE plan."""
+    source_model = _model(12)
+    target_model = _model(12)
+    method = _PreparedTheseusStub()
+
+    prepared = _build_rebase_prepared(
+        method_name="theseus",
+        method=method,
+        method_params={},
+        cfg={"seed": 33},
+        device="cpu",
+        grad_batch_size=None,
+        grad_imgs_per_class=None,
+        grad_num_batches=None,
+        theseus_like_method=True,
+        bico_mode=False,
+        run_block_extension_prestep=False,
+        clf_source=SimpleNamespace(model=source_model),
+        clf_target=SimpleNamespace(model=target_model),
+        classnames=[],
+        loaders=SimpleNamespace(train=None),
+        source_loaders=SimpleNamespace(train=None),
+        build_cfg_task=None,
+        source_build_cfg_task=None,
+        task_source_base_sd={},
+        target_base_sd={},
+        task_delta={},
+        source_base_model_task=None,
+        transfusion_prepared=None,
+        source_activation_plan=None,
+    )
+
+    assert prepared["source_activation_plan"] is None
+
+
 def test_theseus_places_isolated_calibration_models_on_requested_device() -> None:
     method = _PreparedTheseusStub()
 

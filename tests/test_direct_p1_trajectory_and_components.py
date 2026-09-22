@@ -34,6 +34,7 @@ from merge_and_rebase.eval.target_informed_runtime import (
     capture_tokens,
     complete_residuals_direct,
     realized_source_coordinates,
+    scale_completion,
 )
 from merge_and_rebase.eval.target_residual_completion import (
     ResidualCompletionConfig,
@@ -148,6 +149,42 @@ def _fixture():
     }
     target_base_sd = {k: v.clone() for k, v in target.state_dict().items()}
     return source, source_ft, target, data, layout, target_base_sd
+
+
+def _shrink_fixture():
+    """Source depth 4 collapsed into a target depth 2 chain.
+
+    Each target position represents one complete source span.  The recorded
+    ancestor is the terminal source boundary, matching ``build_reduction_layout``.
+    """
+    torch.manual_seed(17)
+    source = _Model(3, 4).eval()
+    target = _Model(5, 2).eval()
+    source_ft = deepcopy(source)
+    with torch.no_grad():
+        source_ft.visual.transformer.resblocks[1].mlp.c_proj.weight.add_(0.2)
+        source_ft.visual.transformer.resblocks[3].mlp.c_proj.weight.sub_(0.15)
+    data = _loader()
+    layout = {
+        "direction": "shrink",
+        "p1_source_ancestry": "span_end_boundary",
+        "final_blocks": [
+            {"position": 0, "source_orig_idx": 1, "span_orig_idxs": (0, 1), "block_kind": "collapsed"},
+            {"position": 1, "source_orig_idx": 3, "span_orig_idxs": (2, 3), "block_kind": "collapsed"},
+        ],
+        "inserted_blocks": (),
+    }
+    target_base_sd = {k: v.clone() for k, v in target.state_dict().items()}
+    return source, source_ft, target, data, layout, target_base_sd
+
+
+def _run_shrink(config):
+    source, source_ft, target, data, layout, target_base_sd = _shrink_fixture()
+    references = _references(source, source_ft, target, data, config)
+    corrections, diagnostics = complete_residuals_direct(
+        target, target_base_sd, references, layout, data, config=config, device="cpu",
+    )
+    return corrections, diagnostics, target, target_base_sd
 
 
 def _config(**overrides):
@@ -314,6 +351,51 @@ def test_interpolate_outside_direct_mode_is_refused():
         parse_residual_completion_config(
             {"enabled": True, "target_scope": "all", "target_trajectory": "interpolate"}
         )
+
+
+def test_shrink_direct_target_uses_span_end_boundaries_and_all_positions():
+    corrections, diagnostics, target, target_base = _run_shrink(_config())
+    assert [row["position"] for row in diagnostics] == [0, 1]
+    assert [row["source_orig_idx"] for row in diagnostics] == [1, 3]
+    assert all(row["scope"] == "all" for row in diagnostics)
+    assert all(row["block_kind"] == "collapsed" for row in diagnostics)
+    assert all(row["trajectory"] == "step" for row in diagnostics)
+    assert all(".mlp.c_proj." in key for key in corrections)
+    for key, value in target.state_dict().items():
+        torch.testing.assert_close(value, target_base[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("target_scope", "target_trajectory", "message"),
+    [
+        ("inserted", "step", "requires target_scope='all'"),
+        ("all", "interpolate", "requires target_trajectory='step'"),
+    ],
+)
+def test_shrink_direct_target_rejects_extension_scope_and_interpolation(
+    target_scope, target_trajectory, message
+):
+    source, source_ft, target, data, layout, target_base = _shrink_fixture()
+    config = _config(target_scope=target_scope, target_trajectory=target_trajectory)
+    with pytest.raises(ValueError, match=message):
+        complete_residuals_direct(
+            target,
+            target_base,
+            {"scope": target_scope},
+            layout,
+            data,
+            config=config,
+            device="cpu",
+        )
+
+
+def test_shrink_direct_target_strength_zero_is_a_null_task_vector():
+    corrections, diagnostics, _target, target_base = _run_shrink(_config(strength=0.0))
+    assert diagnostics
+    assert corrections
+    completed = scale_completion(target_base, corrections, 0.0)
+    for key, value in target_base.items():
+        torch.testing.assert_close(completed[key], value, rtol=0, atol=0)
 
 
 # --------------------------------------------------------------------------

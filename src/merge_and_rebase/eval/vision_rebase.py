@@ -81,7 +81,11 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import JointCorrectionConfig, ResidualCompletionConfig
+from .target_residual_completion import (
+    JointCorrectionConfig,
+    ResidualCompletionConfig,
+    validate_residual_completion_depth_direction,
+)
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
 
@@ -1720,8 +1724,24 @@ def main() -> None:
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
+        validate_residual_completion_depth_direction(
+            block_extension_cfg.target_residual_completion,
+            source_depth=source_depth,
+            target_depth=target_depth,
+        )
         run_block_extension_prestep = bool(
             blockext_like_method and block_extension_enabled and source_depth != target_depth
+        )
+        # Direct-target P1 can also operate on an unchanged depth: it writes a
+        # complete target-space task vector into the native target's residual
+        # projections.  Unlike BRACE there is no source structural operation
+        # in that case, so use an explicit identity ancestry layout below.
+        run_same_depth_direct_target = bool(
+            blockext_like_method
+            and block_extension_enabled
+            and source_depth == target_depth
+            and block_extension_cfg.target_residual_completion.enabled
+            and block_extension_cfg.target_residual_completion.mode == "direct_target"
         )
         if (
             block_extension_cfg.joint_blockwise_correction.enabled
@@ -1994,10 +2014,16 @@ def main() -> None:
             task_joint_target_loader: Any = None
             task_direct_p1_references: dict[str, Any] | None = None
             task_direct_p1_target_loader: Any = None
+            # Only depth-changing BRACE assigns a plan below.  Same-architecture
+            # Theseus/BiCo runs deliberately have no structural activation plan
+            # and must pass None to the ordinary prepare path.
+            task_source_activation_plan: Any | None = None
 
             source_base_model_task: torch.nn.Module | None = None
             source_ft_model_task: torch.nn.Module | None = None
-            if blockext_like_method and (task_block_extension_prestep or block_extension_eval_enabled):
+            if blockext_like_method and (
+                task_block_extension_prestep or run_same_depth_direct_target or block_extension_eval_enabled
+            ):
                 source_base_model_task = deepcopy(clf_source.model)
                 source_ft_model_task = deepcopy(clf_source.model)
                 load_into_model(source_base_model_task, source_base_sd, strict=True)
@@ -2305,6 +2331,50 @@ def main() -> None:
                     f"  {task}: block extension preprocess completed "
                     f"(source_depth={source_depth} -> {final_depth}, delta_keys={len(task_delta)})."
                 )
+
+            elif run_same_depth_direct_target:
+                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Same-depth direct-target P1 requires source models and calibration loaders.")
+                calibration_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=source_loaders.train,
+                    test_loader=source_loaders.test,
+                    val_loader=source_loaders.val,
+                )
+                task_residual_target_loader = select_loader(
+                    block_extension_cfg.calibration_split,
+                    train_loader=loaders.train,
+                    test_loader=loaders.test,
+                    val_loader=loaders.val,
+                )
+                task_residual_references = _maybe_capture_target_residual_references(
+                    config=block_extension_cfg.target_residual_completion,
+                    source_base_model=source_base_model_task,
+                    source_ft_model=source_ft_model_task,
+                    target_model=clf_target.model,
+                    source_loader=calibration_loader,
+                    target_loader=task_residual_target_loader,
+                    seed=int(cfg.get("seed", 42)),
+                    device=device,
+                )
+                task_extension_layout = {
+                    "direction": "extend",
+                    "final_blocks": [
+                        {
+                            "position": pos,
+                            "source_orig_idx": pos,
+                            "span_orig_idxs": [pos],
+                            "block_kind": "original",
+                        }
+                        for pos in range(target_depth)
+                    ],
+                    "inserted_blocks": [],
+                }
+                recorded_extension_layout = dict(task_extension_layout)
+                print(
+                    f"  {task}: same-depth direct-target preprocess completed "
+                    f"(identity layout, depth={target_depth}; parameter transport disabled)."
+                )
             elif block_extension_eval_enabled and block_extension_eval_rows:
                 last_row = block_extension_eval_rows[-1]
                 print(
@@ -2387,7 +2457,18 @@ def main() -> None:
                 n_keys = len(tuned_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
-            print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
+            direct_target_p1 = bool(
+                (task_block_extension_prestep or run_same_depth_direct_target)
+                and block_extension_cfg.target_residual_completion.enabled
+                and block_extension_cfg.target_residual_completion.mode == "direct_target"
+            )
+            if direct_target_p1:
+                print(
+                    f"\n--- Direct-target P1 for '{task}' "
+                    "(parameter transport skipped) ---"
+                )
+            else:
+                print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if merge_mode not in _SINGLE_TRANSPORT_MODES:
                 if torch.cuda.is_available() and device != "cpu":
                     torch.cuda.reset_peak_memory_stats()
@@ -2399,11 +2480,6 @@ def main() -> None:
                 # all without parameter transport, so invoking the transport
                 # fit and then discarding its output would only burn GPU hours
                 # and blur the claim.
-                direct_target_p1 = bool(
-                    task_block_extension_prestep
-                    and block_extension_cfg.target_residual_completion.enabled
-                    and block_extension_cfg.target_residual_completion.mode == "direct_target"
-                )
                 prepared = None if direct_target_p1 else _build_rebase_prepared(
                     method_name=method_name,
                     method=method,
@@ -2455,7 +2531,7 @@ def main() -> None:
                     "peak_memory_allocated_bytes": peak_memory_bytes,
                 }
 
-                if task_block_extension_prestep and block_extension_cfg.target_residual_completion.enabled:
+                if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # ARIADNE proposal 1: complete the just-transported task
                     # vector's inserted c_proj keys. Runs after transport is
                     # fitted; never touches the target base weights. Gated on

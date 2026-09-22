@@ -19,6 +19,7 @@ from .block_extension import (
     BlockExtensionConfig,
     _deterministic_calibration_loader,
     build_extension_layout,
+    build_reduction_layout,
     spread_anchor_schedule,
 )
 
@@ -1001,6 +1002,10 @@ class DecoderBlockExtender:
                     )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
+        # Publish the realized many-to-one ancestry for consumers such as
+        # direct-target P1.  Shrink has no inserted positions; every target
+        # position is addressed by the source span it absorbed.
+        self.realized_layout = build_reduction_layout(chain_base)
         self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
         return final_depth
 

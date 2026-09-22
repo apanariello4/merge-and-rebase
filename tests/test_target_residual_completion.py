@@ -11,6 +11,7 @@ from merge_and_rebase.eval.target_residual_completion import (
     fit_joint_cproj_correction,
     parse_joint_correction_config,
     parse_residual_completion_config,
+    validate_residual_completion_depth_direction,
 )
 from merge_and_rebase.rebase.methods.theseus import _transport_weight
 
@@ -31,6 +32,51 @@ def test_config_defaults_and_validation() -> None:
         parse_residual_completion_config({"exact_form": 1})
     with pytest.raises(ValueError):
         parse_residual_completion_config({"target_scope": "added"})
+
+
+def test_direct_target_shrink_depth_preflight_rejects_extension_semantics() -> None:
+    inserted = parse_residual_completion_config(
+        {"enabled": True, "mode": "direct_target", "target_scope": "inserted"}
+    )
+    with pytest.raises(ValueError, match="requires target_scope='all'"):
+        validate_residual_completion_depth_direction(
+            inserted, source_depth=24, target_depth=12
+        )
+
+    interpolated = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "interpolate",
+        }
+    )
+    with pytest.raises(ValueError, match="requires target_trajectory='step'"):
+        validate_residual_completion_depth_direction(
+            interpolated, source_depth=24, target_depth=12
+        )
+
+
+def test_direct_target_depth_preflight_accepts_step_shrink_and_extensions() -> None:
+    shrink = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "step",
+        }
+    )
+    validate_residual_completion_depth_direction(shrink, source_depth=24, target_depth=12)
+
+    extension = parse_residual_completion_config(
+        {
+            "enabled": True,
+            "mode": "direct_target",
+            "target_scope": "all",
+            "target_trajectory": "interpolate",
+        }
+    )
+    validate_residual_completion_depth_direction(extension, source_depth=12, target_depth=24)
 
 
 def test_joint_correction_config_is_explicit_and_validated() -> None:
