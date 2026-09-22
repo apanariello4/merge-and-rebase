@@ -61,6 +61,12 @@ class ResidualCompletionConfig:
     target_scope: str = "inserted"
     component: str = "c_proj.weight"
     ridge_relative: float = 1e-3
+    # ``fixed_relative`` preserves the historical trace-scaled ridge
+    # ``ridge_relative * trace(S) / d_in``. ``empirical_bayes`` uses the
+    # tuning-free trace ridge induced by the precision estimator of Wang et
+    # al. (ICLR 2024), namely ``trace(S) / (N - 1)``; equivalently its
+    # component-specific effective relative ridge is ``d_in / (N - 1)``.
+    ridge_estimator: str = "fixed_relative"
     strength: float = 1.0
     num_batches: int = 10
     # Exact affine fit (centered sufficient statistics + closed-form intercept,
@@ -176,7 +182,7 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
     if not isinstance(value, Mapping):
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
-        "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
+        "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "ridge_estimator", "strength", "num_batches",
         "exact_form", "missing_bias", "mode", "target_trajectory", "components",
         "cascade_order",
         "direct_passthrough",
@@ -206,6 +212,8 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise ValueError("ridge_relative must be finite")
     if cfg.ridge_relative <= 0:
         raise ValueError("ridge_relative must be > 0")
+    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes"}:
+        raise ValueError("ridge_estimator must be 'fixed_relative' or 'empirical_bayes'")
     if isinstance(cfg.strength, bool) or not isinstance(cfg.strength, (int, float)):
         raise ValueError("strength must be a finite real number")
     if not math.isfinite(float(cfg.strength)):
@@ -469,11 +477,19 @@ class ResidualSufficientStatistics:
         bias_term = 2.0 * n * float((c_vec @ (pred_mean - mu_e)).item()) + n * float((c_vec @ c_vec).item())
         return max(0.0, resid_no_bias + bias_term)
 
-    def solve(self, *, ridge_relative: float, exact_form: bool = True) -> tuple[Tensor, dict[str, Any]]:
+    def solve(
+        self,
+        *,
+        ridge_relative: float,
+        ridge_estimator: str = "fixed_relative",
+        exact_form: bool = True,
+    ) -> tuple[Tensor, dict[str, Any]]:
         if self.s is None or self.g is None or self.b is None or self.n_rows == 0:
             raise ValueError("cannot solve empty residual statistics")
         if isinstance(ridge_relative, bool) or ridge_relative <= 0 or not math.isfinite(float(ridge_relative)):
             raise ValueError("ridge_relative must be finite and > 0")
+        if ridge_estimator not in {"fixed_relative", "empirical_bayes"}:
+            raise ValueError("ridge_estimator must be 'fixed_relative' or 'empirical_bayes'")
         s = (self.s + self.s.T) * 0.5
         g = (self.g + self.g.T) * 0.5
         n = float(self.n_rows)
@@ -493,7 +509,20 @@ class ResidualSufficientStatistics:
 
         trace_sc = float(torch.trace(sc).item())
         trace_g = float(torch.trace(g).item())
-        base = float(ridge_relative) * trace_sc / float(self.m_source)
+        if ridge_estimator == "empirical_bayes":
+            if self.n_rows <= 1:
+                raise ValueError("empirical_bayes ridge requires at least two activation rows")
+            # With empirical covariance Sigma_hat = S_c / (N - 1), the
+            # empirical-Bayes precision denominator is
+            #   S_c + trace(Sigma_hat) I.
+            # Therefore the scalar ridge is trace(S_c) / (N - 1), which is
+            # the historical relative parameterization evaluated at the
+            # component-specific value d_in / (N - 1).
+            effective_ridge_relative = float(self.m_source) / float(self.n_rows - 1)
+            base = trace_sc / float(self.n_rows - 1)
+        else:
+            effective_ridge_relative = float(ridge_relative)
+            base = effective_ridge_relative * trace_sc / float(self.m_source)
         lam = base * (trace_g / float(self.d_source)) if exact_form else base
 
         es, us, sc_inv = _clamped_eigh_inverse(sc)
@@ -532,6 +561,9 @@ class ResidualSufficientStatistics:
         diag: dict[str, Any] = {
             "n_rows": self.n_rows,
             "ridge": lam,
+            "ridge_estimator": ridge_estimator,
+            "configured_ridge_relative": float(ridge_relative),
+            "effective_ridge_relative": effective_ridge_relative,
             "residual_norm_before": self.sum_e2**0.5,
             "residual_norm_after": residual_sq**0.5,
             "reachable_residual_norm": reachable_sq**0.5,

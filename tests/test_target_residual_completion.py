@@ -19,6 +19,8 @@ def test_config_defaults_and_validation() -> None:
     cfg = parse_residual_completion_config({"enabled": True})
     assert cfg.enabled and cfg.num_batches == 10
     assert cfg.target_scope == "inserted"
+    assert cfg.ridge_estimator == "fixed_relative"
+    assert parse_residual_completion_config({"ridge_estimator": "empirical_bayes"}).ridge_estimator == "empirical_bayes"
     assert parse_residual_completion_config({"added_blocks": "all", "target_scope": "all"}).target_scope == "all"
     assert cfg.exact_form is True  # no proposal-1 result predates this fix; exact is the only sane default.
     assert parse_residual_completion_config({"num_batches": 1}).num_batches == 1
@@ -31,6 +33,32 @@ def test_config_defaults_and_validation() -> None:
         parse_residual_completion_config({"exact_form": 1})
     with pytest.raises(ValueError):
         parse_residual_completion_config({"target_scope": "added"})
+    with pytest.raises(ValueError):
+        parse_residual_completion_config({"ridge_estimator": "automatic"})
+
+
+def test_empirical_bayes_ridge_matches_component_specific_relative_ridge() -> None:
+    torch.manual_seed(29)
+    h = torch.randn(17, 7)
+    e = torch.randn(17, 5)
+    tin = torch.randn(3, 7)
+    tout = torch.randn(2, 5)
+    stats = ResidualSufficientStatistics()
+    stats.update(h, e, tin, tout)
+
+    automatic, automatic_diag = stats.solve(
+        ridge_relative=123.0,
+        ridge_estimator="empirical_bayes",
+        exact_form=True,
+    )
+    expected_relative = 3.0 / 16.0
+    fixed, fixed_diag = stats.solve(ridge_relative=expected_relative, exact_form=True)
+
+    assert torch.allclose(automatic, fixed, atol=1e-6, rtol=1e-5)
+    assert automatic_diag["ridge"] == pytest.approx(fixed_diag["ridge"])
+    assert automatic_diag["ridge_estimator"] == "empirical_bayes"
+    assert automatic_diag["configured_ridge_relative"] == 123.0
+    assert automatic_diag["effective_ridge_relative"] == pytest.approx(expected_relative)
 
 
 def test_joint_correction_config_is_explicit_and_validated() -> None:
