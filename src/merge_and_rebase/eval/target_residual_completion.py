@@ -61,6 +61,12 @@ class ResidualCompletionConfig:
     target_scope: str = "inserted"
     component: str = "c_proj.weight"
     ridge_relative: float = 1e-3
+    # ``trace_normalized`` makes rho dimensionless by scaling it by the mean
+    # centered feature and output-transport Gram traces. ``absolute`` is an
+    # explicit ablation: one raw lambda is used for every fitted block/task.
+    # It is intentionally opt-in because it is not scale portable.
+    ridge_mode: str = "trace_normalized"
+    ridge_absolute: float | None = None
     strength: float = 1.0
     num_batches: int = 10
     # Exact affine fit (centered sufficient statistics + closed-form intercept,
@@ -176,7 +182,7 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
     if not isinstance(value, Mapping):
         raise TypeError("target_residual_completion must be a mapping")
     allowed = {
-        "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "strength", "num_batches",
+        "enabled", "added_blocks", "target_scope", "component", "ridge_relative", "ridge_mode", "ridge_absolute", "strength", "num_batches",
         "exact_form", "missing_bias", "mode", "target_trajectory", "components",
         "cascade_order",
         "direct_passthrough",
@@ -206,6 +212,15 @@ def parse_residual_completion_config(value: Mapping[str, Any] | None) -> Residua
         raise ValueError("ridge_relative must be finite")
     if cfg.ridge_relative <= 0:
         raise ValueError("ridge_relative must be > 0")
+    if cfg.ridge_mode not in {"trace_normalized", "absolute"}:
+        raise ValueError("ridge_mode must be 'trace_normalized' or 'absolute'")
+    if cfg.ridge_mode == "absolute":
+        if isinstance(cfg.ridge_absolute, bool) or not isinstance(cfg.ridge_absolute, (int, float)):
+            raise ValueError("ridge_absolute must be a finite real number when ridge_mode='absolute'")
+        if not math.isfinite(float(cfg.ridge_absolute)) or float(cfg.ridge_absolute) <= 0:
+            raise ValueError("ridge_absolute must be finite and > 0 when ridge_mode='absolute'")
+    elif cfg.ridge_absolute is not None:
+        raise ValueError("ridge_absolute is only valid when ridge_mode='absolute'")
     if isinstance(cfg.strength, bool) or not isinstance(cfg.strength, (int, float)):
         raise ValueError("strength must be a finite real number")
     if not math.isfinite(float(cfg.strength)):
@@ -469,11 +484,25 @@ class ResidualSufficientStatistics:
         bias_term = 2.0 * n * float((c_vec @ (pred_mean - mu_e)).item()) + n * float((c_vec @ c_vec).item())
         return max(0.0, resid_no_bias + bias_term)
 
-    def solve(self, *, ridge_relative: float, exact_form: bool = True) -> tuple[Tensor, dict[str, Any]]:
+    def solve(
+        self,
+        *,
+        ridge_relative: float,
+        exact_form: bool = True,
+        ridge_mode: str = "trace_normalized",
+        ridge_absolute: float | None = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
         if self.s is None or self.g is None or self.b is None or self.n_rows == 0:
             raise ValueError("cannot solve empty residual statistics")
         if isinstance(ridge_relative, bool) or ridge_relative <= 0 or not math.isfinite(float(ridge_relative)):
             raise ValueError("ridge_relative must be finite and > 0")
+        if ridge_mode not in {"trace_normalized", "absolute"}:
+            raise ValueError("ridge_mode must be 'trace_normalized' or 'absolute'")
+        if ridge_mode == "absolute":
+            if isinstance(ridge_absolute, bool) or not isinstance(ridge_absolute, (int, float)):
+                raise ValueError("ridge_absolute must be a finite real number for absolute ridge")
+            if not math.isfinite(float(ridge_absolute)) or float(ridge_absolute) <= 0:
+                raise ValueError("ridge_absolute must be finite and > 0 for absolute ridge")
         s = (self.s + self.s.T) * 0.5
         g = (self.g + self.g.T) * 0.5
         n = float(self.n_rows)
@@ -494,7 +523,8 @@ class ResidualSufficientStatistics:
         trace_sc = float(torch.trace(sc).item())
         trace_g = float(torch.trace(g).item())
         base = float(ridge_relative) * trace_sc / float(self.m_source)
-        lam = base * (trace_g / float(self.d_source)) if exact_form else base
+        trace_normalized_lam = base * (trace_g / float(self.d_source)) if exact_form else base
+        lam = float(ridge_absolute) if ridge_mode == "absolute" else trace_normalized_lam
 
         es, us, sc_inv = _clamped_eigh_inverse(sc)
         eg, ug, g_inv = _clamped_eigh_inverse(g)
@@ -532,6 +562,12 @@ class ResidualSufficientStatistics:
         diag: dict[str, Any] = {
             "n_rows": self.n_rows,
             "ridge": lam,
+            "ridge_mode": ridge_mode,
+            "ridge_relative": float(ridge_relative),
+            "ridge_absolute": float(ridge_absolute) if ridge_absolute is not None else None,
+            "ridge_trace_normalized": trace_normalized_lam,
+            "trace_centered_feature_gram": trace_sc,
+            "trace_output_transport_gram": trace_g,
             "residual_norm_before": self.sum_e2**0.5,
             "residual_norm_after": residual_sq**0.5,
             "reachable_residual_norm": reachable_sq**0.5,

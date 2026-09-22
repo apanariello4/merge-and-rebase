@@ -803,7 +803,12 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             ):
                 error = desired_batch - (out - base_out)
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), t_in, effective_out)
-            correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+            correction, diag = stats.solve(
+                ridge_relative=config.ridge_relative,
+                exact_form=config.exact_form,
+                ridge_mode=config.ridge_mode,
+                ridge_absolute=config.ridge_absolute,
+            )
             correction = correction.cpu()
             diag["bias_correction"] = diag["bias_correction"].cpu()
             transported = t_out.T @ correction @ t_in
@@ -978,7 +983,12 @@ def _fit_direct_target_position(
                     "Direct completion started from a target model that is not the native "
                     f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
                 )
-        correction, diag = stats.solve(ridge_relative=config.ridge_relative, exact_form=config.exact_form)
+        correction, diag = stats.solve(
+            ridge_relative=config.ridge_relative,
+            exact_form=config.exact_form,
+            ridge_mode=config.ridge_mode,
+            ridge_absolute=config.ridge_absolute,
+        )
         correction = correction.cpu()
         diag["bias_correction"] = diag["bias_correction"].cpu()
         if block_rows:
