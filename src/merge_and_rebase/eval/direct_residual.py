@@ -44,6 +44,7 @@ approximation.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -53,10 +54,14 @@ import torch
 
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, discrete_layer_pairing
 from .target_informed_runtime import (
+    COMPONENT_INPUT_KIND,
     _aligned,
+    _component_effective_out,
+    _finalize_independent_component,
     _fit_all_positions_independent,
     _fit_block_boundary_backfit,
     _fit_component_outputs_from_contributions,
+    _layout_for,
     _rows,
     capture_source_component_references,
     capture_tokens,
@@ -67,6 +72,7 @@ from .target_informed_runtime import (
     # DirectResidualConfig.realization_diagnostics, and neither is called by
     # fit_direct_residual itself (its own 2-tuple return is unchanged).
     compute_direct_residual_task_vector_stats,
+    iter_capture_tokens,
     measure_direct_residual_realization,
     paired_calibration,
 )
@@ -77,13 +83,17 @@ __all__ = [
     "compute_desired_effects",
     "compute_direct_residual_task_vector_stats",
     "fit_direct_residual",
+    "fit_direct_residual_streaming",
     "measure_direct_residual_realization",
     "parse_direct_residual_config",
     "position_source_contributions",
+    "prepare_direct_residual_streaming",
 ]
 from .target_residual_completion import (
     COMPONENT_FORWARD_ORDER,
     INTERNAL_COMPONENTS,
+    ResidualSufficientStatistics,
+    _procrustes_from_cross,
     centered_rectangular_procrustes,
     order_components,
 )
@@ -250,6 +260,21 @@ class DirectResidualConfig:
     # Stop when the change in ||E||/||D_j|| between consecutive sweeps drops
     # below this.
     backfit_tol: float = 1e-4
+    # "resident" (default): capture_paired_boundary_activations/fit_direct_residual
+    # hold full per-batch activation banks in host RAM for every position at
+    # once (see the module docstring); bit-identical to pre-ablation code.
+    # "streaming": prepare_direct_residual_streaming/fit_direct_residual_streaming
+    # accumulate Procrustes and ridge sufficient statistics batch-by-batch,
+    # keeping host RAM O(1) in num_batches, at the cost of requiring
+    # component_target='block_boundary', block_split='none' and
+    # realization_diagnostics=False (see parse_direct_residual_config).
+    activation_storage: str = "resident"
+    # Only meaningful with activation_storage="streaming": split
+    # fit_direct_residual_streaming's target positions into chunks of this
+    # size (each chunk gets its own capture sweep) to bound host RAM further
+    # when num_positions * num_components is itself large. None (default)
+    # fits every position in one chunk.
+    streaming_position_chunk: int | None = None
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -283,6 +308,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "block_split",
         "backfit_max_iters",
         "backfit_tol",
+        "activation_storage",
+        "streaming_position_chunk",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -375,6 +402,20 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("backfit_tol must be a finite real number")
     if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
         raise ValueError("backfit_tol must be finite and > 0")
+    if cfg.activation_storage not in {"resident", "streaming"}:
+        raise ValueError("activation_storage must be 'resident' or 'streaming'")
+    if cfg.streaming_position_chunk is not None:
+        if isinstance(cfg.streaming_position_chunk, bool) or not isinstance(cfg.streaming_position_chunk, int):
+            raise ValueError("streaming_position_chunk must be None or a positive integer")
+        if cfg.streaming_position_chunk <= 0:
+            raise ValueError("streaming_position_chunk must be None or a positive integer")
+    if cfg.activation_storage == "streaming":
+        if cfg.component_target != "block_boundary":
+            raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
+        if cfg.block_split != "none":
+            raise ValueError("activation_storage='streaming' requires block_split='none'")
+        if cfg.realization_diagnostics:
+            raise ValueError("activation_storage='streaming' requires realization_diagnostics=False")
     return cfg
 
 
@@ -618,4 +659,300 @@ def fit_direct_residual(
                 diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)
+    return target_corrections, diagnostics
+
+
+class _StreamingCrossCovariance:
+    """Chan's pairwise online accumulator for a centered cross-covariance.
+
+    Equivalent to accumulating every row into one bank and computing
+    ``(X - mean_x).T @ (Y - mean_y)`` directly (what
+    `centered_rectangular_procrustes` does), but in O(1) batches rather than
+    O(num_batches) host memory. Kept on ``device`` (float64) throughout;
+    inputs are expected already cast to float64 by the caller.
+    """
+
+    def __init__(self, device=None) -> None:
+        self.device = device
+        self.n = 0
+        self.mean_x: Tensor | None = None
+        self.mean_y: Tensor | None = None
+        self.c: Tensor | None = None
+
+    def update(self, x: Tensor, y: Tensor) -> None:
+        if x.shape[0] != y.shape[0]:
+            raise ValueError("cross-covariance update requires matching row counts")
+        n_b = int(x.shape[0])
+        if n_b == 0:
+            return
+        if self.device is not None:
+            x = x.to(self.device)
+            y = y.to(self.device)
+        mean_x_b = x.mean(dim=0)
+        mean_y_b = y.mean(dim=0)
+        c_b = (x - mean_x_b).T @ (y - mean_y_b)
+        if self.n == 0:
+            self.n, self.mean_x, self.mean_y, self.c = n_b, mean_x_b, mean_y_b, c_b
+            return
+        n_a = self.n
+        n = n_a + n_b
+        dx = mean_x_b - self.mean_x
+        dy = mean_y_b - self.mean_y
+        self.c = self.c + c_b + (n_a * n_b / n) * torch.outer(dx, dy)
+        self.mean_x = self.mean_x + dx * (n_b / n)
+        self.mean_y = self.mean_y + dy * (n_b / n)
+        self.n = n
+
+    def cross(self) -> Tensor:
+        if self.c is None:
+            raise ValueError("cannot compute cross-covariance of zero batches")
+        return self.c
+
+
+def prepare_direct_residual_streaming(
+    source_base_model,
+    target_base_model,
+    source_loader,
+    target_loader,
+    pairing: DiscreteLayerPairing,
+    *,
+    num_batches: int,
+    seed: int | None,
+    device,
+    family_adapter=None,
+) -> dict[str, Any]:
+    """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
+    ``compute_desired_effects``: accumulates each position's Procrustes cross-
+    covariance batch-by-batch instead of holding every batch's boundary bank
+    resident, then solves the SVD once per position at the end.
+
+    Uses the identical `paired_calibration` call as the resident path (same
+    ``num_batches``/``seed`` -> identical sample IDs) and the identical
+    `_aligned` token-interpolation helper, so the only difference from the
+    resident path is *when* the Procrustes map is extracted from the
+    accumulated cross-covariance (once at the end here, vs. from a fully
+    materialized row bank there) -- both compute ``_procrustes_from_cross``
+    over mathematically the same centered cross-covariance matrix.
+
+    Returns a dict consumed by `fit_direct_residual_streaming`: the fitted
+    per-position Procrustes maps (``"q_by_position"``), a per-(batch,
+    position) determinism fingerprint of the target boundary activations
+    (``"fingerprints"``) that Pass B uses to detect a target model mutated
+    between passes, the replayed calibration batches for both sides, and the
+    calibration metadata.
+    """
+    if pairing.target_depth < 1:
+        raise ValueError("pairing.target_depth must be positive")
+    if pairing.source_depth < 1:
+        raise ValueError("pairing.source_depth must be positive")
+    source_batches, target_batches, metadata = paired_calibration(
+        source_loader, target_loader, num_batches=num_batches, seed=seed
+    )
+    distinct_source_indices = sorted(set(pairing.pairing))
+    src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
+    tgt_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
+    accumulators = {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)}
+    fingerprints: dict[tuple[int, int], tuple[float, float]] = {}
+
+    src_gen = iter_capture_tokens(
+        source_base_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+    )
+    tgt_gen = iter_capture_tokens(
+        target_base_model, target_batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+    )
+    with contextlib.closing(src_gen), contextlib.closing(tgt_gen):
+        for k, (src, tgt) in enumerate(zip(src_gen, tgt_gen, strict=True)):
+            for j in range(pairing.target_depth):
+                i = pairing.pairing[j]
+                t = tgt[str(j)]
+                x = _aligned([src[str(i)]], [t])[0]
+                x_rows = x.reshape(-1, x.shape[-1]).double()
+                y_rows = t.reshape(-1, t.shape[-1]).double()
+                accumulators[j].update(x_rows, y_rows)
+                t64 = t.double()
+                fingerprints[(k, j)] = (float(t64.sum().item()), float((t64**2).sum().item()))
+
+    q_by_position = {j: _procrustes_from_cross(acc.cross()).float().cpu() for j, acc in accumulators.items()}
+    return {
+        "q_by_position": q_by_position,
+        "fingerprints": fingerprints,
+        "source_batches": source_batches,
+        "target_batches": target_batches,
+        "calibration": metadata,
+        "distinct_source_indices": distinct_source_indices,
+    }
+
+
+@torch.no_grad()
+def fit_direct_residual_streaming(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    source_base_model,
+    source_ft_model,
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
+    """Streaming (Pass B) equivalent of ``fit_direct_residual``: fits every
+    target position's residual-writing components from chunked capture
+    sweeps that accumulate `ResidualSufficientStatistics` batch-by-batch,
+    instead of ``_fit_all_positions_independent``'s single fully-materialized
+    capture. Requires ``config.activation_storage == 'streaming'`` semantics
+    to already be validated by `parse_direct_residual_config`
+    (``component_target='block_boundary'``, ``block_split='none'``,
+    ``realization_diagnostics=False``).
+
+    Mirrors ``fit_direct_residual``'s wrapper exactly: same position checks,
+    same forced ``cascade_order='independent'``, same
+    save/load/restore-in-``finally`` of the target model's state, and the
+    same final ``source_coordinate`` -> ``source_position`` diagnostic
+    renaming, in position order.
+
+    Each chunk of ``config.streaming_position_chunk`` positions (``None`` ->
+    one chunk of all positions) gets its own lockstep sweep over three
+    ``iter_capture_tokens`` generators (source_base, source_ft, target),
+    re-deriving ``desired = (f - b) @ q_j`` per batch from `prepared`'s
+    Procrustes maps instead of reading a resident ``desired`` bank, and
+    checking the just-captured target boundary against `prepared`'s
+    fingerprint before trusting it as ``base_out`` (there is no resident
+    ``target_base_outputs_by_position`` bank to diff against directly).
+    """
+    if pairing.target_depth < 1:
+        raise ValueError("pairing.target_depth must be positive")
+    components = order_components(config.components)
+    batches = prepared["target_batches"]
+    source_batches = prepared["source_batches"]
+    q_by_position = prepared["q_by_position"]
+    fingerprints = prepared["fingerprints"]
+    positions = list(range(pairing.target_depth))
+    for j in positions:
+        if j not in q_by_position:
+            raise ValueError(f"Missing prepared Procrustes map for position {j}")
+    source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
+    solver_config = replace(config, cascade_order="independent") if config.cascade_order != "independent" else config
+    shim = _layout_for(family_adapter)
+
+    chunk_size = config.streaming_position_chunk or len(positions)
+    chunks = [positions[start : start + chunk_size] for start in range(0, len(positions), chunk_size)]
+
+    unique_models: dict[int, Any] = {}
+    for m in (target_model, source_base_model, source_ft_model):
+        unique_models.setdefault(id(m), m)
+    originals = {mid: (next(m.parameters()).device, m.training) for mid, m in unique_models.items()}
+
+    original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    target_corrections: dict[str, Tensor] = {}
+    diagnostics: list[dict[str, Any]] = []
+    try:
+        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        target_model.load_state_dict(current_state, strict=True)
+        for m in unique_models.values():
+            m.to(device).eval()
+
+        for chunk in chunks:
+            distinct_i_needed = sorted({pairing.pairing[pos] for pos in chunk})
+            src_requests = {str(i): (i, "boundary") for i in distinct_i_needed}
+            tgt_requests: dict[str, tuple[int, str]] = {}
+            for pos in chunk:
+                tgt_requests[f"{pos}.out"] = (pos, "boundary")
+                for component in components:
+                    tgt_requests[f"{pos}.{component}.h"] = (pos, COMPONENT_INPUT_KIND[component])
+
+            stats_by: dict[tuple[int, str], ResidualSufficientStatistics] = {}
+            desired_sq: dict[tuple[int, str], float] = {}
+            effect_sq: dict[tuple[int, str], float] = {}
+            effective_out: dict[tuple[int, str], Tensor] = {}
+            for pos in chunk:
+                for component in components:
+                    key = shim.component_key(pos, component, prefixed=True)
+                    width = int(current_state[key].shape[0])
+                    pair = (pos, component)
+                    effective_out[pair] = _component_effective_out(shim, target_model, pos, component, width)
+                    stats_by[pair] = ResidualSufficientStatistics(device=device)
+                    desired_sq[pair] = 0.0
+                    effect_sq[pair] = 0.0
+
+            sb_gen = iter_capture_tokens(
+                source_base_model, source_batches, src_requests, device, family_adapter=family_adapter,
+                store_device=device,
+            )
+            sf_gen = iter_capture_tokens(
+                source_ft_model, source_batches, src_requests, device, family_adapter=family_adapter,
+                store_device=device,
+            )
+            tgt_gen = iter_capture_tokens(
+                target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+            )
+            with contextlib.closing(sb_gen), contextlib.closing(sf_gen), contextlib.closing(tgt_gen):
+                for k, (sb, sf, tgt) in enumerate(zip(sb_gen, sf_gen, tgt_gen, strict=True)):
+                    for pos in chunk:
+                        i = pairing.pairing[pos]
+                        out = tgt[f"{pos}.out"]
+                        out64 = out.double()
+                        fp_sum = float(out64.sum().item())
+                        fp_sumsq = float((out64**2).sum().item())
+                        exp_sum, exp_sumsq = fingerprints[(k, pos)]
+                        scale = math.sqrt(exp_sumsq) if exp_sumsq > 0 else 1.0
+                        sumsq_ok = math.isclose(fp_sumsq, exp_sumsq, rel_tol=1e-9, abs_tol=1e-9)
+                        sum_ok = abs(fp_sum - exp_sum) <= 1e-9 * max(scale, 1.0)
+                        if not (sumsq_ok and sum_ok):
+                            raise RuntimeError(
+                                "Direct completion started from a target model that is not the "
+                                f"native base: target boundary fingerprint mismatch between "
+                                f"pass A and pass B at position {pos} (batch {k})"
+                            )
+                        # Align on CPU, as the resident path does on its CPU banks, so D_j stays bit-comparable.
+                        out_cpu = out.cpu()
+                        b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
+                        f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
+                        base_out = out_cpu
+                        q = q_by_position[pos]
+                        desired = (f - b) @ q
+                        effect = out_cpu - base_out
+                        error = desired - effect
+                        desired_sq_val = float((desired.double() ** 2).sum().item())
+                        effect_sq_val = float((effect.double() ** 2).sum().item())
+                        for component in components:
+                            pair = (pos, component)
+                            h = tgt[f"{pos}.{component}.h"].cpu()
+                            desired_sq[pair] += desired_sq_val
+                            effect_sq[pair] += effect_sq_val
+                            stats_by[pair].update(
+                                h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None,
+                                effective_out[pair],
+                            )
+
+            for pos in chunk:
+                position_corrections: dict[str, Tensor] = {}
+                block_rows: list[dict[str, Any]] = []
+                for component in components:
+                    key = shim.component_key(pos, component, prefixed=True)
+                    pair = (pos, component)
+                    _finalize_independent_component(
+                        stats_by[pair],
+                        desired_sq[pair],
+                        effect_sq[pair],
+                        pos,
+                        component,
+                        key,
+                        current_state,
+                        effective_out[pair],
+                        solver_config,
+                        source_coordinates,
+                        position_corrections,
+                        block_rows,
+                        h_batches=None,
+                    )
+                target_corrections.update(position_corrections)
+                for row in block_rows:
+                    row["source_position"] = row.pop("source_coordinate")
+                    diagnostics.append(row)
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+        for mid, m in unique_models.items():
+            orig_device, orig_training = originals[mid]
+            m.to(orig_device).train(orig_training)
     return target_corrections, diagnostics

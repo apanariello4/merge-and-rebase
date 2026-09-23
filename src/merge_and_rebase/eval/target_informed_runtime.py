@@ -505,6 +505,116 @@ def _verify_recomputed_attention_input(module, rows, module_output):
         )
 
 
+def _register_capture_hooks(
+    layout, blocks, requests: Mapping[str, tuple[int, str]], store, *, family_adapter=None
+) -> list:
+    """Register one forward hook per capture request, calling ``store(name, tensor)``.
+
+    Every branch (boundary/block_input, the ``nn.MultiheadAttention`` recompute
+    path, the self-attention query check, mlp_input, proj, plain ``*_input``
+    kinds) is preserved exactly from the historical ``capture_tokens`` body.
+    Returns the list of handles the caller must ``.remove()``.
+    """
+    handles = []
+    for key, (index, kind) in requests.items():
+        if kind not in _CAPTURE_KINDS:
+            raise ValueError(f"Unknown capture kind {kind}")
+        block = layout.block_module(blocks[index])
+        recompute = False
+        query_capture = kind in _ATTN_QUERY_KINDS
+        if kind in ("boundary", "block_input"):
+            module = block
+        elif kind in _ATTN_CAPTURE_KINDS:
+            attention = layout.attn_module(blocks[index])
+            # A stock nn.MultiheadAttention applies out_proj functionally, so
+            # a hook on that submodule would never fire and the "fired once
+            # per batch" check below would reject the whole capture. Hook the
+            # attention itself and recover the projection's rows exactly.
+            recompute = isinstance(attention, nn.MultiheadAttention)
+            module = attention if recompute else layout.attn_proj_module(blocks[index])
+        elif query_capture:
+            if family_adapter is not None:
+                raise NotImplementedError("attn_input capture is vision-only")
+            module = layout.attn_module(blocks[index])
+        elif kind == "mlp_input":
+            module = layout.mlp_in_module(blocks[index])
+        else:
+            module = layout.proj_module(blocks[index])
+
+        if recompute:
+            def hook(mod, args, kwargs, value, *, name=key, capture_kind=kind):
+                if capture_kind == "attn_proj_input":
+                    rows = _stock_mha_out_proj_input(mod, args, kwargs)
+                    _verify_recomputed_attention_input(mod, rows, value)
+                    store(name, rows)
+                else:
+                    store(name, value)
+            handles.append(module.register_forward_hook(hook, with_kwargs=True))
+        elif query_capture:
+            def hook(_mod, args, kwargs, _value, *, name=key):
+                query, key_arg, value_arg = _mha_query_key_value(args, kwargs)
+                if not (query is key_arg and query is value_arg):
+                    raise ValueError(
+                        "attn_input capture requires self-attention (query, key and value "
+                        "must be the same tensor)"
+                    )
+                store(name, query)
+            handles.append(module.register_forward_hook(hook, with_kwargs=True))
+        else:
+            def hook(_m, inputs, value, *, name=key, capture_kind=kind):
+                store(name, inputs[0] if capture_kind in _INPUT_CAPTURE_KINDS else value)
+            handles.append(module.register_forward_hook(hook))
+    return handles
+
+
+def iter_capture_tokens(
+    model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None, store_device="cpu"
+):
+    """Yield one ``{key: tensor}`` dict per batch instead of accumulating all of them.
+
+    Same hook/module resolution as ``capture_tokens`` (see ``_register_capture_hooks``),
+    but hooks are registered and removed around EACH batch rather than once for the
+    whole sweep -- this lets several generators over the same model object run in
+    lockstep (e.g. one per source/finetuned/target model) without cross-firing.
+    ``store_device="cpu"`` keeps the historical ``tokens.float().cpu().clone()`` store
+    op; any other value stores via ``tokens.float().to(store_device).clone()``.
+    Restores the model's device/train mode on normal completion, early
+    ``.close()``, garbage collection, or an exception raised mid-sweep.
+    """
+    layout = _layout_for(family_adapter)
+    blocks = layout.blocks(model)
+    training = model.training
+    original_device = next(model.parameters()).device
+    try:
+        model.to(device).eval()
+        for batch in batches:
+            batch_size = layout.batch_size(batch)
+            values: dict[str, list[torch.Tensor]] = {key: [] for key in requests}
+
+            def store(name, tensor, *, _batch_size=batch_size, _values=values):
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
+                tokens = _to_tokens(tensor.detach(), batch_size=_batch_size)
+                if store_device == "cpu":
+                    tokens = tokens.float().cpu().clone()
+                else:
+                    tokens = tokens.float().to(store_device).clone()
+                _values[name].append(tokens)
+
+            handles = _register_capture_hooks(layout, blocks, requests, store, family_adapter=family_adapter)
+            try:
+                with torch.no_grad():
+                    layout.forward(model, batch, device)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            if any(len(v) != 1 for v in values.values()):
+                raise RuntimeError("A requested activation hook did not fire exactly once per batch")
+            yield {key: v[0] for key, v in values.items()}
+    finally:
+        model.to(original_device).train(training)
+
+
 @torch.no_grad()
 def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None):
     """Capture B,T,D tensors, releasing hooks and restoring placement on errors.
@@ -514,79 +624,12 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
     their names on both paths -- on a decoder they resolve to mlp.down_proj,
     which plays the same residual-writing role.
     """
-    layout = _layout_for(family_adapter)
-    blocks = layout.blocks(model)
-    training = model.training
-    original_device = next(model.parameters()).device
     output = {key: [] for key in requests}
-    current_batch = [0]
-    handles = []
-    try:
-        model.to(device).eval()
-
-        def store(name, tensor):
-            if isinstance(tensor, tuple):
-                tensor = tensor[0]
-            tokens = _to_tokens(tensor.detach(), batch_size=current_batch[0])
-            output[name].append(tokens.float().cpu().clone())
-
-        for key, (index, kind) in requests.items():
-            if kind not in _CAPTURE_KINDS:
-                raise ValueError(f"Unknown capture kind {kind}")
-            block = layout.block_module(blocks[index])
-            recompute = False
-            query_capture = kind in _ATTN_QUERY_KINDS
-            if kind in ("boundary", "block_input"):
-                module = block
-            elif kind in _ATTN_CAPTURE_KINDS:
-                attention = layout.attn_module(blocks[index])
-                # A stock nn.MultiheadAttention applies out_proj functionally, so
-                # a hook on that submodule would never fire and the "fired once
-                # per batch" check below would reject the whole capture. Hook the
-                # attention itself and recover the projection's rows exactly.
-                recompute = isinstance(attention, nn.MultiheadAttention)
-                module = attention if recompute else layout.attn_proj_module(blocks[index])
-            elif query_capture:
-                if family_adapter is not None:
-                    raise NotImplementedError("attn_input capture is vision-only")
-                module = layout.attn_module(blocks[index])
-            elif kind == "mlp_input":
-                module = layout.mlp_in_module(blocks[index])
-            else:
-                module = layout.proj_module(blocks[index])
-
-            if recompute:
-                def hook(mod, args, kwargs, value, *, name=key, capture_kind=kind):
-                    if capture_kind == "attn_proj_input":
-                        rows = _stock_mha_out_proj_input(mod, args, kwargs)
-                        _verify_recomputed_attention_input(mod, rows, value)
-                        store(name, rows)
-                    else:
-                        store(name, value)
-                handles.append(module.register_forward_hook(hook, with_kwargs=True))
-            elif query_capture:
-                def hook(_mod, args, kwargs, _value, *, name=key):
-                    query, key_arg, value_arg = _mha_query_key_value(args, kwargs)
-                    if not (query is key_arg and query is value_arg):
-                        raise ValueError(
-                            "attn_input capture requires self-attention (query, key and value "
-                            "must be the same tensor)"
-                        )
-                    store(name, query)
-                handles.append(module.register_forward_hook(hook, with_kwargs=True))
-            else:
-                def hook(_m, inputs, value, *, name=key, capture_kind=kind):
-                    store(name, inputs[0] if capture_kind in _INPUT_CAPTURE_KINDS else value)
-                handles.append(module.register_forward_hook(hook))
-        for batch in batches:
-            current_batch[0] = layout.batch_size(batch)
-            layout.forward(model, batch, device)
-        if any(len(values) != len(batches) for values in output.values()):
-            raise RuntimeError("A requested activation hook did not fire exactly once per batch")
-    finally:
-        for handle in handles:
-            handle.remove()
-        model.to(original_device).train(training)
+    for batch_values in iter_capture_tokens(model, batches, requests, device, family_adapter=family_adapter):
+        for key, tensor in batch_values.items():
+            output[key].append(tensor)
+    if any(len(values) != len(batches) for values in output.values()):
+        raise RuntimeError("A requested activation hook did not fire exactly once per batch")
     return output
 
 
@@ -1407,14 +1450,7 @@ def _fit_all_positions_independent(
             key = shim.component_key(pos, component, prefixed=True)
             h_batches = captured[f"{pos}.{component}.h"]
             width = int(current_state[key].shape[0])
-            identity_out = torch.eye(width, dtype=torch.float32)
-            scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
-            effective_out = identity_out
-            if not isinstance(scale_module, nn.Identity):
-                scale = getattr(scale_module, "gamma", None)
-                if scale is None or scale.ndim != 1 or scale.shape[0] != width:
-                    raise ValueError("Unsupported non-diagonal target LayerScale")
-                effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+            effective_out = _component_effective_out(shim, target_model, pos, component, width)
             stats = ResidualSufficientStatistics(device=device)
             desired_sq = 0.0
             effect_sq = 0.0
@@ -1426,89 +1462,141 @@ def _fit_all_positions_independent(
                 desired_sq += float((desired_batch.double() ** 2).sum().item())
                 effect_sq += float((effect.double() ** 2).sum().item())
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
-            # See the docstring: under independent mode this holds for every
-            # (position, component) pair, not only a historically-first one.
-            if effect_sq > 1e-12 * max(desired_sq, 1.0):
-                raise RuntimeError(
-                    "Direct completion started from a target model that is not the native "
-                    f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
-                )
-            correction, diag = stats.solve(
-                ridge_relative=config.ridge_relative,
-                ridge_estimator=config.ridge_estimator,
-                exact_form=config.exact_form,
+            _finalize_independent_component(
+                stats,
+                desired_sq,
+                effect_sq,
+                pos,
+                component,
+                key,
+                current_state,
+                effective_out,
+                config,
+                source_coordinates,
+                position_corrections,
+                block_rows,
+                h_batches=h_batches,
             )
-            correction = correction.cpu()
-            diag["bias_correction"] = diag["bias_correction"].cpu()
-            weight_before = current_state[key].detach().clone()
-            if block_rows:
-                # Same bookkeeping as _fit_direct_target_position: the previous
-                # component's row records this component's own pre-fit residual
-                # under its historical name. Under independent mode nothing
-                # mounted in between, so this is not a "post-mount" measurement
-                # -- see the docstring -- but it is the identical value the old
-                # per-pair-capture path would have recorded.
-                block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
-            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
-                raise RuntimeError("Direct residual completion produced an invalid projection")
-            position_corrections[key] = correction
-            current_state[key] = current_state[key] + correction.to(current_state[key])
-            bias_key = f"{key[: -len('.weight')]}.bias"
-            bias_correction = diag["bias_correction"]
-            skip_bias = False
-            if bias_key not in current_state:
-                if config.missing_bias == "materialize":
-                    raise RuntimeError(
-                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
-                        "before residual completion runs; call "
-                        "materialize_missing_projection_biases() on the target model and its "
-                        "base state dict first"
-                    )
-                elif config.missing_bias == "skip":
-                    if torch.count_nonzero(bias_correction):
-                        raise RuntimeError(
-                            "missing_bias='skip' would discard a nonzero intercept at "
-                            f"{bias_key}; the weight was fitted on centered banks and is "
-                            "not valid without it"
-                        )
-                    skip_bias = True
-                else:
-                    raise RuntimeError(
-                        f"Target model is missing the expected bias parameter {bias_key}. "
-                        "Decoder MLP projections are bias-free; set "
-                        "target_residual_completion.missing_bias to 'materialize' "
-                        "(exact, adds the parameter) or 'skip' with exact_form=false."
-                    )
-            if not skip_bias:
-                bias_delta = bias_correction.to(current_state[bias_key])
-                if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
-                    raise RuntimeError("Direct residual completion produced an invalid bias")
-                position_corrections[bias_key] = bias_correction
-                current_state[bias_key] = current_state[bias_key] + bias_delta
-            desired_norm = desired_sq ** 0.5
-            block_row = {
-                "mode": "direct_target",
-                "component": component,
-                "position": pos,
-                "source_coordinate": float(source_coordinates[pos]),
-                "desired_norm": desired_norm,
-                "effect_before_norm": effect_sq ** 0.5,
-                "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
-                "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
-                **diag,
-            }
-            if bool(getattr(config, "realization_diagnostics", False)):
-                bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
-                block_row.update(
-                    _realization_diagnostic_fields(
-                        h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm,
-                        diag["residual_norm_after"],
-                    )
-                )
-            block_rows.append(block_row)
         results[pos] = (position_corrections, block_rows)
     return results
+
+
+def _component_effective_out(shim, target_model, pos, component, width) -> torch.Tensor:
+    """Build the ``effective_out`` (identity, or LayerScale-diagonal) a component's
+    solve is pushed through, exactly as ``_fit_all_positions_independent`` inlined it.
+    """
+    identity_out = torch.eye(width, dtype=torch.float32)
+    scale_module = shim.component_scale_module(shim.blocks(target_model)[pos], component)
+    if isinstance(scale_module, nn.Identity):
+        return identity_out
+    scale = getattr(scale_module, "gamma", None)
+    if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+        raise ValueError("Unsupported non-diagonal target LayerScale")
+    return identity_out * scale.detach().cpu().float().unsqueeze(0)
+
+
+def _finalize_independent_component(
+    stats,
+    desired_sq,
+    effect_sq,
+    pos,
+    component,
+    key,
+    current_state,
+    effective_out,
+    config,
+    source_coordinates,
+    position_corrections,
+    block_rows,
+    h_batches=None,
+):
+    """Everything after one component's accumulation loop in
+    ``_fit_all_positions_independent``: the pristine-effect check, the ridge
+    solve, state/bookkeeping updates, missing-bias handling, and the block_row
+    diagnostic (plus optional realization diagnostics). Mutates
+    ``position_corrections``, ``current_state`` and ``block_rows`` in place.
+    """
+    # See the docstring: under independent mode this holds for every
+    # (position, component) pair, not only a historically-first one.
+    if effect_sq > 1e-12 * max(desired_sq, 1.0):
+        raise RuntimeError(
+            "Direct completion started from a target model that is not the native "
+            f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
+        )
+    correction, diag = stats.solve(
+        ridge_relative=config.ridge_relative,
+        ridge_estimator=config.ridge_estimator,
+        exact_form=config.exact_form,
+    )
+    correction = correction.cpu()
+    diag["bias_correction"] = diag["bias_correction"].cpu()
+    weight_before = current_state[key].detach().clone()
+    if block_rows:
+        # Same bookkeeping as _fit_direct_target_position: the previous
+        # component's row records this component's own pre-fit residual
+        # under its historical name. Under independent mode nothing
+        # mounted in between, so this is not a "post-mount" measurement
+        # -- see the docstring -- but it is the identical value the old
+        # per-pair-capture path would have recorded.
+        block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
+    if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+        raise RuntimeError("Direct residual completion produced an invalid projection")
+    position_corrections[key] = correction
+    current_state[key] = current_state[key] + correction.to(current_state[key])
+    bias_key = f"{key[: -len('.weight')]}.bias"
+    bias_correction = diag["bias_correction"]
+    skip_bias = False
+    if bias_key not in current_state:
+        if config.missing_bias == "materialize":
+            raise RuntimeError(
+                f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                "before residual completion runs; call "
+                "materialize_missing_projection_biases() on the target model and its "
+                "base state dict first"
+            )
+        elif config.missing_bias == "skip":
+            if torch.count_nonzero(bias_correction):
+                raise RuntimeError(
+                    "missing_bias='skip' would discard a nonzero intercept at "
+                    f"{bias_key}; the weight was fitted on centered banks and is "
+                    "not valid without it"
+                )
+            skip_bias = True
+        else:
+            raise RuntimeError(
+                f"Target model is missing the expected bias parameter {bias_key}. "
+                "Decoder MLP projections are bias-free; set "
+                "target_residual_completion.missing_bias to 'materialize' "
+                "(exact, adds the parameter) or 'skip' with exact_form=false."
+            )
+    if not skip_bias:
+        bias_delta = bias_correction.to(current_state[bias_key])
+        if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+            raise RuntimeError("Direct residual completion produced an invalid bias")
+        position_corrections[bias_key] = bias_correction
+        current_state[bias_key] = current_state[bias_key] + bias_delta
+    desired_norm = desired_sq ** 0.5
+    block_row = {
+        "mode": "direct_target",
+        "component": component,
+        "position": pos,
+        "source_coordinate": float(source_coordinates[pos]),
+        "desired_norm": desired_norm,
+        "effect_before_norm": effect_sq ** 0.5,
+        "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+        "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+        "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+        **diag,
+    }
+    if bool(getattr(config, "realization_diagnostics", False)):
+        bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
+        block_row.update(
+            _realization_diagnostic_fields(
+                h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm,
+                diag["residual_norm_after"],
+            )
+        )
+    block_rows.append(block_row)
 
 
 def _replay_block_components(shim, local_block, x_batches, components, device):

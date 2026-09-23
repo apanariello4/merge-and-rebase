@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import itertools
 import os
+import resource
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -77,7 +78,9 @@ from .direct_residual import (
     capture_paired_boundary_activations,
     compute_desired_effects,
     fit_direct_residual,
+    fit_direct_residual_streaming,
     parse_direct_residual_config,
+    prepare_direct_residual_streaming,
 )
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
@@ -1463,26 +1466,53 @@ def _run_direct_residual_fit(
     by the fit) is assembled" requirement. Neither call mutates
     ``target_model``'s entry state (both restore it internally and assert so
     via a state-dict hash).
+
+    ``config.activation_storage`` branches between the resident path above
+    (full per-batch banks, unchanged) and the streaming path
+    (``prepare_direct_residual_streaming`` + ``fit_direct_residual_streaming``,
+    O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
+    already rejected any streaming config for which realization diagnostics
+    would be reachable, so that block below only ever runs for the resident
+    path. Both paths additionally record each bracket's peak host RSS
+    (``resource.getrusage(resource.RUSAGE_SELF).ru_maxrss``, KiB on Linux) so
+    campaigns can see streaming's host memory stay flat as ``num_batches``
+    grows while resident's does not.
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     alignment_started = time.perf_counter()
-    component_inputs = (
-        order_components(config.components) if config.component_target != "block_boundary" else ()
-    )
-    captured = capture_paired_boundary_activations(
-        source_base_model,
-        source_ft_model,
-        target_model,
-        source_loader,
-        target_loader,
-        pairing,
-        num_batches=config.num_batches,
-        seed=config.seed,
-        device=device,
-        component_inputs=component_inputs,
-    )
-    desired = compute_desired_effects(captured, pairing)
+    streaming = config.activation_storage == "streaming"
+    captured = None
+    desired = None
+    prepared = None
+    if streaming:
+        prepared = prepare_direct_residual_streaming(
+            source_base_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+        )
+    else:
+        component_inputs = (
+            order_components(config.components) if config.component_target != "block_boundary" else ()
+        )
+        captured = capture_paired_boundary_activations(
+            source_base_model,
+            source_ft_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+            component_inputs=component_inputs,
+        )
+        desired = compute_desired_effects(captured, pairing)
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1491,20 +1521,35 @@ def _run_direct_residual_fit(
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
         "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
+        "alignment_calibration_process_peak_host_rss_bytes": float(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        ),
     }
 
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     fit_started = time.perf_counter()
-    target_corrections, diagnostics = fit_direct_residual(
-        target_model,
-        target_base_sd,
-        captured,
-        desired,
-        pairing,
-        config=config,
-        device=device,
-    )
+    if streaming:
+        target_corrections, diagnostics = fit_direct_residual_streaming(
+            target_model,
+            target_base_sd,
+            source_base_model,
+            source_ft_model,
+            prepared,
+            pairing,
+            config=config,
+            device=device,
+        )
+    else:
+        target_corrections, diagnostics = fit_direct_residual(
+            target_model,
+            target_base_sd,
+            captured,
+            desired,
+            pairing,
+            config=config,
+            device=device,
+        )
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         fit_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1513,6 +1558,9 @@ def _run_direct_residual_fit(
     fit_timing = {
         "correction_fit_seconds": time.perf_counter() - fit_started,
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
+        "correction_fit_process_peak_host_rss_bytes": float(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        ),
     }
 
     realization_by_position = None

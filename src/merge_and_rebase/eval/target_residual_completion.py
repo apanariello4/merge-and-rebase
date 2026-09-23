@@ -390,9 +390,14 @@ def centered_rectangular_procrustes(
     src_mean = source_rows.mean(dim=0)
     tgt_mean = target_rows.mean(dim=0)
     cross = (source_rows - src_mean).T @ (target_rows - tgt_mean)
-    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
-    q = u @ vh
+    q = _procrustes_from_cross(cross)
     return q, src_mean, tgt_mean
+
+
+def _procrustes_from_cross(cross: Tensor) -> Tensor:
+    """Orthogonal Procrustes map from a cross-covariance matrix via SVD."""
+    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
+    return u @ vh
 
 
 def backproject_target_rows(target_rows: Tensor, q: Tensor, target_mean: Tensor, source_mean: Tensor) -> Tensor:
