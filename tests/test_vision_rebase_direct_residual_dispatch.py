@@ -226,10 +226,13 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
         memory_key = f"{bracket}_peak_memory_bytes"
-        assert set(timing[bracket]) == {seconds_key, memory_key}
+        rss_key = f"{bracket}_process_peak_host_rss_bytes"
+        assert set(timing[bracket]) == {seconds_key, memory_key, rss_key}
         assert isinstance(timing[bracket][seconds_key], float)
         assert timing[bracket][seconds_key] >= 0.0
         assert isinstance(timing[bracket][memory_key], float)
+        assert isinstance(timing[bracket][rss_key], float)
+        assert timing[bracket][rss_key] > 0.0
     assert isinstance(diagnostics, list) and diagnostics
     # target_base is restored to its pristine state by fit_direct_residual's
     # try/finally (see direct_residual.py); the model handed back must be

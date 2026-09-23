@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import itertools
 import os
+import resource
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -79,7 +80,9 @@ from .direct_residual import (
     compute_alignment_diagnostics,
     compute_desired_effects,
     fit_direct_residual,
+    fit_direct_residual_streaming,
     parse_direct_residual_config,
+    prepare_direct_residual_streaming,
 )
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
@@ -1490,69 +1493,96 @@ def _run_direct_residual_fit(
     ``target_text_features``) are required only in that mode. The
     activation-vs-gradient Procrustes overlap diagnostic is merged into each
     position's diagnostics row by position.
+
+    ``config.activation_storage`` branches between the resident path above
+    (full per-batch banks, unchanged) and the streaming path
+    (``prepare_direct_residual_streaming`` + ``fit_direct_residual_streaming``,
+    O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
+    already rejected any streaming config for which realization diagnostics
+    would be reachable, so that block below only ever runs for the resident
+    path. Both paths additionally record each bracket's peak host RSS
+    (``resource.getrusage(resource.RUSAGE_SELF).ru_maxrss``, KiB on Linux) so
+    campaigns can see streaming's host memory stay flat as ``num_batches``
+    grows while resident's does not.
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     alignment_started = time.perf_counter()
-    component_inputs = (
-        order_components(config.components) if config.component_target != "block_boundary" else ()
-    )
+    streaming = config.activation_storage == "streaming"
+    captured = None
+    desired = None
+    prepared = None
     gradient_mode = config.procrustes_source == "gradient"
-    source_recipe = target_recipe = None
-    if gradient_mode:
-        missing = [
-            name
-            for name, value in (
-                ("clf_source", clf_source),
-                ("clf_target", clf_target),
-                ("classnames", classnames),
-                ("source_build_cfg_task", source_build_cfg_task),
-                ("build_cfg_task", build_cfg_task),
-            )
-            if value is None
-        ]
-        if missing:
-            raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
-        from ..models.grad_recipes import clip_contrastive_recipe
-
-        source_recipe = clip_contrastive_recipe(
-            clf_source,
-            classnames,
-            source_build_cfg_task,
-            device=device,
-            text_features=source_text_features,
-        )
-        target_recipe = clip_contrastive_recipe(
-            clf_target,
-            classnames,
-            build_cfg_task,
-            device=device,
-            text_features=target_text_features,
-        )
-    captured = capture_paired_boundary_activations(
-        source_base_model,
-        source_ft_model,
-        target_model,
-        source_loader,
-        target_loader,
-        pairing,
-        num_batches=config.num_batches,
-        seed=config.seed,
-        device=device,
-        component_inputs=component_inputs,
-        procrustes_source=config.procrustes_source,
-        source_recipe=source_recipe,
-        target_recipe=target_recipe,
-        capture_source_ft_component_inputs=config.component_target == "output_total",
-    )
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
-    desired = compute_desired_effects(
-        captured,
-        pairing,
-        residual_target=config.residual_target,
-        procrustes_source=config.procrustes_source,
-        diagnostics_out=procrustes_diagnostics if gradient_mode else None,
-    )
+    if streaming:
+        prepared = prepare_direct_residual_streaming(
+            source_base_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+        )
+    else:
+        component_inputs = (
+            order_components(config.components) if config.component_target != "block_boundary" else ()
+        )
+        source_recipe = target_recipe = None
+        if gradient_mode:
+            missing = [
+                name
+                for name, value in (
+                    ("clf_source", clf_source),
+                    ("clf_target", clf_target),
+                    ("classnames", classnames),
+                    ("source_build_cfg_task", source_build_cfg_task),
+                    ("build_cfg_task", build_cfg_task),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
+            from ..models.grad_recipes import clip_contrastive_recipe
+
+            source_recipe = clip_contrastive_recipe(
+                clf_source,
+                classnames,
+                source_build_cfg_task,
+                device=device,
+                text_features=source_text_features,
+            )
+            target_recipe = clip_contrastive_recipe(
+                clf_target,
+                classnames,
+                build_cfg_task,
+                device=device,
+                text_features=target_text_features,
+            )
+        captured = capture_paired_boundary_activations(
+            source_base_model,
+            source_ft_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+            component_inputs=component_inputs,
+            procrustes_source=config.procrustes_source,
+            source_recipe=source_recipe,
+            target_recipe=target_recipe,
+            capture_source_ft_component_inputs=config.component_target == "output_total",
+        )
+        desired = compute_desired_effects(
+            captured,
+            pairing,
+            residual_target=config.residual_target,
+            procrustes_source=config.procrustes_source,
+            diagnostics_out=procrustes_diagnostics if gradient_mode else None,
+        )
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1561,6 +1591,9 @@ def _run_direct_residual_fit(
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
         "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
+        "alignment_calibration_process_peak_host_rss_bytes": float(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        ),
     }
 
     # Deliberately outside BOTH the alignment_calibration bracket above (just
@@ -1576,21 +1609,35 @@ def _run_direct_residual_fit(
     # under procrustes_source="gradient" that is not the Q_j the fit used, so it
     # is not reported there (None) rather than reported for the wrong map.
     alignment_diagnostics = (
-        compute_alignment_diagnostics(captured, pairing) if config.procrustes_source == "activation" else None
+        compute_alignment_diagnostics(captured, pairing)
+        if config.procrustes_source == "activation" and not streaming
+        else None
     )
 
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     fit_started = time.perf_counter()
-    target_corrections, diagnostics = fit_direct_residual(
-        target_model,
-        target_base_sd,
-        captured,
-        desired,
-        pairing,
-        config=config,
-        device=device,
-    )
+    if streaming:
+        target_corrections, diagnostics = fit_direct_residual_streaming(
+            target_model,
+            target_base_sd,
+            source_base_model,
+            source_ft_model,
+            prepared,
+            pairing,
+            config=config,
+            device=device,
+        )
+    else:
+        target_corrections, diagnostics = fit_direct_residual(
+            target_model,
+            target_base_sd,
+            captured,
+            desired,
+            pairing,
+            config=config,
+            device=device,
+        )
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         fit_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1599,6 +1646,9 @@ def _run_direct_residual_fit(
     fit_timing = {
         "correction_fit_seconds": time.perf_counter() - fit_started,
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
+        "correction_fit_process_peak_host_rss_bytes": float(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        ),
     }
     if procrustes_diagnostics:
         for row in diagnostics:
