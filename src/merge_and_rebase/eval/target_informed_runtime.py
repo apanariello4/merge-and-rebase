@@ -433,7 +433,9 @@ def _component_weight_bias(shim, block, component):
     raise ValueError(f"Unsupported completion component {component!r}")
 
 
-def _assert_layerscale_identity(shim, block, *, context, requirement="component_target='output_local'"):
+def _assert_layerscale_identity(
+    shim, block, *, context, requirement="component_target='output_local'/'output_total'"
+):
     """Refuse a nontrivial LayerScale under output-target modes (and, via
     ``requirement``, under ``block_split='joint'``, which shares the same
     ``t_out=I`` assumption -- see ``_fit_block_boundary_joint``).
@@ -902,9 +904,10 @@ def capture_source_component_references(
     device,
     *,
     family_adapter=None,
+    capture_ft_inputs=False,
 ):
     """Capture source-base component input banks and both endpoints' weight
-    slices, for the ``component_target='output_local'`` fit.
+    slices, for the ``component_target='output_local'``/``'output_total'`` fit.
 
     Shared by any caller that needs component-specific (rather than block-
     boundary) targets -- currently Direct Residual
@@ -915,23 +918,46 @@ def capture_source_component_references(
     does not call this: Proposal 1 only ever fits ``component_target=
     'block_boundary'``.
 
-    Only the source **base** model's own inputs are captured: the
+    The source **base** model's own inputs are always captured: the
     ``output_local`` target is ``A(X^s0, W) - A(X^s0, W0)``, which never
-    evaluates either model on a fine-tuned input. ``source_batches`` must
-    already be the paired calibration source batches (e.g. from
-    ``paired_calibration``); this function runs no calibration pairing of its
-    own. Returns ``(source_component_inputs, source_component_weights)``,
-    both keyed by the entries of ``source_indices``.
+    evaluates either model on a fine-tuned input, and ``output_local``'s
+    Procrustes alignment (``A^{s0}`` vs the target's own ``A^{t0}``) is shared
+    unchanged by ``output_total``. ``source_batches`` must already be the
+    paired calibration source batches (e.g. from ``paired_calibration``);
+    this function runs no calibration pairing of its own.
+
+    ``capture_ft_inputs=True`` (``component_target='output_total'`` only)
+    additionally captures the source **fine-tuned** model's own component
+    inputs ``X^{s1}`` on the same ``source_batches`` -- needed because
+    ``output_total``'s target is ``A(X^{s1}, W^{ft}) - A(X^{s0}, W^{base})``,
+    which evaluates the fine-tuned endpoint on the fine-tuned model's own
+    (possibly upstream-drifted) input rather than reusing ``X^{s0}``. When
+    ``False`` (the default, ``output_local``'s case), no extra forward pass
+    runs and the third return value is ``{}``.
+
+    Returns ``(source_component_inputs, source_component_weights,
+    source_component_inputs_ft)``, all keyed by the entries of
+    ``source_indices``; ``source_component_inputs_ft`` is empty unless
+    ``capture_ft_inputs`` is set.
     """
     if family_adapter is not None:
-        raise NotImplementedError("component_target='output_local' is vision-only")
+        raise NotImplementedError("component_target='output_local'/'output_total' is vision-only")
     layout_shim = _layout_for(family_adapter)
     needed_kinds = sorted({COMPONENT_INPUT_KIND[c] for c in components})
     component_req = {f"{i}.{kind}": (i, kind) for i in source_indices for kind in needed_kinds}
     component_base = capture_tokens(source_base, source_batches, component_req, device, family_adapter=family_adapter)
-    source_component_inputs, source_component_weights = {}, {}
+    component_ft = None
+    if capture_ft_inputs:
+        component_ft = capture_tokens(source_ft, source_batches, component_req, device, family_adapter=family_adapter)
+    source_component_inputs, source_component_weights, source_component_inputs_ft = {}, {}, {}
     for i in source_indices:
-        source_component_inputs[i] = {kind: [t.clone() for t in component_base[f"{i}.{kind}"]] for kind in needed_kinds}
+        source_component_inputs[i] = {
+            kind: [t.clone() for t in component_base[f"{i}.{kind}"]] for kind in needed_kinds
+        }
+        if capture_ft_inputs:
+            source_component_inputs_ft[i] = {
+                kind: [t.clone() for t in component_ft[f"{i}.{kind}"]] for kind in needed_kinds
+            }
         base_block = layout_shim.blocks(source_base)[i]
         ft_block = layout_shim.blocks(source_ft)[i]
         _assert_layerscale_identity(layout_shim, base_block, context=f"source base block {i}")
@@ -947,7 +973,7 @@ def capture_source_component_references(
                 "ft_bias": None if ft_b is None else ft_b.detach().float().cpu().clone(),
             }
         source_component_weights[i] = weights
-    return source_component_inputs, source_component_weights
+    return source_component_inputs, source_component_weights, source_component_inputs_ft
 
 
 def projection_transforms(prepared, layout, *, target_scope="inserted", family_adapter=None):
@@ -2622,10 +2648,11 @@ def _fit_component_outputs_from_contributions(
     config,
     device,
     family_adapter=None,
+    source_component_inputs_ft: dict[int, dict[str, list[torch.Tensor]]] | None = None,
 ) -> dict[int, tuple[dict, list]]:
     """Fit every position's requested components against a per-component
     target built from one or more weighted source contributions
-    (``config.component_target == 'output_local'``).
+    (``config.component_target in {'output_local', 'output_total'}``).
 
     Unlike ``_fit_all_positions_independent`` -- where every requested
     component (``attn.out_proj`` and ``mlp.c_proj`` alike) is regressed onto
@@ -2639,14 +2666,28 @@ def _fit_component_outputs_from_contributions(
     (``1/m_i`` on extend/same_arch, ``1.0`` on shrink -- see the caller, e.g.
     ``direct_residual.position_source_contributions``, for how these weights
     are derived per direction). The
-    per-contribution term is
+    per-contribution term, for ``component_target='output_local'``, is
 
         Delta_A_{i,c} = X^{s0}_i (W_c^{s1,i} - W_c^{s0,i})^T + (b_c^{s1,i} - b_c^{s0,i})
                       = A_c(X^{s0}_i, W_c^{s1,i}) - A_c(X^{s0}_i, W_c^{s0,i}),
 
     i.e. only source block ``i``'s own weight change ("output_local": no
     upstream-induced input drift), evaluated on that block's own base input
-    ``X^{s0}_i`` for both endpoints. ``Q_{j,i,c}`` is that term's own centered
+    ``X^{s0}_i`` for both endpoints.
+
+    For ``component_target='output_total'`` (``source_component_inputs_ft``
+    not ``None``), the fine-tuned endpoint is instead evaluated on the source
+    FT model's OWN captured input ``X^{s1}_i`` (which may differ from
+    ``X^{s0}_i`` once any upstream block's weights have changed), so the term
+    becomes
+
+        Delta_A_{i,c} = A_c(X^{s1}_i, W_c^{s1,i}) - A_c(X^{s0}_i, W_c^{s0,i}),
+
+    i.e. component ``c``'s full realized output change, upstream drift
+    included. The alignment map ``Q_{j,i,c}`` (below) is unchanged between
+    the two modes: it is always fit from the BASE-input raw output
+    ``A_c^{s0}_i = X^{s0}_i (W_c^{s0,i})^T + b_c^{s0,i}``, never the FT one.
+    ``Q_{j,i,c}`` is that term's own centered
     rectangular Procrustes map, fitted from source block ``i``'s raw
     component output ``A_c^{s0}_i = X^{s0}_i (W_c^{s0,i})^T + b_c^{s0,i}`` onto
     the target's own pristine raw component output ``A_c^{t0}_j = H (W_c^{t,0,j})^T
@@ -2750,7 +2791,22 @@ def _fit_component_outputs_from_contributions(
                 base_w, base_b = weights["base_weight"], weights["base_bias"]
                 ft_w, ft_b = weights["ft_weight"], weights["ft_bias"]
                 a0_batches = [F.linear(x, base_w, base_b) for x in source_x_batches]
-                delta_batches = [F.linear(x, ft_w, ft_b) - F.linear(x, base_w, base_b) for x in source_x_batches]
+                if source_component_inputs_ft is not None:
+                    # output_total: evaluate the FT endpoint on the source FT
+                    # model's OWN captured input X^{s1}_i, not X^{s0}_i -- the
+                    # only way this term differs from output_local's.
+                    if source_idx not in source_component_inputs_ft:
+                        raise ValueError(f"Missing captured FT component references for source block {source_idx}")
+                    source_x_ft_batches = source_component_inputs_ft[source_idx][input_kind]
+                    ft_a_batches = [F.linear(x, ft_w, ft_b) for x in source_x_ft_batches]
+                    delta_batches = [
+                        ft_a - F.linear(x, base_w, base_b)
+                        for ft_a, x in zip(ft_a_batches, source_x_batches, strict=True)
+                    ]
+                else:
+                    delta_batches = [
+                        F.linear(x, ft_w, ft_b) - F.linear(x, base_w, base_b) for x in source_x_batches
+                    ]
                 aligned_a0 = _aligned(a0_batches, h_batches)
                 aligned_delta = _aligned(delta_batches, h_batches)
                 q, _mu_s, _mu_t = centered_rectangular_procrustes(

@@ -87,6 +87,7 @@ __all__ = [
     "fit_direct_residual",
     "measure_direct_residual_realization",
     "parse_direct_residual_config",
+    "position_paired_only_contributions",
     "position_source_contributions",
 ]
 from .target_residual_completion import (
@@ -115,6 +116,7 @@ def capture_paired_boundary_activations(
     procrustes_source: str = "activation",
     source_recipe=None,
     target_recipe=None,
+    capture_source_ft_component_inputs: bool = False,
 ) -> dict[str, Any]:
     """Capture native boundary activations for every position Direct Residual fits.
 
@@ -153,9 +155,10 @@ def capture_paired_boundary_activations(
     forward passes against the (possibly partially-corrected) target model
     during the solve without needing the original `target_loader` again.
 
-    ``component_inputs``, when non-empty (``component_target='output_local'``),
-    additionally captures every source block's own component input banks and
-    both endpoints' weight/bias slices for the named components, via
+    ``component_inputs``, when non-empty (``component_target in
+    {'output_local', 'output_total'}``), additionally captures every source
+    block's own component input banks and both endpoints' weight/bias slices
+    for the named components, via
     ``target_informed_runtime.capture_source_component_references``. Unlike
     the deduplicated ``distinct_source_indices`` above, this always spans
     ``range(pairing.source_depth)``: a shrink layout's span partition
@@ -164,6 +167,13 @@ def capture_paired_boundary_activations(
     references have to exist regardless of direction. When
     ``component_inputs=()`` (the default), this is a strict no-op -- the
     returned dict is unchanged from before this parameter existed.
+
+    ``capture_source_ft_component_inputs=True`` (``component_target=
+    'output_total'`` only) additionally captures the source FT model's own
+    component inputs ``X^{s1}`` for the same blocks/kinds, under
+    ``"source_component_inputs_ft"``. It is a no-op unless ``component_inputs``
+    is also non-empty, and the default (``False``) reproduces
+    ``output_local``'s capture set exactly.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -200,17 +210,22 @@ def capture_paired_boundary_activations(
         "calibration": metadata,
     }
     if component_inputs:
-        source_component_inputs, source_component_weights = capture_source_component_references(
-            source_base_model,
-            source_ft_model,
-            source_batches,
-            list(range(pairing.source_depth)),
-            component_inputs,
-            device,
-            family_adapter=family_adapter,
+        source_component_inputs, source_component_weights, source_component_inputs_ft = (
+            capture_source_component_references(
+                source_base_model,
+                source_ft_model,
+                source_batches,
+                list(range(pairing.source_depth)),
+                component_inputs,
+                device,
+                family_adapter=family_adapter,
+                capture_ft_inputs=capture_source_ft_component_inputs,
+            )
         )
         result["source_component_inputs"] = source_component_inputs
         result["source_component_weights"] = source_component_weights
+        if capture_source_ft_component_inputs:
+            result["source_component_inputs_ft"] = source_component_inputs_ft
     if procrustes_source == "gradient":
         source_grad_requests = {str(i): i for i in distinct_source_indices}
         target_grad_requests = {str(j): j for j in range(pairing.target_depth)}
@@ -269,8 +284,22 @@ class DirectResidualConfig:
     #                       ``target_informed_runtime._fit_component_outputs_
     #                       from_contributions`` for the fit itself. Requires
     #                       LayerScale to be nn.Identity, asserted at fit time.
-    #                       Only this mode allows internal components
-    #                       (q/k/v/c_fc) in ``components``.
+    #   "output_total"    -- component-specific target using each contributing
+    #                       source block's FULL output change between its
+    #                       fine-tuned and base endpoints, i.e.
+    #                       A_c(X^{s1}_i, W^{ft}_i) - A_c(X^{s0}_i, W^{base}_i)
+    #                       -- upstream-propagated input drift included, unlike
+    #                       "output_local". Depth rule is deliberately matched
+    #                       to "block_boundary" (every position uses only its
+    #                       own paired source block, at weight 1.0), NOT to
+    #                       "output_local"'s span/multiplicity-aware rule, so
+    #                       that component_target is the only factor varied
+    #                       against "block_boundary". See
+    #                       ``position_paired_only_contributions``. Requires
+    #                       LayerScale to be nn.Identity, same as
+    #                       "output_local".
+    #   Both "output_local" and "output_total" allow internal components
+    #   (q/k/v/c_fc) in ``components``; "block_boundary" does not.
     component_target: str = "block_boundary"
     # Analysis-only. Never read by any fit; only adds diagnostic fields to the
     # per-component rows. False reproduces the exact historical row schema.
@@ -429,8 +458,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("strength must be >= 0")
     if not isinstance(cfg.exact_form, bool):
         raise TypeError("exact_form must be bool")
-    if cfg.component_target not in {"block_boundary", "output_local"}:
-        raise ValueError("component_target must be 'block_boundary' or 'output_local'")
+    if cfg.component_target not in {"block_boundary", "output_local", "output_total"}:
+        raise ValueError("component_target must be 'block_boundary', 'output_local' or 'output_total'")
     if not isinstance(cfg.realization_diagnostics, bool):
         raise TypeError("realization_diagnostics must be bool")
     output_mode = cfg.component_target != "block_boundary"
@@ -814,6 +843,29 @@ def position_source_contributions(pairing: DiscreteLayerPairing) -> dict[int, li
     return contributions
 
 
+def position_paired_only_contributions(pairing: DiscreteLayerPairing) -> dict[int, list[tuple[int, float]]]:
+    """Per-target-position weighted source contributions for
+    ``component_target='output_total'``.
+
+    Deliberately different from ``position_source_contributions``
+    (``output_local``'s span/multiplicity-aware rule): every position ``j``
+    gets exactly one contribution, its own paired source block
+    ``pairing.pairing[j]``, at weight 1.0 -- for every direction (extend,
+    shrink, same_arch) and every component, matching ``block_boundary``'s own
+    depth handling, where each position is fit against its paired block's
+    full ``D_j`` alone. This is intentional, not an oversight:
+    ``output_total``'s target already carries the block's full realized
+    effect (including any upstream-propagated input drift, via ``X^{s1}``),
+    so there is no local/global split left to represent through fractional
+    weights or multi-source spans the way ``output_local``'s purely local
+    target needs. Keeping this the ONLY behavioural difference from
+    ``block_boundary``'s depth rule isolates ``component_target`` as the sole
+    varied factor between a ``block_boundary`` and an ``output_total``
+    ablation at the same pairing.
+    """
+    return {j: [(pairing.pairing[j], 1.0)] for j in range(pairing.target_depth)}
+
+
 @torch.no_grad()
 def fit_direct_residual(
     target_model,
@@ -879,7 +931,7 @@ def fit_direct_residual(
             if j not in target_outputs_by_position:
                 raise ValueError(f"Captured target reference is missing for position {j}")
         source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
-        if config.component_target == "output_local":
+        if config.component_target in ("output_local", "output_total"):
             # Every component gets its own per-component, per-contribution
             # target -- not the shared block-boundary D_j the branch below
             # fits against -- so this is a genuinely different solve, not a
@@ -888,17 +940,31 @@ def fit_direct_residual(
             source_component_weights = captured.get("source_component_weights")
             if source_component_inputs is None or source_component_weights is None:
                 raise ValueError(
-                    "component_target='output_local' requires 'source_component_inputs' and "
-                    "'source_component_weights' in captured; call "
+                    f"component_target={config.component_target!r} requires 'source_component_inputs' "
+                    "and 'source_component_weights' in captured; call "
                     "capture_paired_boundary_activations with component_inputs set to the "
                     "requested components"
                 )
+            source_component_inputs_ft = None
+            if config.component_target == "output_total":
+                source_component_inputs_ft = captured.get("source_component_inputs_ft")
+                if source_component_inputs_ft is None:
+                    raise ValueError(
+                        "component_target='output_total' requires 'source_component_inputs_ft' in "
+                        "captured; call capture_paired_boundary_activations with component_inputs set "
+                        "and capture_source_ft_component_inputs=True"
+                    )
             paired_source_index = {j: pairing.pairing[j] for j in positions}
+            contributions = (
+                position_paired_only_contributions(pairing)
+                if config.component_target == "output_total"
+                else position_source_contributions(pairing)
+            )
             fitted = _fit_component_outputs_from_contributions(
                 target_model,
                 current_state,
                 positions,
-                position_source_contributions(pairing),
+                contributions,
                 paired_source_index,
                 source_component_inputs,
                 source_component_weights,
@@ -907,6 +973,7 @@ def fit_direct_residual(
                 solver_config,
                 device,
                 family_adapter=family_adapter,
+                source_component_inputs_ft=source_component_inputs_ft,
             )
         elif config.block_split == "backfit":
             fitted = _fit_block_boundary_backfit(

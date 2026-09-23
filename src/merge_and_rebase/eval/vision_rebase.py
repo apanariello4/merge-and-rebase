@@ -1543,6 +1543,7 @@ def _run_direct_residual_fit(
         procrustes_source=config.procrustes_source,
         source_recipe=source_recipe,
         target_recipe=target_recipe,
+        capture_source_ft_component_inputs=config.component_target == "output_total",
     )
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
     desired = compute_desired_effects(

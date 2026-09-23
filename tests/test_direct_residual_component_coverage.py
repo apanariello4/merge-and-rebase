@@ -260,9 +260,17 @@ def test_all_six_component_sets_parse_in_output_local(components):
     assert order_components(cfg.components) == tuple(c for c in _ALL_SIX if c in components)
 
 
-def test_output_total_is_rejected():
-    with pytest.raises(ValueError, match="component_target"):
-        parse_direct_residual_config({"component_target": "output_total"})
+@pytest.mark.parametrize("components", _SIX_ARMS)
+def test_all_six_component_sets_parse_in_output_total(components):
+    cfg = parse_direct_residual_config(
+        {"component_target": "output_total", "components": list(components)}
+    )
+    assert order_components(cfg.components) == tuple(c for c in _ALL_SIX if c in components)
+
+
+def test_output_total_rejects_block_split_backfit():
+    with pytest.raises(ValueError, match="block_split='backfit' requires component_target"):
+        parse_direct_residual_config({"component_target": "output_total", "block_split": "backfit"})
 
 
 def test_internal_components_rejected_for_block_boundary():
