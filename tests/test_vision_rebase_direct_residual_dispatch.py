@@ -186,7 +186,7 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
     config = DirectResidualConfig(num_batches=3, ridge_relative=0.05, strength=1.0)
 
-    delta, timing, diagnostics = _run_direct_residual_fit(
+    delta, timing, diagnostics, extra = _run_direct_residual_fit(
         source_base_model=source_base,
         source_ft_model=source_ft,
         target_model=target_base,
@@ -200,6 +200,8 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
 
     assert delta  # nonzero strength -> a nonempty correction dict
     assert all(key.endswith(("c_proj.weight", "c_proj.bias", "out_proj.weight", "out_proj.bias")) for key in delta)
+    # realization_diagnostics defaults to False: both extras absent.
+    assert extra == {"realization_by_position": None, "task_vector_stats": None}
     assert set(timing) == {"alignment_calibration", "correction_fit"}
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
@@ -226,7 +228,7 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
     config = DirectResidualConfig(num_batches=3, ridge_relative=0.05, strength=0.0)
 
-    delta, _timing, _diagnostics = _run_direct_residual_fit(
+    delta, _timing, _diagnostics, extra = _run_direct_residual_fit(
         source_base_model=source_base,
         source_ft_model=source_ft,
         target_model=target_base,
@@ -239,3 +241,48 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     )
 
     assert delta == {}
+    assert extra == {"realization_by_position": None, "task_vector_stats": None}
+
+
+def test_run_direct_residual_fit_realization_diagnostics_populates_extra():
+    """Wiring check: realization_diagnostics=True reaches _run_direct_residual_fit's
+    returned ``extra`` with both new artifacts populated per position, and the
+    live target model is left bit-identical to its entry state afterward."""
+    torch.manual_seed(31)
+    source_base = _Model(5, 2).eval()
+    source_ft = _tuned_copy(source_base, seed=32)
+    target_base = _Model(5, 4).eval()
+    data = _loader(seed=33)
+    pairing = DiscreteLayerPairing.compute(source_depth=2, target_depth=4)
+    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
+    config = DirectResidualConfig(
+        num_batches=3, ridge_relative=0.05, strength=1.0, realization_diagnostics=True,
+    )
+    before = {k: v.clone() for k, v in target_base.state_dict().items()}
+
+    _delta, _timing, _diagnostics, extra = _run_direct_residual_fit(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        target_model=target_base,
+        target_base_sd=target_base_sd,
+        source_loader=data,
+        target_loader=data,
+        pairing=pairing,
+        config=config,
+        device="cpu",
+    )
+
+    realization = extra["realization_by_position"]
+    stats = extra["task_vector_stats"]
+    assert set(realization) == set(range(pairing.target_depth))
+    for row in realization.values():
+        assert row["component_interaction_error"] is not None  # two families requested
+        for key in ("block_realized_target_error", "joint_delta_norm_over_desired"):
+            assert torch.isfinite(torch.tensor(float(row[key])))
+    assert set(stats) == {
+        "n_modified_tensors", "n_modified_parameters", "tau_norm",
+        "tau_norm_over_touched_base", "tau_norm_over_all_base", "tau_sha256",
+    }
+    assert stats["n_modified_parameters"] > 0
+    for key, value in before.items():
+        assert torch.equal(dict(target_base.state_dict())[key], value)

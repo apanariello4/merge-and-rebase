@@ -51,15 +51,42 @@ from typing import Any
 
 import torch
 
-from ..rebase.discrete_layer_match import DiscreteLayerPairing
+from ..rebase.discrete_layer_match import DiscreteLayerPairing, discrete_layer_pairing
 from .target_informed_runtime import (
     _aligned,
     _fit_all_positions_independent,
+    _fit_block_boundary_backfit,
+    _fit_component_outputs_from_contributions,
     _rows,
+    capture_source_component_references,
     capture_tokens,
+    # Re-exported for callers that assemble Direct Residual's realization
+    # diagnostics (vision_rebase.py's _run_direct_residual_fit) and for
+    # tests: both are standalone, post-hoc analyses over an already-fitted,
+    # unit-strength task vector, gated entirely on
+    # DirectResidualConfig.realization_diagnostics, and neither is called by
+    # fit_direct_residual itself (its own 2-tuple return is unchanged).
+    compute_direct_residual_task_vector_stats,
+    measure_direct_residual_realization,
     paired_calibration,
 )
-from .target_residual_completion import centered_rectangular_procrustes, order_components
+
+__all__ = [
+    "DirectResidualConfig",
+    "capture_paired_boundary_activations",
+    "compute_desired_effects",
+    "compute_direct_residual_task_vector_stats",
+    "fit_direct_residual",
+    "measure_direct_residual_realization",
+    "parse_direct_residual_config",
+    "position_source_contributions",
+]
+from .target_residual_completion import (
+    COMPONENT_FORWARD_ORDER,
+    INTERNAL_COMPONENTS,
+    centered_rectangular_procrustes,
+    order_components,
+)
 
 Tensor = torch.Tensor
 
@@ -76,6 +103,7 @@ def capture_paired_boundary_activations(
     seed: int | None,
     device,
     family_adapter=None,
+    component_inputs: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Capture native boundary activations for every position Direct Residual fits.
 
@@ -98,6 +126,18 @@ def capture_paired_boundary_activations(
     batches (under ``"target_batches"``) so `fit_direct_residual` can re-run
     forward passes against the (possibly partially-corrected) target model
     during the solve without needing the original `target_loader` again.
+
+    ``component_inputs``, when non-empty (``component_target='output_local'``),
+    additionally captures every source block's own component input banks and
+    both endpoints' weight/bias slices for the named components, via
+    ``target_informed_runtime.capture_source_component_references``. Unlike
+    the deduplicated ``distinct_source_indices`` above, this always spans
+    ``range(pairing.source_depth)``: a shrink layout's span partition
+    (``position_source_contributions``) can reference source blocks that are
+    not any position's *closest* pairing match, so every source block's
+    references have to exist regardless of direction. When
+    ``component_inputs=()`` (the default), this is a strict no-op -- the
+    returned dict is unchanged from before this parameter existed.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -122,13 +162,26 @@ def capture_paired_boundary_activations(
     target_raw = capture_tokens(
         target_base_model, target_batches, target_requests, device, family_adapter=family_adapter
     )
-    return {
+    result = {
         "source_base_outputs": {int(k): v for k, v in source_base_raw.items()},
         "source_ft_outputs": {int(k): v for k, v in source_ft_raw.items()},
         "target_base_outputs_by_position": {int(k): v for k, v in target_raw.items()},
         "target_batches": target_batches,
         "calibration": metadata,
     }
+    if component_inputs:
+        source_component_inputs, source_component_weights = capture_source_component_references(
+            source_base_model,
+            source_ft_model,
+            source_batches,
+            list(range(pairing.source_depth)),
+            component_inputs,
+            device,
+            family_adapter=family_adapter,
+        )
+        result["source_component_inputs"] = source_component_inputs
+        result["source_component_weights"] = source_component_weights
+    return result
 
 
 @dataclass(frozen=True)
@@ -160,6 +213,43 @@ class DirectResidualConfig:
     # merge-once orchestration lives entirely in the caller (vision_rebase.py).
     merge_mode: str = "per_task_then_merge"
     seed: int = 89
+    # Which target each component's fit is asked to reproduce.
+    #   "block_boundary" -- the historical, default behaviour: every requested
+    #                       component (out_proj and c_proj alike) is fit
+    #                       against the SAME block-boundary target D_j.
+    #                       Bit-identical to pre-ablation code, golden-hash
+    #                       pinned (see tests/test_direct_residual_component_
+    #                       coverage.py).
+    #   "output_local"   -- component-specific target using only each
+    #                       contributing source block's own (local) weight
+    #                       change; see ``position_source_contributions`` for
+    #                       how contributions and their weights are derived
+    #                       per direction (extend/shrink/same_arch), and
+    #                       ``target_informed_runtime._fit_component_outputs_
+    #                       from_contributions`` for the fit itself. Requires
+    #                       LayerScale to be nn.Identity, asserted at fit time.
+    #                       Only this mode allows internal components
+    #                       (q/k/v/c_fc) in ``components``.
+    component_target: str = "block_boundary"
+    # Analysis-only. Never read by any fit; only adds diagnostic fields to the
+    # per-component rows. False reproduces the exact historical row schema.
+    realization_diagnostics: bool = False
+    # Only valid with component_target="block_boundary" and components subset
+    # of {"attn.out_proj", "mlp.c_proj"}.
+    #   "none"    -- historical behaviour: every requested component is fit
+    #                independently against the SAME block-boundary target D_j
+    #                (golden-hash pinned).
+    #   "backfit" -- intra-block Gauss-Seidel: each component is refit against
+    #                the residual left over once every OTHER component's
+    #                current fit is mounted on a local (never the live target
+    #                model) copy of the block and replayed on the pristine
+    #                captured block input X_j^0. See
+    #                target_informed_runtime._fit_block_boundary_backfit.
+    block_split: str = "none"
+    backfit_max_iters: int = 20
+    # Stop when the change in ||E||/||D_j|| between consecutive sweeps drops
+    # below this.
+    backfit_tol: float = 1e-4
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -188,6 +278,11 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "missing_bias",
         "merge_mode",
         "seed",
+        "component_target",
+        "realization_diagnostics",
+        "block_split",
+        "backfit_max_iters",
+        "backfit_tol",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -214,6 +309,11 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("strength must be >= 0")
     if not isinstance(cfg.exact_form, bool):
         raise TypeError("exact_form must be bool")
+    if cfg.component_target not in {"block_boundary", "output_local"}:
+        raise ValueError("component_target must be 'block_boundary' or 'output_local'")
+    if not isinstance(cfg.realization_diagnostics, bool):
+        raise TypeError("realization_diagnostics must be bool")
+    output_mode = cfg.component_target != "block_boundary"
     components = cfg.components
     if isinstance(components, str) or not isinstance(components, (list, tuple)):
         raise ValueError("components must be a list of projection names")
@@ -222,13 +322,27 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("components must not be empty")
     if len(set(components)) != len(components):
         raise ValueError("components must not repeat a projection")
-    from .target_residual_completion import COMPONENT_FORWARD_ORDER
-
-    unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
-    if unsupported:
-        raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}")
-    if "mlp.c_proj" not in components:
-        raise ValueError("components must contain 'mlp.c_proj'")
+    if output_mode:
+        all_names = frozenset(COMPONENT_FORWARD_ORDER) | frozenset(INTERNAL_COMPONENTS)
+        unsupported = set(components) - all_names
+        if unsupported:
+            raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(all_names)}")
+        # Every requested component fits its own component-specific target, so
+        # there is no "unanchored" fit the way a dangling out_proj-only
+        # block_boundary fit would be; any non-empty, repeat-free subset of
+        # the six names (CANONICAL_COMPONENT_ORDER) is legal.
+    else:
+        unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
+        if unsupported:
+            raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}")
+        # Unlike target_residual_completion.parse_residual_completion_config
+        # (P1), which requires 'mlp.c_proj' to anchor the sequential cascade,
+        # Direct Residual never cascades -- every position is independently
+        # fit against the pristine target base (see the module docstring) --
+        # so there is no "unanchored" out_proj-only fit the way there would
+        # be for a cascaded completion. Any non-empty, repeat-free subset of
+        # COMPONENT_FORWARD_ORDER is legal here, including {'attn.out_proj'}
+        # alone (DT-O).
     if cfg.cascade_order not in {"independent", "bottom_top", "top_bottom"}:
         raise ValueError("cascade_order must be 'independent', 'bottom_top' or 'top_bottom'")
     if cfg.missing_bias not in {"error", "materialize", "skip"}:
@@ -243,6 +357,24 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("merge_mode must be 'per_task_then_merge' or 'merge_in_source_then_fit'")
     if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
         raise ValueError("seed must be an integer")
+    if cfg.block_split not in {"none", "backfit"}:
+        raise ValueError("block_split must be 'none' or 'backfit'")
+    if cfg.block_split == "backfit":
+        if cfg.component_target != "block_boundary":
+            raise ValueError("block_split='backfit' requires component_target='block_boundary'")
+        if set(components) - set(COMPONENT_FORWARD_ORDER):
+            raise ValueError(
+                "block_split='backfit' only supports residual-writing components "
+                f"{sorted(COMPONENT_FORWARD_ORDER)}"
+            )
+    if isinstance(cfg.backfit_max_iters, bool) or not isinstance(cfg.backfit_max_iters, int):
+        raise ValueError("backfit_max_iters must be an integer")
+    if cfg.backfit_max_iters <= 0:
+        raise ValueError("backfit_max_iters must be positive")
+    if isinstance(cfg.backfit_tol, bool) or not isinstance(cfg.backfit_tol, (int, float)):
+        raise ValueError("backfit_tol must be a finite real number")
+    if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
+        raise ValueError("backfit_tol must be finite and > 0")
     return cfg
 
 
@@ -278,6 +410,78 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
         q = q.float()
         desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
     return desired
+
+
+def position_source_contributions(pairing: DiscreteLayerPairing) -> dict[int, list[tuple[int, float]]]:
+    """Per-target-position weighted source contributions for
+    ``component_target='output_local'``'s residual-writing components.
+
+    The rule is span-aware and derived purely from ``pairing`` (never
+    assumed), so it is the same code for extend, shrink and same-arch:
+
+    * **Extend / same-arch** (``target_depth >= source_depth``): let
+      ``m_i = #{j : pairing.pairing[j] == i}`` be how many target positions
+      the discrete pairing sends to source block ``i``. Position ``j``'s only
+      contribution is its own paired source block, at weight ``1/m_{i(j)}``:
+      the source block's one true effect is split evenly across however many
+      target positions realize it, mirroring BRACE's spread/duplicate
+      insertion semantics (``m=1`` -- e.g. every position of a same-arch
+      pairing -- is the plain, unweighted single-block case).
+    * **Shrink** (``source_depth > target_depth``): partition every source
+      block into spans ``S_j = {i : round(i*(target_depth-1)/(source_depth-1))
+      == j}`` -- the mirror-image discrete pairing, from source depth down to
+      target depth. Position ``j``'s contributions are every source block in
+      its span, each at full weight 1.0: a shrunk target position absorbs the
+      whole local effect of every source block that collapsed into it, and
+      ``fit_direct_residual`` sums their (individually Procrustes-aligned)
+      terms.
+
+    Internal components (q/k/v/c_fc) use only the paired block
+    ``pairing.pairing[j]``, but at the same weight that block carries in
+    THIS function's own output for the position (``1/m_i`` on
+    extend/same_arch, ``1.0`` on shrink) -- see
+    ``_fit_component_outputs_from_contributions``, which looks up that
+    weight from this function's return value rather than hardcoding 1.0.
+
+    Raises ``AssertionError`` if the shrink partition does not cover every
+    source block exactly once, or if the forward-pairing's own choice of
+    source block for position ``j`` is not a member of ``j``'s span -- both
+    would indicate the forward/reverse discrete formulas disagree, which
+    should not happen for well-behaved depth pairs and is a bug to surface
+    loudly rather than silently misattribute contributions.
+    """
+    source_depth, target_depth = pairing.source_depth, pairing.target_depth
+    contributions: dict[int, list[tuple[int, float]]] = {j: [] for j in range(target_depth)}
+    if target_depth >= source_depth:
+        counts: dict[int, int] = {}
+        for i in pairing.pairing:
+            counts[i] = counts.get(i, 0) + 1
+        for j in range(target_depth):
+            i = pairing.pairing[j]
+            contributions[j] = [(i, 1.0 / counts[i])]
+        return contributions
+    # Shrink: source_depth > target_depth. Partition every source block by the
+    # mirror-image discrete pairing (source depth playing the "target depth"
+    # role, target depth playing the "source depth" role).
+    reverse = discrete_layer_pairing(target_depth, source_depth)
+    spans: dict[int, list[int]] = {j: [] for j in range(target_depth)}
+    for source_idx, j in enumerate(reverse):
+        spans[j].append(source_idx)
+    covered = sorted(idx for span in spans.values() for idx in span)
+    if covered != list(range(source_depth)):
+        raise AssertionError(
+            "Shrink span partition does not cover every source block exactly once: "
+            f"covered={covered}, expected={list(range(source_depth))}"
+        )
+    for j in range(target_depth):
+        paired = pairing.pairing[j]
+        if paired not in spans[j]:
+            raise AssertionError(
+                f"Forward pairing's source block for position {j} ({paired}) is not a member "
+                f"of its own shrink span {spans[j]}; forward/reverse discrete pairings disagree"
+            )
+        contributions[j] = [(i, 1.0) for i in sorted(spans[j])]
+    return contributions
 
 
 @torch.no_grad()
@@ -345,23 +549,67 @@ def fit_direct_residual(
             if j not in target_outputs_by_position:
                 raise ValueError(f"Captured target reference is missing for position {j}")
         source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
-        # Every position is guaranteed pristine here (nothing is ever mounted
-        # between fits, cross-position or intra-position), so all of them
-        # share one target forward sweep instead of one per position -- see
-        # _fit_all_positions_independent's docstring.
-        fitted = _fit_all_positions_independent(
-            target_model,
-            current_state,
-            positions,
-            source_coordinates,
-            desired,
-            target_outputs_by_position,
-            batches,
-            components,
-            solver_config,
-            device,
-            family_adapter=family_adapter,
-        )
+        if config.component_target == "output_local":
+            # Every component gets its own per-component, per-contribution
+            # target -- not the shared block-boundary D_j the branch below
+            # fits against -- so this is a genuinely different solve, not a
+            # reuse of _fit_all_positions_independent.
+            source_component_inputs = captured.get("source_component_inputs")
+            source_component_weights = captured.get("source_component_weights")
+            if source_component_inputs is None or source_component_weights is None:
+                raise ValueError(
+                    "component_target='output_local' requires 'source_component_inputs' and "
+                    "'source_component_weights' in captured; call "
+                    "capture_paired_boundary_activations with component_inputs set to the "
+                    "requested components"
+                )
+            paired_source_index = {j: pairing.pairing[j] for j in positions}
+            fitted = _fit_component_outputs_from_contributions(
+                target_model,
+                current_state,
+                positions,
+                position_source_contributions(pairing),
+                paired_source_index,
+                source_component_inputs,
+                source_component_weights,
+                batches,
+                components,
+                solver_config,
+                device,
+                family_adapter=family_adapter,
+            )
+        elif config.block_split == "backfit":
+            fitted = _fit_block_boundary_backfit(
+                target_model,
+                current_state,
+                positions,
+                source_coordinates,
+                desired,
+                target_outputs_by_position,
+                batches,
+                components,
+                solver_config,
+                device,
+                family_adapter=family_adapter,
+            )
+        else:
+            # Every position is guaranteed pristine here (nothing is ever
+            # mounted between fits, cross-position or intra-position), so all
+            # of them share one target forward sweep instead of one per
+            # position -- see _fit_all_positions_independent's docstring.
+            fitted = _fit_all_positions_independent(
+                target_model,
+                current_state,
+                positions,
+                source_coordinates,
+                desired,
+                target_outputs_by_position,
+                batches,
+                components,
+                solver_config,
+                device,
+                family_adapter=family_adapter,
+            )
         for j in positions:
             position_corrections, block_rows = fitted[j]
             target_corrections.update(position_corrections)

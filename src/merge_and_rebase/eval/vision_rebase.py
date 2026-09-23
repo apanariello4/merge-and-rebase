@@ -88,12 +88,15 @@ from .target_informed_runtime import (
     complete_joint_blockwise,
     complete_residuals,
     complete_residuals_direct,
+    compute_direct_residual_task_vector_stats,
+    measure_direct_residual_realization,
     projection_transforms,
     scale_completion,
 )
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
+    order_components,
     validate_residual_completion_depth_direction,
 )
 
@@ -1449,13 +1452,24 @@ def _run_direct_residual_fit(
     the empty ``transported_delta={}`` (there is no transport step to have
     populated it).
 
-    Returns ``(scaled_delta, timing, diagnostics)`` where ``timing`` has
+    Returns ``(scaled_delta, timing, diagnostics, extra)`` where ``timing`` has
     ``"alignment_calibration"``/``"correction_fit"`` sub-dicts, each shaped
-    like a ``transport_timings[task]`` entry.
+    like a ``transport_timings[task]`` entry, and ``extra`` is
+    ``{"realization_by_position": ..., "task_vector_stats": ...}``, both
+    ``None`` unless ``config.realization_diagnostics`` is set. Both are
+    computed from the unscaled, unit-strength ``target_corrections``
+    ``fit_direct_residual`` returns -- i.e. before ``strength`` is applied --
+    matching the plan's "AFTER the task vector tau (unit strength, as returned
+    by the fit) is assembled" requirement. Neither call mutates
+    ``target_model``'s entry state (both restore it internally and assert so
+    via a state-dict hash).
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     alignment_started = time.perf_counter()
+    component_inputs = (
+        order_components(config.components) if config.component_target != "block_boundary" else ()
+    )
     captured = capture_paired_boundary_activations(
         source_base_model,
         source_ft_model,
@@ -1466,6 +1480,7 @@ def _run_direct_residual_fit(
         num_batches=config.num_batches,
         seed=config.seed,
         device=device,
+        component_inputs=component_inputs,
     )
     desired = compute_desired_effects(captured, pairing)
     if torch.cuda.is_available() and device != "cpu":
@@ -1500,11 +1515,44 @@ def _run_direct_residual_fit(
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
     }
 
+    realization_by_position = None
+    task_vector_stats = None
+    if bool(config.realization_diagnostics):
+        positions = list(range(pairing.target_depth))
+        # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed
+        # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
+        # presence check keyed only off "is this key in target_corrections"
+        # cannot tell which of q/k/v were actually fit -- e.g. a v-only
+        # output_local run's in_proj_weight key exists in target_corrections
+        # with only its v-rows nonzero, and checking q/k against that same
+        # key would falsely report them "present" too. Passing exactly
+        # order_components(config.components) sidesteps this: only names the
+        # caller actually asked to fit are ever checked.
+        fitted_components = order_components(config.components)
+        realization_by_position = measure_direct_residual_realization(
+            target_model,
+            target_base_sd,
+            target_corrections,
+            positions,
+            captured["target_batches"],
+            captured["target_base_outputs_by_position"],
+            desired,
+            device=device,
+            components=fitted_components,
+        )
+        task_vector_stats = compute_direct_residual_task_vector_stats(
+            target_corrections,
+            target_base_sd,
+            positions,
+            components=fitted_components,
+        )
+
     strength = float(config.strength)
     scaled_delta = (
         {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
     )
-    return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics
+    extra = {"realization_by_position": realization_by_position, "task_vector_stats": task_vector_stats}
+    return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
 
 def main() -> None:
@@ -2101,6 +2149,8 @@ def main() -> None:
         joint_blockwise_diagnostics: dict[str, list[dict[str, Any]]] = {}
         direct_p1_diagnostics: dict[str, list[dict[str, Any]]] = {}
         direct_residual_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        direct_residual_realization: dict[str, dict[int, dict[str, Any]]] = {}
+        direct_residual_task_vector_stats: dict[str, dict[str, Any]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -2250,21 +2300,26 @@ def main() -> None:
             # used elsewhere in this function when no dedicated loader is set.
             merged_calibration_task_ctx = task_context_by_name[merge_in_source_tasks[0]]
             direct_residual_pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
-            direct_residual_merged_correction, direct_residual_merged_timing, direct_residual_merged_diag = (
-                _run_direct_residual_fit(
-                    source_base_model=source_base_model_merged,
-                    source_ft_model=source_ft_model_merged,
-                    target_model=clf_target.model,
-                    target_base_sd=target_base_sd,
-                    source_loader=merged_calibration_task_ctx.source_loaders.train,
-                    target_loader=merged_calibration_task_ctx.loaders.train,
-                    pairing=direct_residual_pairing,
-                    config=direct_residual_cfg,
-                    device=device,
-                )
+            (
+                direct_residual_merged_correction,
+                direct_residual_merged_timing,
+                direct_residual_merged_diag,
+                direct_residual_merged_extra,
+            ) = _run_direct_residual_fit(
+                source_base_model=source_base_model_merged,
+                source_ft_model=source_ft_model_merged,
+                target_model=clf_target.model,
+                target_base_sd=target_base_sd,
+                source_loader=merged_calibration_task_ctx.source_loaders.train,
+                target_loader=merged_calibration_task_ctx.loaders.train,
+                pairing=direct_residual_pairing,
+                config=direct_residual_cfg,
+                device=device,
             )
             for t in merge_in_source_tasks:
                 direct_residual_diagnostics[t] = direct_residual_merged_diag
+                direct_residual_realization[t] = direct_residual_merged_extra["realization_by_position"]
+                direct_residual_task_vector_stats[t] = direct_residual_merged_extra["task_vector_stats"]
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -2864,7 +2919,12 @@ def main() -> None:
                             test_loader=loaders.test,
                             val_loader=loaders.val,
                         )
-                        transported_delta, direct_residual_timing, task_direct_residual_diag = _run_direct_residual_fit(
+                        (
+                            transported_delta,
+                            direct_residual_timing,
+                            task_direct_residual_diag,
+                            task_direct_residual_extra,
+                        ) = _run_direct_residual_fit(
                             source_base_model=source_base_model_native,
                             source_ft_model=source_ft_model_native,
                             target_model=clf_target.model,
@@ -2878,6 +2938,8 @@ def main() -> None:
                         alignment_calibration_timings[task] = direct_residual_timing["alignment_calibration"]
                         correction_fit_timings[task] = direct_residual_timing["correction_fit"]
                         direct_residual_diagnostics[task] = task_direct_residual_diag
+                        direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
+                        direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -4031,6 +4093,12 @@ def main() -> None:
                 {
                     "config": asdict(direct_residual_cfg),
                     "diagnostics_by_task": direct_residual_diagnostics,
+                    # Additive, analysis-only: both are None per task unless
+                    # direct_residual_cfg.realization_diagnostics is set (see
+                    # _run_direct_residual_fit / measure_direct_residual_realization
+                    # / compute_direct_residual_task_vector_stats).
+                    "realization_by_task": direct_residual_realization,
+                    "task_vector_stats_by_task": direct_residual_task_vector_stats,
                 }
                 if direct_residual_like
                 else None
