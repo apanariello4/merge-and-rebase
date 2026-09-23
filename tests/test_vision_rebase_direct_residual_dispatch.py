@@ -201,7 +201,7 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     assert delta  # nonzero strength -> a nonempty correction dict
     assert all(key.endswith(("c_proj.weight", "c_proj.bias", "out_proj.weight", "out_proj.bias")) for key in delta)
     # realization_diagnostics defaults to False: both extras absent.
-    assert extra == {"realization_by_position": None, "task_vector_stats": None}
+    assert extra == {"realization_by_position": None, "task_vector_stats": None, "tv_scaling": None}
     assert set(timing) == {"alignment_calibration", "correction_fit"}
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
@@ -241,7 +241,7 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     )
 
     assert delta == {}
-    assert extra == {"realization_by_position": None, "task_vector_stats": None}
+    assert extra == {"realization_by_position": None, "task_vector_stats": None, "tv_scaling": None}
 
 
 def test_run_direct_residual_fit_realization_diagnostics_populates_extra():

@@ -74,6 +74,7 @@ from .block_extension import (
 from .datasets.vision8_14_20 import SUITES
 from .direct_residual import (
     DirectResidualConfig,
+    apply_tv_scaling,
     capture_paired_boundary_activations,
     compute_desired_effects,
     fit_direct_residual,
@@ -1579,6 +1580,25 @@ def _run_direct_residual_fit(
             if extra:
                 row.update(extra)
 
+    tv_scaling_diagnostics = None
+    if config.tv_scaling != "none":
+        # Label-free, applied AFTER the unit-strength tau is assembled but
+        # BEFORE the caller's per-task alpha-search (and therefore before the
+        # realization_diagnostics/task_vector_stats block below, so both
+        # report the FINAL tau that alpha-search actually sees). tv_scaling
+        # defaults to "none" (a strict no-op, see apply_tv_scaling), so this
+        # branch never executes for the historical, golden-hash-pinned path.
+        target_corrections, tv_scaling_diagnostics = apply_tv_scaling(
+            target_model,
+            target_base_sd,
+            target_corrections,
+            list(range(pairing.target_depth)),
+            captured,
+            desired,
+            config=config,
+            device=device,
+        )
+
     realization_by_position = None
     task_vector_stats = None
     if bool(config.realization_diagnostics):
@@ -1615,7 +1635,11 @@ def _run_direct_residual_fit(
     scaled_delta = (
         {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
     )
-    extra = {"realization_by_position": realization_by_position, "task_vector_stats": task_vector_stats}
+    extra = {
+        "realization_by_position": realization_by_position,
+        "task_vector_stats": task_vector_stats,
+        "tv_scaling": tv_scaling_diagnostics,
+    }
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
 
@@ -2215,6 +2239,7 @@ def main() -> None:
         direct_residual_diagnostics: dict[str, list[dict[str, Any]]] = {}
         direct_residual_realization: dict[str, dict[int, dict[str, Any]]] = {}
         direct_residual_task_vector_stats: dict[str, dict[str, Any]] = {}
+        direct_residual_tv_scaling: dict[str, dict[str, Any] | None] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -2391,6 +2416,7 @@ def main() -> None:
                 direct_residual_diagnostics[t] = direct_residual_merged_diag
                 direct_residual_realization[t] = direct_residual_merged_extra["realization_by_position"]
                 direct_residual_task_vector_stats[t] = direct_residual_merged_extra["task_vector_stats"]
+                direct_residual_tv_scaling[t] = direct_residual_merged_extra["tv_scaling"]
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -3018,6 +3044,7 @@ def main() -> None:
                         direct_residual_diagnostics[task] = task_direct_residual_diag
                         direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
                         direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
+                        direct_residual_tv_scaling[task] = task_direct_residual_extra["tv_scaling"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -4177,6 +4204,14 @@ def main() -> None:
                     # / compute_direct_residual_task_vector_stats).
                     "realization_by_task": direct_residual_realization,
                     "task_vector_stats_by_task": direct_residual_task_vector_stats,
+                    # Additive, analysis-only: None per task unless
+                    # direct_residual_cfg.tv_scaling != "none" (see
+                    # apply_tv_scaling / _run_direct_residual_fit). tv_scaling
+                    # mode + iters are already carried by "config" above
+                    # (asdict(direct_residual_cfg)); this key carries the
+                    # per-task measurement (r_j traces, s_j / c, tau stats
+                    # before/after).
+                    "tv_scaling_by_task": direct_residual_tv_scaling,
                 }
                 if direct_residual_like
                 else None
