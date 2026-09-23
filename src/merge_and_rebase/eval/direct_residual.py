@@ -59,6 +59,7 @@ from .target_informed_runtime import (
     _fit_block_boundary_joint,
     _fit_component_outputs_from_contributions,
     _rows,
+    capture_block_gradients,
     capture_source_component_references,
     capture_tokens,
     # Re-exported for callers that assemble Direct Residual's realization
@@ -105,6 +106,9 @@ def capture_paired_boundary_activations(
     device,
     family_adapter=None,
     component_inputs: tuple[str, ...] = (),
+    procrustes_source: str = "activation",
+    source_recipe=None,
+    target_recipe=None,
 ) -> dict[str, Any]:
     """Capture native boundary activations for every position Direct Residual fits.
 
@@ -122,6 +126,21 @@ def capture_paired_boundary_activations(
     No structural resize of any model happens (the three models passed in are
     used exactly as given, at their native depths) and no correction is
     fitted -- this function only captures activation banks.
+
+    ``procrustes_source="gradient"`` (``DirectResidualConfig.procrustes_source``)
+    additionally captures block-boundary GRADIENTS -- ``dL/dT_i`` on
+    ``source_base_model`` at every distinct paired source index, and
+    ``dL/dT_j`` on ``target_base_model`` at every target position -- via
+    ``target_informed_runtime.capture_block_gradients``, using
+    ``source_recipe``/``target_recipe`` (each model's own
+    ``models.grad_recipes.clip_contrastive_recipe``, exactly BiCo's
+    recipe/statistic) on the SAME paired calibration batches the activation
+    banks above use. ``source_ft_model`` is never used for gradients (BiCo
+    only ever differentiates through base models). Stored under
+    ``"source_base_gradients"``/``"target_base_gradients"``, keyed by index
+    like the activation banks. Both recipes are required in gradient mode.
+    Vision only: `capture_block_gradients` raises `NotImplementedError` for a
+    non-``None`` ``family_adapter``.
 
     The returned dict also carries the replayed target-side calibration
     batches (under ``"target_batches"``) so `fit_direct_residual` can re-run
@@ -144,6 +163,10 @@ def capture_paired_boundary_activations(
         raise ValueError("pairing.target_depth must be positive")
     if pairing.source_depth < 1:
         raise ValueError("pairing.source_depth must be positive")
+    if procrustes_source not in {"activation", "gradient"}:
+        raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
+    if procrustes_source == "gradient" and (source_recipe is None or target_recipe is None):
+        raise ValueError("procrustes_source='gradient' requires both source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
         source_loader, target_loader, num_batches=num_batches, seed=seed
     )
@@ -182,6 +205,17 @@ def capture_paired_boundary_activations(
         )
         result["source_component_inputs"] = source_component_inputs
         result["source_component_weights"] = source_component_weights
+    if procrustes_source == "gradient":
+        source_grad_requests = {str(i): i for i in distinct_source_indices}
+        target_grad_requests = {str(j): j for j in range(pairing.target_depth)}
+        source_base_grad_raw = capture_block_gradients(
+            source_base_model, source_batches, source_grad_requests, source_recipe, device, family_adapter=family_adapter
+        )
+        target_base_grad_raw = capture_block_gradients(
+            target_base_model, target_batches, target_grad_requests, target_recipe, device, family_adapter=family_adapter
+        )
+        result["source_base_gradients"] = {int(k): v for k, v in source_base_grad_raw.items()}
+        result["target_base_gradients"] = {int(k): v for k, v in target_base_grad_raw.items()}
     return result
 
 
@@ -263,6 +297,28 @@ class DirectResidualConfig:
     # sweep AND accepted/rejected at every Gauss-Seidel sub-step, so it is
     # non-increasing by construction -- see the same docstring.
     backfit_tol: float = 1e-4
+    # Which statistic Q_j (the per-position Procrustes alignment map) is fit
+    # on -- D_j = (S_ft - S_base) @ Q_j is unchanged in form either way; only
+    # what Q_j is fit against changes.
+    #   "activation" -- the historical, default behaviour: Q_j is fit on the
+    #                   (source_base, target_base) block-boundary ACTIVATION
+    #                   banks. Bit-identical to pre-ablation code, golden-hash
+    #                   pinned (see tests/test_direct_residual_gradient_
+    #                   procrustes.py).
+    #   "gradient"  -- Q_j is fit on the block-boundary GRADIENT banks
+    #                   dL/dT_i (source base) and dL/dT_j (target base),
+    #                   L = BiCo's own zero-shot contrastive CE
+    #                   (models.grad_recipes.clip_contrastive_recipe), on the
+    #                   same paired calibration batches -- see
+    #                   target_informed_runtime.capture_block_gradients and
+    #                   capture_paired_boundary_activations's
+    #                   procrustes_source parameter. Vision only. Only valid
+    #                   with component_target="block_boundary": output_local
+    #                   never calls compute_desired_effects (its own
+    #                   per-component targets are fit directly from component
+    #                   activation banks), so there is no Q_j for this field
+    #                   to redirect there.
+    procrustes_source: str = "activation"
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -296,6 +352,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "block_split",
         "backfit_max_iters",
         "backfit_tol",
+        "procrustes_source",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -388,10 +445,25 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("backfit_tol must be a finite real number")
     if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
         raise ValueError("backfit_tol must be finite and > 0")
+    if cfg.procrustes_source not in {"activation", "gradient"}:
+        raise ValueError("procrustes_source must be 'activation' or 'gradient'")
+    if cfg.procrustes_source == "gradient" and cfg.component_target != "block_boundary":
+        raise ValueError(
+            "procrustes_source='gradient' requires component_target='block_boundary': "
+            f"component_target={cfg.component_target!r} never calls compute_desired_effects "
+            "(its per-component targets are fit directly from component activation banks), "
+            "so there is no block-boundary Q_j for procrustes_source to redirect"
+        )
     return cfg
 
 
-def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerPairing) -> dict[int, list[Tensor]]:
+def compute_desired_effects(
+    captured: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    procrustes_source: str = "activation",
+    diagnostics_out: dict[int, dict[str, Any]] | None = None,
+) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned ``(source_ft_j - source_base_j)`` at ``pairing.pairing[j]``.
 
     Generalizes `target_informed_runtime._capture_residual_references`'s
@@ -402,7 +474,28 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
     Residual doesn't need that bookkeeping: one cardinality (one target
     position <- exactly one source position, for every regime) handles
     extend, shrink, and same-arch uniformly.
+
+    ``procrustes_source="activation"`` (default) is bit-identical to the
+    pre-ablation code: ``Q_j`` is fit on the (source_base, target_base)
+    ACTIVATION banks, exactly as before. ``procrustes_source="gradient"``
+    changes only the statistic ``Q_j`` is fit on -- to the block-boundary
+    GRADIENT banks `capture_paired_boundary_activations` captured under
+    ``"source_base_gradients"``/``"target_base_gradients"`` -- using the same
+    helper, the same centering and the same ``_aligned`` token interpolation.
+    ``D_j = (source_ft_i - source_base_i) @ Q_j`` is unchanged in form in both
+    modes: a gradient difference is never used as the regression target,
+    only as the alignment statistic.
+
+    When ``diagnostics_out`` is provided (a caller-owned, initially-empty
+    dict), it is populated per position with analysis-only fields -- never
+    read by any fit. In gradient mode this includes the activation-space
+    ``Q`` computed purely for comparison (``"activation_gradient_procrustes_
+    overlap"`` = :math:`\\lVert Q_{act}^\\top Q_{grad}\\rVert_F^2 / d_{\\min}`)
+    and ``"procrustes_rank"`` (the numerical rank of the centered
+    cross-covariance the gradient ``Q`` was solved from).
     """
+    if procrustes_source not in {"activation", "gradient"}:
+        raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
     target_by_position = captured["target_base_outputs_by_position"]
@@ -410,6 +503,13 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
         raise ValueError(
             "Captured target references do not exactly match the pairing's target positions: "
             f"expected={sorted(range(pairing.target_depth))}, found={sorted(target_by_position)}"
+        )
+    source_base_grad = captured.get("source_base_gradients")
+    target_base_grad = captured.get("target_base_gradients")
+    if procrustes_source == "gradient" and (source_base_grad is None or target_base_grad is None):
+        raise ValueError(
+            "procrustes_source='gradient' requires 'source_base_gradients' and 'target_base_gradients' in "
+            "captured; call capture_paired_boundary_activations with procrustes_source='gradient'"
         )
     desired: dict[int, list[Tensor]] = {}
     for j in range(pairing.target_depth):
@@ -419,8 +519,35 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
         targets = target_by_position[j]
         source_base_batches = _aligned(source_base[i], targets)
         source_ft_batches = _aligned(source_ft[i], targets)
-        q, _mu_s, _mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
-        q = q.float()
+        if procrustes_source == "gradient":
+            if i not in source_base_grad or j not in target_base_grad:
+                raise ValueError(f"Missing captured gradient reference for pairing index {i} at target position {j}")
+            aligned_source_grad = _aligned(source_base_grad[i], target_base_grad[j])
+            grad_source_rows = _rows(aligned_source_grad).double()
+            grad_target_rows = _rows(target_base_grad[j]).double()
+            q, _mu_gs, _mu_gt = centered_rectangular_procrustes(grad_source_rows, grad_target_rows)
+            if diagnostics_out is not None:
+                q_act, _mu_s, _mu_t = centered_rectangular_procrustes(
+                    _rows(source_base_batches).double(), _rows(targets).double()
+                )
+                d_min = min(q.shape)
+                overlap = float(((q_act.T @ q).norm() ** 2) / d_min)
+                gs_centered = grad_source_rows - grad_source_rows.mean(dim=0)
+                gt_centered = grad_target_rows - grad_target_rows.mean(dim=0)
+                cross = gs_centered.T @ gt_centered
+                diagnostics_out[j] = {
+                    "procrustes_source": "gradient",
+                    "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
+                    "activation_gradient_procrustes_overlap": overlap,
+                }
+            q = q.float()
+        else:
+            q, _mu_s, _mu_t = centered_rectangular_procrustes(
+                _rows(source_base_batches).double(), _rows(targets).double()
+            )
+            if diagnostics_out is not None:
+                diagnostics_out[j] = {"procrustes_source": "activation"}
+            q = q.float()
         desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
     return desired
 
@@ -642,6 +769,11 @@ def fit_direct_residual(
             target_corrections.update(position_corrections)
             for row in block_rows:
                 row["source_position"] = row.pop("source_coordinate")
+                # Analysis-only: which statistic Q_j was fit on. Never read by
+                # any fit -- the row schema is otherwise unchanged, so this is
+                # additive for every existing consumer (golden hashes are over
+                # target_corrections, not these diagnostics rows).
+                row["procrustes_source"] = config.procrustes_source
                 diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)

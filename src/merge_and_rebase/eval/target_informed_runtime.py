@@ -631,6 +631,96 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
     return output
 
 
+def capture_block_gradients(
+    model,
+    batches,
+    requests: Mapping[str, int],
+    recipe,
+    device,
+    *,
+    family_adapter=None,
+):
+    """Capture block-boundary gradients ``dL/dT_j`` for the gradient-aligned
+    Procrustes source (``DirectResidualConfig.procrustes_source="gradient"``).
+
+    For every batch, runs one forward+backward pass of
+    ``recipe(model, batch) -> (scalar_loss, named_params)`` (a
+    ``models.grad_recipes.GradRecipe``, e.g. ``clip_contrastive_recipe`` --
+    mean-reduced CE, exactly BiCo's statistic) and stores each requested
+    resblock's ``grad_output[0]`` -- the gradient of the loss with respect to
+    that block's OUTPUT, i.e. the same tensor `capture_tokens`'s ``"boundary"``
+    kind captures in the forward pass -- as CPU float32, in the same
+    `_to_tokens` ``[B,T,D]`` token layout. ``requests`` maps an arbitrary key
+    to a resblock index (there is only one capture kind here, so no
+    ``(index, kind)`` pair is needed).
+
+    Mirrors `rebase.methods.bico._collect_batch`'s forward+backward pattern:
+    ``model.zero_grad(set_to_none=True)`` both before and after each batch's
+    backward pass, so no parameter gradient is ever retained. Every
+    parameter's ``requires_grad`` is temporarily forced ``True`` for the
+    capture (so the backward graph reaches every block even when the model is
+    normally used frozen/inference-only) and restored -- together with
+    ``training`` mode and device placement -- on return, including on any
+    exception. This function never mutates a parameter's *value*, only reads
+    gradients off the graph; callers that want a belt-and-braces check can
+    compare ``model.state_dict()`` before/after (see
+    ``tests/test_direct_residual_gradient_procrustes.py``).
+
+    Vision only: raises `NotImplementedError` for a non-``None``
+    ``family_adapter``, since block-boundary gradient capture has no decoder
+    equivalent yet.
+    """
+    if family_adapter is not None:
+        raise NotImplementedError("capture_block_gradients is vision-only")
+    layout = _layout_for(None)
+    blocks = layout.blocks(model)
+    training = model.training
+    original_device = next(model.parameters()).device
+    requires_grad_flags = {name: p.requires_grad for name, p in model.named_parameters()}
+    output: dict[str, list[torch.Tensor]] = {key: [] for key in requests}
+    current_batch = [0]
+    handles = []
+    try:
+        model.to(device).eval()
+        for p in model.parameters():
+            p.requires_grad_(True)
+
+        def store(name, tensor):
+            if isinstance(tensor, tuple):
+                tensor = tensor[0]
+            tokens = _to_tokens(tensor.detach(), batch_size=current_batch[0])
+            output[name].append(tokens.float().cpu().clone())
+
+        for key, index in requests.items():
+            block = layout.block_module(blocks[index])
+
+            def hook(_module, _grad_input, grad_output, *, name=key):
+                if grad_output is None or grad_output[0] is None:
+                    raise RuntimeError(f"Block gradient hook {name!r} produced no output gradient")
+                store(name, grad_output[0])
+
+            handles.append(block.register_full_backward_hook(hook))
+
+        for batch in batches:
+            current_batch[0] = layout.batch_size(batch)
+            model.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(True):
+                loss, _ = recipe(model, batch)
+                if loss.dim() > 0:
+                    loss = loss.sum()
+                loss.backward()
+            model.zero_grad(set_to_none=True)
+        if any(len(values) != len(batches) for values in output.values()):
+            raise RuntimeError("A requested block gradient hook did not fire exactly once per batch")
+    finally:
+        for handle in handles:
+            handle.remove()
+        for name, p in model.named_parameters():
+            p.requires_grad_(requires_grad_flags[name])
+        model.to(original_device).train(training)
+    return output
+
+
 def _rows(batches):
     return torch.cat([b.reshape(-1, b.shape[-1]) for b in batches], dim=0)
 

@@ -1432,6 +1432,13 @@ def _run_direct_residual_fit(
     pairing: DiscreteLayerPairing,
     config: DirectResidualConfig,
     device: str,
+    clf_source: Any = None,
+    clf_target: Any = None,
+    classnames: list[str] | None = None,
+    source_build_cfg_task: Any = None,
+    build_cfg_task: Any = None,
+    source_text_features: torch.Tensor | None = None,
+    target_text_features: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Run Direct Residual's capture -> desired-effect -> fit -> scale pipeline once.
 
@@ -1463,6 +1470,17 @@ def _run_direct_residual_fit(
     by the fit) is assembled" requirement. Neither call mutates
     ``target_model``'s entry state (both restore it internally and assert so
     via a state-dict hash).
+
+    When ``config.procrustes_source == "gradient"``, builds source/target
+    ``clip_contrastive_recipe`` gradient recipes exactly like the BiCo branch
+    above (same classifier/classnames/build-cfg/text-features arguments) and
+    passes them into ``capture_paired_boundary_activations`` so ``Q_j`` is
+    fit on block-boundary gradients instead of activations; the six extra
+    kwargs (``clf_source``, ``clf_target``, ``classnames``,
+    ``source_build_cfg_task``, ``build_cfg_task``, ``source_text_features``/
+    ``target_text_features``) are required only in that mode. The
+    activation-vs-gradient Procrustes overlap diagnostic is merged into each
+    position's diagnostics row by position.
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1470,6 +1488,38 @@ def _run_direct_residual_fit(
     component_inputs = (
         order_components(config.components) if config.component_target != "block_boundary" else ()
     )
+    gradient_mode = config.procrustes_source == "gradient"
+    source_recipe = target_recipe = None
+    if gradient_mode:
+        missing = [
+            name
+            for name, value in (
+                ("clf_source", clf_source),
+                ("clf_target", clf_target),
+                ("classnames", classnames),
+                ("source_build_cfg_task", source_build_cfg_task),
+                ("build_cfg_task", build_cfg_task),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
+        from ..models.grad_recipes import clip_contrastive_recipe
+
+        source_recipe = clip_contrastive_recipe(
+            clf_source,
+            classnames,
+            source_build_cfg_task,
+            device=device,
+            text_features=source_text_features,
+        )
+        target_recipe = clip_contrastive_recipe(
+            clf_target,
+            classnames,
+            build_cfg_task,
+            device=device,
+            text_features=target_text_features,
+        )
     captured = capture_paired_boundary_activations(
         source_base_model,
         source_ft_model,
@@ -1481,8 +1531,17 @@ def _run_direct_residual_fit(
         seed=config.seed,
         device=device,
         component_inputs=component_inputs,
+        procrustes_source=config.procrustes_source,
+        source_recipe=source_recipe,
+        target_recipe=target_recipe,
     )
-    desired = compute_desired_effects(captured, pairing)
+    procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    desired = compute_desired_effects(
+        captured,
+        pairing,
+        procrustes_source=config.procrustes_source,
+        diagnostics_out=procrustes_diagnostics if gradient_mode else None,
+    )
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1514,6 +1573,11 @@ def _run_direct_residual_fit(
         "correction_fit_seconds": time.perf_counter() - fit_started,
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
     }
+    if procrustes_diagnostics:
+        for row in diagnostics:
+            extra = procrustes_diagnostics.get(int(row.get("position", -1)))
+            if extra:
+                row.update(extra)
 
     realization_by_position = None
     task_vector_stats = None
@@ -2315,6 +2379,13 @@ def main() -> None:
                 pairing=direct_residual_pairing,
                 config=direct_residual_cfg,
                 device=device,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                classnames=merged_calibration_task_ctx.classnames,
+                source_build_cfg_task=merged_calibration_task_ctx.source_build_cfg_task,
+                build_cfg_task=merged_calibration_task_ctx.build_cfg_task,
+                source_text_features=merged_calibration_task_ctx.source_text_features,
+                target_text_features=merged_calibration_task_ctx.target_text_features,
             )
             for t in merge_in_source_tasks:
                 direct_residual_diagnostics[t] = direct_residual_merged_diag
@@ -2934,6 +3005,13 @@ def main() -> None:
                             pairing=pairing,
                             config=direct_residual_cfg,
                             device=device,
+                            clf_source=clf_source,
+                            clf_target=clf_target,
+                            classnames=classnames,
+                            source_build_cfg_task=source_build_cfg_task,
+                            build_cfg_task=build_cfg_task,
+                            source_text_features=task_ctx.source_text_features,
+                            target_text_features=task_ctx.target_text_features,
                         )
                         alignment_calibration_timings[task] = direct_residual_timing["alignment_calibration"]
                         correction_fit_timings[task] = direct_residual_timing["correction_fit"]
