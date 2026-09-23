@@ -48,6 +48,8 @@ from typing import Any
 
 import torch
 
+from ..utils.cost_accounting import cost_phase_decorator
+
 Tensor = torch.Tensor
 
 
@@ -370,6 +372,7 @@ def parse_joint_correction_config(value: Mapping[str, Any] | None) -> JointCorre
     return cfg
 
 
+@cost_phase_decorator("transformation")
 def centered_rectangular_procrustes(
     source_rows: Tensor, target_rows: Tensor, *, eps: float = 1e-8
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -394,6 +397,7 @@ def centered_rectangular_procrustes(
     return q, src_mean, tgt_mean
 
 
+@cost_phase_decorator("transformation")
 def _procrustes_from_cross(cross: Tensor) -> Tensor:
     """Orthogonal Procrustes map from a cross-covariance matrix via SVD."""
     u, _, vh = torch.linalg.svd(cross, full_matrices=False)
@@ -449,6 +453,7 @@ class ResidualSufficientStatistics:
         self.m_source: int | None = None
         self.d_source: int | None = None
 
+    @cost_phase_decorator("transformation")
     def update(self, h: Tensor, e: Tensor, t_in: Tensor | None, t_out: Tensor) -> None:
         """Accumulate one batch.
 
@@ -522,6 +527,7 @@ class ResidualSufficientStatistics:
         bias_term = 2.0 * n * float((c_vec @ (pred_mean - mu_e)).item()) + n * float((c_vec @ c_vec).item())
         return max(0.0, resid_no_bias + bias_term)
 
+    @cost_phase_decorator("transformation")
     def solve(
         self,
         *,

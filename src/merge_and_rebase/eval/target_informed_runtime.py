@@ -35,6 +35,7 @@ from torch import nn
 from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 from ..rebase.methods.theseus import _interp_2d_tokens, _to_tokens
+from ..utils.cost_accounting import cost_phase
 from .block_extension import _encode_image
 from .target_residual_completion import (
     CANONICAL_COMPONENT_ORDER,
@@ -642,7 +643,7 @@ def iter_capture_tokens(
 
             handles = _register_capture_hooks(layout, blocks, requests, store, family_adapter=family_adapter)
             try:
-                with torch.no_grad():
+                with torch.no_grad(), cost_phase("activation_collection"):
                     layout.forward(model, batch, device)
             finally:
                 for handle in handles:
@@ -745,7 +746,7 @@ def capture_block_gradients(
         for batch in batches:
             current_batch[0] = layout.batch_size(batch)
             model.zero_grad(set_to_none=True)
-            with torch.set_grad_enabled(True):
+            with torch.set_grad_enabled(True), cost_phase("activation_collection"):
                 loss, _ = recipe(model, batch)
                 if loss.dim() > 0:
                     loss = loss.sum()
@@ -4135,7 +4136,7 @@ def iter_capture_block_gradients(
                 for p in model.parameters():
                     p.requires_grad_(True)
                 model.zero_grad(set_to_none=True)
-                with torch.set_grad_enabled(True):
+                with torch.set_grad_enabled(True), cost_phase("activation_collection"):
                     loss, _ = recipe(model, batch)
                     if loss.dim() > 0:
                         loss = loss.sum()

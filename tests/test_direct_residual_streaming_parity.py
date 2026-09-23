@@ -41,6 +41,7 @@ from merge_and_rebase.eval.target_informed_runtime import (
     iter_capture_block_gradients,
 )
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.utils.cost_accounting import PhaseCostRecorder, recording
 
 
 class _Attention(torch.nn.Module):
@@ -371,3 +372,22 @@ def test_streaming_tv_scaling_matches_resident(mode, source_depth, target_depth)
         for trace_r, trace_s in zip(diag_r["s_traces"], diag_s["s_traces"], strict=True):
             for j in positions:
                 assert trace_s[j] == pytest.approx(trace_r[j], rel=1e-5)
+
+
+# ---- cost accounting ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("overrides", [{}, {"procrustes_source": "gradient"}, {"residual_target": "transported_endpoint"}])
+def test_streaming_fit_bit_identical_under_cost_recording(overrides):
+    config = DirectResidualConfig(num_batches=3, ridge_relative=0.05, activation_storage="streaming", **overrides)
+    recipes = (_recipe(5, 1), _recipe(5, 2)) if overrides.get("procrustes_source") == "gradient" else (None, None)
+    plain, _rows, _prepared = _streaming(_setup(2, 4), config, recipes)
+    recorder = PhaseCostRecorder("cpu")
+    with recording(recorder):
+        recorded, _rows, _prepared = _streaming(_setup(2, 4), config, recipes)
+    assert set(plain) == set(recorded)
+    for key in plain:
+        assert torch.equal(plain[key], recorded[key]), key
+    phases = recorder.summary()["phases"]
+    assert phases["activation_collection"]["segments"] > 0
+    assert phases["transformation"]["segments"] > 0

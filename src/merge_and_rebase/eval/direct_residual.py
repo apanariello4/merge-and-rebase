@@ -54,6 +54,7 @@ from typing import Any
 import torch
 
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, discrete_layer_pairing
+from ..utils.cost_accounting import cost_phase_decorator
 from .target_informed_runtime import (
     COMPONENT_INPUT_KIND,
     _aligned,
@@ -602,6 +603,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     return cfg
 
 
+@cost_phase_decorator("transformation")
 def compute_desired_effects(
     captured: Mapping[str, Any],
     pairing: DiscreteLayerPairing,
@@ -1116,6 +1118,7 @@ def _position_delta(
     return out
 
 
+@cost_phase_decorator("transformation", exclusive=True)
 def apply_tv_scaling(
     target_model,
     target_base_state: Mapping[str, Tensor],
@@ -1299,6 +1302,7 @@ class _StreamingCrossCovariance:
         self.mean_y: Tensor | None = None
         self.c: Tensor | None = None
 
+    @cost_phase_decorator("transformation")
     def update(self, x: Tensor, y: Tensor) -> None:
         if x.shape[0] != y.shape[0]:
             raise ValueError("cross-covariance update requires matching row counts")

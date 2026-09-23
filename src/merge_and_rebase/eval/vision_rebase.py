@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import itertools
 import os
-import resource
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -64,6 +63,7 @@ from ..rebase.runtime import (
 )
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
+from ..utils.cost_accounting import PhaseCostRecorder, cost_excluded, cost_phase, recording
 from .block_extension import (
     BlockExtensionConfig,
     block_extension_protocol,
@@ -1428,7 +1428,22 @@ def _maybe_complete_direct_p1_task_vector(
     return completed, diagnostics
 
 
-def _run_direct_residual_fit(
+def _run_direct_residual_fit(**kwargs: Any):
+    """Run `_direct_residual_fit_body` under its own `PhaseCostRecorder`.
+
+    Same arguments and return value as `_direct_residual_fit_body`, plus
+    ``timing["cost_phases"]``: the recorder summary splitting this fit's wall time,
+    CUDA peak and host peak RSS into activation_collection / transformation /
+    transport (analysis-only diagnostics are excluded; see utils.cost_accounting).
+    """
+    with recording(PhaseCostRecorder(kwargs["device"])) as recorder:
+        scaled_delta, timing, diagnostics, extra = _direct_residual_fit_body(recorder, **kwargs)
+    timing["cost_phases"] = recorder.summary()
+    return scaled_delta, timing, diagnostics, extra
+
+
+def _direct_residual_fit_body(
+    recorder: PhaseCostRecorder,
     *,
     source_base_model: torch.nn.Module,
     source_ft_model: torch.nn.Module,
@@ -1502,13 +1517,14 @@ def _run_direct_residual_fit(
     O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
     already rejected any streaming config for which realization diagnostics
     would be reachable, so that block below only ever runs for the resident
-    path. Both paths additionally record each bracket's peak host RSS
-    (``resource.getrusage(resource.RUSAGE_SELF).ru_maxrss``, KiB on Linux) so
-    campaigns can see streaming's host memory stay flat as ``num_batches``
-    grows while resident's does not.
+    path. Both paths additionally record each bracket's exact peak host RSS
+    (``{bracket}_peak_host_rss_bytes``, VmHWM reset at the bracket start via
+    ``recorder``; see utils.cost_accounting) so campaigns can see streaming's
+    host memory stay flat as ``num_batches`` grows while resident's does not.
+    Every bracket peak is read through ``recorder.mark()``/``peaks_since`` so the
+    recorder's per-segment counter resets never corrupt it.
     """
-    if torch.cuda.is_available() and device != "cpu":
-        torch.cuda.reset_peak_memory_stats()
+    alignment_mark = recorder.mark()
     alignment_started = time.perf_counter()
     streaming = config.activation_storage == "streaming"
     captured = None
@@ -1589,17 +1605,11 @@ def _run_direct_residual_fit(
             procrustes_source=config.procrustes_source,
             diagnostics_out=procrustes_diagnostics if gradient_mode else None,
         )
-    if torch.cuda.is_available() and device != "cpu":
-        torch.cuda.synchronize()
-        alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
-    else:
-        alignment_peak_memory_bytes = 0.0
+    alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
         "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
-        "alignment_calibration_process_peak_host_rss_bytes": float(
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        ),
+        "alignment_calibration_peak_host_rss_bytes": alignment_calibration_host_peak,
     }
 
     # Deliberately outside BOTH the alignment_calibration bracket above (just
@@ -1615,16 +1625,16 @@ def _run_direct_residual_fit(
     # under procrustes_source="gradient" that is not the Q_j the fit used, so it
     # is not reported there (None) rather than reported for the wrong map.
     alignment_diagnostics = None
-    if config.procrustes_source == "activation":
-        if streaming:
-            alignment_diagnostics = compute_alignment_diagnostics_streaming(
-                source_base_model, source_ft_model, target_model, target_base_sd, prepared, pairing, device=device
-            )
-        else:
-            alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
+    with cost_excluded():
+        if config.procrustes_source == "activation":
+            if streaming:
+                alignment_diagnostics = compute_alignment_diagnostics_streaming(
+                    source_base_model, source_ft_model, target_model, target_base_sd, prepared, pairing, device=device
+                )
+            else:
+                alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
 
-    if torch.cuda.is_available() and device != "cpu":
-        torch.cuda.reset_peak_memory_stats()
+    fit_mark = recorder.mark()
     fit_started = time.perf_counter()
     if streaming:
         target_corrections, diagnostics = fit_direct_residual_streaming(
@@ -1647,17 +1657,11 @@ def _run_direct_residual_fit(
             config=config,
             device=device,
         )
-    if torch.cuda.is_available() and device != "cpu":
-        torch.cuda.synchronize()
-        fit_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
-    else:
-        fit_peak_memory_bytes = 0.0
+    fit_peak_memory_bytes, correction_fit_host_peak = recorder.peaks_since(fit_mark)
     fit_timing = {
         "correction_fit_seconds": time.perf_counter() - fit_started,
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
-        "correction_fit_process_peak_host_rss_bytes": float(
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        ),
+        "correction_fit_peak_host_rss_bytes": correction_fit_host_peak,
     }
     if procrustes_diagnostics:
         for row in diagnostics:
@@ -1695,43 +1699,45 @@ def _run_direct_residual_fit(
 
     realization_by_position = None
     task_vector_stats = None
-    if bool(config.realization_diagnostics):
-        positions = list(range(pairing.target_depth))
-        # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed
-        # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
-        # presence check keyed only off "is this key in target_corrections"
-        # cannot tell which of q/k/v were actually fit -- e.g. a v-only
-        # output_local run's in_proj_weight key exists in target_corrections
-        # with only its v-rows nonzero, and checking q/k against that same
-        # key would falsely report them "present" too. Passing exactly
-        # order_components(config.components) sidesteps this: only names the
-        # caller actually asked to fit are ever checked.
-        fitted_components = order_components(config.components)
-        if streaming:
-            realization_by_position = streaming_measure(target_corrections)
-        else:
-            realization_by_position = measure_direct_residual_realization(
-                target_model,
-                target_base_sd,
+    with cost_excluded():
+        if bool(config.realization_diagnostics):
+            positions = list(range(pairing.target_depth))
+            # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed
+            # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
+            # presence check keyed only off "is this key in target_corrections"
+            # cannot tell which of q/k/v were actually fit -- e.g. a v-only
+            # output_local run's in_proj_weight key exists in target_corrections
+            # with only its v-rows nonzero, and checking q/k against that same
+            # key would falsely report them "present" too. Passing exactly
+            # order_components(config.components) sidesteps this: only names the
+            # caller actually asked to fit are ever checked.
+            fitted_components = order_components(config.components)
+            if streaming:
+                realization_by_position = streaming_measure(target_corrections)
+            else:
+                realization_by_position = measure_direct_residual_realization(
+                    target_model,
+                    target_base_sd,
+                    target_corrections,
+                    positions,
+                    captured["target_batches"],
+                    captured["target_base_outputs_by_position"],
+                    desired,
+                    device=device,
+                    components=fitted_components,
+                )
+            task_vector_stats = compute_direct_residual_task_vector_stats(
                 target_corrections,
+                target_base_sd,
                 positions,
-                captured["target_batches"],
-                captured["target_base_outputs_by_position"],
-                desired,
-                device=device,
                 components=fitted_components,
             )
-        task_vector_stats = compute_direct_residual_task_vector_stats(
-            target_corrections,
-            target_base_sd,
-            positions,
-            components=fitted_components,
-        )
 
     strength = float(config.strength)
-    scaled_delta = (
-        {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
-    )
+    with cost_phase("transport"):
+        scaled_delta = (
+            {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
+        )
     extra = {
         "realization_by_position": realization_by_position,
         "task_vector_stats": task_vector_stats,
@@ -2429,6 +2435,10 @@ def main() -> None:
         # parsing is uniform across every method.
         alignment_calibration_timings: dict[str, dict[str, float]] = {}
         correction_fit_timings: dict[str, dict[str, float]] = {}
+        # Per-task activation_collection / transformation / transport cost split
+        # (utils.cost_accounting), for THESEUS/BiCo prepare+transport and for
+        # Direct Residual's fit alike.
+        cost_phase_timings: dict[str, dict[str, Any]] = {}
 
         # merge_in_source_then_fit (a DirectResidualConfig field, distinct
         # from the top-level `merge_mode` cfg key): merge every task's native
@@ -3016,67 +3026,66 @@ def main() -> None:
             else:
                 print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if merge_mode not in _SINGLE_TRANSPORT_MODES:
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.reset_peak_memory_stats()
-                prepare_started = time.perf_counter()
+                task_cost_recorder = PhaseCostRecorder(device)
+                with recording(task_cost_recorder):
+                    prepare_mark = task_cost_recorder.mark()
+                    prepare_started = time.perf_counter()
 
-                # Proposal-1 transport-free ablation: THESEUS/BiCo are neither
-                # fitted nor applied. The question this arm asks is whether the
-                # desired functional effect can be written into the target at
-                # all without parameter transport, so invoking the transport
-                # fit and then discarding its output would only burn GPU hours
-                # and blur the claim.
-                bypass_ordinary_transport = direct_target_p1 or direct_residual_like
-                prepared = None if bypass_ordinary_transport else _build_rebase_prepared(
-                    method_name=method_name,
-                    method=method,
-                    method_params=method_params,
-                    cfg=cfg,
-                    device=device,
-                    grad_batch_size=grad_batch_size,
-                    grad_imgs_per_class=grad_imgs_per_class,
-                    grad_num_batches=grad_num_batches,
-                    theseus_like_method=theseus_like_method,
-                    bico_mode=bico_mode,
-                    run_block_extension_prestep=task_block_extension_prestep or task_discrete_layer_match_prestep,
-                    clf_source=clf_source,
-                    clf_target=clf_target,
-                    classnames=classnames,
-                    loaders=loaders,
-                    source_loaders=source_loaders,
-                    build_cfg_task=build_cfg_task,
-                    source_build_cfg_task=source_build_cfg_task,
-                    task_source_base_sd=task_source_base_sd,
-                    target_base_sd=target_base_sd,
-                    task_delta=task_delta,
-                    source_base_model_task=source_base_model_task,
-                    transfusion_prepared=transfusion_prepared,
-                    source_activation_plan=task_source_activation_plan,
-                )
+                    # Proposal-1 transport-free ablation: THESEUS/BiCo are neither
+                    # fitted nor applied. The question this arm asks is whether the
+                    # desired functional effect can be written into the target at
+                    # all without parameter transport, so invoking the transport
+                    # fit and then discarding its output would only burn GPU hours
+                    # and blur the claim.
+                    bypass_ordinary_transport = direct_target_p1 or direct_residual_like
+                    prepared = None if bypass_ordinary_transport else _build_rebase_prepared(
+                        method_name=method_name,
+                        method=method,
+                        method_params=method_params,
+                        cfg=cfg,
+                        device=device,
+                        grad_batch_size=grad_batch_size,
+                        grad_imgs_per_class=grad_imgs_per_class,
+                        grad_num_batches=grad_num_batches,
+                        theseus_like_method=theseus_like_method,
+                        bico_mode=bico_mode,
+                        run_block_extension_prestep=task_block_extension_prestep or task_discrete_layer_match_prestep,
+                        clf_source=clf_source,
+                        clf_target=clf_target,
+                        classnames=classnames,
+                        loaders=loaders,
+                        source_loaders=source_loaders,
+                        build_cfg_task=build_cfg_task,
+                        source_build_cfg_task=source_build_cfg_task,
+                        task_source_base_sd=task_source_base_sd,
+                        target_base_sd=target_base_sd,
+                        task_delta=task_delta,
+                        source_base_model_task=source_base_model_task,
+                        transfusion_prepared=transfusion_prepared,
+                        source_activation_plan=task_source_activation_plan,
+                    )
 
-                prepare_seconds = time.perf_counter() - prepare_started
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.synchronize()
-                    peak_memory_bytes = float(torch.cuda.max_memory_allocated())
-                else:
-                    peak_memory_bytes = 0.0
+                    prepare_seconds = time.perf_counter() - prepare_started
+                    peak_memory_bytes = task_cost_recorder.peaks_since(prepare_mark)[0]
 
-                transport_started = time.perf_counter()
-                transported_delta = {} if bypass_ordinary_transport else method.transport(
-                    source_base=task_source_base_sd,
-                    target_base=target_base_sd,
-                    delta=task_delta,
-                    strict=strict_load,
-                    prepared=prepared,
-                    **method_params,
-                )
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.synchronize()
-                transport_timings[task] = {
-                    "prepare_seconds": prepare_seconds,
-                    "transport_seconds": time.perf_counter() - transport_started,
-                    "peak_memory_allocated_bytes": peak_memory_bytes,
-                }
+                    transport_started = time.perf_counter()
+                    with cost_phase("transport"):
+                        transported_delta = {} if bypass_ordinary_transport else method.transport(
+                            source_base=task_source_base_sd,
+                            target_base=target_base_sd,
+                            delta=task_delta,
+                            strict=strict_load,
+                            prepared=prepared,
+                            **method_params,
+                        )
+                    if torch.cuda.is_available() and device != "cpu":
+                        torch.cuda.synchronize()
+                    transport_timings[task] = {
+                        "prepare_seconds": prepare_seconds,
+                        "transport_seconds": time.perf_counter() - transport_started,
+                        "peak_memory_allocated_bytes": peak_memory_bytes,
+                    }
+                    cost_phase_timings[task] = task_cost_recorder.summary()
 
                 if direct_residual_like:
                     # Direct Residual never resizes anything: capture must run
@@ -3098,6 +3107,7 @@ def main() -> None:
                         transported_delta = dict(direct_residual_merged_correction)
                         alignment_calibration_timings[task] = dict(direct_residual_merged_timing["alignment_calibration"])
                         correction_fit_timings[task] = dict(direct_residual_merged_timing["correction_fit"])
+                        cost_phase_timings[task] = dict(direct_residual_merged_timing["cost_phases"])
                     else:
                         source_base_model_native = deepcopy(clf_source.model)
                         source_ft_model_native = deepcopy(clf_source.model)
@@ -3141,6 +3151,7 @@ def main() -> None:
                         )
                         alignment_calibration_timings[task] = direct_residual_timing["alignment_calibration"]
                         correction_fit_timings[task] = direct_residual_timing["correction_fit"]
+                        cost_phase_timings[task] = direct_residual_timing["cost_phases"]
                         direct_residual_diagnostics[task] = task_direct_residual_diag
                         direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
                         direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
@@ -4289,6 +4300,7 @@ def main() -> None:
             "all_task_source_lmc": all_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
+            "cost_phase_timings": cost_phase_timings,
             # Always present (default {}) regardless of method/path, so a
             # downstream summary-JSON parser can read these keys uniformly
             # across every method, not only depth_alignment='discrete_index_match'

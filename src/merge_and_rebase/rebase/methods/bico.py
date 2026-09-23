@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from ...models.patch_openclip_attention import merge_openclip_vit_attn
+from ...utils.cost_accounting import cost_phase_decorator
 from ..base import TensorDict
 from ..registry import register
 from . import theseus as _t
@@ -136,6 +137,7 @@ def _calibration_row_mask(
     return _t._content_row_mask(masks[0], masks[1])
 
 
+@cost_phase_decorator("activation_collection")
 def _collect_batch(
     model: torch.nn.Module,
     recipe,

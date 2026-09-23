@@ -222,11 +222,18 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
         }
     assert extra["tv_scaling"] is None
     assert set(extra) == {"realization_by_position", "task_vector_stats", "alignment_diagnostics", "tv_scaling"}
-    assert set(timing) == {"alignment_calibration", "correction_fit"}
+    assert set(timing) == {"alignment_calibration", "correction_fit", "cost_phases"}
+    cost = timing["cost_phases"]
+    assert set(cost["phases"]) == {"activation_collection", "transformation", "transport"}
+    assert cost["phases"]["activation_collection"]["seconds"] > 0.0
+    assert cost["phases"]["transformation"]["seconds"] > 0.0
+    assert cost["phases"]["transport"]["segments"] == 1
+    # alignment diagnostics run, and are excluded from every phase
+    assert cost["excluded_seconds"] > 0.0
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
         memory_key = f"{bracket}_peak_memory_bytes"
-        rss_key = f"{bracket}_process_peak_host_rss_bytes"
+        rss_key = f"{bracket}_peak_host_rss_bytes"
         assert set(timing[bracket]) == {seconds_key, memory_key, rss_key}
         assert isinstance(timing[bracket][seconds_key], float)
         assert timing[bracket][seconds_key] >= 0.0

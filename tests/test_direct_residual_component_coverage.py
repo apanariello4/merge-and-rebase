@@ -49,6 +49,7 @@ from merge_and_rebase.eval.direct_residual import (
 )
 from merge_and_rebase.eval.target_residual_completion import order_components
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.utils.cost_accounting import PhaseCostRecorder, recording
 
 # --------------------------------------------------------------------------
 # Golden hashes for the untouched block_boundary path, recorded at HEAD
@@ -179,6 +180,21 @@ def _fit(source_depth, target_depth, config=None, **setup_kwargs):
 def test_golden_hash_block_boundary(source_depth, target_depth, golden):
     corrections, _diag = _fit(source_depth, target_depth)
     assert _state_dict_sha256(corrections) == golden
+
+
+@pytest.mark.parametrize("source_depth, target_depth, golden", [
+    (2, 4, _GOLDEN_EXTEND), (4, 2, _GOLDEN_SHRINK), (3, 3, _GOLDEN_SAME_ARCH),
+])
+def test_golden_hash_block_boundary_under_cost_recording(source_depth, target_depth, golden):
+    # Cost accounting only synchronizes and reads counters: the pinned default
+    # path is bit-identical with an active recorder.
+    recorder = PhaseCostRecorder("cpu")
+    with recording(recorder):
+        corrections, _diag = _fit(source_depth, target_depth)
+    assert _state_dict_sha256(corrections) == golden
+    phases = recorder.summary()["phases"]
+    assert phases["activation_collection"]["segments"] > 0
+    assert phases["transformation"]["segments"] > 0
 
 
 def test_component_target_defaults_to_block_boundary():
