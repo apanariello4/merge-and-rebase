@@ -78,9 +78,11 @@ from .direct_residual import (
     apply_tv_scaling,
     capture_paired_boundary_activations,
     compute_alignment_diagnostics,
+    compute_alignment_diagnostics_streaming,
     compute_desired_effects,
     fit_direct_residual,
     fit_direct_residual_streaming,
+    measure_streaming_realization_for,
     parse_direct_residual_config,
     prepare_direct_residual_streaming,
 )
@@ -1514,6 +1516,37 @@ def _run_direct_residual_fit(
     prepared = None
     gradient_mode = config.procrustes_source == "gradient"
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    source_recipe = target_recipe = None
+    if gradient_mode:
+        missing = [
+            name
+            for name, value in (
+                ("clf_source", clf_source),
+                ("clf_target", clf_target),
+                ("classnames", classnames),
+                ("source_build_cfg_task", source_build_cfg_task),
+                ("build_cfg_task", build_cfg_task),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
+        from ..models.grad_recipes import clip_contrastive_recipe
+
+        source_recipe = clip_contrastive_recipe(
+            clf_source,
+            classnames,
+            source_build_cfg_task,
+            device=device,
+            text_features=source_text_features,
+        )
+        target_recipe = clip_contrastive_recipe(
+            clf_target,
+            classnames,
+            build_cfg_task,
+            device=device,
+            text_features=target_text_features,
+        )
     if streaming:
         prepared = prepare_direct_residual_streaming(
             source_base_model,
@@ -1524,42 +1557,15 @@ def _run_direct_residual_fit(
             num_batches=config.num_batches,
             seed=config.seed,
             device=device,
+            procrustes_source=config.procrustes_source,
+            source_recipe=source_recipe,
+            target_recipe=target_recipe,
         )
+        procrustes_diagnostics.update(prepared["procrustes_diagnostics"])
     else:
         component_inputs = (
             order_components(config.components) if config.component_target != "block_boundary" else ()
         )
-        source_recipe = target_recipe = None
-        if gradient_mode:
-            missing = [
-                name
-                for name, value in (
-                    ("clf_source", clf_source),
-                    ("clf_target", clf_target),
-                    ("classnames", classnames),
-                    ("source_build_cfg_task", source_build_cfg_task),
-                    ("build_cfg_task", build_cfg_task),
-                )
-                if value is None
-            ]
-            if missing:
-                raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
-            from ..models.grad_recipes import clip_contrastive_recipe
-
-            source_recipe = clip_contrastive_recipe(
-                clf_source,
-                classnames,
-                source_build_cfg_task,
-                device=device,
-                text_features=source_text_features,
-            )
-            target_recipe = clip_contrastive_recipe(
-                clf_target,
-                classnames,
-                build_cfg_task,
-                device=device,
-                text_features=target_text_features,
-            )
         captured = capture_paired_boundary_activations(
             source_base_model,
             source_ft_model,
@@ -1608,11 +1614,14 @@ def _run_direct_residual_fit(
     # compute_alignment_diagnostics describes the ACTIVATION-space Procrustes fit;
     # under procrustes_source="gradient" that is not the Q_j the fit used, so it
     # is not reported there (None) rather than reported for the wrong map.
-    alignment_diagnostics = (
-        compute_alignment_diagnostics(captured, pairing)
-        if config.procrustes_source == "activation" and not streaming
-        else None
-    )
+    alignment_diagnostics = None
+    if config.procrustes_source == "activation":
+        if streaming:
+            alignment_diagnostics = compute_alignment_diagnostics_streaming(
+                source_base_model, source_ft_model, target_model, target_base_sd, prepared, pairing, device=device
+            )
+        else:
+            alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
 
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1656,6 +1665,14 @@ def _run_direct_residual_fit(
             if extra:
                 row.update(extra)
 
+    streaming_measure = (
+        measure_streaming_realization_for(
+            target_model, target_base_sd, source_base_model, source_ft_model, prepared, pairing,
+            config=config, device=device,
+        )
+        if streaming
+        else None
+    )
     tv_scaling_diagnostics = None
     if config.tv_scaling != "none":
         # Label-free, applied AFTER the unit-strength tau is assembled but
@@ -1673,6 +1690,7 @@ def _run_direct_residual_fit(
             desired,
             config=config,
             device=device,
+            measure_fn=streaming_measure,
         )
 
     realization_by_position = None
@@ -1689,17 +1707,20 @@ def _run_direct_residual_fit(
         # order_components(config.components) sidesteps this: only names the
         # caller actually asked to fit are ever checked.
         fitted_components = order_components(config.components)
-        realization_by_position = measure_direct_residual_realization(
-            target_model,
-            target_base_sd,
-            target_corrections,
-            positions,
-            captured["target_batches"],
-            captured["target_base_outputs_by_position"],
-            desired,
-            device=device,
-            components=fitted_components,
-        )
+        if streaming:
+            realization_by_position = streaming_measure(target_corrections)
+        else:
+            realization_by_position = measure_direct_residual_realization(
+                target_model,
+                target_base_sd,
+                target_corrections,
+                positions,
+                captured["target_batches"],
+                captured["target_base_outputs_by_position"],
+                desired,
+                device=device,
+                components=fitted_components,
+            )
         task_vector_stats = compute_direct_residual_task_vector_stats(
             target_corrections,
             target_base_sd,

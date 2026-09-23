@@ -274,13 +274,29 @@ def test_streaming_position_chunk_is_bitwise_invariant(source_depth, target_dept
     "overrides",
     [
         {"component_target": "output_local", "components": ("attn.out_proj",)},
+        {"component_target": "output_total", "components": ("attn.out_proj",)},
         {"block_split": "backfit"},
-        {"realization_diagnostics": True},
+        {"block_split": "joint"},
     ],
 )
 def test_streaming_rejects_unsupported_config_combinations(overrides):
     with pytest.raises(ValueError):
         parse_direct_residual_config({"activation_storage": "streaming", **overrides})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"realization_diagnostics": True},
+        {"procrustes_source": "gradient"},
+        {"residual_target": "transported_endpoint"},
+        {"tv_scaling": "global"},
+        {"tv_scaling": "per_block"},
+    ],
+)
+def test_streaming_accepts_supported_features(overrides):
+    cfg = parse_direct_residual_config({"activation_storage": "streaming", **overrides})
+    assert cfg.activation_storage == "streaming"
 
 
 @pytest.mark.parametrize("bad_value", ["bogus", 1, 1.0, None])

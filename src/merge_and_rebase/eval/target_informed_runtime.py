@@ -19,6 +19,7 @@ and `cache_identity`; it does not drive any execution path in this module.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import math
@@ -1514,7 +1515,7 @@ def _fit_direct_target_position(
 
 
 def _realization_diagnostic_fields(
-    h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm, residual_norm_after
+    h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm, residual_norm_after, *, stats=None
 ):
     """Analysis-only per-component fit fields, gated on ``realization_
     diagnostics`` (never read by any fit -- see the callers). Shared by every
@@ -1532,11 +1533,18 @@ def _realization_diagnostic_fields(
     """
     update_norm = float(torch.linalg.norm(correction).item())
     weight_norm = float(torch.linalg.norm(weight_before).item())
-    pred_sq = 0.0
-    for h in h_batches:
-        pred = h.reshape(-1, h.shape[-1]).double() @ correction.double().T + bias_for_pred.double()
-        pred = pred @ effective_out.double()
-        pred_sq += float((pred**2).sum().item())
+    if h_batches is None:
+        # Streaming path: no resident input bank, so the prediction norm comes from the
+        # solver's accumulated statistics (exact up to floating-point summation order).
+        if stats is None:
+            raise ValueError("realization fields need either h_batches or the accumulated stats")
+        pred_sq = _realized_pred_sq_from_stats(stats, correction, bias_for_pred, effective_out)
+    else:
+        pred_sq = 0.0
+        for h in h_batches:
+            pred = h.reshape(-1, h.shape[-1]).double() @ correction.double().T + bias_for_pred.double()
+            pred = pred @ effective_out.double()
+            pred_sq += float((pred**2).sum().item())
     return {
         "fit_relative_residual": (residual_norm_after / desired_norm) if desired_norm else 0.0,
         "target_norm": desired_norm,
@@ -1781,7 +1789,7 @@ def _finalize_independent_component(
         block_row.update(
             _realization_diagnostic_fields(
                 h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm,
-                diag["residual_norm_after"],
+                diag["residual_norm_after"], stats=stats,
             )
         )
     block_rows.append(block_row)
@@ -4074,3 +4082,206 @@ def load_cache(path, expected_identity):
     if payload.get("identity") != expected_identity:
         raise ValueError(f"Cached task vector provenance does not match the requested experiment: {path}")
     return payload
+
+
+def iter_capture_block_gradients(
+    model,
+    batches,
+    requests: Mapping[str, int],
+    recipe,
+    device,
+    *,
+    family_adapter=None,
+):
+    """Per-batch generator form of `capture_block_gradients` for the streaming path.
+
+    Yields one ``{key: dL/dT_j}`` dict per batch, with exactly the forward+backward,
+    ``zero_grad``, store op and ``_to_tokens`` layout of `capture_block_gradients`, but
+    registers the backward hooks around EACH batch (like `iter_capture_tokens`) so it can
+    run in lockstep with activation generators over the same model object. Deliberately
+    not routed through `iter_capture_tokens`: that generator runs its forward under
+    ``torch.no_grad()``, while this one needs the backward graph.
+    """
+    if family_adapter is not None:
+        raise NotImplementedError("iter_capture_block_gradients is vision-only")
+    layout = _layout_for(None)
+    blocks = layout.blocks(model)
+    training = model.training
+    original_device = next(model.parameters()).device
+    requires_grad_flags = {name: p.requires_grad for name, p in model.named_parameters()}
+    try:
+        model.to(device).eval()
+        for batch in batches:
+            batch_size = layout.batch_size(batch)
+            values: dict[str, list[torch.Tensor]] = {key: [] for key in requests}
+
+            def store(name, tensor, *, _batch_size=batch_size, _values=values):
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
+                tokens = _to_tokens(tensor.detach(), batch_size=_batch_size)
+                _values[name].append(tokens.float().cpu().clone())
+
+            handles = []
+            for key, index in requests.items():
+                block = layout.block_module(blocks[index])
+
+                def hook(_module, _grad_input, grad_output, *, name=key):
+                    if grad_output is None or grad_output[0] is None:
+                        raise RuntimeError(f"Block gradient hook {name!r} produced no output gradient")
+                    store(name, grad_output[0])
+
+                handles.append(block.register_full_backward_hook(hook))
+            try:
+                for p in model.parameters():
+                    p.requires_grad_(True)
+                model.zero_grad(set_to_none=True)
+                with torch.set_grad_enabled(True):
+                    loss, _ = recipe(model, batch)
+                    if loss.dim() > 0:
+                        loss = loss.sum()
+                    loss.backward()
+                model.zero_grad(set_to_none=True)
+            finally:
+                for handle in handles:
+                    handle.remove()
+                for name, p in model.named_parameters():
+                    p.requires_grad_(requires_grad_flags[name])
+            if any(len(v) != 1 for v in values.values()):
+                raise RuntimeError("A requested block gradient hook did not fire exactly once per batch")
+            yield {key: v[0] for key, v in values.items()}
+    finally:
+        for name, p in model.named_parameters():
+            p.requires_grad_(requires_grad_flags[name])
+        model.to(original_device).train(training)
+
+
+def _realized_pred_sq_from_stats(stats, correction, bias_for_pred, effective_out) -> float:
+    """``||(H C^T + 1 b^T) E||_F^2`` from `ResidualSufficientStatistics` alone.
+
+    With ``A = H`` (``t_in=None``, the direct-target convention), the solver accumulates
+    ``s = A^T A``, ``sum_a = A^T 1`` and ``n_rows``, so
+    ``P^T P = C s C^T + (C sum_a) b^T + b (C sum_a)^T + n b b^T`` and the value is
+    ``trace(E^T P^T P E)``. Equals `_realization_diagnostic_fields`'s bank-based sum up to
+    floating-point summation order; used where no activation bank is resident (streaming).
+    """
+    if stats.s is None or stats.sum_a is None:
+        raise ValueError("realization fields from stats require an accumulated ResidualSufficientStatistics")
+    c = correction.double().to(stats.s.device)
+    b = bias_for_pred.double().to(stats.s.device)
+    e_out = effective_out.double().to(stats.s.device)
+    c_sum_a = c @ stats.sum_a
+    ptp = c @ stats.s @ c.T + torch.outer(c_sum_a, b) + torch.outer(b, c_sum_a) + float(stats.n_rows) * torch.outer(b, b)
+    return float(torch.trace(e_out.T @ ptp @ e_out).item())
+
+
+@torch.no_grad()
+def measure_direct_residual_realization_streaming(
+    target_model,
+    target_base_state: Mapping[str, torch.Tensor],
+    target_corrections: Mapping[str, torch.Tensor],
+    positions: list[int],
+    target_batches: list,
+    desired_fn,
+    source_iters_fn,
+    *,
+    device,
+    components: tuple[str, ...] = CANONICAL_COMPONENT_ORDER,
+    family_adapter=None,
+) -> dict[int, dict[str, Any]]:
+    """Streaming counterpart of `measure_direct_residual_realization` (same row schema).
+
+    Instead of holding every variant's all-position boundary banks, runs ONE lockstep
+    sweep over the calibration batches: the pristine target (``target_model`` loaded with
+    ``target_base_state``), one deep copy of it per variant (joint ``tau`` plus one per
+    component family present, each mounted as ``base + tau_variant``), and whatever source
+    generators ``source_iters_fn()`` returns. Per batch, ``desired_fn(k, source_values,
+    t0)`` recomputes ``{pos: D_j}`` (the streaming path never keeps a ``D_j`` bank), and
+    every reported norm is accumulated as a per-batch sum of squares, so the result
+    equals the resident one up to floating-point summation order (the per-batch
+    arithmetic is identical; ``D_j`` itself differs only through the Chan-accumulated
+    Procrustes map). The entry state of ``target_model`` is restored and hash-checked.
+    """
+    shim = _layout_for(family_adapter)
+    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    entry_hash = _task_vector_sha256(entry_state)
+    base_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+
+    def mounted_copy(delta: Mapping[str, torch.Tensor]):
+        state = dict(base_state)
+        for key, value in delta.items():
+            state[key] = state[key] + value.to(state[key])
+        model = copy.deepcopy(target_model)
+        model.load_state_dict(state, strict=True)
+        return model
+
+    present_families = [
+        c for c in components if any(shim.component_key(pos, c, prefixed=True) in target_corrections for pos in positions)
+    ]
+    requests = {str(pos): (pos, "boundary") for pos in positions}
+    variants = {"joint": target_corrections}
+    for component in present_families:
+        variants[component] = _family_delta_state(shim, component, positions, target_corrections, base_state)
+    copies = {name: mounted_copy(delta) for name, delta in variants.items()}
+
+    d_sq = {pos: 0.0 for pos in positions}
+    joint_sq = {pos: 0.0 for pos in positions}
+    err_sq = {pos: 0.0 for pos in positions}
+    fam_sq = {c: {pos: 0.0 for pos in positions} for c in present_families}
+    inter_sq = {pos: 0.0 for pos in positions}
+    try:
+        target_model.load_state_dict(base_state, strict=True)
+        gens = {"__t0__": iter_capture_tokens(target_model, target_batches, requests, device, family_adapter=family_adapter)}
+        for name, model in copies.items():
+            gens[name] = iter_capture_tokens(model, target_batches, requests, device, family_adapter=family_adapter)
+        source_gens = source_iters_fn()
+        names = list(gens)
+        with contextlib.ExitStack() as stack:
+            for gen in list(gens.values()) + list(source_gens.values()):
+                stack.enter_context(contextlib.closing(gen))
+            zipped = zip(*(gens[n] for n in names), *source_gens.values(), strict=True)
+            for k, values in enumerate(zipped):
+                by_name = dict(zip(names, values[: len(names)], strict=True))
+                source_values = dict(zip(source_gens, values[len(names):], strict=True))
+                t0 = by_name["__t0__"]
+                desired = desired_fn(k, source_values, t0)
+                for pos in positions:
+                    base_out = t0[str(pos)]
+                    d = desired[pos]
+                    jd = by_name["joint"][str(pos)] - base_out
+                    d_sq[pos] += float((d.double() ** 2).sum().item())
+                    joint_sq[pos] += float((jd.double() ** 2).sum().item())
+                    err_sq[pos] += float(((jd - d).double() ** 2).sum().item())
+                    running = torch.zeros_like(jd)
+                    for component in present_families:
+                        dc = by_name[component][str(pos)] - base_out
+                        fam_sq[component][pos] += float((dc.double() ** 2).sum().item())
+                        running = running + dc
+                    if len(present_families) > 1:
+                        inter_sq[pos] += float(((jd - running).double() ** 2).sum().item())
+        results: dict[int, dict[str, Any]] = {}
+        for pos in positions:
+            d_norm = d_sq[pos] ** 0.5
+            joint_norm = joint_sq[pos] ** 0.5
+            row: dict[str, Any] = {
+                "position": pos,
+                "desired_norm": d_norm,
+                "joint_delta_norm": joint_norm,
+                "block_realized_target_error": (err_sq[pos] ** 0.5) / (d_norm + 1e-12),
+                "joint_delta_norm_over_desired": joint_norm / (d_norm + 1e-12),
+                "per_family_delta_norm_over_desired": {
+                    c: (fam_sq[c][pos] ** 0.5) / (d_norm + 1e-12) for c in present_families
+                },
+                "component_interaction_error": (
+                    (inter_sq[pos] ** 0.5) / (joint_norm + 1e-12) if len(present_families) > 1 else None
+                ),
+            }
+            results[pos] = row
+        return results
+    finally:
+        del copies
+        target_model.load_state_dict(entry_state, strict=True)
+        exit_hash = _task_vector_sha256({k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()})
+        if exit_hash != entry_hash:
+            raise RuntimeError(
+                "measure_direct_residual_realization_streaming failed to restore the target model's entry state exactly"
+            )

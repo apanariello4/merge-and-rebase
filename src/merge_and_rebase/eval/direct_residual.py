@@ -57,8 +57,8 @@ from ..rebase.discrete_layer_match import DiscreteLayerPairing, discrete_layer_p
 from .target_informed_runtime import (
     COMPONENT_INPUT_KIND,
     _aligned,
-    _family_bias_key,
     _component_effective_out,
+    _family_bias_key,
     _finalize_independent_component,
     _fit_all_positions_independent,
     _fit_block_boundary_backfit,
@@ -77,8 +77,10 @@ from .target_informed_runtime import (
     # DirectResidualConfig.realization_diagnostics, and neither is called by
     # fit_direct_residual itself (its own 2-tuple return is unchanged).
     compute_direct_residual_task_vector_stats,
+    iter_capture_block_gradients,
     iter_capture_tokens,
     measure_direct_residual_realization,
+    measure_direct_residual_realization_streaming,
     paired_calibration,
 )
 
@@ -87,11 +89,13 @@ __all__ = [
     "apply_tv_scaling",
     "capture_paired_boundary_activations",
     "compute_alignment_diagnostics",
+    "compute_alignment_diagnostics_streaming",
     "compute_desired_effects",
     "compute_direct_residual_task_vector_stats",
     "fit_direct_residual",
     "fit_direct_residual_streaming",
     "measure_direct_residual_realization",
+    "measure_direct_residual_realization_streaming",
     "parse_direct_residual_config",
     "position_paired_only_contributions",
     "position_source_contributions",
@@ -595,14 +599,6 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
         if cfg.block_split != "none":
             raise ValueError("activation_storage='streaming' requires block_split='none'")
-        if cfg.realization_diagnostics:
-            raise ValueError("activation_storage='streaming' requires realization_diagnostics=False")
-        if cfg.procrustes_source != "activation":
-            raise ValueError("activation_storage='streaming' requires procrustes_source='activation'")
-        if cfg.residual_target != "transported_delta":
-            raise ValueError("activation_storage='streaming' requires residual_target='transported_delta'")
-        if cfg.tv_scaling != "none":
-            raise ValueError("activation_storage='streaming' requires tv_scaling='none'")
     return cfg
 
 
@@ -1131,8 +1127,13 @@ def apply_tv_scaling(
     config: DirectResidualConfig,
     device,
     family_adapter=None,
+    measure_fn=None,
 ) -> tuple[dict[str, Tensor], dict[str, Any]]:
     """Label-free rescaling of a unit-strength Direct Residual task vector.
+
+    ``measure_fn(delta) -> {j: realization row}`` replaces the resident measurement when
+    given (the streaming path passes `measure_direct_residual_realization_streaming`
+    bound to its own calibration sweep); ``captured``/``desired`` are then unused.
 
     Reuses ``measure_direct_residual_realization`` (mount, capture
     block-boundary outputs over the SAME calibration batches
@@ -1164,8 +1165,6 @@ def apply_tv_scaling(
         )
     shim = _layout_for(family_adapter)
     components = order_components(config.components)
-    batches = captured["target_batches"]
-    target_outputs_by_position = captured["target_base_outputs_by_position"]
 
     tau_stats_before = {
         "frobenius_norm": _tau_frobenius_norm(target_corrections),
@@ -1173,13 +1172,15 @@ def apply_tv_scaling(
     }
 
     def measure(delta: Mapping[str, Tensor]) -> dict[int, dict[str, Any]]:
+        if measure_fn is not None:
+            return measure_fn(delta)
         return measure_direct_residual_realization(
             target_model,
             target_base_state,
             delta,
             positions,
-            batches,
-            target_outputs_by_position,
+            captured["target_batches"],
+            captured["target_base_outputs_by_position"],
             desired,
             device=device,
             components=components,
@@ -1339,6 +1340,9 @@ def prepare_direct_residual_streaming(
     seed: int | None,
     device,
     family_adapter=None,
+    procrustes_source: str = "activation",
+    source_recipe=None,
+    target_recipe=None,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
     ``compute_desired_effects``: accumulates each position's Procrustes cross-
@@ -1353,17 +1357,32 @@ def prepare_direct_residual_streaming(
     materialized row bank there) -- both compute ``_procrustes_from_cross``
     over mathematically the same centered cross-covariance matrix.
 
+    ``procrustes_source="gradient"`` additionally runs the per-batch
+    `iter_capture_block_gradients` generators (source base at the paired
+    indices, target base at every position, each with its own recipe) in
+    lockstep and fits ``Q_j`` on the Chan-accumulated centered GRADIENT
+    cross-covariance, exactly the statistic the resident path fits it on. The
+    activation accumulators always run: they provide the target fingerprints,
+    the activation means ``mu_s``/``mu_t`` (``residual_target=
+    "transported_endpoint"``) and the activation-space map used by the
+    alignment diagnostics and the gradient-vs-activation overlap diagnostic.
+
     Returns a dict consumed by `fit_direct_residual_streaming`: the fitted
     per-position Procrustes maps (``"q_by_position"``), a per-(batch,
     position) determinism fingerprint of the target boundary activations
     (``"fingerprints"``) that Pass B uses to detect a target model mutated
-    between passes, the replayed calibration batches for both sides, and the
-    calibration metadata.
+    between passes, the activation-space maps and means, the replayed
+    calibration batches for both sides, and the calibration metadata.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
     if pairing.source_depth < 1:
         raise ValueError("pairing.source_depth must be positive")
+    if procrustes_source not in {"activation", "gradient"}:
+        raise ValueError("procrustes_source must be 'activation' or 'gradient'")
+    gradient_mode = procrustes_source == "gradient"
+    if gradient_mode and (source_recipe is None or target_recipe is None):
+        raise ValueError("procrustes_source='gradient' requires source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
         source_loader, target_loader, num_batches=num_batches, seed=seed
     )
@@ -1371,16 +1390,43 @@ def prepare_direct_residual_streaming(
     src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
     tgt_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
     accumulators = {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)}
+    grad_accumulators = (
+        {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)} if gradient_mode else {}
+    )
     fingerprints: dict[tuple[int, int], tuple[float, float]] = {}
 
-    src_gen = iter_capture_tokens(
-        source_base_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
-    )
-    tgt_gen = iter_capture_tokens(
-        target_base_model, target_batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
-    )
-    with contextlib.closing(src_gen), contextlib.closing(tgt_gen):
-        for k, (src, tgt) in enumerate(zip(src_gen, tgt_gen, strict=True)):
+    gens = {
+        "src": iter_capture_tokens(
+            source_base_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+        ),
+        "tgt": iter_capture_tokens(
+            target_base_model, target_batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+        ),
+    }
+    if gradient_mode:
+        gens["src_grad"] = iter_capture_block_gradients(
+            source_base_model,
+            source_batches,
+            {str(i): i for i in distinct_source_indices},
+            source_recipe,
+            device,
+            family_adapter=family_adapter,
+        )
+        gens["tgt_grad"] = iter_capture_block_gradients(
+            target_base_model,
+            target_batches,
+            {str(j): j for j in range(pairing.target_depth)},
+            target_recipe,
+            device,
+            family_adapter=family_adapter,
+        )
+    names = list(gens)
+    with contextlib.ExitStack() as stack:
+        for gen in gens.values():
+            stack.enter_context(contextlib.closing(gen))
+        for k, values in enumerate(zip(*(gens[n] for n in names), strict=True)):
+            by_name = dict(zip(names, values, strict=True))
+            src, tgt = by_name["src"], by_name["tgt"]
             for j in range(pairing.target_depth):
                 i = pairing.pairing[j]
                 t = tgt[str(j)]
@@ -1390,10 +1436,36 @@ def prepare_direct_residual_streaming(
                 accumulators[j].update(x_rows, y_rows)
                 t64 = t.double()
                 fingerprints[(k, j)] = (float(t64.sum().item()), float((t64**2).sum().item()))
+                if gradient_mode:
+                    g_t = by_name["tgt_grad"][str(j)]
+                    g_s = _aligned([by_name["src_grad"][str(i)]], [g_t])[0]
+                    grad_accumulators[j].update(
+                        g_s.reshape(-1, g_s.shape[-1]).double(), g_t.reshape(-1, g_t.shape[-1]).double()
+                    )
 
-    q_by_position = {j: _procrustes_from_cross(acc.cross()).float().cpu() for j, acc in accumulators.items()}
+    activation_q64 = {j: _procrustes_from_cross(acc.cross()).cpu() for j, acc in accumulators.items()}
+    procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    if gradient_mode:
+        q_by_position = {}
+        for j, acc in grad_accumulators.items():
+            cross = acc.cross()
+            q64 = _procrustes_from_cross(cross).cpu()
+            q_by_position[j] = q64.float()
+            d_min = min(q64.shape)
+            procrustes_diagnostics[j] = {
+                "procrustes_source": "gradient",
+                "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
+                "activation_gradient_procrustes_overlap": float(((activation_q64[j].T @ q64).norm() ** 2) / d_min),
+            }
+    else:
+        q_by_position = {j: q.float() for j, q in activation_q64.items()}
     return {
         "q_by_position": q_by_position,
+        "procrustes_source": procrustes_source,
+        "procrustes_diagnostics": procrustes_diagnostics,
+        "activation_q64_by_position": activation_q64,
+        "source_mean_by_position": {j: acc.mean_x.cpu() for j, acc in accumulators.items()},
+        "target_mean_by_position": {j: acc.mean_y.cpu() for j, acc in accumulators.items()},
         "fingerprints": fingerprints,
         "source_batches": source_batches,
         "target_batches": target_batches,
@@ -1446,6 +1518,12 @@ def fit_direct_residual_streaming(
     source_batches = prepared["source_batches"]
     q_by_position = prepared["q_by_position"]
     fingerprints = prepared["fingerprints"]
+    residual_target = config.residual_target
+    if residual_target == "transported_endpoint":
+        if prepared.get("procrustes_source", "activation") != "activation":
+            raise ValueError("residual_target='transported_endpoint' requires procrustes_source='activation'")
+        mu_s_by_position = {j: m.float() for j, m in prepared["source_mean_by_position"].items()}
+        mu_t_by_position = {j: m.float() for j, m in prepared["target_mean_by_position"].items()}
     positions = list(range(pairing.target_depth))
     for j in positions:
         if j not in q_by_position:
@@ -1529,7 +1607,10 @@ def fit_direct_residual_streaming(
                         f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
                         base_out = out_cpu
                         q = q_by_position[pos]
-                        desired = (f - b) @ q
+                        if residual_target == "transported_delta":
+                            desired = (f - b) @ q
+                        else:
+                            desired = (f - mu_s_by_position[pos]) @ q + mu_t_by_position[pos] - out_cpu
                         effect = out_cpu - base_out
                         error = desired - effect
                         desired_sq_val = float((desired.double() ** 2).sum().item())
@@ -1575,3 +1656,156 @@ def fit_direct_residual_streaming(
             orig_device, orig_training = originals[mid]
             m.to(orig_device).train(orig_training)
     return target_corrections, diagnostics
+
+
+def _streaming_source_iters(source_base_model, source_ft_model, prepared, pairing, device, family_adapter=None):
+    """Fresh lockstep source generators (base + FT boundary at the paired indices) over the
+    streaming path's replayed source calibration batches."""
+    requests = {str(i): (i, "boundary") for i in sorted(set(pairing.pairing))}
+    batches = prepared["source_batches"]
+    return {
+        "sb": iter_capture_tokens(
+            source_base_model, batches, requests, device, family_adapter=family_adapter, store_device=device
+        ),
+        "sf": iter_capture_tokens(
+            source_ft_model, batches, requests, device, family_adapter=family_adapter, store_device=device
+        ),
+    }
+
+
+def _streaming_desired(prepared, pairing, residual_target, source_values, t0, positions):
+    """Pass B's per-batch ``D_j`` (same arithmetic as `fit_direct_residual_streaming`)."""
+    out: dict[int, Tensor] = {}
+    for pos in positions:
+        i = pairing.pairing[pos]
+        out_cpu = t0[str(pos)].cpu()
+        b = _aligned([source_values["sb"][str(i)].cpu()], [out_cpu])[0]
+        f = _aligned([source_values["sf"][str(i)].cpu()], [out_cpu])[0]
+        q = prepared["q_by_position"][pos]
+        if residual_target == "transported_delta":
+            out[pos] = (f - b) @ q
+        else:
+            mu_s = prepared["source_mean_by_position"][pos].float()
+            mu_t = prepared["target_mean_by_position"][pos].float()
+            out[pos] = (f - mu_s) @ q + mu_t - out_cpu
+    return out
+
+
+def measure_streaming_realization_for(
+    target_model,
+    target_base_state,
+    source_base_model,
+    source_ft_model,
+    prepared,
+    pairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+):
+    """Bind `measure_direct_residual_realization_streaming` to one streaming run: returns
+    ``measure(delta) -> {j: row}`` (the `apply_tv_scaling` ``measure_fn`` signature)."""
+    positions = list(range(pairing.target_depth))
+    components = order_components(config.components)
+
+    def measure(delta):
+        return measure_direct_residual_realization_streaming(
+            target_model,
+            target_base_state,
+            delta,
+            positions,
+            prepared["target_batches"],
+            lambda _k, source_values, t0: _streaming_desired(
+                prepared, pairing, config.residual_target, source_values, t0, positions
+            ),
+            lambda: _streaming_source_iters(
+                source_base_model, source_ft_model, prepared, pairing, device, family_adapter=family_adapter
+            ),
+            device=device,
+            components=components,
+            family_adapter=family_adapter,
+        )
+
+    return measure
+
+
+@torch.no_grad()
+def compute_alignment_diagnostics_streaming(
+    source_base_model,
+    source_ft_model,
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    device,
+    family_adapter=None,
+) -> dict[int, dict[str, float]]:
+    """Streaming counterpart of `compute_alignment_diagnostics` (same keys, same meaning).
+
+    One lockstep sweep (source base, source FT, pristine target) over the calibration
+    batches, reusing Pass A's activation-space map and means (``Q_j``, ``mu_s``, ``mu_t``
+    in float64), and accumulating every norm as a per-batch sum of squares: equal to the
+    resident diagnostics up to floating-point summation order (and the Chan-accumulated
+    Procrustes map). Analysis-only; like the resident function it must be called outside
+    the timed brackets. The target model's entry state is restored.
+    """
+    positions = list(range(pairing.target_depth))
+    q64 = prepared["activation_q64_by_position"]
+    mu_s = prepared["source_mean_by_position"]
+    mu_t = prepared["target_mean_by_position"]
+    sums = {
+        j: {"e": 0.0, "t": 0.0, "delta": 0.0, "in": 0.0, "out": 0.0, "src_dim": 0, "tgt_dim": 0} for j in positions
+    }
+    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    try:
+        target_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
+        requests = {str(j): (j, "boundary") for j in positions}
+        gens = _streaming_source_iters(source_base_model, source_ft_model, prepared, pairing, device, family_adapter)
+        gens["tgt"] = iter_capture_tokens(
+            target_model, prepared["target_batches"], requests, device, family_adapter=family_adapter, store_device=device
+        )
+        names = list(gens)
+        with contextlib.ExitStack() as stack:
+            for gen in gens.values():
+                stack.enter_context(contextlib.closing(gen))
+            for values in zip(*(gens[n] for n in names), strict=True):
+                by_name = dict(zip(names, values, strict=True))
+                for j in positions:
+                    i = pairing.pairing[j]
+                    t_cpu = by_name["tgt"][str(j)].cpu()
+                    b = _aligned([by_name["sb"][str(i)].cpu()], [t_cpu])[0]
+                    f = _aligned([by_name["sf"][str(i)].cpu()], [t_cpu])[0]
+                    s0 = b.reshape(-1, b.shape[-1]).double()
+                    s1 = f.reshape(-1, f.shape[-1]).double()
+                    t0 = t_cpu.reshape(-1, t_cpu.shape[-1]).double()
+                    q = q64[j].double()
+                    e = (s0 - mu_s[j]) @ q - (t0 - mu_t[j])
+                    e_in = (e @ q.T) @ q
+                    acc = sums[j]
+                    acc["e"] += float((e**2).sum().item())
+                    acc["t"] += float(((t0 - mu_t[j]) ** 2).sum().item())
+                    acc["delta"] += float((((s1 - s0) @ q) ** 2).sum().item())
+                    acc["in"] += float((e_in**2).sum().item())
+                    acc["out"] += float(((e - e_in) ** 2).sum().item())
+                    acc["src_dim"], acc["tgt_dim"] = int(s0.shape[-1]), int(t0.shape[-1])
+    finally:
+        target_model.load_state_dict(entry_state, strict=True)
+    diagnostics: dict[int, dict[str, float]] = {}
+    for j in positions:
+        acc = sums[j]
+        error_norm = acc["e"] ** 0.5
+        target_norm = acc["t"] ** 0.5
+        delta_norm = acc["delta"] ** 0.5
+        diagnostics[j] = {
+            "procrustes_error_norm": error_norm,
+            "procrustes_relative_error": error_norm / target_norm if target_norm > 0 else 0.0,
+            "delta_target_norm": delta_norm,
+            "endpoint_minus_delta_over_delta": error_norm / delta_norm if delta_norm > 0 else 0.0,
+            "procrustes_error_in_range_norm": acc["in"] ** 0.5,
+            "procrustes_error_out_of_range_norm": acc["out"] ** 0.5,
+            "mean_offset_norm": float(torch.linalg.norm(mu_s[j] @ q64[j].double() - mu_t[j])),
+            "source_dim": acc["src_dim"],
+            "target_dim": acc["tgt_dim"],
+        }
+    return diagnostics
