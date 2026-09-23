@@ -247,8 +247,12 @@ class DirectResidualConfig:
     #                target_informed_runtime._fit_block_boundary_backfit.
     block_split: str = "none"
     backfit_max_iters: int = 20
-    # Stop when the change in ||E||/||D_j|| between consecutive sweeps drops
-    # below this.
+    # Stop when the relative decrease of the safeguarded block objective J(Delta)
+    # (data-fit term plus each component's own round-1-frozen ridge penalty; see
+    # target_informed_runtime._fit_block_boundary_backfit) between consecutive
+    # full sweeps drops below this. J is measured, not linearized, on every
+    # sweep AND accepted/rejected at every Gauss-Seidel sub-step, so it is
+    # non-increasing by construction -- see the same docstring.
     backfit_tol: float = 1e-4
 
 

@@ -1576,6 +1576,68 @@ def _mount_component(shim, local_block, component, weight, bias):
         module.bias.data.copy_(bias.to(module.bias.dtype).to(module.bias.device))
 
 
+def _mount_all_deltas(shim, local_block, order, base, deltas):
+    """Mount ``base[c] + deltas[c]`` for every ``c in order`` onto ``local_block``."""
+    for c in order:
+        w, b = deltas[c]
+        _mount_component(shim, local_block, c, base[c][0] + w, None if base[c][1] is None else base[c][1] + b)
+
+
+def _backfit_data_fit_sq(shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas):
+    """``||D_j - (block_j(X_j^0; deltas mounted) - T_j^0)||_F^2`` -- the (un-linearized,
+    measured on the actual local block replay) data-fit term of the safeguarded
+    backfit objective ``J(Delta)``. See ``_fit_block_boundary_backfit``'s docstring.
+
+    ``local_block64`` is a dedicated float64 replica of the block (see
+    ``_fit_block_boundary_backfit``), used ONLY for this measurement -- never
+    for the candidate sub-solves, whose CPU-float32 delta convention is
+    unaffected. The accept/backtrack decision this feeds compares two J
+    values that can be arbitrarily close near a fixed point (a near-singular
+    Gauss-Seidel design, e.g., can leave genuine per-sweep improvements far
+    below float32's ~1e-7 relative precision); evaluating in the module's own
+    float32 would let ordinary float32 rounding noise in the forward pass
+    flip the accept/reject decision and stall the sweep well short of
+    convergence -- exactly the kind of numerical noise a *safeguard*
+    (whose entire job is a reliable ``<`` comparison) must not be sensitive
+    to. ``_mount_component``'s own ``.to(module.weight.dtype)`` upcasts the
+    float32 base/delta tensors to float64 automatically since
+    ``local_block64``'s parameters are float64.
+    """
+    _mount_all_deltas(shim, local_block64, order, base, deltas)
+    t_all = [local_block64(x.to(device).double()).detach().cpu().clone() for x in x_batches]
+    return sum(
+        float(((d.double() - (t - t0.double())) ** 2).sum().item())
+        for d, t, t0 in zip(d_batches, t_all, t0_batches, strict=True)
+    )
+
+
+def _backfit_ridge_penalty(order, deltas, lambdas):
+    """``sum_c lambda_c * ||Delta W_c||_F^2`` -- the exact penalty
+    ``ResidualSufficientStatistics.solve`` minimizes for the weight (the bias is
+    fit unpenalized; see ``_fit_block_boundary_backfit``'s docstring), evaluated
+    with each component's FROZEN round-1 ``lambda_c`` from ``lambdas``. A
+    component with no ``lambdas`` entry yet (never solved) contributes 0, which
+    is always exact since its delta is still zero at that point.
+    """
+    total = 0.0
+    for c in order:
+        w, _ = deltas[c]
+        lam = lambdas.get(c)
+        if lam:
+            total += lam * float((w.double() ** 2).sum().item())
+    return total
+
+
+def _backfit_objective(shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas, lambdas):
+    """Returns ``(J, data_fit_sq)`` -- the full safeguarded objective and its
+    data-fit term alone (the latter is what feeds the diagnostic ``r`` trace).
+    """
+    data_fit_sq = _backfit_data_fit_sq(
+        shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas
+    )
+    return data_fit_sq + _backfit_ridge_penalty(order, deltas, lambdas), data_fit_sq
+
+
 @torch.no_grad()
 def _fit_block_boundary_backfit(
     target_model,
@@ -1607,10 +1669,53 @@ def _fit_block_boundary_backfit(
     Gauss-Seidel over ``components`` (canonical forward order), from scratch
     every sweep (no warm start -- ``ResidualSufficientStatistics`` solves a
     fresh ridge system each time, exactly as every other direct-target fit
-    does), until ``|r_prev - r| < config.backfit_tol`` or
-    ``config.backfit_max_iters`` sweeps, where
+    does).
+
+    Monotone safeguarded backfitting. Each Gauss-Seidel sub-step refits
+    component ``c`` against ``E_c`` above, but ``c``'s update also changes
+    the OTHER component's effect through the block's own nonlinear path
+    (``attn.out_proj -> ln_2 -> GELU -> mlp.c_proj``'s input, on ViT), so the
+    sub-step candidate is not an exact block-coordinate minimizer of the true
+    objective and nothing prevents it from increasing that objective. This is
+    fixed by measuring the true, un-linearized per-block objective on the
+    local block replay,
+
+        J(Delta) = ||D_j - (block_j(X_j^0; Delta mounted) - T_j^0)||_F^2
+                   + sum_c lambda_c * ||Delta W_c||_F^2,
+
+    and only ever accepting a change that decreases it. ``lambda_c`` is each
+    component's ridge coefficient -- ``ResidualSufficientStatistics.solve``'s
+    ``diag["ridge"]`` -- FROZEN at the value its round-1 (first sweep) solve
+    returns, not recomputed every sweep: the whole point of a monotone
+    descent objective is that it is a fixed function of ``Delta``, so a
+    ridge that itself drifts sweep to sweep (as it does inside ``solve``,
+    since it is a function of that sweep's own H_c statistics, which change
+    as other components' deltas move) would make "J decreased" incomparable
+    across sweeps. ``lambda_c`` penalizes ``Delta W_c`` (the weight only) at
+    the SAME scale ``solve`` itself minimizes: its normal equations are
+    ``S_c X G + lambda X = B_c``, i.e. the stationarity condition of
+    ``||A X L - E||_F^2 + lambda ||X||_F^2`` with the bias fit unpenalized
+    (``solve``'s ``beta`` is derived with no ridge term) -- so
+    ``lambda_c * ||Delta W_c||_F^2`` is exactly what that component's own
+    sub-solve minimizes, with ``Delta W_c`` the returned weight correction
+    itself (``solve`` returns ``x.T``, and the penalty ``lambda ||x||_F^2``
+    is transpose-invariant).
+
+    Each sub-step computes the candidate ``Delta_c^new`` exactly as the
+    unsafeguarded rule did, then accepts it only if ``J`` decreases;
+    otherwise backtracks ``Delta_c = Delta_c^old + eta (Delta_c^new -
+    Delta_c^old)`` (weight AND bias together) for ``eta = 1, 1/2, 1/4, ...``
+    down to ``1/256`` (an initial full step plus up to 8 halvings); if no
+    ``eta`` decreases ``J``, ``Delta_c`` is left at ``Delta_c^old``
+    (recorded as an accepted ``eta`` of 0). ``J`` is therefore non-increasing
+    by construction, at every sub-step and therefore every sweep. Sweeping
+    stops when the relative decrease of ``J`` over a full sweep (measured
+    once, with every current delta mounted, after each sweep's Gauss-Seidel
+    pass) drops below ``config.backfit_tol``, or at
+    ``config.backfit_max_iters`` sweeps. The plain relative residual
     ``r = ||D_j - (block_j(X_j^0; ALL current deltas mounted) - T_j^0)||_F /
-    ||D_j||_F`` is measured once per full sweep (not once per component).
+    ||D_j||_F`` is still measured and logged every sweep as a diagnostic
+    (``backfit_residual_trace``), but no longer drives the stopping rule.
 
     With a single component, the first sweep's ``E_c`` reduces exactly to
     ``D_j`` (no other component is mounted, so the replay term is
@@ -1619,7 +1724,12 @@ def _fit_block_boundary_backfit(
     ``H_c``/output from the local block copy on the captured pristine
     ``X_j^0`` bitwise reproduce what a direct hook on the live target model
     would have captured -- asserted below (see ``block_replay_bitwise`` in the
-    returned diagnostics) rather than assumed.
+    returned diagnostics) rather than assumed. With one component there is
+    also nothing to backtrack against on later sweeps: the candidate is
+    always accepted at ``eta=1`` (see the docstring of
+    ``_fit_block_boundary_backfit``'s test coverage), since a single
+    component's own sub-solve is an exact minimizer of ``J`` restricted to
+    that component with every OTHER (nonexistent) component fixed.
 
     The full target model is never mutated: every mount happens on a
     ``copy.deepcopy`` of the block, discarded at the end of each position.
@@ -1675,6 +1785,12 @@ def _fit_block_boundary_backfit(
                 raise RuntimeError("block_split='backfit' components must not be packed (row_slice must be None)")
             base[c] = (w.detach().cpu().clone(), None if b is None else b.detach().cpu().clone())
         scale_modules = {c: shim.component_scale_module(local_block, c) for c in order}
+        # A dedicated float64 replica, used ONLY by the monotone safeguard's own
+        # J(Delta) measurement (see _backfit_data_fit_sq's docstring) -- never
+        # for candidate generation, so the returned corrections' CPU-float32
+        # convention is untouched. Deepcopied here while `local_block` is still
+        # pristine (nothing has been mounted onto it yet).
+        local_block64 = copy.deepcopy(local_block).double().eval()
 
         def reset_all(local_block=local_block, order=order, base=base):
             for c in order:
@@ -1704,12 +1820,23 @@ def _fit_block_boundary_backfit(
         d_sq_total = sum(float((d.double() ** 2).sum().item()) for d in d_batches)
         desired_norm = d_sq_total**0.5
         residual_trace: list[float] = []
+        j_trace: list[float] = []
         converged = False
         n_sweeps = 0
-        r_prev = None
+        j_prev = None
+        round1_j: float | None = None
+        round1_r: float | None = None
+        # J(Delta=0) = ||D_j - (T_j^0 - T_j^0)||^2 + 0 = ||D_j||^2 (no ridge penalty
+        # at the all-zero start).
+        lambdas: dict[str, float] = {}
         per_component_diag: dict[str, dict] = {}
         per_component_h: dict[str, list] = {}
         per_component_effective_out: dict[str, torch.Tensor] = {}
+        per_component_eta_history: dict[str, list[float]] = {c: [] for c in order}
+        # Backtracking line-search factors: an initial full step, then up to 8
+        # halvings (see the docstring). eta=0 (keep the old delta) is the
+        # implicit fallback when none of these decrease J.
+        backtrack_etas = [1.0] + [1.0 / (2**k) for k in range(1, 9)]
         for sweep in range(1, int(config.backfit_max_iters) + 1):
             n_sweeps = sweep
             for c in order:
@@ -1745,26 +1872,59 @@ def _fit_block_boundary_backfit(
                 diag["bias_correction"] = diag["bias_correction"].cpu()
                 if correction.shape != base[c][0].shape or not torch.isfinite(correction).all():
                     raise RuntimeError("block_split='backfit' produced an invalid projection")
-                deltas[c] = (correction, diag["bias_correction"])
                 per_component_diag[c] = diag
                 per_component_h[c] = h_batches
                 per_component_effective_out[c] = effective_out
-            # Measure the full-sweep residual with every current delta mounted.
-            reset_all()
-            for c in order:
-                w, b = deltas[c]
-                _mount_component(shim, local_block, c, base[c][0] + w, None if base[c][1] is None else base[c][1] + b)
-            t_all = [local_block(x.to(device)).detach().float().cpu().clone() for x in x_batches]
-            num_sq = sum(
-                float(((d - (t - t0)).double() ** 2).sum().item())
-                for d, t, t0 in zip(d_batches, t_all, t0_batches, strict=True)
+
+                # Freeze lambda_c at its round-1 (first-solve) value: J must stay
+                # a FIXED function of Delta across the whole backfit for "J
+                # decreased" to be comparable sweep to sweep (see the docstring).
+                # solve()'s own internal ridge is recomputed every sweep from
+                # that sweep's H_c -- that only shapes the CANDIDATE proposed
+                # below, never the objective the safeguard accepts or rejects
+                # against.
+                if sweep == 1:
+                    lambdas[c] = float(diag["ridge"])
+
+                old_w, old_b = deltas[c]
+                candidate_w, candidate_b = correction, diag["bias_correction"]
+                trial_deltas = dict(deltas)
+                j_old, _ = _backfit_objective(
+                    shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, trial_deltas, lambdas
+                )
+                accepted_eta = 0.0
+                accepted_delta = (old_w, old_b)
+                for eta in backtrack_etas:
+                    trial_w = old_w + eta * (candidate_w - old_w)
+                    trial_b = None if old_b is None else old_b + eta * (candidate_b - old_b)
+                    trial_deltas[c] = (trial_w, trial_b)
+                    j_trial, _ = _backfit_objective(
+                        shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, trial_deltas, lambdas
+                    )
+                    if j_trial < j_old:
+                        accepted_eta = eta
+                        accepted_delta = (trial_w, trial_b)
+                        break
+                deltas[c] = accepted_delta
+                per_component_eta_history[c].append(accepted_eta)
+            # Measure the full-sweep objective and diagnostic residual with every
+            # current delta mounted -- the same mount _backfit_objective performs,
+            # done once more here only because we also want the plain (ridge-free)
+            # data-fit norm `r` for the diagnostic trace.
+            j_now, data_fit_sq = _backfit_objective(
+                shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas, lambdas
             )
-            r = (num_sq**0.5) / (desired_norm + 1e-12)
+            r = (data_fit_sq**0.5) / (desired_norm + 1e-12)
             residual_trace.append(r)
-            if r_prev is not None and abs(r_prev - r) < float(config.backfit_tol):
-                converged = True
-                break
-            r_prev = r
+            j_trace.append(j_now)
+            if sweep == 1:
+                round1_j, round1_r = j_now, r
+            if j_prev is not None:
+                rel_decrease = (j_prev - j_now) / j_prev if j_prev > 0 else 0.0
+                if rel_decrease < float(config.backfit_tol):
+                    converged = True
+                    break
+            j_prev = j_now
 
         position_corrections: dict[str, torch.Tensor] = {}
         block_rows: list[dict[str, Any]] = []
@@ -1816,6 +1976,11 @@ def _fit_block_boundary_backfit(
                 "backfit_n_sweeps": n_sweeps,
                 "backfit_converged": converged,
                 "backfit_residual_trace": list(residual_trace),
+                "backfit_j_trace": list(j_trace),
+                "backfit_round1_j": round1_j,
+                "backfit_round1_r": round1_r,
+                "backfit_ridge_lambda": lambdas.get(c),
+                "backfit_eta_history": list(per_component_eta_history[c]),
                 "block_replay_bitwise": block_replay_bitwise,
                 **diag,
             }
