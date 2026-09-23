@@ -424,6 +424,22 @@ class DirectResidualConfig:
     # when num_positions * num_components is itself large. None (default)
     # fits every position in one chunk.
     streaming_position_chunk: int | None = None
+    # Which images every Direct Residual fit collects its activations on.
+    #   "task_local" (default) -- each per-task fit uses that task's own train
+    #                             loaders; merge_in_source_then_fit uses the
+    #                             first contributing task's. Bit-identical to
+    #                             pre-field code.
+    #   "tiny_imagenet"        -- one task-independent paired context
+    #                             (zh-plus/tiny-imagenet, split "valid") shared
+    #                             by every fit.
+    #   "vision8_mix"          -- one exactly balanced Vision8 train context
+    #                             (batch_size / 8 images per task per batch)
+    #                             shared by every fit.
+    # Only the fit's calibration changes: the per-task alpha search and the
+    # evaluation stay on each task's own splits. Non-default values require
+    # procrustes_source="activation" (gradient Procrustes needs task labels
+    # and text features). The context is built in vision_rebase.py.
+    calibration_data: str = "task_local"
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -463,6 +479,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "tv_scaling_iters",
         "activation_storage",
         "streaming_position_chunk",
+        "calibration_data",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -600,6 +617,14 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
         if cfg.block_split != "none":
             raise ValueError("activation_storage='streaming' requires block_split='none'")
+    if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix"}:
+        raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet' or 'vision8_mix'")
+    if cfg.calibration_data != "task_local" and cfg.procrustes_source != "activation":
+        raise ValueError(
+            f"calibration_data={cfg.calibration_data!r} requires procrustes_source='activation': gradient "
+            "Procrustes backpropagates the task's own labelled loss, which a task-independent calibration "
+            "set does not provide"
+        )
     return cfg
 
 

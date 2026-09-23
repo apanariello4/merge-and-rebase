@@ -797,6 +797,75 @@ def _build_balanced_calibration_context(
     return context, {"plan": balanced.plan, "fingerprint": balanced.fingerprint}
 
 
+DIRECT_RESIDUAL_TINY_IMAGENET_SPEC = {"path": "zh-plus/tiny-imagenet", "split": "valid"}
+
+
+def _build_direct_residual_calibration(
+    calibration_data: str,
+    *,
+    per_task: Sequence[Mapping[str, Any]],
+    suite: Any,
+    cfg: dict[str, Any],
+    clf_source: OpenClipClassifier,
+    clf_target: OpenClipClassifier,
+    source_cfg: OpenClipBuildConfig,
+    target_cfg: OpenClipBuildConfig,
+    num_batches: int,
+    calibration_seed: int,
+) -> tuple[_TaskContext, dict[str, Any]]:
+    """The one task-independent calibration context of ``calibration_data``.
+
+    ``"tiny_imagenet"`` reuses `_build_direct_paired_calibration_context` on the
+    whole Tiny-ImageNet ``valid`` split (10,000 images); Direct Residual's own
+    seeded ``paired_calibration`` then draws ``num_batches * batch_size`` of
+    them, exactly as it does from a task's train split. ``"vision8_mix"`` reuses
+    `_build_balanced_calibration_context` on the tasks' train splits with
+    ``num_batches`` complete balanced batches (``batch_size / n_tasks`` images
+    per task per batch), so the fit sees every balanced image once; its
+    per-task sample draw uses ``calibration_seed`` (Direct Residual's own
+    seed), so a calibration-seed replicate changes the balanced images too.
+    """
+    if calibration_data == "tiny_imagenet":
+        context = _build_direct_paired_calibration_context(
+            DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+            suite=suite,
+            cfg=cfg,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+        )
+        return context, {
+            "calibration_data": calibration_data,
+            **DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+            "num_samples": len(context.loaders.train.dataset),
+        }
+    if calibration_data == "vision8_mix":
+        batch_size = int(cfg.get("batch_size", 128))
+        if not per_task or batch_size % len(per_task):
+            raise ValueError(
+                f"calibration_data='vision8_mix' needs batch_size divisible by the {len(per_task)} "
+                f"calibrated tasks (got batch_size={batch_size})."
+            )
+        context, meta = _build_balanced_calibration_context(
+            per_task,
+            cfg={**cfg, "seed": int(calibration_seed)},
+            clf_source=clf_source,
+            clf_target=clf_target,
+            n_batches=num_batches,
+            split="train",
+        )
+        return context, {
+            "calibration_data": calibration_data,
+            "split": "train",
+            "n_batches": int(num_batches),
+            "seed": int(calibration_seed),
+            "samples_per_task": meta["plan"]["samples_per_task"],
+            "fingerprint": meta["fingerprint"],
+        }
+    raise ValueError(f"no task-independent calibration context for calibration_data={calibration_data!r}")
+
+
 def _build_task_context(
     task: str,
     *,
@@ -2394,6 +2463,28 @@ def main() -> None:
                 }
             )
 
+        # Task-independent Direct Residual calibration (direct_residual_params.
+        # calibration_data != "task_local"): ONE paired context, built here once
+        # and passed to every Direct Residual fit below (per task and
+        # merge_in_source_then_fit alike). Only the fit's calibration images
+        # change; each task's alpha search and evaluation keep its own splits.
+        direct_residual_calibration_ctx: _TaskContext | None = None
+        direct_residual_calibration_meta: dict[str, Any] = {"calibration_data": "task_local"}
+        if direct_residual_like and direct_residual_cfg.calibration_data != "task_local":
+            direct_residual_calibration_ctx, direct_residual_calibration_meta = _build_direct_residual_calibration(
+                direct_residual_cfg.calibration_data,
+                per_task=[item for item in per_task if item["task"] not in native_tasks],
+                suite=suite,
+                cfg=cfg,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                source_cfg=source_cfg,
+                target_cfg=target_cfg,
+                num_batches=int(direct_residual_cfg.num_batches),
+                calibration_seed=int(direct_residual_cfg.seed),
+            )
+            print(f"Direct Residual calibration: {direct_residual_calibration_meta}")
+
         brace_protocol = str(
             (cfg.get("block_extension_params", {}) or {}).get("calibration_protocol", "task_local")
         ).lower()
@@ -2496,7 +2587,11 @@ def main() -> None:
             # loaders, mirroring the existing calibration-loader fallback
             # pattern (`calibration_loader = ...; if None: select_loader(...)`)
             # used elsewhere in this function when no dedicated loader is set.
-            merged_calibration_task_ctx = task_context_by_name[merge_in_source_tasks[0]]
+            merged_calibration_task_ctx = (
+                direct_residual_calibration_ctx
+                if direct_residual_calibration_ctx is not None
+                else task_context_by_name[merge_in_source_tasks[0]]
+            )
             direct_residual_pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
             (
                 direct_residual_merged_correction,
@@ -3114,18 +3209,24 @@ def main() -> None:
                         load_into_model(source_base_model_native, source_base_sd, strict=True)
                         load_into_model(source_ft_model_native, source_base_sd, strict=True)
                         load_into_model(source_ft_model_native, load_ckpt(str(tuned_by_task[task])), strict=False)
-                        direct_residual_source_loader = select_loader(
-                            "train",
-                            train_loader=source_loaders.train,
-                            test_loader=source_loaders.test,
-                            val_loader=source_loaders.val,
-                        )
-                        direct_residual_target_loader = select_loader(
-                            "train",
-                            train_loader=loaders.train,
-                            test_loader=loaders.test,
-                            val_loader=loaders.val,
-                        )
+                        if direct_residual_calibration_ctx is not None:
+                            # Task-independent calibration: the same paired
+                            # images for every task (see calibration_data).
+                            direct_residual_source_loader = direct_residual_calibration_ctx.source_loaders.train
+                            direct_residual_target_loader = direct_residual_calibration_ctx.loaders.train
+                        else:
+                            direct_residual_source_loader = select_loader(
+                                "train",
+                                train_loader=source_loaders.train,
+                                test_loader=source_loaders.test,
+                                val_loader=source_loaders.val,
+                            )
+                            direct_residual_target_loader = select_loader(
+                                "train",
+                                train_loader=loaders.train,
+                                test_loader=loaders.test,
+                                val_loader=loaders.val,
+                            )
                         (
                             transported_delta,
                             direct_residual_timing,
@@ -4310,6 +4411,10 @@ def main() -> None:
             "direct_residual": (
                 {
                     "config": asdict(direct_residual_cfg),
+                    # Which images every fit calibrated on (see
+                    # DirectResidualConfig.calibration_data): the dataset and,
+                    # for vision8_mix, the balanced plan's fingerprint.
+                    "calibration": direct_residual_calibration_meta,
                     "diagnostics_by_task": direct_residual_diagnostics,
                     # Additive, analysis-only: both are None per task unless
                     # direct_residual_cfg.realization_diagnostics is set (see
