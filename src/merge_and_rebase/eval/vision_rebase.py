@@ -74,6 +74,7 @@ from .block_extension import (
 from .datasets.vision8_14_20 import SUITES
 from .direct_residual import (
     DirectResidualConfig,
+    apply_tv_scaling,
     capture_paired_boundary_activations,
     compute_alignment_diagnostics,
     compute_desired_effects,
@@ -1433,6 +1434,13 @@ def _run_direct_residual_fit(
     pairing: DiscreteLayerPairing,
     config: DirectResidualConfig,
     device: str,
+    clf_source: Any = None,
+    clf_target: Any = None,
+    classnames: list[str] | None = None,
+    source_build_cfg_task: Any = None,
+    build_cfg_task: Any = None,
+    source_text_features: torch.Tensor | None = None,
+    target_text_features: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Run Direct Residual's capture -> desired-effect -> fit -> scale pipeline once.
 
@@ -1471,6 +1479,17 @@ def _run_direct_residual_fit(
     feeds any fit regardless of ``config.residual_target``. Neither
     realization-diagnostics call mutates ``target_model``'s entry state (both
     restore it internally and assert so via a state-dict hash).
+
+    When ``config.procrustes_source == "gradient"``, builds source/target
+    ``clip_contrastive_recipe`` gradient recipes exactly like the BiCo branch
+    above (same classifier/classnames/build-cfg/text-features arguments) and
+    passes them into ``capture_paired_boundary_activations`` so ``Q_j`` is
+    fit on block-boundary gradients instead of activations; the six extra
+    kwargs (``clf_source``, ``clf_target``, ``classnames``,
+    ``source_build_cfg_task``, ``build_cfg_task``, ``source_text_features``/
+    ``target_text_features``) are required only in that mode. The
+    activation-vs-gradient Procrustes overlap diagnostic is merged into each
+    position's diagnostics row by position.
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1478,6 +1497,38 @@ def _run_direct_residual_fit(
     component_inputs = (
         order_components(config.components) if config.component_target != "block_boundary" else ()
     )
+    gradient_mode = config.procrustes_source == "gradient"
+    source_recipe = target_recipe = None
+    if gradient_mode:
+        missing = [
+            name
+            for name, value in (
+                ("clf_source", clf_source),
+                ("clf_target", clf_target),
+                ("classnames", classnames),
+                ("source_build_cfg_task", source_build_cfg_task),
+                ("build_cfg_task", build_cfg_task),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
+        from ..models.grad_recipes import clip_contrastive_recipe
+
+        source_recipe = clip_contrastive_recipe(
+            clf_source,
+            classnames,
+            source_build_cfg_task,
+            device=device,
+            text_features=source_text_features,
+        )
+        target_recipe = clip_contrastive_recipe(
+            clf_target,
+            classnames,
+            build_cfg_task,
+            device=device,
+            text_features=target_text_features,
+        )
     captured = capture_paired_boundary_activations(
         source_base_model,
         source_ft_model,
@@ -1489,8 +1540,18 @@ def _run_direct_residual_fit(
         seed=config.seed,
         device=device,
         component_inputs=component_inputs,
+        procrustes_source=config.procrustes_source,
+        source_recipe=source_recipe,
+        target_recipe=target_recipe,
     )
-    desired = compute_desired_effects(captured, pairing, residual_target=config.residual_target)
+    procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    desired = compute_desired_effects(
+        captured,
+        pairing,
+        residual_target=config.residual_target,
+        procrustes_source=config.procrustes_source,
+        diagnostics_out=procrustes_diagnostics if gradient_mode else None,
+    )
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1510,7 +1571,12 @@ def _run_direct_residual_fit(
     # memory bytes -- even in the default residual_target="transported_delta"
     # path -- contaminating any cross-code-generation cost comparison for a
     # quantity these diagnostics never feed into.
-    alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
+    # compute_alignment_diagnostics describes the ACTIVATION-space Procrustes fit;
+    # under procrustes_source="gradient" that is not the Q_j the fit used, so it
+    # is not reported there (None) rather than reported for the wrong map.
+    alignment_diagnostics = (
+        compute_alignment_diagnostics(captured, pairing) if config.procrustes_source == "activation" else None
+    )
 
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1533,6 +1599,30 @@ def _run_direct_residual_fit(
         "correction_fit_seconds": time.perf_counter() - fit_started,
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
     }
+    if procrustes_diagnostics:
+        for row in diagnostics:
+            extra = procrustes_diagnostics.get(int(row.get("position", -1)))
+            if extra:
+                row.update(extra)
+
+    tv_scaling_diagnostics = None
+    if config.tv_scaling != "none":
+        # Label-free, applied AFTER the unit-strength tau is assembled but
+        # BEFORE the caller's per-task alpha-search (and therefore before the
+        # realization_diagnostics/task_vector_stats block below, so both
+        # report the FINAL tau that alpha-search actually sees). tv_scaling
+        # defaults to "none" (a strict no-op, see apply_tv_scaling), so this
+        # branch never executes for the historical, golden-hash-pinned path.
+        target_corrections, tv_scaling_diagnostics = apply_tv_scaling(
+            target_model,
+            target_base_sd,
+            target_corrections,
+            list(range(pairing.target_depth)),
+            captured,
+            desired,
+            config=config,
+            device=device,
+        )
 
     realization_by_position = None
     task_vector_stats = None
@@ -1574,6 +1664,7 @@ def _run_direct_residual_fit(
         "realization_by_position": realization_by_position,
         "task_vector_stats": task_vector_stats,
         "alignment_diagnostics": alignment_diagnostics,
+        "tv_scaling": tv_scaling_diagnostics,
     }
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
@@ -2175,6 +2266,7 @@ def main() -> None:
         direct_residual_realization: dict[str, dict[int, dict[str, Any]]] = {}
         direct_residual_task_vector_stats: dict[str, dict[str, Any]] = {}
         direct_residual_alignment_diagnostics: dict[str, dict[int, dict[str, float]]] = {}
+        direct_residual_tv_scaling: dict[str, dict[str, Any] | None] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -2339,12 +2431,20 @@ def main() -> None:
                 pairing=direct_residual_pairing,
                 config=direct_residual_cfg,
                 device=device,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                classnames=merged_calibration_task_ctx.classnames,
+                source_build_cfg_task=merged_calibration_task_ctx.source_build_cfg_task,
+                build_cfg_task=merged_calibration_task_ctx.build_cfg_task,
+                source_text_features=merged_calibration_task_ctx.source_text_features,
+                target_text_features=merged_calibration_task_ctx.target_text_features,
             )
             for t in merge_in_source_tasks:
                 direct_residual_diagnostics[t] = direct_residual_merged_diag
                 direct_residual_realization[t] = direct_residual_merged_extra["realization_by_position"]
                 direct_residual_task_vector_stats[t] = direct_residual_merged_extra["task_vector_stats"]
                 direct_residual_alignment_diagnostics[t] = direct_residual_merged_extra["alignment_diagnostics"]
+                direct_residual_tv_scaling[t] = direct_residual_merged_extra["tv_scaling"]
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -2959,6 +3059,13 @@ def main() -> None:
                             pairing=pairing,
                             config=direct_residual_cfg,
                             device=device,
+                            clf_source=clf_source,
+                            clf_target=clf_target,
+                            classnames=classnames,
+                            source_build_cfg_task=source_build_cfg_task,
+                            build_cfg_task=build_cfg_task,
+                            source_text_features=task_ctx.source_text_features,
+                            target_text_features=task_ctx.target_text_features,
                         )
                         alignment_calibration_timings[task] = direct_residual_timing["alignment_calibration"]
                         correction_fit_timings[task] = direct_residual_timing["correction_fit"]
@@ -2966,6 +3073,7 @@ def main() -> None:
                         direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
                         direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
                         direct_residual_alignment_diagnostics[task] = task_direct_residual_extra["alignment_diagnostics"]
+                        direct_residual_tv_scaling[task] = task_direct_residual_extra["tv_scaling"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -4130,6 +4238,14 @@ def main() -> None:
                     # config.residual_target or realization_diagnostics; see
                     # compute_alignment_diagnostics.
                     "alignment_diagnostics_by_task": direct_residual_alignment_diagnostics,
+                    # Additive, analysis-only: None per task unless
+                    # direct_residual_cfg.tv_scaling != "none" (see
+                    # apply_tv_scaling / _run_direct_residual_fit). tv_scaling
+                    # mode + iters are already carried by "config" above
+                    # (asdict(direct_residual_cfg)); this key carries the
+                    # per-task measurement (r_j traces, s_j / c, tau stats
+                    # before/after).
+                    "tv_scaling_by_task": direct_residual_tv_scaling,
                 }
                 if direct_residual_like
                 else None

@@ -24,6 +24,7 @@ same-architecture pair as a control.
 from __future__ import annotations
 
 import hashlib
+import math
 from copy import deepcopy
 
 import pytest
@@ -196,6 +197,29 @@ def test_block_boundary_backfit_od_end_to_end_finite(direction, device):
         assert torch.isfinite(value).all()
     for row in diagnostics:
         assert isinstance(row["backfit_n_sweeps"], int)
+
+
+@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
+def test_block_boundary_backfit_j_trace_is_non_increasing(direction):
+    """The monotone safeguard's own guarantee (see
+    target_informed_runtime._fit_block_boundary_backfit's docstring): J(Delta),
+    measured on the real (un-linearized) local block replay every sweep, must
+    never increase -- on a REAL open_clip block (real ln_2/GELU coupling, real
+    LayerNorm/patch embedding), not only the hand-built toy fixture covered in
+    test_direct_residual_backfit.py.
+    """
+    cfg = DirectResidualConfig(
+        num_batches=3, ridge_relative=0.05, components=("attn.out_proj", "mlp.c_proj"),
+        block_split="backfit", backfit_max_iters=10, backfit_tol=1e-12,
+    )
+    _corrections, diagnostics, _model, _sd = _fit(direction, cfg, "cpu")
+    for row in diagnostics:
+        j_trace = row["backfit_j_trace"]
+        assert len(j_trace) == row["backfit_n_sweeps"]
+        assert all(math.isfinite(v) for v in j_trace), (direction, row["component"], j_trace)
+        for prev, curr in zip(j_trace, j_trace[1:], strict=False):
+            assert curr <= prev + 1e-6, (direction, row["component"], j_trace)
+        assert row["backfit_round1_j"] == pytest.approx(j_trace[0])
 
 
 @pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])

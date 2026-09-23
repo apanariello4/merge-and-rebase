@@ -47,6 +47,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from statistics import median
 from typing import Any
 
 import torch
@@ -54,10 +55,15 @@ import torch
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, discrete_layer_pairing
 from .target_informed_runtime import (
     _aligned,
+    _family_bias_key,
     _fit_all_positions_independent,
     _fit_block_boundary_backfit,
+    _fit_block_boundary_joint,
     _fit_component_outputs_from_contributions,
+    _layout_for,
     _rows,
+    _task_vector_sha256,
+    capture_block_gradients,
     capture_source_component_references,
     capture_tokens,
     # Re-exported for callers that assemble Direct Residual's realization
@@ -73,6 +79,7 @@ from .target_informed_runtime import (
 
 __all__ = [
     "DirectResidualConfig",
+    "apply_tv_scaling",
     "capture_paired_boundary_activations",
     "compute_alignment_diagnostics",
     "compute_desired_effects",
@@ -105,6 +112,9 @@ def capture_paired_boundary_activations(
     device,
     family_adapter=None,
     component_inputs: tuple[str, ...] = (),
+    procrustes_source: str = "activation",
+    source_recipe=None,
+    target_recipe=None,
 ) -> dict[str, Any]:
     """Capture native boundary activations for every position Direct Residual fits.
 
@@ -122,6 +132,21 @@ def capture_paired_boundary_activations(
     No structural resize of any model happens (the three models passed in are
     used exactly as given, at their native depths) and no correction is
     fitted -- this function only captures activation banks.
+
+    ``procrustes_source="gradient"`` (``DirectResidualConfig.procrustes_source``)
+    additionally captures block-boundary GRADIENTS -- ``dL/dT_i`` on
+    ``source_base_model`` at every distinct paired source index, and
+    ``dL/dT_j`` on ``target_base_model`` at every target position -- via
+    ``target_informed_runtime.capture_block_gradients``, using
+    ``source_recipe``/``target_recipe`` (each model's own
+    ``models.grad_recipes.clip_contrastive_recipe``, exactly BiCo's
+    recipe/statistic) on the SAME paired calibration batches the activation
+    banks above use. ``source_ft_model`` is never used for gradients (BiCo
+    only ever differentiates through base models). Stored under
+    ``"source_base_gradients"``/``"target_base_gradients"``, keyed by index
+    like the activation banks. Both recipes are required in gradient mode.
+    Vision only: `capture_block_gradients` raises `NotImplementedError` for a
+    non-``None`` ``family_adapter``.
 
     The returned dict also carries the replayed target-side calibration
     batches (under ``"target_batches"``) so `fit_direct_residual` can re-run
@@ -144,6 +169,10 @@ def capture_paired_boundary_activations(
         raise ValueError("pairing.target_depth must be positive")
     if pairing.source_depth < 1:
         raise ValueError("pairing.source_depth must be positive")
+    if procrustes_source not in {"activation", "gradient"}:
+        raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
+    if procrustes_source == "gradient" and (source_recipe is None or target_recipe is None):
+        raise ValueError("procrustes_source='gradient' requires both source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
         source_loader, target_loader, num_batches=num_batches, seed=seed
     )
@@ -182,6 +211,17 @@ def capture_paired_boundary_activations(
         )
         result["source_component_inputs"] = source_component_inputs
         result["source_component_weights"] = source_component_weights
+    if procrustes_source == "gradient":
+        source_grad_requests = {str(i): i for i in distinct_source_indices}
+        target_grad_requests = {str(j): j for j in range(pairing.target_depth)}
+        source_base_grad_raw = capture_block_gradients(
+            source_base_model, source_batches, source_grad_requests, source_recipe, device, family_adapter=family_adapter
+        )
+        target_base_grad_raw = capture_block_gradients(
+            target_base_model, target_batches, target_grad_requests, target_recipe, device, family_adapter=family_adapter
+        )
+        result["source_base_gradients"] = {int(k): v for k, v in source_base_grad_raw.items()}
+        result["target_base_gradients"] = {int(k): v for k, v in target_base_grad_raw.items()}
     return result
 
 
@@ -246,10 +286,22 @@ class DirectResidualConfig:
     #                model) copy of the block and replayed on the pristine
     #                captured block input X_j^0. See
     #                target_informed_runtime._fit_block_boundary_backfit.
+    #   "joint"   -- closed-form joint ridge over the stacked (attn.out_proj,
+    #                mlp.c_proj) features, solved in one linear-algebra step
+    #                under the first-order approximation that the MLP does
+    #                not respond to a change in attn.out_proj. Only valid for
+    #                components subset of {"attn.out_proj", "mlp.c_proj"};
+    #                with a single component this reduces to (is literally
+    #                the same fit as) block_split="none". See
+    #                target_informed_runtime._fit_block_boundary_joint.
     block_split: str = "none"
     backfit_max_iters: int = 20
-    # Stop when the change in ||E||/||D_j|| between consecutive sweeps drops
-    # below this.
+    # Stop when the relative decrease of the safeguarded block objective J(Delta)
+    # (data-fit term plus each component's own round-1-frozen ridge penalty; see
+    # target_informed_runtime._fit_block_boundary_backfit) between consecutive
+    # full sweeps drops below this. J is measured, not linearized, on every
+    # sweep AND accepted/rejected at every Gauss-Seidel sub-step, so it is
+    # non-increasing by construction -- see the same docstring.
     backfit_tol: float = 1e-4
     # What each position's target D_j is built from, out of the SAME centered
     # Procrustes fit Q_j: S_{j,0} -> T_j^0 (`centered_rectangular_procrustes`).
@@ -268,6 +320,52 @@ class DirectResidualConfig:
     #                            "block_boundary" (the endpoint form is only
     #                            defined against the block-boundary target).
     residual_target: str = "transported_delta"
+    # Which statistic Q_j (the per-position Procrustes alignment map) is fit
+    # on -- D_j = (S_ft - S_base) @ Q_j is unchanged in form either way; only
+    # what Q_j is fit against changes.
+    #   "activation" -- the historical, default behaviour: Q_j is fit on the
+    #                   (source_base, target_base) block-boundary ACTIVATION
+    #                   banks. Bit-identical to pre-ablation code, golden-hash
+    #                   pinned (see tests/test_direct_residual_gradient_
+    #                   procrustes.py).
+    #   "gradient"  -- Q_j is fit on the block-boundary GRADIENT banks
+    #                   dL/dT_i (source base) and dL/dT_j (target base),
+    #                   L = BiCo's own zero-shot contrastive CE
+    #                   (models.grad_recipes.clip_contrastive_recipe), on the
+    #                   same paired calibration batches -- see
+    #                   target_informed_runtime.capture_block_gradients and
+    #                   capture_paired_boundary_activations's
+    #                   procrustes_source parameter. Vision only. Only valid
+    #                   with component_target="block_boundary": output_local
+    #                   never calls compute_desired_effects (its own
+    #                   per-component targets are fit directly from component
+    #                   activation banks), so there is no Q_j for this field
+    #                   to redirect there.
+    procrustes_source: str = "activation"
+    # Label-free rescaling of the unit-strength task vector, applied AFTER
+    # fit_direct_residual assembles tau but BEFORE the caller's per-task
+    # alpha-search. Motivation: block_boundary O+D realizes ||delta T_j|| far
+    # from ||D_j|| (see measure_direct_residual_realization's
+    # joint_delta_norm_over_desired), which pushes alpha-search onto a
+    # badly-resolved region of its grid.
+    #   "none"      -- historical behaviour: tau is untouched (golden-hash
+    #                   pinned; see tests/test_direct_residual_tv_scaling.py).
+    #   "global"    -- tau <- tau / c, c = median_j(||delta T_j|| / ||D_j||)
+    #                   measured with all of tau mounted at unit strength in
+    #                   one sweep. See apply_tv_scaling.
+    #   "per_block" -- per-block-boundary-position scalars s_j, found by
+    #                   tv_scaling_iters rounds of a simultaneous (Jacobi-
+    #                   style) update s_j <- s_j / r_j, r_j measured from one
+    #                   mounted sweep of the CURRENT scaled combination. See
+    #                   apply_tv_scaling.
+    # Only block_split="none" is supported; parse_direct_residual_config
+    # rejects tv_scaling != "none" combined with block_split in
+    # {"backfit", "joint"} rather than silently mis-scaling a per-block-split
+    # fit whose interaction with this measurement has not been verified.
+    tv_scaling: str = "none"
+    # Number of simultaneous (Jacobi) update rounds for tv_scaling="per_block".
+    # Unused (but still validated) for "none"/"global".
+    tv_scaling_iters: int = 3
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -302,6 +400,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "backfit_max_iters",
         "backfit_tol",
         "residual_target",
+        "procrustes_source",
+        "tv_scaling",
+        "tv_scaling_iters",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -376,14 +477,14 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("merge_mode must be 'per_task_then_merge' or 'merge_in_source_then_fit'")
     if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
         raise ValueError("seed must be an integer")
-    if cfg.block_split not in {"none", "backfit"}:
-        raise ValueError("block_split must be 'none' or 'backfit'")
-    if cfg.block_split == "backfit":
+    if cfg.block_split not in {"none", "backfit", "joint"}:
+        raise ValueError("block_split must be 'none', 'backfit' or 'joint'")
+    if cfg.block_split in {"backfit", "joint"}:
         if cfg.component_target != "block_boundary":
-            raise ValueError("block_split='backfit' requires component_target='block_boundary'")
+            raise ValueError(f"block_split={cfg.block_split!r} requires component_target='block_boundary'")
         if set(components) - set(COMPONENT_FORWARD_ORDER):
             raise ValueError(
-                "block_split='backfit' only supports residual-writing components "
+                f"block_split={cfg.block_split!r} only supports residual-writing components "
                 f"{sorted(COMPONENT_FORWARD_ORDER)}"
             )
     if isinstance(cfg.backfit_max_iters, bool) or not isinstance(cfg.backfit_max_iters, int):
@@ -398,6 +499,35 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
     if cfg.residual_target == "transported_endpoint" and cfg.component_target != "block_boundary":
         raise ValueError("residual_target='transported_endpoint' requires component_target='block_boundary'")
+    if cfg.procrustes_source not in {"activation", "gradient"}:
+        raise ValueError("procrustes_source must be 'activation' or 'gradient'")
+    if cfg.procrustes_source == "gradient" and cfg.component_target != "block_boundary":
+        raise ValueError(
+            "procrustes_source='gradient' requires component_target='block_boundary': "
+            f"component_target={cfg.component_target!r} never calls compute_desired_effects "
+            "(its per-component targets are fit directly from component activation banks), "
+            "so there is no block-boundary Q_j for procrustes_source to redirect"
+        )
+    if cfg.tv_scaling not in {"none", "global", "per_block"}:
+        raise ValueError("tv_scaling must be 'none', 'global' or 'per_block'")
+    if isinstance(cfg.tv_scaling_iters, bool) or not isinstance(cfg.tv_scaling_iters, int):
+        raise ValueError("tv_scaling_iters must be an integer")
+    if cfg.tv_scaling_iters <= 0:
+        raise ValueError("tv_scaling_iters must be a positive integer")
+    if cfg.tv_scaling != "none" and cfg.block_split != "none":
+        raise ValueError(
+            f"tv_scaling={cfg.tv_scaling!r} requires block_split='none' (got "
+            f"block_split={cfg.block_split!r}): tv_scaling's mount-and-measure machinery "
+            "(apply_tv_scaling) is only verified against the unsplit fit path; combining it "
+            "with the backfit/joint intra-block solve is rejected rather than silently "
+            "producing an unverified rescaling"
+        )
+    if cfg.residual_target == "transported_endpoint" and cfg.procrustes_source != "activation":
+        raise ValueError(
+            "residual_target='transported_endpoint' requires procrustes_source='activation': the endpoint "
+            "target uses the activation-space means mu_s, mu_t of the same Procrustes fit, which a "
+            "gradient-fitted Q_j does not provide"
+        )
     return cfg
 
 
@@ -406,6 +536,8 @@ def compute_desired_effects(
     pairing: DiscreteLayerPairing,
     *,
     residual_target: str = "transported_delta",
+    procrustes_source: str = "activation",
+    diagnostics_out: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
 
@@ -434,7 +566,28 @@ def compute_desired_effects(
     `compute_alignment_diagnostics` for that residual's diagnostics, kept
     deliberately separate (and out of this function's cost) -- see its
     docstring for why.
+
+    ``procrustes_source="activation"`` (default) is bit-identical to the
+    pre-ablation code: ``Q_j`` is fit on the (source_base, target_base)
+    ACTIVATION banks, exactly as before. ``procrustes_source="gradient"``
+    changes only the statistic ``Q_j`` is fit on -- to the block-boundary
+    GRADIENT banks `capture_paired_boundary_activations` captured under
+    ``"source_base_gradients"``/``"target_base_gradients"`` -- using the same
+    helper, the same centering and the same ``_aligned`` token interpolation.
+    ``D_j = (source_ft_i - source_base_i) @ Q_j`` is unchanged in form in both
+    modes: a gradient difference is never used as the regression target,
+    only as the alignment statistic.
+
+    When ``diagnostics_out`` is provided (a caller-owned, initially-empty
+    dict), it is populated per position with analysis-only fields -- never
+    read by any fit. In gradient mode this includes the activation-space
+    ``Q`` computed purely for comparison (``"activation_gradient_procrustes_
+    overlap"`` = :math:`\\lVert Q_{act}^\\top Q_{grad}\\rVert_F^2 / d_{\\min}`)
+    and ``"procrustes_rank"`` (the numerical rank of the centered
+    cross-covariance the gradient ``Q`` was solved from).
     """
+    if procrustes_source not in {"activation", "gradient"}:
+        raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
     target_by_position = captured["target_base_outputs_by_position"]
@@ -445,6 +598,15 @@ def compute_desired_effects(
         )
     if residual_target not in {"transported_delta", "transported_endpoint"}:
         raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
+    source_base_grad = captured.get("source_base_gradients")
+    target_base_grad = captured.get("target_base_gradients")
+    if procrustes_source == "gradient" and (source_base_grad is None or target_base_grad is None):
+        raise ValueError(
+            "procrustes_source='gradient' requires 'source_base_gradients' and 'target_base_gradients' in "
+            "captured; call capture_paired_boundary_activations with procrustes_source='gradient'"
+        )
+    if residual_target == "transported_endpoint" and procrustes_source != "activation":
+        raise ValueError("residual_target='transported_endpoint' requires procrustes_source='activation'")
     desired: dict[int, list[Tensor]] = {}
     for j in range(pairing.target_depth):
         i = pairing.pairing[j]
@@ -453,7 +615,33 @@ def compute_desired_effects(
         targets = target_by_position[j]
         source_base_batches = _aligned(source_base[i], targets)
         source_ft_batches = _aligned(source_ft[i], targets)
+        if procrustes_source == "gradient":
+            if i not in source_base_grad or j not in target_base_grad:
+                raise ValueError(f"Missing captured gradient reference for pairing index {i} at target position {j}")
+            aligned_source_grad = _aligned(source_base_grad[i], target_base_grad[j])
+            grad_source_rows = _rows(aligned_source_grad).double()
+            grad_target_rows = _rows(target_base_grad[j]).double()
+            q, _mu_gs, _mu_gt = centered_rectangular_procrustes(grad_source_rows, grad_target_rows)
+            if diagnostics_out is not None:
+                q_act, _mu_s, _mu_t = centered_rectangular_procrustes(
+                    _rows(source_base_batches).double(), _rows(targets).double()
+                )
+                d_min = min(q.shape)
+                overlap = float(((q_act.T @ q).norm() ** 2) / d_min)
+                gs_centered = grad_source_rows - grad_source_rows.mean(dim=0)
+                gt_centered = grad_target_rows - grad_target_rows.mean(dim=0)
+                cross = gs_centered.T @ gt_centered
+                diagnostics_out[j] = {
+                    "procrustes_source": "gradient",
+                    "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
+                    "activation_gradient_procrustes_overlap": overlap,
+                }
+            q = q.float()
+            desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+            continue
         q, mu_s, mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
+        if diagnostics_out is not None:
+            diagnostics_out[j] = {"procrustes_source": "activation"}
         if residual_target == "transported_delta":
             q = q.float()
             desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
@@ -734,6 +922,20 @@ def fit_direct_residual(
                 device,
                 family_adapter=family_adapter,
             )
+        elif config.block_split == "joint":
+            fitted = _fit_block_boundary_joint(
+                target_model,
+                current_state,
+                positions,
+                source_coordinates,
+                desired,
+                target_outputs_by_position,
+                batches,
+                components,
+                solver_config,
+                device,
+                family_adapter=family_adapter,
+            )
         else:
             # Every position is guaranteed pristine here (nothing is ever
             # mounted between fits, cross-position or intra-position), so all
@@ -757,7 +959,210 @@ def fit_direct_residual(
             target_corrections.update(position_corrections)
             for row in block_rows:
                 row["source_position"] = row.pop("source_coordinate")
+                # Analysis-only: which statistic Q_j was fit on. Never read by
+                # any fit -- the row schema is otherwise unchanged, so this is
+                # additive for every existing consumer (golden hashes are over
+                # target_corrections, not these diagnostics rows).
+                row["procrustes_source"] = config.procrustes_source
                 diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return target_corrections, diagnostics
+
+
+# Below-epsilon ||D_j|| positions have no reliable ratio r_j = ||delta T_j|| /
+# ||D_j||; per_block's guard keeps s_j frozen for that position/iteration
+# rather than dividing by (near) zero.
+_TV_SCALING_D_NORM_EPS = 1e-8
+
+
+def _tau_frobenius_norm(sd: Mapping[str, Tensor]) -> float:
+    total_sq = 0.0
+    for value in sd.values():
+        total_sq += float((value.detach().double() ** 2).sum().item())
+    return total_sq**0.5
+
+
+def _position_delta(
+    shim, position: int, components: tuple[str, ...], target_corrections: Mapping[str, Tensor]
+) -> dict[str, Tensor]:
+    """The subset of ``target_corrections`` (weight + bias, unsliced) that
+    belongs to block-boundary position ``position``.
+
+    Each ``(position, component)`` pair maps to a distinct physical
+    state-dict key (one set of projection matrices per block), so, unlike
+    ``target_informed_runtime._family_delta_state`` (which slices packed
+    q/k/v rows to isolate one COMPONENT out of several sharing one physical
+    parameter), no row-slicing is needed here to isolate one POSITION: a
+    key present in ``target_corrections`` belongs to exactly one position.
+    """
+    out: dict[str, Tensor] = {}
+    for component in components:
+        key = shim.component_key(position, component, prefixed=True)
+        if key in target_corrections:
+            out[key] = target_corrections[key]
+        bias_key = _family_bias_key(key)
+        if bias_key is not None and bias_key in target_corrections:
+            out[bias_key] = target_corrections[bias_key]
+    return out
+
+
+def apply_tv_scaling(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    target_corrections: Mapping[str, Tensor],
+    positions: list[int],
+    captured: Mapping[str, Any],
+    desired: Mapping[int, list[Tensor]],
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], dict[str, Any]]:
+    """Label-free rescaling of a unit-strength Direct Residual task vector.
+
+    Reuses ``measure_direct_residual_realization`` (mount, capture
+    block-boundary outputs over the SAME calibration batches
+    ``capture_paired_boundary_activations`` collected for the fit, compare to
+    the pristine target base and to the block-boundary desired effect
+    ``D_j``, restore-and-hash-verify) as the sole measurement primitive:
+    ``r_j = joint_delta_norm_over_desired`` is ``||delta T_j||_F /
+    (||D_j||_F + eps)`` for whatever delta is currently mounted.
+
+    ``config.tv_scaling == "none"`` is a strict no-op (returns
+    ``target_corrections`` unchanged, by value) -- callers must gate on this
+    themselves for the golden-hash-pinned default path, but calling this
+    function directly with ``tv_scaling="none"`` is also safe.
+
+    Returns ``(scaled_corrections, diagnostics)``. ``diagnostics`` is
+    intended to be recorded verbatim (or nested) under the Direct Residual
+    run-summary section's additive ``tv_scaling_by_task`` key.
+    """
+    if config.tv_scaling == "none":
+        return dict(target_corrections), {"mode": "none"}
+    if config.block_split != "none":
+        # parse_direct_residual_config should already have rejected this
+        # combination; re-check here so a caller that builds a
+        # DirectResidualConfig by hand (bypassing the parser) cannot reach
+        # the unverified interaction either.
+        raise ValueError(
+            f"apply_tv_scaling: tv_scaling={config.tv_scaling!r} requires block_split='none' "
+            f"(got block_split={config.block_split!r})"
+        )
+    shim = _layout_for(family_adapter)
+    components = order_components(config.components)
+    batches = captured["target_batches"]
+    target_outputs_by_position = captured["target_base_outputs_by_position"]
+
+    tau_stats_before = {
+        "frobenius_norm": _tau_frobenius_norm(target_corrections),
+        "sha256": _task_vector_sha256(target_corrections),
+    }
+
+    def measure(delta: Mapping[str, Tensor]) -> dict[int, dict[str, Any]]:
+        return measure_direct_residual_realization(
+            target_model,
+            target_base_state,
+            delta,
+            positions,
+            batches,
+            target_outputs_by_position,
+            desired,
+            device=device,
+            components=components,
+            family_adapter=family_adapter,
+        )
+
+    if config.tv_scaling == "global":
+        realization = measure(target_corrections)
+        r_j = {j: float(realization[j]["joint_delta_norm_over_desired"]) for j in positions}
+        c = float(median(r_j[j] for j in positions))
+        if not math.isfinite(c) or c == 0.0:
+            raise ValueError(
+                f"tv_scaling='global' produced a degenerate scale c={c} "
+                "(median of r_j across positions); cannot rescale tau"
+            )
+        final = {key: value / c for key, value in target_corrections.items()}
+        post_realization = measure(final)
+        diagnostics = {
+            "mode": "global",
+            "c": c,
+            "r_j": r_j,
+            "post_scaling_r_j": {
+                j: float(post_realization[j]["joint_delta_norm_over_desired"]) for j in positions
+            },
+            "tau_stats_before": tau_stats_before,
+            "tau_stats_after": {
+                "frobenius_norm": _tau_frobenius_norm(final),
+                "sha256": _task_vector_sha256(final),
+            },
+        }
+        return final, diagnostics
+
+    # config.tv_scaling == "per_block": per-position scalars s_j, found by a
+    # simultaneous (Jacobi-style) fixed-point update -- every s_j is updated
+    # from the SAME mounted-combination measurement sweep, never sequentially
+    # (Gauss-Seidel) against a partially-updated combination.
+    pos_delta = {j: _position_delta(shim, j, components, target_corrections) for j in positions}
+    s = {j: 1.0 for j in positions}
+    r_traces: list[dict[int, float | None]] = []
+    s_traces: list[dict[int, float]] = []
+    max_dev_trace: list[float] = []
+    guard_log: list[dict[str, Any]] = []
+    for iteration in range(int(config.tv_scaling_iters)):
+        combined: dict[str, Tensor] = {}
+        for j in positions:
+            for key, value in pos_delta[j].items():
+                combined[key] = value * s[j]
+        realization = measure(combined)
+        r_j: dict[int, float | None] = {}
+        for j in positions:
+            d_norm = float(realization[j]["desired_norm"])
+            r = float(realization[j]["joint_delta_norm_over_desired"])
+            if d_norm < _TV_SCALING_D_NORM_EPS or not math.isfinite(r):
+                r_j[j] = None
+                guard_log.append(
+                    {
+                        "iteration": iteration,
+                        "position": j,
+                        "reason": "desired_norm_near_zero" if d_norm < _TV_SCALING_D_NORM_EPS else "non_finite_r",
+                        "desired_norm": d_norm,
+                        "r_j": r,
+                        "s_j_kept": s[j],
+                    }
+                )
+            else:
+                r_j[j] = r
+        r_traces.append(dict(r_j))
+        new_s = dict(s)
+        for j in positions:
+            if r_j[j] is not None:
+                new_s[j] = s[j] / r_j[j]
+        max_dev = max(abs((r_j[j] if r_j[j] is not None else 1.0) - 1.0) for j in positions)
+        max_dev_trace.append(max_dev)
+        s = new_s
+        s_traces.append(dict(s))
+    final = {}
+    for j in positions:
+        for key, value in pos_delta[j].items():
+            final[key] = value * s[j]
+    post_realization = measure(final)
+    diagnostics = {
+        "mode": "per_block",
+        "iters": int(config.tv_scaling_iters),
+        "r_traces": r_traces,
+        "s_traces": s_traces,
+        # max_j|r_j - 1| per iteration; "did it decrease vs the previous
+        # iteration" is derivable from this trace directly (max_dev_trace[k]
+        # < max_dev_trace[k-1]), reported as its own list rather than
+        # collapsed to one bool so an oscillating trace is visible verbatim.
+        "max_dev_trace": max_dev_trace,
+        "guard_log": guard_log,
+        "tau_stats_before": tau_stats_before,
+        "tau_stats_after": {
+            "frobenius_norm": _tau_frobenius_norm(final),
+            "sha256": _task_vector_sha256(final),
+        },
+        "post_scaling_r_j": {j: float(post_realization[j]["joint_delta_norm_over_desired"]) for j in positions},
+    }
+    return final, diagnostics

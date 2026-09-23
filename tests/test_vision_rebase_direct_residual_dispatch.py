@@ -220,6 +220,8 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
             "source_dim",
             "target_dim",
         }
+    assert extra["tv_scaling"] is None
+    assert set(extra) == {"realization_by_position", "task_vector_stats", "alignment_diagnostics", "tv_scaling"}
     assert set(timing) == {"alignment_calibration", "correction_fit"}
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
@@ -262,6 +264,8 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     assert extra["realization_by_position"] is None
     assert extra["task_vector_stats"] is None
     assert set(extra["alignment_diagnostics"]) == set(range(pairing.target_depth))
+    assert extra["tv_scaling"] is None
+    assert set(extra) == {"realization_by_position", "task_vector_stats", "alignment_diagnostics", "tv_scaling"}
 
 
 def test_run_direct_residual_fit_realization_diagnostics_populates_extra():
