@@ -141,12 +141,19 @@ def _direction_setup(direction, seed=101):
     )
 
 
-def _recipes(source_text_feats, target_text_feats):
+def _recipes(source_text_feats, target_text_feats, device="cpu"):
+    # clip_contrastive_recipe's closure moves the BATCH to `device` (images,
+    # text_feats) but never the model -- capture_block_gradients/capture_
+    # paired_boundary_activations own that (temporarily to(device) inside the
+    # capture, restored after). The two must agree: a recipe built for one
+    # device fed a model that capture moved to a different device will hit a
+    # cpu/cuda tensor-type mismatch in the very first conv, which is why this
+    # takes `device` explicitly rather than hardcoding "cpu".
     source_recipe = clip_contrastive_recipe(
-        _DummyClassifier(), [], None, text_features=source_text_feats, device="cpu",
+        _DummyClassifier(), [], None, text_features=source_text_feats, device=device,
     )
     target_recipe = clip_contrastive_recipe(
-        _DummyClassifier(), [], None, text_features=target_text_feats, device="cpu",
+        _DummyClassifier(), [], None, text_features=target_text_feats, device=device,
     )
     return source_recipe, target_recipe
 
@@ -372,7 +379,7 @@ def test_fit_direct_residual_gradient_mode_end_to_end_finite(direction, device):
         source_base, source_ft, target_base, source_loader, target_loader, pairing, target_base_sd,
         source_text_feats, target_text_feats,
     ) = _direction_setup(direction)
-    source_recipe, target_recipe = _recipes(source_text_feats, target_text_feats)
+    source_recipe, target_recipe = _recipes(source_text_feats, target_text_feats, device=device)
     cfg = DirectResidualConfig(
         num_batches=3, ridge_relative=0.05, components=("attn.out_proj", "mlp.c_proj"),
         procrustes_source="gradient",
