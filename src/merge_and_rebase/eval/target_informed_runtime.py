@@ -16,6 +16,7 @@ authoritative, tested implementation lives in `block_extension.py`
 separate, older top-level-config validator used by `validate_target_protocol`
 and `cache_identity`; it does not drive any execution path in this module.
 """
+
 from __future__ import annotations
 
 import copy
@@ -87,11 +88,14 @@ def parse_target_shared_config(raw: Mapping[str, Any] | None) -> TargetSharedCon
 def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_name, merge_mode):
     """Reject unsupported experiments instead of silently dropping their options."""
     from .target_residual_completion import parse_residual_completion_config
+
     shared = parse_target_shared_config(cfg.get("target_shared_correction"))
     residual = parse_residual_completion_config(cfg.get("target_residual_completion"))
     joint = bool(block_cfg.joint_blockwise_correction.enabled)
     direct_p1 = bool(block_cfg.direct_p1_correction.enabled)
-    active = shared.enabled or residual.enabled or joint or direct_p1 or bool(cfg.get("capture_target_residual_reference"))
+    active = (
+        shared.enabled or residual.enabled or joint or direct_p1 or bool(cfg.get("capture_target_residual_reference"))
+    )
     if not active:
         return
     if method_name not in {"theseus", "bico"}:
@@ -102,15 +106,16 @@ def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_
         raise ValueError("Target-informed BRACE requires per-task transport before merging")
     if not cfg.get("block_extension_enabled", True):
         raise ValueError("Target-informed BRACE requires block extension")
-    if (block_cfg.insertion_order != "bottom-top" or block_cfg.extension_density not in {"spread", "spread_mod"}
-            or block_cfg.extension_strategy != "duplicate_per_weight"):
+    if (
+        block_cfg.insertion_order != "bottom-top"
+        or block_cfg.extension_density not in {"spread", "spread_mod"}
+        or block_cfg.extension_strategy != "duplicate_per_weight"
+    ):
         raise ValueError("Target-informed BRACE requires bottom-top spread duplicate insertion")
     if block_cfg.blocks_to_add not in (None, source_depth):
         raise ValueError("blocks_to_add must match the depth-doubling protocol")
     identity_p1 = (
-        residual.enabled
-        and block_cfg.skip_correction
-        and block_cfg.inserted_block_mode == "residual_identity"
+        residual.enabled and block_cfg.skip_correction and block_cfg.inserted_block_mode == "residual_identity"
     )
     if block_cfg.lmc_mode != "shared":
         raise ValueError("Target-informed methods require lmc_mode='shared'")
@@ -133,13 +138,17 @@ def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_
         raise ValueError("Target-informed correction uses the published direct component targets")
     if shared.enabled and shared.target_weight > 0 and shared.num_batches != block_cfg.n_batches_act:
         raise ValueError("Target shared references must use the BRACE calibration batch count")
-    if str((cfg.get("block_extension_params") or {}).get("calibration_protocol", "task_local")).startswith("vision8_mix"):
+    if str((cfg.get("block_extension_params") or {}).get("calibration_protocol", "task_local")).startswith(
+        "vision8_mix"
+    ):
         raise ValueError("Mixed-dataset target references are outside this task-local experiment")
     if cfg.get("native_target_tasks") or cfg.get("base_construction", "per_task") != "per_task":
         raise ValueError("Target-informed experiments require all-source tasks on the native target base")
     if cfg.get("patched_attn") or cfg.get("attn_patch_cfg"):
         raise ValueError("Target-informed experiments require the ordinary unpatched ViT checkpoints")
-    if cfg.get("load_transported_tvs_dir") and (cfg.get("source_lmc_eval") or cfg.get("cross_task_lmc_pairs") or cfg.get("all_task_lmc_eval")):
+    if cfg.get("load_transported_tvs_dir") and (
+        cfg.get("source_lmc_eval") or cfg.get("cross_task_lmc_pairs") or cfg.get("all_task_lmc_eval")
+    ):
         raise ValueError("Cached target vectors cannot supply source endpoint diagnostics")
 
 
@@ -169,8 +178,10 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
     n = len(source_loader.dataset)
     if not n:
         raise ValueError("Calibration set is empty")
-    order = list(range(n)) if seed is None else torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
-    order = order[:num_batches * source_loader.batch_size]
+    order = (
+        list(range(n)) if seed is None else torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+    )
+    order = order[: num_batches * source_loader.batch_size]
     kwargs = dict(batch_size=source_loader.batch_size, shuffle=False, num_workers=0, drop_last=False)
     source = DataLoader(Subset(source_loader.dataset, order), collate_fn=source_loader.collate_fn, **kwargs)
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
@@ -189,9 +200,13 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
         source_batches.append(a)
         target_batches.append(b)
     metadata = {
-        "indices": order, "dataset_identity": repr(_dataset_identity(source_loader.dataset)),
-        "requested_batches": num_batches, "actual_batches": len(source_batches),
-        "batch_size": source_loader.batch_size, "sampling_seed": seed, "split": "val",
+        "indices": order,
+        "dataset_identity": repr(_dataset_identity(source_loader.dataset)),
+        "requested_batches": num_batches,
+        "actual_batches": len(source_batches),
+        "batch_size": source_loader.batch_size,
+        "sampling_seed": seed,
+        "split": "val",
     }
     return source_batches, target_batches, metadata
 
@@ -332,9 +347,7 @@ class _DecoderLayout:
             return self.proj_key(pos, prefixed=prefixed)
         if component == "attn.out_proj":
             return self.attn_proj_key(pos, prefixed=prefixed)
-        raise NotImplementedError(
-            f"{component!r} is only supported on the vision (stock nn.MultiheadAttention) layout"
-        )
+        raise NotImplementedError(f"{component!r} is only supported on the vision (stock nn.MultiheadAttention) layout")
 
     def component_scale_module(self, block, component):
         """Decoder blocks carry no LayerScale; the write is unscaled."""
@@ -420,8 +433,10 @@ def _component_weight_bias(shim, block, component):
     raise ValueError(f"Unsupported completion component {component!r}")
 
 
-def _assert_layerscale_identity(shim, block, *, context):
-    """Refuse a nontrivial LayerScale under output-target modes.
+def _assert_layerscale_identity(shim, block, *, context, requirement="component_target='output_local'"):
+    """Refuse a nontrivial LayerScale under output-target modes (and, via
+    ``requirement``, under ``block_split='joint'``, which shares the same
+    ``t_out=I`` assumption -- see ``_fit_block_boundary_joint``).
 
     Output-target fits solve with ``t_out = I``: any nonidentity ``ls_1``/
     ``ls_2`` would silently drop a scale the block actually applies, so the
@@ -432,7 +447,7 @@ def _assert_layerscale_identity(shim, block, *, context):
         module = getattr(inner, name, nn.Identity())
         if not isinstance(module, nn.Identity):
             raise ValueError(
-                f"component_target='output_local' requires {name}=nn.Identity on {context}; "
+                f"{requirement} requires {name}=nn.Identity on {context}; "
                 "found a non-identity LayerScale, which the fit's t_out=I would silently ignore"
             )
 
@@ -472,20 +487,41 @@ def _stock_mha_out_proj_input(module, args, kwargs):
     }
     if module._qkv_same_embed_dim:
         rows, _ = F.multi_head_attention_forward(
-            query, key, value, module.embed_dim, module.num_heads,
-            module.in_proj_weight, module.in_proj_bias,
-            module.bias_k, module.bias_v, module.add_zero_attn, module.dropout,
-            identity, None, **shared,
+            query,
+            key,
+            value,
+            module.embed_dim,
+            module.num_heads,
+            module.in_proj_weight,
+            module.in_proj_bias,
+            module.bias_k,
+            module.bias_v,
+            module.add_zero_attn,
+            module.dropout,
+            identity,
+            None,
+            **shared,
         )
     else:
         rows, _ = F.multi_head_attention_forward(
-            query, key, value, module.embed_dim, module.num_heads,
-            None, module.in_proj_bias,
-            module.bias_k, module.bias_v, module.add_zero_attn, module.dropout,
-            identity, None,
+            query,
+            key,
+            value,
+            module.embed_dim,
+            module.num_heads,
+            None,
+            module.in_proj_bias,
+            module.bias_k,
+            module.bias_v,
+            module.add_zero_attn,
+            module.dropout,
+            identity,
+            None,
             use_separate_proj_weight=True,
-            q_proj_weight=module.q_proj_weight, k_proj_weight=module.k_proj_weight,
-            v_proj_weight=module.v_proj_weight, **shared,
+            q_proj_weight=module.q_proj_weight,
+            k_proj_weight=module.k_proj_weight,
+            v_proj_weight=module.v_proj_weight,
+            **shared,
         )
     return rows.transpose(1, 0) if batch_first else rows
 
@@ -556,6 +592,7 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
                 module = layout.proj_module(blocks[index])
 
             if recompute:
+
                 def hook(mod, args, kwargs, value, *, name=key, capture_kind=kind):
                     if capture_kind == "attn_proj_input":
                         rows = _stock_mha_out_proj_input(mod, args, kwargs)
@@ -563,20 +600,24 @@ def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], devi
                         store(name, rows)
                     else:
                         store(name, value)
+
                 handles.append(module.register_forward_hook(hook, with_kwargs=True))
             elif query_capture:
+
                 def hook(_mod, args, kwargs, _value, *, name=key):
                     query, key_arg, value_arg = _mha_query_key_value(args, kwargs)
                     if not (query is key_arg and query is value_arg):
                         raise ValueError(
-                            "attn_input capture requires self-attention (query, key and value "
-                            "must be the same tensor)"
+                            "attn_input capture requires self-attention (query, key and value must be the same tensor)"
                         )
                     store(name, query)
+
                 handles.append(module.register_forward_hook(hook, with_kwargs=True))
             else:
+
                 def hook(_m, inputs, value, *, name=key, capture_kind=kind):
                     store(name, inputs[0] if capture_kind in _INPUT_CAPTURE_KINDS else value)
+
                 handles.append(module.register_forward_hook(hook))
         for batch in batches:
             current_batch[0] = layout.batch_size(batch)
@@ -688,25 +729,37 @@ def _capture_residual_references(
     # preserving its byte-compatible downstream behavior.
     source_base_outputs = {int(i): value for i, value in base.items() if i.isdigit()}
     source_ft_outputs = {int(i): value for i, value in ft.items() if i.isdigit()}
-    source_base_cproj_inputs = {
-        int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_input")
-    } if capture_joint else {}
-    source_ft_cproj_inputs = {
-        int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_input")
-    } if capture_joint else {}
-    source_base_cproj_outputs = {
-        int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_output")
-    } if capture_joint else {}
-    source_ft_cproj_outputs = {
-        int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_output")
-    } if capture_joint else {}
+    source_base_cproj_inputs = (
+        {int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_input")}
+        if capture_joint
+        else {}
+    )
+    source_ft_cproj_inputs = (
+        {int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_input")}
+        if capture_joint
+        else {}
+    )
+    source_base_cproj_outputs = (
+        {int(i.split(".", 1)[0]): value for i, value in base.items() if i.endswith(".c_proj_output")}
+        if capture_joint
+        else {}
+    )
+    source_ft_cproj_outputs = (
+        {int(i.split(".", 1)[0]): value for i, value in ft.items() if i.endswith(".c_proj_output")}
+        if capture_joint
+        else {}
+    )
     target_outputs_by_position = {int(i): value for i, value in target.items() if i.isdigit()}
-    target_cproj_inputs_by_position = {
-        int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_input")
-    } if capture_joint else {}
-    target_cproj_outputs_by_position = {
-        int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_output")
-    } if capture_joint else {}
+    target_cproj_inputs_by_position = (
+        {int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_input")}
+        if capture_joint
+        else {}
+    )
+    target_cproj_outputs_by_position = (
+        {int(i.split(".", 1)[0]): value for i, value in target.items() if i.endswith(".c_proj_output")}
+        if capture_joint
+        else {}
+    )
     desired, maps, target_outputs = {}, {}, {}
     if target_scope == "inserted":
         for i in range(depth):
@@ -788,9 +841,7 @@ def capture_source_component_references(
     component_base = capture_tokens(source_base, source_batches, component_req, device, family_adapter=family_adapter)
     source_component_inputs, source_component_weights = {}, {}
     for i in source_indices:
-        source_component_inputs[i] = {
-            kind: [t.clone() for t in component_base[f"{i}.{kind}"]] for kind in needed_kinds
-        }
+        source_component_inputs[i] = {kind: [t.clone() for t in component_base[f"{i}.{kind}"]] for kind in needed_kinds}
         base_block = layout_shim.blocks(source_base)[i]
         ft_block = layout_shim.blocks(source_ft)[i]
         _assert_layerscale_identity(layout_shim, base_block, context=f"source base block {i}")
@@ -860,15 +911,13 @@ def _validate_target_informed_layout(layout, *, target_scope, target_trajectory=
     direction = str(layout.get("direction", "extend"))
     if direction not in {"extend", "shrink"}:
         raise ValueError(
-            "Target-informed completion requires layout.direction to be 'extend' or 'shrink'; "
-            f"got {direction!r}"
+            f"Target-informed completion requires layout.direction to be 'extend' or 'shrink'; got {direction!r}"
         )
     if direction != "shrink":
         return
     if target_scope != "all":
         raise ValueError(
-            "Shrink direct_target completion requires target_scope='all': a reduction has no "
-            "inserted blocks to address"
+            "Shrink direct_target completion requires target_scope='all': a reduction has no inserted blocks to address"
         )
     if target_trajectory is not None and target_trajectory != "step":
         raise ValueError(
@@ -881,14 +930,12 @@ def _validate_target_informed_layout(layout, *, target_scope, target_trajectory=
     for row in entries:
         span = row.get("span_orig_idxs")
         if not span:
-            raise ValueError(
-                "Shrink direct_target layout entries must record non-empty span_orig_idxs"
-            )
+            raise ValueError("Shrink direct_target layout entries must record non-empty span_orig_idxs")
         if int(row.get("source_orig_idx", -1)) != int(span[-1]):
             raise ValueError(
-                "Shrink direct_target layout source_orig_idx must equal the span's terminal "
-                "source boundary"
+                "Shrink direct_target layout source_orig_idx must equal the span's terminal source boundary"
             )
+
 
 def _materialize_zero_bias(model, bias_key, out_features):
     """Add a zero bias to one bias-free projection. Returns True if it added one."""
@@ -940,15 +987,25 @@ def materialize_missing_projection_biases(
                 continue
             out_features = int(target_base_state[weight_key].shape[0])
             _materialize_zero_bias(target_model, bias_key, out_features)
-            target_base_state[bias_key] = torch.zeros(
-                out_features, dtype=target_base_state[weight_key].dtype
-            )
+            target_base_state[bias_key] = torch.zeros(out_features, dtype=target_base_state[weight_key].dtype)
             added.append(bias_key)
     return added
 
 
 @torch.no_grad()
-def complete_residuals(target_model, target_base_state, baseline_delta, references, transforms, layout, target_loader, *, config: ResidualCompletionConfig, device, family_adapter=None):
+def complete_residuals(
+    target_model,
+    target_base_state,
+    baseline_delta,
+    references,
+    transforms,
+    layout,
+    target_loader,
+    *,
+    config: ResidualCompletionConfig,
+    device,
+    family_adapter=None,
+):
     """Fit all blocks at gamma=1, returning a separately scalable correction."""
     if references.get("scope", "inserted") != config.target_scope:
         raise ValueError(
@@ -975,7 +1032,12 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
     expected_positions = {int(row["position"]) for row in entries}
     if config.cascade_order == "top_bottom":
         entries = list(reversed(entries))
-    for name, values in (("desired", desired), ("target_base_outputs", target_outputs), ("maps", maps), ("transforms", transforms)):
+    for name, values in (
+        ("desired", desired),
+        ("target_base_outputs", target_outputs),
+        ("maps", maps),
+        ("transforms", transforms),
+    ):
         if set(values) != expected_positions:
             raise ValueError(
                 f"Residual completion {name} keys do not exactly match realized target positions: "
@@ -984,8 +1046,15 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
     meta = references["calibration"]
     if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
         raise ValueError("Cached reference images do not match this task's validation dataset")
-    batches = list(DataLoader(Subset(target_loader.dataset, meta["indices"]), batch_size=meta["batch_size"],
-                              shuffle=False, num_workers=0, collate_fn=target_loader.collate_fn))
+    batches = list(
+        DataLoader(
+            Subset(target_loader.dataset, meta["indices"]),
+            batch_size=meta["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=target_loader.collate_fn,
+        )
+    )
     original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     target_corrections, source_corrections, diagnostics = {}, {}, []
     try:
@@ -1002,8 +1071,11 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
             shim = _layout_for(family_adapter)
             key = shim.proj_key(pos, prefixed=True)
             captured = capture_tokens(
-                target_model, batches, {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
-                device, family_adapter=family_adapter,
+                target_model,
+                batches,
+                {"h": (pos, "c_proj_input"), "out": (pos, "boundary")},
+                device,
+                family_adapter=family_adapter,
             )
             t_in, t_out = transforms[pos]["t_in"], transforms[pos]["t_out"]
             block = shim.block_module(shim.blocks(target_model)[pos])
@@ -1107,6 +1179,7 @@ def complete_residuals(target_model, target_base_state, baseline_delta, referenc
         target_model.load_state_dict(original_state, strict=True)
     return source_corrections, target_corrections, diagnostics
 
+
 @torch.no_grad()
 def _fit_direct_target_position(
     target_model,
@@ -1163,9 +1236,11 @@ def _fit_direct_target_position(
     for component_index, component in enumerate(components):
         key = shim.component_key(pos, component, prefixed=True)
         captured = capture_tokens(
-            target_model, batches,
+            target_model,
+            batches,
             {"h": (pos, COMPONENT_INPUT_KIND[component]), "out": (pos, "boundary")},
-            device, family_adapter=family_adapter,
+            device,
+            family_adapter=family_adapter,
         )
         width = int(current_state[key].shape[0])
         identity_out = torch.eye(width, dtype=torch.float32)
@@ -1261,7 +1336,7 @@ def _fit_direct_target_position(
         # E_j == D_j and no correction can move another's target.
         if config.cascade_order != "independent":
             target_model.load_state_dict(current_state, strict=True)
-        desired_norm = desired_sq ** 0.5
+        desired_norm = desired_sq**0.5
         block_rows.append(
             {
                 "mode": "direct_target",
@@ -1269,7 +1344,7 @@ def _fit_direct_target_position(
                 "position": pos,
                 "source_coordinate": float(source_coordinate),
                 "desired_norm": desired_norm,
-                "effect_before_norm": effect_sq ** 0.5,
+                "effect_before_norm": effect_sq**0.5,
                 # r_j: the fraction of the desired local effect still missing,
                 # before and after this fit. See the identical comment this
                 # was extracted from in complete_residuals_direct's history
@@ -1284,7 +1359,9 @@ def _fit_direct_target_position(
     return position_corrections, block_rows
 
 
-def _realization_diagnostic_fields(h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm, residual_norm_after):
+def _realization_diagnostic_fields(
+    h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm, residual_norm_after
+):
     """Analysis-only per-component fit fields, gated on ``realization_
     diagnostics`` (never read by any fit -- see the callers). Shared by every
     block_boundary fit path (``_fit_all_positions_independent``,
@@ -1485,14 +1562,14 @@ def _fit_all_positions_independent(
                     raise RuntimeError("Direct residual completion produced an invalid bias")
                 position_corrections[bias_key] = bias_correction
                 current_state[bias_key] = current_state[bias_key] + bias_delta
-            desired_norm = desired_sq ** 0.5
+            desired_norm = desired_sq**0.5
             block_row = {
                 "mode": "direct_target",
                 "component": component,
                 "position": pos,
                 "source_coordinate": float(source_coordinates[pos]),
                 "desired_norm": desired_norm,
-                "effect_before_norm": effect_sq ** 0.5,
+                "effect_before_norm": effect_sq**0.5,
                 "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
                 "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
                 "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
@@ -1502,7 +1579,12 @@ def _fit_all_positions_independent(
                 bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
                 block_row.update(
                     _realization_diagnostic_fields(
-                        h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm,
+                        h_batches,
+                        correction,
+                        bias_for_pred,
+                        effective_out,
+                        weight_before,
+                        desired_norm,
                         diag["residual_norm_after"],
                     )
                 )
@@ -1803,9 +1885,7 @@ def _fit_block_boundary_backfit(
         t_replayed = []
         for x in x_batches:
             t_replayed.append(local_block(x.to(device)).detach().float().cpu().clone())
-        block_replay_bitwise = all(
-            torch.equal(rep, ref) for rep, ref in zip(t_replayed, t0_batches, strict=True)
-        )
+        block_replay_bitwise = all(torch.equal(rep, ref) for rep, ref in zip(t_replayed, t0_batches, strict=True))
         for rep, ref in zip(t_replayed, t0_batches, strict=True):
             if not torch.allclose(rep, ref, atol=1e-4, rtol=1e-4):
                 raise RuntimeError(
@@ -1845,12 +1925,12 @@ def _fit_block_boundary_backfit(
                     if c2 == c:
                         continue
                     w2, b2 = deltas[c2]
-                    _mount_component(shim, local_block, c2, base[c2][0] + w2, None if base[c2][1] is None else base[c2][1] + b2)
+                    _mount_component(
+                        shim, local_block, c2, base[c2][0] + w2, None if base[c2][1] is None else base[c2][1] + b2
+                    )
                 component_h, out_batches = _replay_block_components(shim, local_block, x_batches, [c], device)
                 h_batches = component_h[c]
-                e_batches = [
-                    d - (t - t0) for d, t, t0 in zip(d_batches, out_batches, t0_batches, strict=True)
-                ]
+                e_batches = [d - (t - t0) for d, t, t0 in zip(d_batches, out_batches, t0_batches, strict=True)]
                 width = int(base[c][0].shape[0])
                 identity_out = torch.eye(width, dtype=torch.float32)
                 scale_module = scale_modules[c]
@@ -1899,7 +1979,16 @@ def _fit_block_boundary_backfit(
                     trial_b = None if old_b is None else old_b + eta * (candidate_b - old_b)
                     trial_deltas[c] = (trial_w, trial_b)
                     j_trial, _ = _backfit_objective(
-                        shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, trial_deltas, lambdas
+                        shim,
+                        local_block64,
+                        device,
+                        x_batches,
+                        d_batches,
+                        t0_batches,
+                        order,
+                        base,
+                        trial_deltas,
+                        lambdas,
                     )
                     if j_trial < j_old:
                         accepted_eta = eta
@@ -1988,13 +2077,445 @@ def _fit_block_boundary_backfit(
                 bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
                 block_row.update(
                     _realization_diagnostic_fields(
-                        per_component_h[c], correction, bias_for_pred, per_component_effective_out[c],
-                        base[c][0], desired_norm, diag["residual_norm_after"],
+                        per_component_h[c],
+                        correction,
+                        bias_for_pred,
+                        per_component_effective_out[c],
+                        base[c][0],
+                        desired_norm,
+                        diag["residual_norm_after"],
                     )
                 )
             block_rows.append(block_row)
         results[pos] = (position_corrections, block_rows)
     return results
+
+
+class _JointBlockRidgeStatistics:
+    """Streaming Gram/cross accumulator for the closed-form joint (O, D)-stacked
+    ridge fit ``block_split='joint'`` uses (see ``_fit_block_boundary_joint``).
+
+    Mirrors ``ResidualSufficientStatistics`` at ``t_in=None, t_out=I`` (the only
+    configuration ``block_split='joint'`` ever needs -- LayerScale is asserted
+    ``nn.Identity`` before this class is ever touched), generalized from one
+    ridge scalar to a per-block-diagonal ridge vector over the STACKED feature
+    dimension ``sum(dims)``. Accumulates the ``(d_total, d_total)`` Gram and
+    ``(d_total, d_out)`` cross statistics batch by batch in float64, never
+    materializing a design matrix with as many rows as calibration tokens (the
+    Gram/cross tensors are the only ``O(d^2)``-sized state this class holds --
+    ``d_total = d_O + d_D`` is a few thousand for ViT-L/14, not the token
+    count).
+    """
+
+    def __init__(self, dims: list[int], d_out: int, device=None) -> None:
+        if len(dims) < 1 or any(d <= 0 for d in dims) or d_out <= 0:
+            raise ValueError("dims and d_out must be positive")
+        self.device = device
+        self.dims = list(dims)
+        self.d_total = sum(dims)
+        self.d_out = d_out
+        self.gram = torch.zeros(self.d_total, self.d_total, dtype=torch.float64, device=device)
+        self.cross = torch.zeros(self.d_total, d_out, dtype=torch.float64, device=device)
+        self.sum_a = torch.zeros(self.d_total, dtype=torch.float64, device=device)
+        self.sum_e = torch.zeros(d_out, dtype=torch.float64, device=device)
+        self.sum_e2 = 0.0
+        self.n_rows = 0
+
+    def update(self, h_list: list[torch.Tensor], e: torch.Tensor) -> None:
+        if len(h_list) != len(self.dims):
+            raise ValueError("h_list must supply one feature bank per stacked component")
+        if self.device is not None:
+            h_list = [h.to(self.device) for h in h_list]
+            e = e.to(self.device)
+        for h, d in zip(h_list, self.dims, strict=True):
+            if h.ndim != 2 or h.shape[1] != d:
+                raise ValueError("component feature bank has an unexpected shape")
+        if e.ndim != 2 or e.shape[1] != self.d_out:
+            raise ValueError("target bank has an unexpected shape")
+        rows = {h.shape[0] for h in h_list} | {e.shape[0]}
+        if len(rows) != 1:
+            raise ValueError("component feature banks and the target bank must share the row count")
+        a = torch.cat([h.to(torch.float64) for h in h_list], dim=1)
+        er = e.to(torch.float64)
+        if not torch.isfinite(a).all() or not torch.isfinite(er).all():
+            raise ValueError("solver inputs must be finite")
+        self.gram += a.T @ a
+        self.cross += a.T @ er
+        self.sum_a += a.sum(dim=0)
+        self.sum_e += er.sum(dim=0)
+        self.sum_e2 += float((er * er).sum().item())
+        self.n_rows += int(a.shape[0])
+
+    def solve(self, lambdas: list[float]) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Exact centered normal-equation solve with a block-diagonal ridge.
+
+        Returns ``(x, beta, diag)`` with ``x`` shaped ``(d_total, d_out)`` (the
+        stacked, UNTRANSPOSED weight -- callers split it by ``self.dims`` and
+        transpose each block to the usual ``(out, in)`` weight convention) and
+        ``beta`` the shared ``(d_out,)`` intercept solved jointly with ``x``
+        (not ridge-penalized, matching ``ResidualSufficientStatistics.solve``'s
+        own convention).
+
+        Equivalent to rescaling features by ``1/sqrt(lambda_c)`` per block and
+        solving with unit ridge (the textbook reduction of a block-diagonal
+        ridge to a scalar one), but implemented directly on the centered normal
+        equations ``(S_c + diag(lambda)) X = B_c`` -- exact in float64, no
+        rescale/un-rescale round trip.
+        """
+        if len(lambdas) != len(self.dims):
+            raise ValueError("lambdas must supply one ridge coefficient per stacked component")
+        if self.n_rows == 0:
+            raise ValueError("cannot solve empty joint block statistics")
+        if any((not math.isfinite(float(lam))) or float(lam) < 0 for lam in lambdas):
+            raise ValueError("lambdas must be finite and non-negative")
+        n = float(self.n_rows)
+        mu_a = self.sum_a / n
+        mu_e = self.sum_e / n
+        s = (self.gram + self.gram.T) * 0.5
+        sc = s - torch.outer(self.sum_a, self.sum_a) / n
+        bc = self.cross - torch.outer(self.sum_a, mu_e)
+        sc = (sc + sc.T) * 0.5
+        lam_vec = torch.cat(
+            [
+                torch.full((d,), float(lam), dtype=torch.float64, device=sc.device)
+                for d, lam in zip(self.dims, lambdas, strict=True)
+            ]
+        )
+        reg = sc + torch.diag(lam_vec)
+        x = torch.linalg.solve(reg, bc)
+        beta = mu_e - x.T @ mu_a
+        # Exact total ||A x + 1 beta^T - E||_F^2 from raw (uncentered) sufficient
+        # statistics -- same decomposition as ResidualSufficientStatistics.
+        # _residual_sq, specialized to t_out=I (g=I, lmat=I).
+        predicted_sq = torch.trace(x.T @ s @ x).item()
+        cross_term = 2.0 * torch.sum(x * self.cross).item()
+        resid_no_bias = self.sum_e2 - cross_term + predicted_sq
+        pred_mean = mu_a @ x
+        bias_term = 2.0 * n * float((beta @ (pred_mean - mu_e)).item()) + n * float((beta @ beta).item())
+        residual_sq = max(0.0, resid_no_bias + bias_term)
+        diag = {
+            "n_rows": self.n_rows,
+            "residual_norm_before": self.sum_e2**0.5,
+            "residual_norm_after": residual_sq**0.5,
+        }
+        return x, beta, diag
+
+
+@torch.no_grad()
+def _fit_block_boundary_joint(
+    target_model,
+    current_state: dict[str, torch.Tensor],
+    positions: list[int],
+    source_coordinates: dict[int, float],
+    desired_batches: dict[int, list],
+    target_output_batches: dict[int, list],
+    batches: list,
+    components: tuple,
+    config,
+    device,
+    family_adapter=None,
+) -> dict[int, tuple[dict, list]]:
+    """Closed-form joint ridge fit for ``component_target='block_boundary'``,
+    ``block_split='joint'`` (Direct Residual only; see ``DirectResidualConfig``).
+
+    Where ``block_split='none'`` fits every requested component INDEPENDENTLY
+    against the same block-boundary target ``D_j`` (double-counting the target
+    when more than one component is requested) and ``block_split='backfit'``
+    resolves that by iterative Gauss-Seidel replay of the block's own
+    nonlinearity, ``'joint'`` instead solves ONE closed-form ridge in a single
+    linear-algebra step, under the explicit first-order approximation that the
+    MLP does not respond to a change in ``attn.out_proj`` (``J_M = 0``): with
+    ``H_O``/``H_D`` the pristine ``attn.out_proj``/``mlp.c_proj`` inputs (the
+    SAME captures ``_fit_all_positions_independent`` uses) and
+    ``D_j`` the block-boundary desired effect,
+
+        min_{Wo,Wd,beta} ||H_O Wo^T + H_D Wd^T + 1 beta^T - D_j||_F^2
+                          + lambda_O ||Wo||_F^2 + lambda_D ||Wd||_F^2.
+
+    Only valid for ``components`` a non-empty subset of
+    ``{"attn.out_proj", "mlp.c_proj"}`` (enforced by
+    ``direct_residual.parse_direct_residual_config``).
+
+    **lambda_c convention.** Each component's ridge coefficient is EXACTLY the
+    value its OWN standalone ``block_split='none'`` fit would use --
+    ``ResidualSufficientStatistics.solve(...)``'s own ``diag["ridge"]``,
+    computed from that component's own ``H_c`` and the ridge_relative/
+    ridge_estimator/exact_form config, penalizing ``Delta W_c`` (the weight
+    only; the joint intercept below is unpenalized) at the identical scale
+    ``solve`` itself would use it at alone -- see
+    ``tests/test_direct_residual_joint.py``'s ``test_lambda_matches_single_
+    component_solver`` for the regression pinning this.
+
+    **Bias convention.** The joint intercept is not identifiable between the
+    two components' biases (only their sum enters the objective). The WHOLE
+    fitted intercept is assigned to ``mlp.c_proj.bias`` -- the block's LAST
+    residual writer -- and ``attn.out_proj.bias`` is left untouched (a zero
+    delta): ``attn.out_proj``'s bias also feeds the MLP's input on the real
+    (nonlinear) block, which this first-order joint model ignores by
+    construction, so it must not absorb any share of the block-level
+    intercept a purely-linear model derived. With a single requested component
+    this convention is moot -- see below.
+
+    **LayerScale.** Asserted ``nn.Identity`` on both ``ls_1``/``ls_2`` before
+    any solve (``_assert_layerscale_identity``): a nontrivial LayerScale would
+    give the two writers different output gammas, which the stacked-feature
+    derivation above assumes away.
+
+    **Single-component reduction.** With one requested component, this
+    function does not build a (degenerate, one-block) joint system at all --
+    it returns that component's own standalone ``block_split='none'`` solve
+    directly (the same ``ResidualSufficientStatistics`` call this function
+    computes ``lambda_c`` from in the first place), so single-component
+    ``block_split='joint'`` is not merely numerically close to
+    ``block_split='none'`` but literally the same function call.
+
+    Every position is independent and pristine (nothing is ever mounted
+    between fits, matching every other Direct Residual path), so ``E_j ==
+    D_j`` identically and this reuses ``capture_tokens``'s combined-request,
+    one-sweep capture exactly like ``_fit_all_positions_independent``.
+    """
+    shim = _layout_for(family_adapter)
+    residual_writers = set(COMPONENT_FORWARD_ORDER)
+    if set(components) - residual_writers:
+        raise ValueError(
+            "block_split='joint' only supports residual-writing components "
+            f"{sorted(residual_writers)}; internal components (q/k/v/c_fc) act on the block "
+            "output nonlinearly and have no linear regression onto a block-boundary target"
+        )
+    order = order_components(components)
+    if not order:
+        raise ValueError("components must not be empty")
+
+    requests: dict[str, tuple[int, str]] = {}
+    for pos in positions:
+        requests[f"{pos}.out"] = (pos, "boundary")
+        for component in order:
+            requests[f"{pos}.{component}.h"] = (pos, COMPONENT_INPUT_KIND[component])
+    captured = capture_tokens(target_model, batches, requests, device, family_adapter=family_adapter)
+
+    results: dict[int, tuple[dict, list]] = {}
+    for pos in positions:
+        block = shim.blocks(target_model)[pos]
+        _assert_layerscale_identity(shim, block, context=f"position {pos}", requirement="block_split='joint'")
+        out_batches = captured[f"{pos}.out"]
+        d_batches = desired_batches[pos]
+        t0_batches = target_output_batches[pos]
+
+        # The block hasn't been touched yet at this position (independent
+        # mode, pristine by construction): the pre-fit effect is the SAME for
+        # every component, so it is measured once rather than per component.
+        desired_sq = 0.0
+        effect_sq = 0.0
+        error_batches = []
+        for out, desired_batch, base_out in zip(out_batches, d_batches, t0_batches, strict=True):
+            effect = out - base_out
+            desired_sq += float((desired_batch.double() ** 2).sum().item())
+            effect_sq += float((effect.double() ** 2).sum().item())
+            error_batches.append(desired_batch - effect)
+        if effect_sq > 1e-12 * max(desired_sq, 1.0):
+            raise RuntimeError(
+                "Direct completion started from a target model that is not the native "
+                f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
+            )
+        desired_norm = desired_sq**0.5
+
+        h_batches_by_component: dict[str, list[torch.Tensor]] = {}
+        widths: dict[str, int] = {}
+        lambdas: dict[str, float] = {}
+        single_component_fit: dict[str, tuple[torch.Tensor, dict[str, Any]]] = {}
+        for component in order:
+            key = shim.component_key(pos, component, prefixed=True)
+            h_batches = captured[f"{pos}.{component}.h"]
+            h_batches_by_component[component] = h_batches
+            width = int(current_state[key].shape[0])
+            widths[component] = width
+            scale_module = shim.component_scale_module(block, component)
+            if not isinstance(scale_module, nn.Identity):
+                raise ValueError(f"block_split='joint' requires an identity LayerScale on {component}'s output")
+            effective_out = torch.eye(width, dtype=torch.float32)
+            stats = ResidualSufficientStatistics(device=device)
+            for h, error in zip(h_batches, error_batches, strict=True):
+                stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+            correction, diag = stats.solve(
+                ridge_relative=config.ridge_relative,
+                ridge_estimator=config.ridge_estimator,
+                exact_form=config.exact_form,
+            )
+            correction = correction.cpu()
+            diag["bias_correction"] = diag["bias_correction"].cpu()
+            lambdas[component] = float(diag["ridge"])
+            single_component_fit[component] = (correction, diag)
+
+        position_corrections: dict[str, torch.Tensor] = {}
+        block_rows: list[dict[str, Any]] = []
+        if len(order) == 1:
+            # See the docstring: the bias-split convention below is only
+            # meaningful with both writers present, so a single requested
+            # component just IS the standalone block_split='none' fit -- the
+            # identical ResidualSufficientStatistics call computed above for
+            # lambda_c, reused verbatim rather than resolved.
+            (component,) = order
+            correction, diag = single_component_fit[component]
+            key = shim.component_key(pos, component, prefixed=True)
+            weight_before = current_state[key].detach().clone()
+            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+                raise RuntimeError("block_split='joint' produced an invalid projection")
+            position_corrections[key] = correction
+            current_state[key] = current_state[key] + correction.to(current_state[key])
+            bias_key = f"{key[: -len('.weight')]}.bias"
+            bias_correction = diag["bias_correction"]
+            skip_bias = _apply_bias_correction(config, current_state, bias_key, bias_correction, position_corrections)
+            block_row = {
+                "mode": "direct_target",
+                "component": component,
+                "component_target": "block_boundary",
+                "block_split": "joint",
+                "position": pos,
+                "source_coordinate": float(source_coordinates[pos]),
+                "desired_norm": desired_norm,
+                "effect_before_norm": effect_sq**0.5,
+                "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+                "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                "joint_lambda": {component: lambdas[component]},
+                "joint_residual_relative": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                **diag,
+            }
+            if bool(getattr(config, "realization_diagnostics", False)):
+                bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
+                block_row.update(
+                    _realization_diagnostic_fields(
+                        h_batches_by_component[component],
+                        correction,
+                        bias_for_pred,
+                        torch.eye(widths[component], dtype=torch.float32),
+                        weight_before,
+                        desired_norm,
+                        diag["residual_norm_after"],
+                    )
+                )
+            block_rows.append(block_row)
+            results[pos] = (position_corrections, block_rows)
+            continue
+
+        # Genuine joint (>=2 component) stacked solve. `dims` is each
+        # component's own INPUT feature width (H_c's last dim -- e.g.
+        # mlp.c_proj's input is d_model*mlp_ratio, NOT its output width
+        # `widths[c]`, which is d_model like every other residual writer's
+        # OUTPUT). d_out is read off the block's own boundary output bank
+        # (the shared regression target every component's H_c writes into).
+        dims = [int(h_batches_by_component[c][0].shape[-1]) for c in order]
+        d_out = int(out_batches[0].shape[-1])
+        joint_stats = _JointBlockRidgeStatistics(dims, d_out, device=device)
+        for rows in zip(*(h_batches_by_component[c] for c in order), error_batches, strict=True):
+            *h_rows, error = rows
+            joint_stats.update([h.reshape(-1, h.shape[-1]) for h in h_rows], error.reshape(-1, error.shape[-1]))
+        lambda_list = [lambdas[c] for c in order]
+        x, beta, joint_diag = joint_stats.solve(lambda_list)
+        x = x.cpu()
+        beta = beta.cpu().to(torch.float32)
+
+        offsets = [0]
+        for d in dims:
+            offsets.append(offsets[-1] + d)
+        last_writer = order[-1]
+        for idx, component in enumerate(order):
+            key = shim.component_key(pos, component, prefixed=True)
+            correction = x[offsets[idx] : offsets[idx + 1], :].T.to(torch.float32).contiguous()
+            weight_before = current_state[key].detach().clone()
+            if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
+                raise RuntimeError("block_split='joint' produced an invalid projection")
+            position_corrections[key] = correction
+            current_state[key] = current_state[key] + correction.to(current_state[key])
+            bias_key = f"{key[: -len('.weight')]}.bias"
+            # See the docstring: the whole joint intercept goes to the LAST
+            # residual writer (mlp.c_proj in the historical two-writer case);
+            # every other component's bias gets an exact zero delta.
+            bias_correction = beta if component == last_writer else torch.zeros_like(beta)
+            skip_bias = _apply_bias_correction(config, current_state, bias_key, bias_correction, position_corrections)
+            _single_correction, single_diag = single_component_fit[component]
+            block_row = {
+                "mode": "direct_target",
+                "component": component,
+                "component_target": "block_boundary",
+                "block_split": "joint",
+                "position": pos,
+                "source_coordinate": float(source_coordinates[pos]),
+                "desired_norm": desired_norm,
+                "effect_before_norm": effect_sq**0.5,
+                "relative_residual_before": (joint_diag["residual_norm_before"] / desired_norm)
+                if desired_norm
+                else 0.0,
+                "relative_residual_after": (joint_diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+                "n_rows": joint_diag["n_rows"],
+                "residual_norm_before": joint_diag["residual_norm_before"],
+                "residual_norm_after": joint_diag["residual_norm_after"],
+                "exact_form": bool(config.exact_form),
+                "ridge_estimator": config.ridge_estimator,
+                "configured_ridge_relative": float(config.ridge_relative),
+                "effective_ridge_relative": single_diag["effective_ridge_relative"],
+                "ridge": lambdas[component],
+                "correction_norm": float(torch.linalg.norm(correction).item()),
+                "bias_norm": float(torch.linalg.norm(bias_correction).item()),
+                "bias_correction": bias_correction,
+                "joint_lambda": dict(lambdas),
+                "joint_residual_relative": (joint_diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+            }
+            if bool(getattr(config, "realization_diagnostics", False)):
+                bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
+                block_row.update(
+                    _realization_diagnostic_fields(
+                        h_batches_by_component[component],
+                        correction,
+                        bias_for_pred,
+                        torch.eye(widths[component], dtype=torch.float32),
+                        weight_before,
+                        desired_norm,
+                        joint_diag["residual_norm_after"],
+                    )
+                )
+            block_rows.append(block_row)
+        results[pos] = (position_corrections, block_rows)
+    return results
+
+
+def _apply_bias_correction(config, current_state, bias_key, bias_correction, position_corrections) -> bool:
+    """Shared ``missing_bias`` handling for a single component's bias delta
+    (extracted from the ``block_split in {'none', 'backfit'}`` paths so
+    ``block_split='joint'`` follows the exact same ``error``/``materialize``/
+    ``skip`` contract). Mutates ``position_corrections`` in place with the
+    accepted bias delta (unless skipped) and returns whether the bias was
+    skipped.
+    """
+    if bias_key not in current_state:
+        if config.missing_bias == "materialize":
+            raise RuntimeError(
+                f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                "before residual completion runs; call "
+                "materialize_missing_projection_biases() on the target model and its "
+                "base state dict first"
+            )
+        elif config.missing_bias == "skip":
+            if torch.count_nonzero(bias_correction):
+                raise RuntimeError(
+                    "missing_bias='skip' would discard a nonzero intercept at "
+                    f"{bias_key}; the weight was fitted on centered banks and is "
+                    "not valid without it"
+                )
+            return True
+        else:
+            raise RuntimeError(
+                f"Target model is missing the expected bias parameter {bias_key}. "
+                "Set target_residual_completion.missing_bias to 'materialize' (exact, "
+                "adds the parameter) or 'skip' with exact_form=false."
+            )
+    bias_delta = bias_correction.to(current_state[bias_key])
+    if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+        raise RuntimeError("block_split='joint' produced an invalid bias")
+    position_corrections[bias_key] = bias_delta
+    current_state[bias_key] = current_state[bias_key] + bias_delta
+    return False
 
 
 @torch.no_grad()
@@ -2076,7 +2597,11 @@ def _fit_component_outputs_from_contributions(
 
         needed_kinds = sorted({COMPONENT_INPUT_KIND[c] for c in components})
         captured = capture_tokens(
-            target_model, batches, {kind: (pos, kind) for kind in needed_kinds}, device, family_adapter=family_adapter,
+            target_model,
+            batches,
+            {kind: (pos, kind) for kind in needed_kinds},
+            device,
+            family_adapter=family_adapter,
         )
 
         position_corrections: dict[str, torch.Tensor] = {}
@@ -2135,9 +2660,7 @@ def _fit_component_outputs_from_contributions(
                 base_w, base_b = weights["base_weight"], weights["base_bias"]
                 ft_w, ft_b = weights["ft_weight"], weights["ft_bias"]
                 a0_batches = [F.linear(x, base_w, base_b) for x in source_x_batches]
-                delta_batches = [
-                    F.linear(x, ft_w, ft_b) - F.linear(x, base_w, base_b) for x in source_x_batches
-                ]
+                delta_batches = [F.linear(x, ft_w, ft_b) - F.linear(x, base_w, base_b) for x in source_x_batches]
                 aligned_a0 = _aligned(a0_batches, h_batches)
                 aligned_delta = _aligned(delta_batches, h_batches)
                 q, _mu_s, _mu_t = centered_rectangular_procrustes(
@@ -2208,7 +2731,10 @@ def _fit_component_outputs_from_contributions(
                 if row_slice is not None:
                     if bias_key not in position_corrections:
                         position_corrections[bias_key] = torch.zeros_like(current_state[bias_key])
-                    if bias_delta.shape != current_state[bias_key][row_slice].shape or not torch.isfinite(bias_delta).all():
+                    if (
+                        bias_delta.shape != current_state[bias_key][row_slice].shape
+                        or not torch.isfinite(bias_delta).all()
+                    ):
                         raise RuntimeError("output_local component fit produced an invalid bias")
                     position_corrections[bias_key][row_slice] = bias_delta
                 else:
@@ -2382,7 +2908,10 @@ def compute_direct_residual_task_vector_stats(
 
 
 def _family_delta_state(
-    shim, component: str, positions: list[int], target_corrections: Mapping[str, torch.Tensor],
+    shim,
+    component: str,
+    positions: list[int],
+    target_corrections: Mapping[str, torch.Tensor],
     base_state: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """The subset of ``target_corrections`` belonging to one component family,
@@ -2513,12 +3042,11 @@ def measure_direct_residual_realization(
             for pos in positions
         }
         del joint_banks
-        joint_norm_sq = {
-            pos: sum(float((d.double() ** 2).sum().item()) for d in joint_delta[pos]) for pos in positions
-        }
+        joint_norm_sq = {pos: sum(float((d.double() ** 2).sum().item()) for d in joint_delta[pos]) for pos in positions}
 
         present_families = [
-            c for c in components
+            c
+            for c in components
             if any(shim.component_key(pos, c, prefixed=True) in target_corrections for pos in positions)
         ]
 
@@ -2528,9 +3056,7 @@ def measure_direct_residual_realization(
             delta = _family_delta_state(shim, component, positions, target_corrections, base_state)
             banks = capture_all(delta)
             for pos in positions:
-                deltas_c = [
-                    v - t0 for v, t0 in zip(banks[pos], target_outputs_by_position[pos], strict=True)
-                ]
+                deltas_c = [v - t0 for v, t0 in zip(banks[pos], target_outputs_by_position[pos], strict=True)]
                 family_norm_sq[component][pos] = sum(float((d.double() ** 2).sum().item()) for d in deltas_c)
                 for idx, d in enumerate(deltas_c):
                     running_sum[pos][idx] = running_sum[pos][idx] + d
@@ -2568,13 +3094,10 @@ def measure_direct_residual_realization(
         return results
     finally:
         target_model.load_state_dict(entry_state, strict=True)
-        exit_hash = _task_vector_sha256(
-            {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
-        )
+        exit_hash = _task_vector_sha256({k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()})
         if exit_hash != entry_hash:
             raise RuntimeError(
-                "measure_direct_residual_realization failed to restore the target model's entry "
-                "state exactly"
+                "measure_direct_residual_realization failed to restore the target model's entry state exactly"
             )
 
 
@@ -2637,9 +3160,7 @@ def complete_residuals_direct(
     restored to its entry state in a ``finally``; no hooks or modules survive.
     """
     if config.mode != "direct_target":
-        raise ValueError(
-            f"complete_residuals_direct requires mode='direct_target', got {config.mode!r}"
-        )
+        raise ValueError(f"complete_residuals_direct requires mode='direct_target', got {config.mode!r}")
     _validate_target_informed_layout(
         layout,
         target_scope=config.target_scope,
@@ -2680,8 +3201,15 @@ def complete_residuals_direct(
     meta = references["calibration"]
     if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
         raise ValueError("Cached reference images do not match this task's validation dataset")
-    batches = list(DataLoader(Subset(target_loader.dataset, meta["indices"]), batch_size=meta["batch_size"],
-                              shuffle=False, num_workers=0, collate_fn=target_loader.collate_fn))
+    batches = list(
+        DataLoader(
+            Subset(target_loader.dataset, meta["indices"]),
+            batch_size=meta["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=target_loader.collate_fn,
+        )
+    )
     original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     target_corrections, diagnostics = {}, []
     try:
@@ -2764,6 +3292,7 @@ def complete_residuals_direct(
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return target_corrections, diagnostics
+
 
 @torch.no_grad()
 def complete_joint_blockwise(
@@ -2853,9 +3382,7 @@ def complete_joint_blockwise(
             # vector.  A zero source target preserves the baseline source
             # reconstruction and prevents double-counting the full FT-base
             # effect in the joint objective.
-            source_y_rows = torch.zeros(
-                source_h_rows.shape[0], int(t_out.shape[0]), dtype=source_h_rows.dtype
-            )
+            source_y_rows = torch.zeros(source_h_rows.shape[0], int(t_out.shape[0]), dtype=source_h_rows.dtype)
             desired_target_batches = references["desired"][pos]
             target_effect_batches = [
                 desired - (current - native)
@@ -2902,14 +3429,16 @@ def complete_joint_blockwise(
             bias = diag.get("bias_correction")
             if not isinstance(bias, torch.Tensor) or bias.ndim != 1:
                 raise RuntimeError("Joint blockwise solver did not return a source-coordinate bias correction")
-            bias_key = f"{key[:-len('.weight')]}.bias"
+            bias_key = f"{key[: -len('.weight')]}.bias"
             if bias_key not in current_state:
                 raise RuntimeError(
-                    "Joint blockwise affine correction requires a target c_proj.bias parameter; "
-                    f"missing {bias_key}"
+                    f"Joint blockwise affine correction requires a target c_proj.bias parameter; missing {bias_key}"
                 )
             transported_bias = t_out.T @ bias.to(t_out)
-            if tuple(transported_bias.shape) != tuple(current_state[bias_key].shape) or not torch.isfinite(transported_bias).all():
+            if (
+                tuple(transported_bias.shape) != tuple(current_state[bias_key].shape)
+                or not torch.isfinite(transported_bias).all()
+            ):
                 raise RuntimeError(f"Joint blockwise correction has invalid bias shape at {bias_key}")
             source_corrections[bias_key] = bias
             target_corrections[bias_key] = transported_bias
@@ -2972,15 +3501,21 @@ def complete_direct_p1_shared_correction(
         raise ValueError("Direct P1 target calibration dataset mismatch")
 
     def _batches(loader):
-        return list(DataLoader(
-            Subset(loader.dataset, metadata["indices"]),
-            batch_size=metadata["batch_size"], shuffle=False, num_workers=0,
-            collate_fn=loader.collate_fn,
-        ))
+        return list(
+            DataLoader(
+                Subset(loader.dataset, metadata["indices"]),
+                batch_size=metadata["batch_size"],
+                shuffle=False,
+                num_workers=0,
+                collate_fn=loader.collate_fn,
+            )
+        )
 
     source_batches, target_batches = _batches(source_loader), _batches(target_loader)
     native_source_outputs = references.get("source_base_cproj_outputs", {})
-    native_target_outputs = references.get("target_base_outputs_by_position", {}) or references.get("target_base_outputs", {})
+    native_target_outputs = references.get("target_base_outputs_by_position", {}) or references.get(
+        "target_base_outputs", {}
+    )
     if not native_source_outputs or not native_target_outputs:
         raise ValueError("Direct P1 references are missing source c_proj or target boundary banks")
 
@@ -2998,24 +3533,24 @@ def complete_direct_p1_shared_correction(
         for row in entries:
             pos, source_idx = int(row["position"]), int(row["source_orig_idx"])
             t_in, t_out = transforms[pos]["t_in"], transforms[pos]["t_out"]
-            source_capture = capture_tokens(
-                source_base_model, source_batches, {"out": (pos, "c_proj")}, device
-            )["out"]
+            source_capture = capture_tokens(source_base_model, source_batches, {"out": (pos, "c_proj")}, device)["out"]
             current_source = source_capture
             reference_source = _aligned(native_source_outputs[source_idx], source_capture)
             source_rows = _rows(current_source)
-            source_residual = _rows([
-                reference - current
-                for current, reference in zip(current_source, reference_source, strict=True)
-            ])
+            source_residual = _rows(
+                [reference - current for current, reference in zip(current_source, reference_source, strict=True)]
+            )
 
             source_base_block = shim.block_module(shim.blocks(source_base_model)[pos])
             source_ft_block = shim.block_module(shim.blocks(source_ft_model)[pos])
-            delta_weight = (source_ft_block.mlp.c_proj.weight - source_base_block.mlp.c_proj.weight).detach().cpu().float()
+            delta_weight = (
+                (source_ft_block.mlp.c_proj.weight - source_base_block.mlp.c_proj.weight).detach().cpu().float()
+            )
             delta_bias = (source_ft_block.mlp.c_proj.bias - source_base_block.mlp.c_proj.bias).detach().cpu().float()
 
             captured_target = capture_tokens(
-                target_model, target_batches,
+                target_model,
+                target_batches,
                 {"h": (pos, "c_proj_input"), "boundary": (pos, "boundary")},
                 device,
             )
@@ -3041,8 +3576,12 @@ def complete_direct_p1_shared_correction(
 
             identity = torch.eye(z_target.shape[1], dtype=z_target.dtype)
             correction, diag = fit_joint_cproj_correction(
-                source_rows, source_residual, z_target, target_residual,
-                identity, effective_out,
+                source_rows,
+                source_residual,
+                z_target,
+                target_residual,
+                identity,
+                effective_out,
                 source_weight=config.source_weight,
                 target_weight=config.target_weight,
                 ridge_relative=config.ridge_relative,
@@ -3060,7 +3599,7 @@ def complete_direct_p1_shared_correction(
             delta_weight_change = correction @ delta_weight
             delta_bias_change = correction @ delta_bias
             weight_key = shim.proj_key(pos, prefixed=True)
-            bias_key = f"{weight_key[:-len('.weight')]}.bias"
+            bias_key = f"{weight_key[: -len('.weight')]}.bias"
             transported_weight = t_out.T @ delta_weight_change @ t_in
             transported_bias = t_out.T @ delta_bias_change
             target_corrections[weight_key] = transported_weight
@@ -3068,13 +3607,15 @@ def complete_direct_p1_shared_correction(
             target_state[weight_key] = target_state[weight_key] + transported_weight.to(target_state[weight_key])
             target_state[bias_key] = target_state[bias_key] + transported_bias.to(target_state[bias_key])
             target_model.load_state_dict(target_state, strict=True)
-            diagnostics.append({
-                "position": pos,
-                "source_orig_idx": source_idx,
-                "shared_affine_bias_norm": float(torch.linalg.norm(shared_bias)),
-                "task_bias_change_norm": float(torch.linalg.norm(delta_bias_change)),
-                **{key: value for key, value in diag.items() if key != "bias_correction"},
-            })
+            diagnostics.append(
+                {
+                    "position": pos,
+                    "source_orig_idx": source_idx,
+                    "shared_affine_bias_norm": float(torch.linalg.norm(shared_bias)),
+                    "task_bias_change_norm": float(torch.linalg.norm(delta_bias_change)),
+                    **{key: value for key, value in diag.items() if key != "bias_correction"},
+                }
+            )
     finally:
         source_base_model.load_state_dict(source_base_original, strict=True)
         source_ft_model.load_state_dict(source_ft_original, strict=True)
@@ -3116,9 +3657,7 @@ def capture_resized_joint_source_inputs(
     requests = {str(int(row["position"])): (int(row["position"]), "c_proj_input") for row in entries}
     captured = capture_tokens(source_model, batches, requests, device, family_adapter=family_adapter)
     updated = dict(references)
-    updated["resized_source_cproj_inputs_by_position"] = {
-        int(position): bank for position, bank in captured.items()
-    }
+    updated["resized_source_cproj_inputs_by_position"] = {int(position): bank for position, bank in captured.items()}
     return updated
 
 
@@ -3184,7 +3723,9 @@ def _materialize_all_scope_references(references, entries, *, trajectory="step")
         pos = int(row["position"])
         source_idx = int(row["source_orig_idx"])
         if source_idx not in source_base or source_idx not in source_ft:
-            raise ValueError(f"Missing native source reference for ancestry index {source_idx} at target position {pos}")
+            raise ValueError(
+                f"Missing native source reference for ancestry index {source_idx} at target position {pos}"
+            )
         targets = target_by_position[pos]
         coordinate = coordinates[pos]
         lower, upper = math.floor(coordinate), math.ceil(coordinate)
@@ -3200,9 +3741,7 @@ def _materialize_all_scope_references(references, entries, *, trajectory="step")
         else:
             weight = coordinate - lower
             upper_base = _aligned(source_base[upper], targets)
-            upper_delta = [
-                f - b for b, f in zip(upper_base, _aligned(source_ft[upper], targets), strict=True)
-            ]
+            upper_delta = [f - b for b, f in zip(upper_base, _aligned(source_ft[upper], targets), strict=True)]
             if lower < 0:
                 # Delta_{-1} = 0: no task effect exists before the first source
                 # block. Its *base* bank has no counterpart either -- nothing is
@@ -3213,23 +3752,17 @@ def _materialize_all_scope_references(references, entries, *, trajectory="step")
                 lower_base, lower_delta = upper_base, [torch.zeros_like(b) for b in upper_base]
             else:
                 lower_base = _aligned(source_base[lower], targets)
-                lower_delta = [
-                    f - b for b, f in zip(lower_base, _aligned(source_ft[lower], targets), strict=True)
-                ]
+                lower_delta = [f - b for b, f in zip(lower_base, _aligned(source_ft[lower], targets), strict=True)]
             base_batches = [
-                (1.0 - weight) * low + weight * high
-                for low, high in zip(lower_base, upper_base, strict=True)
+                (1.0 - weight) * low + weight * high for low, high in zip(lower_base, upper_base, strict=True)
             ]
             delta_batches = [
-                (1.0 - weight) * low + weight * high
-                for low, high in zip(lower_delta, upper_delta, strict=True)
+                (1.0 - weight) * low + weight * high for low, high in zip(lower_delta, upper_delta, strict=True)
             ]
 
         # Q is fitted from whichever base bank the desired effect is expressed
         # against, so the alignment always matches the delta being transported.
-        q, mu_s, mu_t = centered_rectangular_procrustes(
-            _rows(base_batches).double(), _rows(targets).double()
-        )
+        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(base_batches).double(), _rows(targets).double())
         q = q.float()
         desired[pos] = [delta @ q for delta in delta_batches]
         target_outputs[pos] = targets
@@ -3250,23 +3783,48 @@ def scale_completion(baseline, completion, strength):
 
 def cache_identity(cfg, task, target_hash):
     from .block_extension import resolve_block_extension_config
+
     checkpoint = Path(cfg["tuned_ckpts"][task]).resolve()
     stat = checkpoint.stat()
-    keys = ("source_clip_model", "source_clip_pretrained", "target_clip_model", "target_clip_pretrained",
-            "method", "method_params", "seed", "val_fraction", "batch_size", "dtype")
+    keys = (
+        "source_clip_model",
+        "source_clip_pretrained",
+        "target_clip_model",
+        "target_clip_pretrained",
+        "method",
+        "method_params",
+        "seed",
+        "val_fraction",
+        "batch_size",
+        "dtype",
+    )
     protocol = {k: cfg.get(k) for k in keys}
     protocol["block_extension_params"] = asdict(resolve_block_extension_config(cfg)[1])
     shared = parse_target_shared_config(cfg.get("target_shared_correction"))
     protocol["target_shared_correction"] = asdict(shared) if shared.enabled and shared.target_weight > 0 else None
     implementation = hashlib.sha256()
     root = Path(__file__).resolve().parents[1]
-    for relative in ("eval/block_extension.py", "eval/target_informed_runtime.py", "eval/target_residual_completion.py",
-                     "rebase/methods/theseus.py", "rebase/methods/bico.py"):
+    for relative in (
+        "eval/block_extension.py",
+        "eval/target_informed_runtime.py",
+        "eval/target_residual_completion.py",
+        "rebase/methods/theseus.py",
+        "rebase/methods/bico.py",
+    ):
         implementation.update((root / relative).read_bytes())
-    return {"schema_version": 1, "task": task, "target_hash": target_hash,
-            "checkpoint": {"path": str(checkpoint), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                           "sha256": _checkpoint_hash(str(checkpoint), stat.st_size, stat.st_mtime_ns)},
-            "implementation_sha256": implementation.hexdigest(), "protocol": protocol}
+    return {
+        "schema_version": 1,
+        "task": task,
+        "target_hash": target_hash,
+        "checkpoint": {
+            "path": str(checkpoint),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": _checkpoint_hash(str(checkpoint), stat.st_size, stat.st_mtime_ns),
+        },
+        "implementation_sha256": implementation.hexdigest(),
+        "protocol": protocol,
+    }
 
 
 @lru_cache(maxsize=64)

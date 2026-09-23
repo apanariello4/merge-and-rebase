@@ -56,6 +56,7 @@ from .target_informed_runtime import (
     _aligned,
     _fit_all_positions_independent,
     _fit_block_boundary_backfit,
+    _fit_block_boundary_joint,
     _fit_component_outputs_from_contributions,
     _rows,
     capture_source_component_references,
@@ -245,6 +246,14 @@ class DirectResidualConfig:
     #                model) copy of the block and replayed on the pristine
     #                captured block input X_j^0. See
     #                target_informed_runtime._fit_block_boundary_backfit.
+    #   "joint"   -- closed-form joint ridge over the stacked (attn.out_proj,
+    #                mlp.c_proj) features, solved in one linear-algebra step
+    #                under the first-order approximation that the MLP does
+    #                not respond to a change in attn.out_proj. Only valid for
+    #                components subset of {"attn.out_proj", "mlp.c_proj"};
+    #                with a single component this reduces to (is literally
+    #                the same fit as) block_split="none". See
+    #                target_informed_runtime._fit_block_boundary_joint.
     block_split: str = "none"
     backfit_max_iters: int = 20
     # Stop when the relative decrease of the safeguarded block objective J(Delta)
@@ -361,14 +370,14 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("merge_mode must be 'per_task_then_merge' or 'merge_in_source_then_fit'")
     if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
         raise ValueError("seed must be an integer")
-    if cfg.block_split not in {"none", "backfit"}:
-        raise ValueError("block_split must be 'none' or 'backfit'")
-    if cfg.block_split == "backfit":
+    if cfg.block_split not in {"none", "backfit", "joint"}:
+        raise ValueError("block_split must be 'none', 'backfit' or 'joint'")
+    if cfg.block_split in {"backfit", "joint"}:
         if cfg.component_target != "block_boundary":
-            raise ValueError("block_split='backfit' requires component_target='block_boundary'")
+            raise ValueError(f"block_split={cfg.block_split!r} requires component_target='block_boundary'")
         if set(components) - set(COMPONENT_FORWARD_ORDER):
             raise ValueError(
-                "block_split='backfit' only supports residual-writing components "
+                f"block_split={cfg.block_split!r} only supports residual-writing components "
                 f"{sorted(COMPONENT_FORWARD_ORDER)}"
             )
     if isinstance(cfg.backfit_max_iters, bool) or not isinstance(cfg.backfit_max_iters, int):
@@ -584,6 +593,20 @@ def fit_direct_residual(
             )
         elif config.block_split == "backfit":
             fitted = _fit_block_boundary_backfit(
+                target_model,
+                current_state,
+                positions,
+                source_coordinates,
+                desired,
+                target_outputs_by_position,
+                batches,
+                components,
+                solver_config,
+                device,
+                family_adapter=family_adapter,
+            )
+        elif config.block_split == "joint":
+            fitted = _fit_block_boundary_joint(
                 target_model,
                 current_state,
                 positions,
