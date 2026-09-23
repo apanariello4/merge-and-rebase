@@ -201,7 +201,25 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     assert delta  # nonzero strength -> a nonempty correction dict
     assert all(key.endswith(("c_proj.weight", "c_proj.bias", "out_proj.weight", "out_proj.bias")) for key in delta)
     # realization_diagnostics defaults to False: both extras absent.
-    assert extra == {"realization_by_position": None, "task_vector_stats": None}
+    assert extra["realization_by_position"] is None
+    assert extra["task_vector_stats"] is None
+    # alignment_diagnostics is always populated, regardless of
+    # realization_diagnostics or residual_target -- analysis-only, one row
+    # per target position; see compute_alignment_diagnostics. Computed by a
+    # separate, untimed call, outside both timing/peak-memory brackets.
+    assert set(extra["alignment_diagnostics"]) == set(range(pairing.target_depth))
+    for row in extra["alignment_diagnostics"].values():
+        assert set(row) == {
+            "procrustes_error_norm",
+            "procrustes_relative_error",
+            "delta_target_norm",
+            "endpoint_minus_delta_over_delta",
+            "procrustes_error_in_range_norm",
+            "procrustes_error_out_of_range_norm",
+            "mean_offset_norm",
+            "source_dim",
+            "target_dim",
+        }
     assert set(timing) == {"alignment_calibration", "correction_fit"}
     for bracket in ("alignment_calibration", "correction_fit"):
         seconds_key = f"{bracket}_seconds"
@@ -241,7 +259,9 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     )
 
     assert delta == {}
-    assert extra == {"realization_by_position": None, "task_vector_stats": None}
+    assert extra["realization_by_position"] is None
+    assert extra["task_vector_stats"] is None
+    assert set(extra["alignment_diagnostics"]) == set(range(pairing.target_depth))
 
 
 def test_run_direct_residual_fit_realization_diagnostics_populates_extra():

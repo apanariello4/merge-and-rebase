@@ -75,6 +75,7 @@ from .datasets.vision8_14_20 import SUITES
 from .direct_residual import (
     DirectResidualConfig,
     capture_paired_boundary_activations,
+    compute_alignment_diagnostics,
     compute_desired_effects,
     fit_direct_residual,
     parse_direct_residual_config,
@@ -1455,14 +1456,21 @@ def _run_direct_residual_fit(
     Returns ``(scaled_delta, timing, diagnostics, extra)`` where ``timing`` has
     ``"alignment_calibration"``/``"correction_fit"`` sub-dicts, each shaped
     like a ``transport_timings[task]`` entry, and ``extra`` is
-    ``{"realization_by_position": ..., "task_vector_stats": ...}``, both
-    ``None`` unless ``config.realization_diagnostics`` is set. Both are
-    computed from the unscaled, unit-strength ``target_corrections``
-    ``fit_direct_residual`` returns -- i.e. before ``strength`` is applied --
-    matching the plan's "AFTER the task vector tau (unit strength, as returned
-    by the fit) is assembled" requirement. Neither call mutates
-    ``target_model``'s entry state (both restore it internally and assert so
-    via a state-dict hash).
+    ``{"realization_by_position": ..., "task_vector_stats": ...,
+    "alignment_diagnostics": ...}``. The first two are ``None`` unless
+    ``config.realization_diagnostics`` is set, and are computed from the
+    unscaled, unit-strength ``target_corrections`` ``fit_direct_residual``
+    returns -- i.e. before ``strength`` is applied -- matching the plan's
+    "AFTER the task vector tau (unit strength, as returned by the fit) is
+    assembled" requirement. ``alignment_diagnostics`` is always present (keyed
+    by target position): it comes from a separate, untimed call to
+    ``compute_alignment_diagnostics`` -- deliberately outside both the
+    ``alignment_calibration`` and ``correction_fit`` timing/peak-memory
+    brackets, so its own float64 recomputation cost never contaminates either
+    (see the inline comment at the call site) -- is analysis-only, and never
+    feeds any fit regardless of ``config.residual_target``. Neither
+    realization-diagnostics call mutates ``target_model``'s entry state (both
+    restore it internally and assert so via a state-dict hash).
     """
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1482,7 +1490,7 @@ def _run_direct_residual_fit(
         device=device,
         component_inputs=component_inputs,
     )
-    desired = compute_desired_effects(captured, pairing)
+    desired = compute_desired_effects(captured, pairing, residual_target=config.residual_target)
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.synchronize()
         alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
@@ -1492,6 +1500,17 @@ def _run_direct_residual_fit(
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
         "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
     }
+
+    # Deliberately outside BOTH the alignment_calibration bracket above (just
+    # closed) and the correction_fit bracket below (not yet opened):
+    # compute_alignment_diagnostics recomputes the same centered Procrustes
+    # fit a second time purely for analysis, with several float64 N x d_t
+    # temporaries (N in the tens of thousands of rows). Folding it into
+    # either bracket would inflate that bracket's recorded seconds/peak-
+    # memory bytes -- even in the default residual_target="transported_delta"
+    # path -- contaminating any cross-code-generation cost comparison for a
+    # quantity these diagnostics never feed into.
+    alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
 
     if torch.cuda.is_available() and device != "cpu":
         torch.cuda.reset_peak_memory_stats()
@@ -1551,7 +1570,11 @@ def _run_direct_residual_fit(
     scaled_delta = (
         {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
     )
-    extra = {"realization_by_position": realization_by_position, "task_vector_stats": task_vector_stats}
+    extra = {
+        "realization_by_position": realization_by_position,
+        "task_vector_stats": task_vector_stats,
+        "alignment_diagnostics": alignment_diagnostics,
+    }
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
 
@@ -2151,6 +2174,7 @@ def main() -> None:
         direct_residual_diagnostics: dict[str, list[dict[str, Any]]] = {}
         direct_residual_realization: dict[str, dict[int, dict[str, Any]]] = {}
         direct_residual_task_vector_stats: dict[str, dict[str, Any]] = {}
+        direct_residual_alignment_diagnostics: dict[str, dict[int, dict[str, float]]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -2320,6 +2344,7 @@ def main() -> None:
                 direct_residual_diagnostics[t] = direct_residual_merged_diag
                 direct_residual_realization[t] = direct_residual_merged_extra["realization_by_position"]
                 direct_residual_task_vector_stats[t] = direct_residual_merged_extra["task_vector_stats"]
+                direct_residual_alignment_diagnostics[t] = direct_residual_merged_extra["alignment_diagnostics"]
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -2940,6 +2965,7 @@ def main() -> None:
                         direct_residual_diagnostics[task] = task_direct_residual_diag
                         direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
                         direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
+                        direct_residual_alignment_diagnostics[task] = task_direct_residual_extra["alignment_diagnostics"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -4099,6 +4125,11 @@ def main() -> None:
                     # / compute_direct_residual_task_vector_stats).
                     "realization_by_task": direct_residual_realization,
                     "task_vector_stats_by_task": direct_residual_task_vector_stats,
+                    # Analysis-only Procrustes-alignment diagnostics (never
+                    # fed to any fit), always populated regardless of
+                    # config.residual_target or realization_diagnostics; see
+                    # compute_alignment_diagnostics.
+                    "alignment_diagnostics_by_task": direct_residual_alignment_diagnostics,
                 }
                 if direct_residual_like
                 else None

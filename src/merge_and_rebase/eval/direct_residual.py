@@ -74,6 +74,7 @@ from .target_informed_runtime import (
 __all__ = [
     "DirectResidualConfig",
     "capture_paired_boundary_activations",
+    "compute_alignment_diagnostics",
     "compute_desired_effects",
     "compute_direct_residual_task_vector_stats",
     "fit_direct_residual",
@@ -250,6 +251,23 @@ class DirectResidualConfig:
     # Stop when the change in ||E||/||D_j|| between consecutive sweeps drops
     # below this.
     backfit_tol: float = 1e-4
+    # What each position's target D_j is built from, out of the SAME centered
+    # Procrustes fit Q_j: S_{j,0} -> T_j^0 (`centered_rectangular_procrustes`).
+    #   "transported_delta"   -- historical, default behaviour: D_j = (S_1 -
+    #                            S_0) Q_j, the fine-tuning delta transported
+    #                            through Q_j. Bit-identical to pre-ablation
+    #                            code, golden-hash pinned.
+    #   "transported_endpoint" -- D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0: apply
+    #                            the centered source->target map to the
+    #                            fine-tuned source endpoint, then subtract the
+    #                            target zero-shot endpoint. Differs from the
+    #                            delta target by exactly the Procrustes
+    #                            residual E_j = (S_0 - mu_s) Q_j - (T_j^0 -
+    #                            mu_t); see compute_alignment_diagnostics.
+    #                            Requires component_target=
+    #                            "block_boundary" (the endpoint form is only
+    #                            defined against the block-boundary target).
+    residual_target: str = "transported_delta"
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -283,6 +301,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "block_split",
         "backfit_max_iters",
         "backfit_tol",
+        "residual_target",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -375,11 +394,20 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("backfit_tol must be a finite real number")
     if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
         raise ValueError("backfit_tol must be finite and > 0")
+    if cfg.residual_target not in {"transported_delta", "transported_endpoint"}:
+        raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
+    if cfg.residual_target == "transported_endpoint" and cfg.component_target != "block_boundary":
+        raise ValueError("residual_target='transported_endpoint' requires component_target='block_boundary'")
     return cfg
 
 
-def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerPairing) -> dict[int, list[Tensor]]:
-    """``D_j`` = Procrustes-aligned ``(source_ft_j - source_base_j)`` at ``pairing.pairing[j]``.
+def compute_desired_effects(
+    captured: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    residual_target: str = "transported_delta",
+) -> dict[int, list[Tensor]]:
+    """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
 
     Generalizes `target_informed_runtime._capture_residual_references`'s
     inner Procrustes computation from ARIADNE's two-code-path ancestry-group
@@ -389,6 +417,23 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
     Residual doesn't need that bookkeeping: one cardinality (one target
     position <- exactly one source position, for every regime) handles
     extend, shrink, and same-arch uniformly.
+
+    ``residual_target`` selects what ``D_j`` is built from, given the SAME
+    centered Procrustes fit ``Q_j, mu_s, mu_t = centered_rectangular_procrustes
+    (S_{j,0} -> T_j^0)``:
+
+      * ``"transported_delta"`` (default): ``D_j = (S_1 - S_0) Q_j``, exactly
+        the historical expression and op order -- byte-identical to the
+        pre-ablation code.
+      * ``"transported_endpoint"``: ``D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0``
+        per batch, applying the centered map to the fine-tuned source
+        endpoint and subtracting the target zero-shot endpoint.
+
+    The two differ by exactly the Procrustes residual ``E_j = (S_0 - mu_s)
+    Q_j - (T_j^0 - mu_t)`` -- the thing the fit minimizes; see
+    `compute_alignment_diagnostics` for that residual's diagnostics, kept
+    deliberately separate (and out of this function's cost) -- see its
+    docstring for why.
     """
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
@@ -398,6 +443,8 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
             "Captured target references do not exactly match the pairing's target positions: "
             f"expected={sorted(range(pairing.target_depth))}, found={sorted(target_by_position)}"
         )
+    if residual_target not in {"transported_delta", "transported_endpoint"}:
+        raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
     desired: dict[int, list[Tensor]] = {}
     for j in range(pairing.target_depth):
         i = pairing.pairing[j]
@@ -406,10 +453,105 @@ def compute_desired_effects(captured: Mapping[str, Any], pairing: DiscreteLayerP
         targets = target_by_position[j]
         source_base_batches = _aligned(source_base[i], targets)
         source_ft_batches = _aligned(source_ft[i], targets)
-        q, _mu_s, _mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
-        q = q.float()
-        desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
+        if residual_target == "transported_delta":
+            q = q.float()
+            desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
+        else:
+            q = q.float()
+            mu_s = mu_s.float()
+            mu_t = mu_t.float()
+            desired[j] = [
+                (f - mu_s) @ q + mu_t - t for f, t in zip(source_ft_batches, targets, strict=True)
+            ]
     return desired
+
+
+def compute_alignment_diagnostics(
+    captured: Mapping[str, Any], pairing: DiscreteLayerPairing
+) -> dict[int, dict[str, float]]:
+    """Per-position centered-Procrustes alignment diagnostics. Analysis-only.
+
+    Recomputes the SAME deterministic centered Procrustes fit ``compute_
+    desired_effects`` computes internally (`centered_rectangular_procrustes`
+    is a pure function of the captured rows, so this is a second, independent
+    call, not a cached one), then reports the residual it minimizes and a few
+    derived quantities -- never anything fed back into a fit.
+
+    Deliberately NOT called from ``compute_desired_effects`` or folded into
+    its cost: the caller (`vision_rebase._run_direct_residual_fit`) times and
+    peak-memory-profiles the delta/endpoint construction as its own
+    "alignment_calibration" bracket, and this function's float64 N x d_t
+    temporaries (N in the tens of thousands of rows) would otherwise inflate
+    that bracket's recorded seconds/peak-memory even in the default
+    ``residual_target="transported_delta"`` path -- contaminating any
+    cross-code-generation cost comparison for a number this function's own
+    diagnostics never influence. Call it as a separate, untimed (or
+    separately timed) step instead.
+
+    Per position ``j``, all in float64 on the concatenated (all-batch) rows:
+    ``procrustes_error_norm`` = ``||E_j||`` where ``E_j = (S_0 - mu_s) Q_j -
+    (T^0 - mu_t)``; ``procrustes_relative_error`` = ``||E_j|| / ||T^0 -
+    mu_t||`` (0 if the denominator is 0); ``delta_target_norm`` = ``||(S_1 -
+    S_0) Q_j||``; ``endpoint_minus_delta_over_delta`` = ``||E_j|| /
+    delta_target_norm`` (0 if the denominator is 0) -- how the transported-
+    delta and transported-endpoint targets actually differ, scaled against
+    the delta itself (not against ``T^0``, which is typically much larger
+    than a fine-tuning delta); ``procrustes_error_in_range_norm`` /
+    ``procrustes_error_out_of_range_norm`` = ``||E_j Q_j^T Q_j||`` /
+    ``||E_j (I - Q_j^T Q_j)||`` (the latter is exactly 0 when ``d_t <=
+    d_s``, since ``Q_j^T Q_j`` is only a proper projector -- rank ``d_s`` --
+    when ``d_t > d_s``); ``mean_offset_norm`` = ``||mu_s Q_j - mu_t||``
+    (documents what the literal, non-affine ``S Q`` form would have added).
+    Also ``source_dim``, ``target_dim``.
+    """
+    source_base = captured["source_base_outputs"]
+    source_ft = captured["source_ft_outputs"]
+    target_by_position = captured["target_base_outputs_by_position"]
+    if set(target_by_position) != set(range(pairing.target_depth)):
+        raise ValueError(
+            "Captured target references do not exactly match the pairing's target positions: "
+            f"expected={sorted(range(pairing.target_depth))}, found={sorted(target_by_position)}"
+        )
+    alignment_diagnostics: dict[int, dict[str, float]] = {}
+    for j in range(pairing.target_depth):
+        i = pairing.pairing[j]
+        if i not in source_base or i not in source_ft:
+            raise ValueError(f"Missing captured source reference for pairing index {i} at target position {j}")
+        targets = target_by_position[j]
+        source_base_batches = _aligned(source_base[i], targets)
+        source_ft_batches = _aligned(source_ft[i], targets)
+        s0_rows = _rows(source_base_batches).double()
+        s1_rows = _rows(source_ft_batches).double()
+        t0_rows = _rows(targets).double()
+        q64, mu_s64, mu_t64 = centered_rectangular_procrustes(s0_rows, t0_rows)
+
+        e = (s0_rows - mu_s64) @ q64 - (t0_rows - mu_t64)
+        procrustes_error_norm = float(torch.linalg.norm(e))
+        target_centered_norm = float(torch.linalg.norm(t0_rows - mu_t64))
+        procrustes_relative_error = procrustes_error_norm / target_centered_norm if target_centered_norm > 0 else 0.0
+        delta_target_norm = float(torch.linalg.norm((s1_rows - s0_rows) @ q64))
+        endpoint_minus_delta_over_delta = (
+            procrustes_error_norm / delta_target_norm if delta_target_norm > 0 else 0.0
+        )
+        # E @ Q^T @ Q rather than forming the d_t x d_t projector explicitly.
+        e_in_range = (e @ q64.T) @ q64
+        e_out_of_range = e - e_in_range
+        procrustes_error_in_range_norm = float(torch.linalg.norm(e_in_range))
+        procrustes_error_out_of_range_norm = float(torch.linalg.norm(e_out_of_range))
+        mean_offset_norm = float(torch.linalg.norm(mu_s64 @ q64 - mu_t64))
+        alignment_diagnostics[j] = {
+            "procrustes_error_norm": procrustes_error_norm,
+            "procrustes_relative_error": procrustes_relative_error,
+            "delta_target_norm": delta_target_norm,
+            "endpoint_minus_delta_over_delta": endpoint_minus_delta_over_delta,
+            "procrustes_error_in_range_norm": procrustes_error_in_range_norm,
+            "procrustes_error_out_of_range_norm": procrustes_error_out_of_range_norm,
+            "mean_offset_norm": mean_offset_norm,
+            "source_dim": int(s0_rows.shape[-1]),
+            "target_dim": int(t0_rows.shape[-1]),
+        }
+    return alignment_diagnostics
 
 
 def position_source_contributions(pairing: DiscreteLayerPairing) -> dict[int, list[tuple[int, float]]]:
