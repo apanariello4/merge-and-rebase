@@ -1481,6 +1481,7 @@ def _run_direct_residual_fit(
         seed=config.seed,
         device=device,
         component_inputs=component_inputs,
+        capture_source_ft_component_inputs=config.component_target == "output_total",
     )
     desired = compute_desired_effects(captured, pairing)
     if torch.cuda.is_available() and device != "cpu":

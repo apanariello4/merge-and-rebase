@@ -140,7 +140,7 @@ def _state_dict_sha256(d) -> str:
     return h.hexdigest()
 
 
-def _fit(direction, config, device, component_inputs=()):
+def _fit(direction, config, device, component_inputs=(), capture_source_ft_component_inputs=False):
     source_base, source_ft, target_base, source_loader, target_loader, pairing, target_base_sd = _direction_setup(
         direction
     )
@@ -148,6 +148,7 @@ def _fit(direction, config, device, component_inputs=()):
     captured = capture_paired_boundary_activations(
         source_base, source_ft, target_base, source_loader, target_loader, pairing,
         num_batches=config.num_batches, seed=config.seed, device=device, component_inputs=component_inputs,
+        capture_source_ft_component_inputs=capture_source_ft_component_inputs,
     )
     desired = compute_desired_effects(captured, pairing)
     corrections, diagnostics = fit_direct_residual(
@@ -378,3 +379,50 @@ def test_c_fc_recomputation_matches_forward_hook_on_real_block():
     with torch.no_grad():
         recomputed = F.linear(captured_input["x"], block.mlp.c_fc.weight, block.mlp.c_fc.bias)
     torch.testing.assert_close(recomputed, captured_output["y"], rtol=0, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# 3. component_target='output_total' end-to-end, against the real open_clip
+#    VisionTransformer -- (d)/(e)/(f) from the implementation plan.
+# --------------------------------------------------------------------------
+
+_OD = ("attn.out_proj", "mlp.c_proj")
+
+
+@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
+@pytest.mark.parametrize("device", DEVICES)
+def test_output_total_od_end_to_end_finite(direction, device):
+    cfg = DirectResidualConfig(
+        num_batches=3, ridge_relative=0.05, component_target="output_total", components=_OD,
+    )
+    corrections, diagnostics, _model, _sd = _fit(
+        direction, cfg, device, component_inputs=order_components(_OD), capture_source_ft_component_inputs=True,
+    )
+    assert corrections
+    for key, value in corrections.items():
+        assert torch.isfinite(value).all(), key
+    assert {row["component"] for row in diagnostics} == set(_OD)
+    for row in diagnostics:
+        assert row["component_target"] == "output_total"
+        # output_total's paired-only depth rule: exactly one contribution,
+        # at weight 1.0, matching the paired source coordinate (block_boundary's
+        # own depth rule) -- see position_paired_only_contributions.
+        assert row["source_contributions"] == [(int(row["source_position"]), 1.0)]
+
+
+@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
+def test_output_total_realization_diagnostics_finite_real_model(direction):
+    cfg = DirectResidualConfig(
+        num_batches=3, ridge_relative=0.05, component_target="output_total", components=_OD,
+        realization_diagnostics=True,
+    )
+    _corrections, diagnostics, _model, _sd = _fit(
+        direction, cfg, "cpu", component_inputs=order_components(_OD), capture_source_ft_component_inputs=True,
+    )
+    expected = {
+        "fit_relative_residual", "target_norm", "update_norm", "relative_update_norm", "realized_target_norm_ratio",
+    }
+    for row in diagnostics:
+        assert expected <= set(row)
+        for key in expected:
+            assert torch.isfinite(torch.tensor(float(row[key])))
