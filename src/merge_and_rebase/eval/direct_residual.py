@@ -94,6 +94,7 @@ __all__ = [
     "compute_desired_effects",
     "compute_direct_residual_task_vector_stats",
     "fit_direct_residual",
+    "fit_sequential_source_endpoints",
     "fit_direct_residual_streaming",
     "measure_direct_residual_realization",
     "measure_direct_residual_realization_streaming",
@@ -282,6 +283,9 @@ class DirectResidualConfig:
     # assumption about how many tasks contributed to source_ft_model, so the
     # merge-once orchestration lives entirely in the caller (vision_rebase.py).
     merge_mode: str = "per_task_then_merge"
+    # Fit a source-like base endpoint, then fit the FT endpoint on that
+    # mounted target. The returned task vector is their target-space difference.
+    endpoint_construction: str = "native_delta"
     seed: int = 89
     # Which target each component's fit is asked to reproduce.
     #   "block_boundary" -- the historical, default behaviour: every requested
@@ -451,6 +455,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "exact_form",
         "missing_bias",
         "merge_mode",
+        "endpoint_construction",
         "seed",
         "component_target",
         "realization_diagnostics",
@@ -535,6 +540,14 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         )
     if cfg.merge_mode not in {"per_task_then_merge", "merge_in_source_then_fit"}:
         raise ValueError("merge_mode must be 'per_task_then_merge' or 'merge_in_source_then_fit'")
+    if cfg.endpoint_construction not in {"native_delta", "sequential_source_endpoints"}:
+        raise ValueError("endpoint_construction must be 'native_delta' or 'sequential_source_endpoints'")
+    if cfg.endpoint_construction == "sequential_source_endpoints":
+        if (tuple(cfg.components) != ("mlp.c_proj",) or cfg.component_target != "block_boundary"
+                or cfg.block_split != "none" or cfg.procrustes_source != "activation"
+                or cfg.tv_scaling != "none" or cfg.activation_storage != "resident"
+                or cfg.realization_diagnostics or cfg.merge_mode != "per_task_then_merge"):
+            raise ValueError("sequential_source_endpoints requires D-only, block_boundary, no block split or TV scaling, activation Procrustes, resident storage, no realization diagnostics, and per-task fits")
     if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
         raise ValueError("seed must be an integer")
     if cfg.block_split not in {"none", "backfit", "joint"}:
@@ -1079,6 +1092,97 @@ def fit_direct_residual(
     finally:
         target_model.load_state_dict(original_state, strict=True)
     return target_corrections, diagnostics
+
+
+def fit_sequential_source_endpoints(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    captured: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]], dict[str, Any]]:
+    """Fit source base and FT endpoints in sequence, returning their full difference.
+
+    Q and its means are fitted once on source base/native target boundaries.
+    The second ridge fit sees the *mounted* synthesized base network. The
+    returned correction is also theta_ft_syn - theta_pre_syn in target space;
+    subtracting rounded full state dicts is avoided to retain precision.
+    """
+    if config.endpoint_construction != "sequential_source_endpoints":
+        raise ValueError("sequential endpoint fit requires endpoint_construction='sequential_source_endpoints'")
+    native_outputs = captured["target_base_outputs_by_position"]
+    source_base = captured["source_base_outputs"]
+    source_ft = captured["source_ft_outputs"]
+    mapped_base: dict[int, list[Tensor]] = {}
+    mapped_ft: dict[int, list[Tensor]] = {}
+    base_desired: dict[int, list[Tensor]] = {}
+    alignment: dict[int, dict[str, float]] = {}
+    for j in range(pairing.target_depth):
+        i = pairing.pairing[j]
+        native = native_outputs[j]
+        s0 = _aligned(source_base[i], native)
+        s1 = _aligned(source_ft[i], native)
+        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(s0).double(), _rows(native).double())
+        q, mu_s, mu_t = q.float(), mu_s.float(), mu_t.float()
+        mapped_base[j] = [(b - mu_s) @ q + mu_t for b in s0]
+        mapped_ft[j] = [(f - mu_s) @ q + mu_t for f in s1]
+        base_desired[j] = [m - t for m, t in zip(mapped_base[j], native, strict=True)]
+        alignment[j] = {
+            "pretrained_residual_norm": float(_rows(base_desired[j]).double().norm()),
+            "source_update_norm": float(_rows([f - b for b, f in zip(mapped_base[j], mapped_ft[j], strict=True)]).double().norm()),
+        }
+    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    try:
+        base_correction, base_rows = fit_direct_residual(
+            target_model, target_base_state, captured, base_desired, pairing,
+            config=config, device=device, family_adapter=family_adapter,
+        )
+        synthesized_base = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        for key, correction in base_correction.items():
+            synthesized_base[key] = synthesized_base[key] + correction.to(synthesized_base[key])
+        target_model.load_state_dict(synthesized_base, strict=True)
+        requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
+        synthesized_raw = capture_tokens(
+            target_model, captured["target_batches"], requests, device, family_adapter=family_adapter
+        )
+        synthesized_outputs = {int(j): batches for j, batches in synthesized_raw.items()}
+        ft_desired = {
+            j: [m - t for m, t in zip(mapped_ft[j], synthesized_outputs[j], strict=True)]
+            for j in range(pairing.target_depth)
+        }
+        ft_captured = dict(captured)
+        ft_captured["target_base_outputs_by_position"] = synthesized_outputs
+        task_vector, ft_rows = fit_direct_residual(
+            target_model, synthesized_base, ft_captured, ft_desired, pairing,
+            config=config, device=device, family_adapter=family_adapter,
+        )
+        # Confirm that subtracting the two *mounted* endpoints represents the
+        # returned correction, subject to fp32 rounding of full model weights.
+        max_endpoint_error = 0.0
+        for key, correction in task_vector.items():
+            ft_value = synthesized_base[key] + correction.to(synthesized_base[key])
+            max_endpoint_error = max(
+                max_endpoint_error,
+                float(((ft_value - synthesized_base[key]).float() - correction.float()).abs().max()),
+            )
+        if not all(torch.isfinite(value).all() for value in task_vector.values()):
+            raise RuntimeError("sequential endpoint fit produced a non-finite task vector")
+        for row in base_rows:
+            row["endpoint_stage"] = "pretrained"
+        for row in ft_rows:
+            row["endpoint_stage"] = "finetuned"
+        diagnostics = {
+            "alignment_by_position": alignment,
+            "pretrained_correction_norm": float(sum(v.double().square().sum() for v in base_correction.values()).sqrt()),
+            "task_vector_norm": float(sum(v.double().square().sum() for v in task_vector.values()).sqrt()),
+            "max_endpoint_subtraction_error": max_endpoint_error,
+        }
+        return task_vector, base_rows + ft_rows, diagnostics
+    finally:
+        target_model.load_state_dict(entry_state, strict=True)
 
 
 # Below-epsilon ||D_j|| positions have no reliable ratio r_j = ||delta T_j|| /

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -47,6 +48,32 @@ def _run_main_with_cfg(monkeypatch, tmp_path, cfg: dict) -> Exception:
     with pytest.raises(Exception) as excinfo:
         vision_rebase.main()
     return excinfo.value
+
+
+def test_saved_sequential_vector_loader_checks_provenance(tmp_path):
+    key = "visual.transformer.resblocks.0.mlp.c_proj.weight"
+    base = {key: torch.zeros(2, 2)}
+    vector = {key: torch.ones(2, 2)}
+    config = DirectResidualConfig(
+        endpoint_construction="sequential_source_endpoints", components=("mlp.c_proj",),
+        activation_storage="resident",
+    )
+    path = tmp_path / "DTD_direct_residual_transported_native.pt"
+    torch.save(vector, path)
+    metadata = {
+        "task": "DTD",
+        "endpoint_construction": config.endpoint_construction,
+        "target_base_sha256": vision_rebase._state_dict_sha256(base),
+        "vector_sha256": vision_rebase._state_dict_sha256(vector),
+        "calibration_seed": config.seed,
+        "num_batches": config.num_batches,
+        "direct_residual_config": json.loads(json.dumps(asdict(config))),
+    }
+    path.with_suffix(".json").write_text(json.dumps(metadata))
+    loaded, _ = vision_rebase._load_saved_sequential_tv(tmp_path, "DTD", base, config)
+    assert torch.equal(loaded[key], vector[key])
+    with pytest.raises(ValueError, match="target_base_sha256"):
+        vision_rebase._load_saved_sequential_tv(tmp_path, "DTD", {key: torch.ones(2, 2)}, config)
 
 
 def test_direct_residual_never_calls_ariadne_config_gates(monkeypatch, tmp_path):
@@ -223,6 +250,8 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     assert extra["tv_scaling"] is None
     assert set(extra) == {"realization_by_position", "task_vector_stats", "alignment_diagnostics", "tv_scaling"}
     assert set(timing) == {"alignment_calibration", "correction_fit", "cost_phases"}
+
+
     cost = timing["cost_phases"]
     assert set(cost["phases"]) == {"activation_collection", "transformation", "transport"}
     assert cost["phases"]["activation_collection"]["seconds"] > 0.0
@@ -246,6 +275,30 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
     # bit-identical to the state before the fit ran.
     for key, value in target_base_sd.items():
         assert torch.equal(dict(target_base.state_dict())[key], value)
+
+
+def test_run_sequential_endpoint_pipeline_returns_new_vector():
+    torch.manual_seed(31)
+    source_base = _Model(5, 2).eval()
+    source_ft = _tuned_copy(source_base, seed=32)
+    target = _Model(5, 4).eval()
+    data = _loader(seed=33)
+    base_sd = {k: v.clone() for k, v in target.state_dict().items()}
+    config = DirectResidualConfig(
+        num_batches=3, endpoint_construction="sequential_source_endpoints",
+        components=("mlp.c_proj",), activation_storage="resident",
+    )
+    vector, _timing, rows, extra = _run_direct_residual_fit(
+        source_base_model=source_base, source_ft_model=source_ft,
+        target_model=target, target_base_sd=base_sd, source_loader=data,
+        target_loader=data, pairing=DiscreteLayerPairing.compute(2, 4),
+        config=config, device="cpu",
+    )
+    assert vector and all(".mlp.c_proj." in key for key in vector)
+    assert {row["endpoint_stage"] for row in rows} == {"pretrained", "finetuned"}
+    assert extra["sequential_endpoints"]["pretrained_correction_norm"] > 0
+    for key, value in base_sd.items():
+        assert torch.equal(target.state_dict()[key], value)
 
 
 def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():

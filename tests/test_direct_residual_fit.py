@@ -19,6 +19,8 @@ from merge_and_rebase.eval.direct_residual import (
     capture_paired_boundary_activations,
     compute_desired_effects,
     fit_direct_residual,
+    fit_sequential_source_endpoints,
+    parse_direct_residual_config,
 )
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 
@@ -128,6 +130,50 @@ def _fit(source_depth, target_depth, config=None, **setup_kwargs):
         device="cpu",
     )
     return corrections, diagnostics, target_base, target_base_sd
+
+
+def test_sequential_endpoints_fit_on_mounted_base_and_restore_model():
+    source_base, source_ft, target, data, pairing, target_sd = _setup(2, 4)
+    config = parse_direct_residual_config({
+        "endpoint_construction": "sequential_source_endpoints",
+        "components": ["mlp.c_proj"],
+        "num_batches": 3,
+        "ridge_estimator": "empirical_bayes",
+    })
+    captured = capture_paired_boundary_activations(
+        source_base, source_ft, target, data, data, pairing,
+        num_batches=3, seed=config.seed, device="cpu",
+    )
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+    sequential, rows, diagnostics = fit_sequential_source_endpoints(
+        target, target_sd, captured, pairing, config=config, device="cpu",
+    )
+    ordinary, _ = fit_direct_residual(
+        target, target_sd, captured, compute_desired_effects(captured, pairing), pairing,
+        config=config, device="cpu",
+    )
+    assert sequential.keys() == ordinary.keys()
+    assert {row["endpoint_stage"] for row in rows} == {"pretrained", "finetuned"}
+    assert diagnostics["pretrained_correction_norm"] > 0
+    assert diagnostics["task_vector_norm"] > 0
+    assert any(not torch.allclose(sequential[k], ordinary[k], atol=1e-5, rtol=1e-5) for k in sequential)
+    changed_ft = dict(captured)
+    changed_ft["source_ft_outputs"] = {
+        i: [batch + 0.5 for batch in batches]
+        for i, batches in captured["source_ft_outputs"].items()
+    }
+    _, changed_rows, changed_diagnostics = fit_sequential_source_endpoints(
+        target, target_sd, changed_ft, pairing, config=config, device="cpu",
+    )
+    assert diagnostics["pretrained_correction_norm"] == changed_diagnostics["pretrained_correction_norm"]
+    for original, changed in zip(
+        (r for r in rows if r["endpoint_stage"] == "pretrained"),
+        (r for r in changed_rows if r["endpoint_stage"] == "pretrained"),
+        strict=True,
+    ):
+        assert original["correction_norm"] == changed["correction_norm"]
+    for key, value in before.items():
+        assert torch.equal(target.state_dict()[key], value), key
 
 
 REGIMES = [
