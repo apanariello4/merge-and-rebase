@@ -800,6 +800,27 @@ def _build_balanced_calibration_context(
 DIRECT_RESIDUAL_TINY_IMAGENET_SPEC = {"path": "zh-plus/tiny-imagenet", "split": "valid"}
 
 
+TRANSPORT_CALIBRATION_DATA = ("task_local", "tiny_imagenet")
+
+
+def _resolve_transport_calibration_data(cfg: Mapping[str, Any], *, theseus_like_method: bool, bico_mode: bool) -> str:
+    """Validate the top-level ``transport_calibration_data`` key.
+
+    ``"task_local"`` (default) keeps THESEUS/BiCo calibrating on each task's own
+    train loaders. ``"tiny_imagenet"`` makes every per-task prepare use one
+    task-independent paired Tiny-ImageNet context (the same split Direct
+    Residual's ``calibration_data="tiny_imagenet"`` uses); BiCo's gradient
+    recipe then scores Tiny-ImageNet's own labels and class names. Only the
+    per-task transport path of THESEUS/BiCo reads it.
+    """
+    value = str(cfg.get("transport_calibration_data", "task_local")).strip().lower()
+    if value not in TRANSPORT_CALIBRATION_DATA:
+        raise ValueError(f"transport_calibration_data must be one of {TRANSPORT_CALIBRATION_DATA}, got {value!r}")
+    if value != "task_local" and not (theseus_like_method or bico_mode):
+        raise ValueError("transport_calibration_data applies to THESEUS/BiCo only (Direct Residual uses calibration_data)")
+    return value
+
+
 def _build_direct_residual_calibration(
     calibration_data: str,
     *,
@@ -2492,6 +2513,31 @@ def main() -> None:
             )
             print(f"Direct Residual calibration: {direct_residual_calibration_meta}")
 
+        # Task-independent THESEUS/BiCo calibration (transport_calibration_data):
+        # one paired context for every task's prepare; alpha search and
+        # evaluation keep each task's own splits.
+        transport_calibration_data = _resolve_transport_calibration_data(
+            cfg, theseus_like_method=theseus_like_method, bico_mode=bico_mode
+        )
+        transport_calibration_ctx: _TaskContext | None = None
+        transport_calibration_meta: dict[str, Any] = {"transport_calibration_data": transport_calibration_data}
+        if transport_calibration_data == "tiny_imagenet":
+            transport_calibration_ctx = _build_direct_paired_calibration_context(
+                DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+                suite=suite,
+                cfg=cfg,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                source_cfg=source_cfg,
+                target_cfg=target_cfg,
+            )
+            transport_calibration_meta.update(
+                **DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+                num_samples=len(transport_calibration_ctx.loaders.train.dataset),
+                num_classes=len(transport_calibration_ctx.classnames),
+            )
+            print(f"Transport calibration: {transport_calibration_meta}")
+
         brace_protocol = str(
             (cfg.get("block_extension_params", {}) or {}).get("calibration_protocol", "task_local")
         ).lower()
@@ -3155,11 +3201,21 @@ def main() -> None:
                         run_block_extension_prestep=task_block_extension_prestep or task_discrete_layer_match_prestep,
                         clf_source=clf_source,
                         clf_target=clf_target,
-                        classnames=classnames,
-                        loaders=loaders,
-                        source_loaders=source_loaders,
-                        build_cfg_task=build_cfg_task,
-                        source_build_cfg_task=source_build_cfg_task,
+                        classnames=(
+                            classnames if transport_calibration_ctx is None else transport_calibration_ctx.classnames
+                        ),
+                        loaders=loaders if transport_calibration_ctx is None else transport_calibration_ctx.loaders,
+                        source_loaders=(
+                            source_loaders if transport_calibration_ctx is None else transport_calibration_ctx.source_loaders
+                        ),
+                        build_cfg_task=(
+                            build_cfg_task if transport_calibration_ctx is None else transport_calibration_ctx.build_cfg_task
+                        ),
+                        source_build_cfg_task=(
+                            source_build_cfg_task
+                            if transport_calibration_ctx is None
+                            else transport_calibration_ctx.source_build_cfg_task
+                        ),
                         task_source_base_sd=task_source_base_sd,
                         target_base_sd=target_base_sd,
                         task_delta=task_delta,
@@ -4423,6 +4479,7 @@ def main() -> None:
             "all_task_source_lmc": all_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
+            "transport_calibration": transport_calibration_meta,
             "cost_phase_timings": cost_phase_timings,
             # Always present (default {}) regardless of method/path, so a
             # downstream summary-JSON parser can read these keys uniformly
