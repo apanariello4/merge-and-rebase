@@ -153,7 +153,10 @@ def _resident(setup, config, recipes=(None, None)):
     diag_out: dict = {}
     desired = compute_desired_effects(
         captured, pairing, residual_target=config.residual_target,
-        procrustes_source=config.procrustes_source, diagnostics_out=diag_out,
+        procrustes_source=config.procrustes_source,
+        alignment_map=config.alignment_map,
+        alignment_row_weighting=config.alignment_row_weighting,
+        diagnostics_out=diag_out,
     )
     corr, rows = fit_direct_residual(target_base, target_base_sd, captured, desired, pairing, config=config, device="cpu")
     return corr, rows, captured, desired, diag_out
@@ -164,7 +167,9 @@ def _streaming(setup, config, recipes=(None, None)):
     prepared = prepare_direct_residual_streaming(
         source_base, target_base, data, data, pairing,
         num_batches=config.num_batches, seed=config.seed, device="cpu",
+        source_ft_model=source_ft,
         procrustes_source=config.procrustes_source, source_recipe=recipes[0], target_recipe=recipes[1],
+        alignment_map=config.alignment_map, alignment_row_weighting=config.alignment_row_weighting,
     )
     corr, rows = fit_direct_residual_streaming(
         target_base, target_base_sd, source_base, source_ft, prepared, pairing, config=config, device="cpu",
@@ -227,6 +232,59 @@ def test_streaming_gradient_procrustes_matches_resident(source_depth, target_dep
         assert row_s["activation_gradient_procrustes_overlap"] == pytest.approx(
             row["activation_gradient_procrustes_overlap"], rel=1e-6
         )
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+@pytest.mark.parametrize(
+    "alignment_map,alignment_row_weighting",
+    [("polar", "cls_balanced"), ("polar", "delta_magnitude"), ("ridge", "uniform")],
+)
+def test_alignment_variants_match_resident_streaming(source_depth, target_depth, alignment_map, alignment_row_weighting):
+    setup = _setup(source_depth, target_depth, seed=71)
+    common = dict(
+        num_batches=3, ridge_relative=0.05,
+        alignment_map=alignment_map, alignment_row_weighting=alignment_row_weighting,
+    )
+    corr_r, _rows_r, captured, _desired_r, _diag = _resident(setup, DirectResidualConfig(**common))
+    corr_s, _rows_s, prepared = _streaming(setup, DirectResidualConfig(**common))
+    _assert_corr_close(corr_r, corr_s)
+    from merge_and_rebase.eval.direct_residual import _aligned, _fit_activation_map
+
+    for j in range(setup[4].target_depth):
+        i = setup[4].pairing[j]
+        x = _aligned(captured["source_base_outputs"][i], captured["target_base_outputs_by_position"][j])
+        ft = _aligned(captured["source_ft_outputs"][i], captured["target_base_outputs_by_position"][j])
+        y = captured["target_base_outputs_by_position"][j]
+        q, *_ = _fit_activation_map(
+            x, y, ft, alignment_map=alignment_map, row_weighting=alignment_row_weighting
+        )
+        assert torch.allclose(q.float(), prepared["q_by_position"][j], rtol=1e-5, atol=1e-6)
+    assert prepared["alignment_map"] == alignment_map
+
+
+def test_delta_magnitude_weights_are_per_image_scale_normalized_and_grid_aligned():
+    from merge_and_rebase.eval.direct_residual import _fit_activation_map
+    from merge_and_rebase.eval.target_informed_runtime import _interp_2d_tokens
+
+    torch.manual_seed(171)
+    # float64 so the invariance is checked exactly, not up to float32 rounding of the rescaled delta.
+    f64 = torch.float64
+    source = [torch.randn(3, 5, 4, dtype=f64), torch.randn(2, 5, 4, dtype=f64)]
+    ft = [x + torch.randn_like(x) * torch.tensor([[[1.0], [2.0], [3.0], [4.0], [5.0]]], dtype=f64) for x in source]
+    target = [torch.randn(3, 7, 3, dtype=f64), torch.randn(2, 7, 3, dtype=f64)]
+    aligned = [_interp_2d_tokens(x, 7) for x in source]
+    aligned_ft = [_interp_2d_tokens(x, 7) for x in ft]
+    q1, *_ = _fit_activation_map(aligned, target, aligned_ft, row_weighting="delta_magnitude")
+    # Per-image normalization makes positive rescaling of an image's whole
+    # delta irrelevant.
+    changed = [x.clone() for x in aligned_ft]
+    changed[0][0] = aligned[0][0] + 13.0 * (changed[0][0] - aligned[0][0])
+    q2, *_ = _fit_activation_map(aligned, target, changed, row_weighting="delta_magnitude")
+    assert torch.allclose(q1, q2, atol=1e-10, rtol=1e-10)
+    zero_delta = [x.clone() for x in aligned_ft]
+    zero_delta[1][0] = aligned[1][0]
+    q_zero, *_ = _fit_activation_map(aligned, target, zero_delta, row_weighting="delta_magnitude")
+    assert torch.isfinite(q_zero).all()
 
 
 # ---- endpoint target ----------------------------------------------------------

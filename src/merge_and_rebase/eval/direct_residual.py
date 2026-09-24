@@ -108,6 +108,7 @@ from .target_residual_completion import (
     ResidualSufficientStatistics,
     _procrustes_from_cross,
     centered_rectangular_procrustes,
+    centered_ridge_alignment,
     order_components,
 )
 
@@ -385,6 +386,10 @@ class DirectResidualConfig:
     #                   activation banks), so there is no Q_j for this field
     #                   to redirect there.
     procrustes_source: str = "activation"
+    # Activation-map family and calibration row weights. Defaults preserve
+    # the historical centered polar factor exactly.
+    alignment_map: str = "polar"
+    alignment_row_weighting: str = "uniform"
     # Label-free rescaling of the unit-strength task vector, applied AFTER
     # fit_direct_residual assembles tau but BEFORE the caller's per-task
     # alpha-search. Motivation: block_boundary O+D realizes ||delta T_j|| far
@@ -475,6 +480,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "backfit_tol",
         "residual_target",
         "procrustes_source",
+        "alignment_map",
+        "alignment_row_weighting",
         "tv_scaling",
         "tv_scaling_iters",
         "activation_storage",
@@ -585,6 +592,18 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "(its per-component targets are fit directly from component activation banks), "
             "so there is no block-boundary Q_j for procrustes_source to redirect"
         )
+    if cfg.alignment_map not in {"polar", "ridge"}:
+        raise ValueError("alignment_map must be 'polar' or 'ridge'")
+    if cfg.alignment_row_weighting not in {"uniform", "cls_balanced", "delta_magnitude"}:
+        raise ValueError("alignment_row_weighting must be 'uniform', 'cls_balanced' or 'delta_magnitude'")
+    if (cfg.alignment_map != "polar" or cfg.alignment_row_weighting != "uniform") and (
+        cfg.procrustes_source != "activation" or cfg.component_target != "block_boundary"
+    ):
+        raise ValueError("non-default alignment options require activation alignment and component_target='block_boundary'")
+    if cfg.alignment_map == "ridge" and cfg.alignment_row_weighting != "uniform":
+        raise ValueError("alignment_map='ridge' requires alignment_row_weighting='uniform'")
+    if (cfg.alignment_map != "polar" or cfg.alignment_row_weighting != "uniform") and cfg.residual_target != "transported_delta":
+        raise ValueError("non-default alignment options require residual_target='transported_delta'")
     if cfg.tv_scaling not in {"none", "global", "per_block"}:
         raise ValueError("tv_scaling must be 'none', 'global' or 'per_block'")
     if isinstance(cfg.tv_scaling_iters, bool) or not isinstance(cfg.tv_scaling_iters, int):
@@ -635,6 +654,8 @@ def compute_desired_effects(
     *,
     residual_target: str = "transported_delta",
     procrustes_source: str = "activation",
+    alignment_map: str = "polar",
+    alignment_row_weighting: str = "uniform",
     diagnostics_out: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
@@ -686,6 +707,9 @@ def compute_desired_effects(
     """
     if procrustes_source not in {"activation", "gradient"}:
         raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
+    _validate_alignment_options(alignment_map, alignment_row_weighting, procrustes_source)
+    if (alignment_map != "polar" or alignment_row_weighting != "uniform") and residual_target != "transported_delta":
+        raise ValueError("non-default alignment options require residual_target='transported_delta'")
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
     target_by_position = captured["target_base_outputs_by_position"]
@@ -726,6 +750,10 @@ def compute_desired_effects(
                 )
                 d_min = min(q.shape)
                 overlap = float(((q_act.T @ q).norm() ** 2) / d_min)
+                map_distance = float(torch.linalg.norm(q_act - q) / (2.0 * d_min) ** 0.5)
+                delta_act = torch.cat([(f - b).double() for b, f in zip(source_base_batches, source_ft_batches, strict=True)], 0) @ q_act
+                delta_grad = torch.cat([(f - b).double() for b, f in zip(source_base_batches, source_ft_batches, strict=True)], 0) @ q
+                delta_disagreement = float(torch.linalg.norm(delta_act - delta_grad) / (torch.linalg.norm(delta_act) + 1e-12))
                 gs_centered = grad_source_rows - grad_source_rows.mean(dim=0)
                 gt_centered = grad_target_rows - grad_target_rows.mean(dim=0)
                 cross = gs_centered.T @ gt_centered
@@ -733,13 +761,23 @@ def compute_desired_effects(
                     "procrustes_source": "gradient",
                     "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
                     "activation_gradient_procrustes_overlap": overlap,
+                    "activation_gradient_map_distance": map_distance,
+                    "activation_gradient_delta_disagreement": delta_disagreement,
                 }
             q = q.float()
             desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
             continue
-        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(source_base_batches).double(), _rows(targets).double())
+        q, mu_s, mu_t, alignment_diag = _fit_activation_map(
+            source_base_batches, targets, source_ft_batches,
+            alignment_map=alignment_map, row_weighting=alignment_row_weighting,
+        )
         if diagnostics_out is not None:
-            diagnostics_out[j] = {"procrustes_source": "activation"}
+            diagnostics_out[j] = {
+                "procrustes_source": "activation",
+                "alignment_q_frobenius": float(torch.linalg.norm(q).item()),
+                "alignment_q_rank": int(torch.linalg.matrix_rank(q)),
+                **alignment_diag,
+            }
         if residual_target == "transported_delta":
             q = q.float()
             desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
@@ -751,6 +789,62 @@ def compute_desired_effects(
                 (f - mu_s) @ q + mu_t - t for f, t in zip(source_ft_batches, targets, strict=True)
             ]
     return desired
+
+
+def _validate_alignment_options(alignment_map, row_weighting, procrustes_source="activation"):
+    if alignment_map not in {"polar", "ridge"}:
+        raise ValueError("alignment_map must be 'polar' or 'ridge'")
+    if row_weighting not in {"uniform", "cls_balanced", "delta_magnitude"}:
+        raise ValueError("alignment_row_weighting must be 'uniform', 'cls_balanced' or 'delta_magnitude'")
+    if alignment_map != "polar" and row_weighting != "uniform":
+        raise ValueError("ridge alignment requires uniform row weighting")
+    if (alignment_map != "polar" or row_weighting != "uniform") and procrustes_source != "activation":
+        raise ValueError("non-default alignment options require procrustes_source='activation'")
+
+
+def _fit_activation_map(source_batches, target_batches, ft_batches, *, alignment_map="polar", row_weighting="uniform"):
+    """Fit an activation map, optionally weighting each image's token rows."""
+    xs, ys = [], []
+    for x, y in zip(source_batches, target_batches, strict=True):
+        xs.append(x.double())
+        ys.append(y.double())
+    # Keep the historical uniform polar call, including its exact reduction
+    # order, so default configurations retain their golden hashes.
+    if alignment_map == "polar" and row_weighting == "uniform":
+        q, mx, my = centered_rectangular_procrustes(_rows(xs), _rows(ys))
+        return q, mx, my, {"alignment_map": "polar", "alignment_row_weighting": "uniform"}
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0)
+    weights = torch.ones(x.shape[:2], dtype=torch.float64, device=x.device)
+    if row_weighting == "cls_balanced":
+        if x.shape[1] < 2:
+            raise ValueError("cls_balanced alignment requires a CLS token and at least one patch token")
+        weights[:, 0] = 0.5
+        weights[:, 1:] = 0.5 / (x.shape[1] - 1)
+    elif row_weighting == "delta_magnitude":
+        if ft_batches is None:
+            raise ValueError("delta_magnitude alignment requires source_ft_batches")
+        ds = torch.cat([(f.double() - b.double()) for b, f in zip(source_batches, ft_batches, strict=True)], 0)
+        norms = torch.linalg.vector_norm(ds, dim=-1)
+        means = norms.mean(dim=1, keepdim=True)
+        image_scale = torch.where(means > 0, (norms / means.clamp_min(torch.finfo(norms.dtype).tiny)).clamp(0.25, 4.0), torch.ones_like(norms))
+        weights = image_scale
+    # Each image receives equal total mass; within-image token weights sum to 1.
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    weights = weights / weights.sum()
+    mu_x = (x * weights[..., None]).sum((0, 1))
+    mu_y = (y * weights[..., None]).sum((0, 1))
+    xc, yc = x - mu_x, y - mu_y
+    xf, yf, wf = xc.reshape(-1, x.shape[-1]), yc.reshape(-1, y.shape[-1]), weights.reshape(-1)
+    cross = xf.T @ (yf * wf[:, None])
+    if alignment_map == "ridge":
+        q, _, _, diag = centered_ridge_alignment(xf, yf)
+        return q, mu_x, mu_y, {"alignment_map": "ridge", "alignment_row_weighting": "uniform", **diag}
+    q = _procrustes_from_cross(cross)
+    return q, mu_x, mu_y, {
+        "alignment_map": "polar", "alignment_row_weighting": row_weighting,
+        "weighted_cross_frobenius": float(torch.linalg.norm(cross).item()),
+    }
 
 
 def compute_alignment_diagnostics(
@@ -1320,15 +1414,18 @@ class _StreamingCrossCovariance:
     inputs are expected already cast to float64 by the caller.
     """
 
-    def __init__(self, device=None) -> None:
+    def __init__(self, device=None, *, track_source_gram: bool = False) -> None:
         self.device = device
+        self.track_source_gram = track_source_gram
         self.n = 0
         self.mean_x: Tensor | None = None
         self.mean_y: Tensor | None = None
         self.c: Tensor | None = None
+        self.xx: Tensor | None = None
+        self.weight = 0.0
 
     @cost_phase_decorator("transformation")
-    def update(self, x: Tensor, y: Tensor) -> None:
+    def update(self, x: Tensor, y: Tensor, weights: Tensor | None = None) -> None:
         if x.shape[0] != y.shape[0]:
             raise ValueError("cross-covariance update requires matching row counts")
         n_b = int(x.shape[0])
@@ -1337,20 +1434,52 @@ class _StreamingCrossCovariance:
         if self.device is not None:
             x = x.to(self.device)
             y = y.to(self.device)
-        mean_x_b = x.mean(dim=0)
-        mean_y_b = y.mean(dim=0)
-        c_b = (x - mean_x_b).T @ (y - mean_y_b)
-        if self.n == 0:
-            self.n, self.mean_x, self.mean_y, self.c = n_b, mean_x_b, mean_y_b, c_b
+        if weights is None:
+            # Preserve historical uniform streaming arithmetic exactly.
+            mean_x_b = x.mean(dim=0)
+            mean_y_b = y.mean(dim=0)
+            c_b = (x - mean_x_b).T @ (y - mean_y_b)
+            if self.n == 0:
+                self.n, self.weight, self.mean_x, self.mean_y, self.c = n_b, float(n_b), mean_x_b, mean_y_b, c_b
+                if self.track_source_gram:
+                    self.xx = (x - mean_x_b).T @ (x - mean_x_b)
+                return
+            n_a = self.n
+            n = n_a + n_b
+            dx = mean_x_b - self.mean_x
+            dy = mean_y_b - self.mean_y
+            self.c = self.c + c_b + (n_a * n_b / n) * torch.outer(dx, dy)
+            if self.track_source_gram:
+                xx_b = (x - mean_x_b).T @ (x - mean_x_b)
+                self.xx = self.xx + xx_b + (n_a * n_b / n) * torch.outer(dx, dx)
+            self.mean_x = self.mean_x + dx * (n_b / n)
+            self.mean_y = self.mean_y + dy * (n_b / n)
+            self.n = n
+            self.weight = float(n)
             return
-        n_a = self.n
-        n = n_a + n_b
+        w_b_rows = weights.to(device=x.device, dtype=x.dtype)
+        if w_b_rows.shape != (n_b,) or (w_b_rows < 0).any() or not torch.isfinite(w_b_rows).all():
+            raise ValueError("cross-covariance weights must be finite nonnegative row weights")
+        w_b = float(w_b_rows.sum().item())
+        if w_b <= 0:
+            return
+        mean_x_b = (x * w_b_rows[:, None]).sum(0) / w_b
+        mean_y_b = (y * w_b_rows[:, None]).sum(0) / w_b
+        c_b = (x - mean_x_b).T @ ((y - mean_y_b) * w_b_rows[:, None])
+        xx_b = (x - mean_x_b).T @ ((x - mean_x_b) * w_b_rows[:, None]) if self.track_source_gram else None
+        if self.weight == 0:
+            self.n, self.weight, self.mean_x, self.mean_y, self.c, self.xx = n_b, w_b, mean_x_b, mean_y_b, c_b, xx_b
+            return
+        w_total = self.weight + w_b
         dx = mean_x_b - self.mean_x
         dy = mean_y_b - self.mean_y
-        self.c = self.c + c_b + (n_a * n_b / n) * torch.outer(dx, dy)
-        self.mean_x = self.mean_x + dx * (n_b / n)
-        self.mean_y = self.mean_y + dy * (n_b / n)
-        self.n = n
+        self.c = self.c + c_b + (self.weight * w_b / w_total) * torch.outer(dx, dy)
+        if self.track_source_gram:
+            self.xx = self.xx + xx_b + (self.weight * w_b / w_total) * torch.outer(dx, dx)
+        self.mean_x = self.mean_x + dx * (w_b / w_total)
+        self.mean_y = self.mean_y + dy * (w_b / w_total)
+        self.weight = w_total
+        self.n += n_b
 
     def cross(self) -> Tensor:
         if self.c is None:
@@ -1372,6 +1501,9 @@ def prepare_direct_residual_streaming(
     procrustes_source: str = "activation",
     source_recipe=None,
     target_recipe=None,
+    source_ft_model=None,
+    alignment_map: str = "polar",
+    alignment_row_weighting: str = "uniform",
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
     ``compute_desired_effects``: accumulates each position's Procrustes cross-
@@ -1409,6 +1541,7 @@ def prepare_direct_residual_streaming(
         raise ValueError("pairing.source_depth must be positive")
     if procrustes_source not in {"activation", "gradient"}:
         raise ValueError("procrustes_source must be 'activation' or 'gradient'")
+    _validate_alignment_options(alignment_map, alignment_row_weighting, procrustes_source)
     gradient_mode = procrustes_source == "gradient"
     if gradient_mode and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires source_recipe and target_recipe")
@@ -1418,11 +1551,17 @@ def prepare_direct_residual_streaming(
     distinct_source_indices = sorted(set(pairing.pairing))
     src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
     tgt_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
-    accumulators = {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)}
+    accumulators = {
+        j: _StreamingCrossCovariance(device=device, track_source_gram=alignment_map == "ridge")
+        for j in range(pairing.target_depth)
+    }
     grad_accumulators = (
         {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)} if gradient_mode else {}
     )
     fingerprints: dict[tuple[int, int], tuple[float, float]] = {}
+
+    if alignment_row_weighting == "delta_magnitude" and source_ft_model is None:
+        raise ValueError("delta_magnitude streaming alignment requires source_ft_model")
 
     gens = {
         "src": iter_capture_tokens(
@@ -1432,6 +1571,10 @@ def prepare_direct_residual_streaming(
             target_base_model, target_batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
         ),
     }
+    if alignment_row_weighting == "delta_magnitude":
+        gens["ft"] = iter_capture_tokens(
+            source_ft_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+        )
     if gradient_mode:
         gens["src_grad"] = iter_capture_block_gradients(
             source_base_model,
@@ -1462,7 +1605,24 @@ def prepare_direct_residual_streaming(
                 x = _aligned([src[str(i)]], [t])[0]
                 x_rows = x.reshape(-1, x.shape[-1]).double()
                 y_rows = t.reshape(-1, t.shape[-1]).double()
-                accumulators[j].update(x_rows, y_rows)
+                row_weights = None
+                if alignment_row_weighting == "cls_balanced":
+                    if x.shape[1] < 2:
+                        raise ValueError("cls_balanced alignment requires a CLS token and at least one patch token")
+                    row_weights = torch.full(x.shape[:2], 0.5 / (x.shape[1] - 1), dtype=torch.float64, device=x.device)
+                    row_weights[:, 0] = 0.5
+                elif alignment_row_weighting == "delta_magnitude":
+                    sf = by_name["ft"][str(i)]
+                    sf = _aligned([sf], [t])[0]
+                    delta_norms = torch.linalg.vector_norm(sf.double() - x.double(), dim=-1)
+                    means = delta_norms.mean(dim=1, keepdim=True)
+                    scale = torch.where(
+                        means > 0,
+                        (delta_norms / means.clamp_min(torch.finfo(delta_norms.dtype).tiny)).clamp(0.25, 4.0),
+                        torch.ones_like(delta_norms),
+                    )
+                    row_weights = scale / scale.sum(dim=1, keepdim=True)
+                accumulators[j].update(x_rows, y_rows, None if row_weights is None else row_weights.reshape(-1))
                 t64 = t.double()
                 fingerprints[(k, j)] = (float(t64.sum().item()), float((t64**2).sum().item()))
                 if gradient_mode:
@@ -1472,7 +1632,19 @@ def prepare_direct_residual_streaming(
                         g_s.reshape(-1, g_s.shape[-1]).double(), g_t.reshape(-1, g_t.shape[-1]).double()
                     )
 
-    activation_q64 = {j: _procrustes_from_cross(acc.cross()).cpu() for j, acc in accumulators.items()}
+    def solve_map(acc):
+        cross = acc.cross()
+        if alignment_map == "polar":
+            return _procrustes_from_cross(cross)
+        assert acc.xx is not None
+        trace = float(torch.trace(acc.xx).item())
+        lam = trace / max(1, acc.n - 1)
+        if trace == 0:
+            return torch.zeros_like(cross)
+        eye = torch.eye(acc.xx.shape[0], dtype=acc.xx.dtype, device=acc.xx.device)
+        return torch.linalg.solve(acc.xx + lam * eye, cross)
+
+    activation_q64 = {j: solve_map(acc).cpu() for j, acc in accumulators.items()}
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
     if gradient_mode:
         q_by_position = {}
@@ -1491,6 +1663,8 @@ def prepare_direct_residual_streaming(
     return {
         "q_by_position": q_by_position,
         "procrustes_source": procrustes_source,
+        "alignment_map": alignment_map,
+        "alignment_row_weighting": alignment_row_weighting,
         "procrustes_diagnostics": procrustes_diagnostics,
         "activation_q64_by_position": activation_q64,
         "source_mean_by_position": {j: acc.mean_x.cpu() for j, acc in accumulators.items()},

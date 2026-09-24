@@ -1642,7 +1642,10 @@ def _direct_residual_fit_body(
             num_batches=config.num_batches,
             seed=config.seed,
             device=device,
+            source_ft_model=source_ft_model,
             procrustes_source=config.procrustes_source,
+            alignment_map=config.alignment_map,
+            alignment_row_weighting=config.alignment_row_weighting,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )
@@ -1672,6 +1675,8 @@ def _direct_residual_fit_body(
             pairing,
             residual_target=config.residual_target,
             procrustes_source=config.procrustes_source,
+            alignment_map=config.alignment_map,
+            alignment_row_weighting=config.alignment_row_weighting,
             diagnostics_out=procrustes_diagnostics if gradient_mode else None,
         )
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
@@ -1811,6 +1816,7 @@ def _direct_residual_fit_body(
         "realization_by_position": realization_by_position,
         "task_vector_stats": task_vector_stats,
         "alignment_diagnostics": alignment_diagnostics,
+        "calibration": (prepared if streaming else captured)["calibration"],
         "tv_scaling": tv_scaling_diagnostics,
     }
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
@@ -2413,6 +2419,7 @@ def main() -> None:
         direct_residual_realization: dict[str, dict[int, dict[str, Any]]] = {}
         direct_residual_task_vector_stats: dict[str, dict[str, Any]] = {}
         direct_residual_alignment_diagnostics: dict[str, dict[int, dict[str, float]]] = {}
+        direct_residual_calibration_by_task: dict[str, Any] = {}
         direct_residual_tv_scaling: dict[str, dict[str, Any] | None] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
@@ -2621,6 +2628,7 @@ def main() -> None:
                 direct_residual_realization[t] = direct_residual_merged_extra["realization_by_position"]
                 direct_residual_task_vector_stats[t] = direct_residual_merged_extra["task_vector_stats"]
                 direct_residual_alignment_diagnostics[t] = direct_residual_merged_extra["alignment_diagnostics"]
+                direct_residual_calibration_by_task[t] = direct_residual_merged_extra["calibration"]
                 direct_residual_tv_scaling[t] = direct_residual_merged_extra["tv_scaling"]
 
         for task in tasks:
@@ -3257,6 +3265,7 @@ def main() -> None:
                         direct_residual_realization[task] = task_direct_residual_extra["realization_by_position"]
                         direct_residual_task_vector_stats[task] = task_direct_residual_extra["task_vector_stats"]
                         direct_residual_alignment_diagnostics[task] = task_direct_residual_extra["alignment_diagnostics"]
+                        direct_residual_calibration_by_task[task] = task_direct_residual_extra["calibration"]
                         direct_residual_tv_scaling[task] = task_direct_residual_extra["tv_scaling"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
@@ -3752,6 +3761,7 @@ def main() -> None:
         per_task_premerge_alphas: list[float] | None = None
         hierarchical_premerge_alpha_curve: list[dict[str, Any]] | None = None
         global_alpha_curve: list[dict[str, Any]] | None = None
+        selected_validation_results: dict[str, Any] | None = None
 
         if alpha_selection == "shared" or hierarchical:
             if hierarchical:
@@ -4176,6 +4186,17 @@ def main() -> None:
                     f"baseline_val={tracker.best_secondary_acc[idx]:.6f}"
                 )
             print(f"\nAvg per-task best rebase val acc: {tracker.best_avg():.6f}")
+            if alpha_search_split == "val":
+                # Preserve the scores used for selection separately from test
+                # metrics so campaign selection never needs a test fallback.
+                selected_validation_results = {
+                    "split": "val",
+                    "per_task_rebased": {
+                        item["task"]: float(tracker.best_primary_acc[i])
+                        for i, item in enumerate(per_task)
+                    },
+                    "avg_rebased": float(tracker.best_avg()),
+                }
             best_baseline_vals = [float(v) for v in tracker.best_secondary_acc if v != float("-inf")]
             if best_baseline_vals:
                 print(f"Avg per-task best baseline val acc: {sum(best_baseline_vals) / len(best_baseline_vals):.6f}")
@@ -4330,6 +4351,7 @@ def main() -> None:
             "hierarchical_premerge_alpha_curve": hierarchical_premerge_alpha_curve,
             "global_alpha_curve": global_alpha_curve,
             "alpha_selection": alpha_selection,
+            "validation_results": selected_validation_results,
             "best_alpha": float(best_alpha),
             "best_baseline_alpha": float(best_baseline_alpha),
             "baseline_label": baseline_label,
@@ -4427,6 +4449,7 @@ def main() -> None:
                     # config.residual_target or realization_diagnostics; see
                     # compute_alignment_diagnostics.
                     "alignment_diagnostics_by_task": direct_residual_alignment_diagnostics,
+                    "calibration_by_task": direct_residual_calibration_by_task,
                     # Additive, analysis-only: None per task unless
                     # direct_residual_cfg.tv_scaling != "none" (see
                     # apply_tv_scaling / _run_direct_residual_fit). tv_scaling
