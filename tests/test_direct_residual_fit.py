@@ -16,7 +16,11 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval.direct_residual import (
     DirectResidualConfig,
+    _aligned,
+    _rows,
     capture_paired_boundary_activations,
+    capture_tokens,
+    centered_rectangular_procrustes,
     compute_desired_effects,
     fit_direct_residual,
     fit_sequential_source_endpoints,
@@ -174,6 +178,114 @@ def test_sequential_endpoints_fit_on_mounted_base_and_restore_model():
         assert original["correction_norm"] == changed["correction_norm"]
     for key, value in before.items():
         assert torch.equal(target.state_dict()[key], value), key
+
+
+def test_sequential_delta_on_synthesized_base_zero_update_and_native_control():
+    source_base, source_ft, target, data, pairing, target_sd = _setup(2, 4)
+    source_ft.load_state_dict(source_base.state_dict(), strict=True)
+    config = parse_direct_residual_config({
+        "endpoint_construction": "sequential_delta_on_synthesized_base",
+        "components": ["mlp.c_proj"],
+        "num_batches": 3,
+        "ridge_estimator": "empirical_bayes",
+    })
+    captured = capture_paired_boundary_activations(
+        source_base, source_ft, target, data, data, pairing,
+        num_batches=3, seed=config.seed, device="cpu",
+    )
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+    zero_vector, rows, diagnostics = fit_sequential_source_endpoints(
+        target, target_sd, captured, pairing, config=config, device="cpu",
+    )
+    assert diagnostics["pretrained_correction_norm"] > 0
+    assert diagnostics["task_vector_norm"] == 0.0
+    assert {row["endpoint_stage"] for row in rows} == {"pretrained", "finetuned"}
+    assert all(torch.count_nonzero(value) == 0 for value in zero_vector.values())
+    for key, value in before.items():
+        assert torch.equal(target.state_dict()[key], value), key
+
+    # With a nonzero source update, the synthesized-base design defines a
+    # distinct hypothesis from the ordinary native-delta fit.
+    source_ft = _tuned_copy(source_base, seed=91)
+    captured["source_ft_outputs"] = capture_paired_boundary_activations(
+        source_base, source_ft, target, data, data, pairing,
+        num_batches=3, seed=config.seed, device="cpu",
+    )["source_ft_outputs"]
+    synthesized, _rows, synthesized_diagnostics = fit_sequential_source_endpoints(
+        target, target_sd, captured, pairing, config=config, device="cpu",
+    )
+    native, _ = fit_direct_residual(
+        target, target_sd, captured, compute_desired_effects(captured, pairing), pairing,
+        config=config, device="cpu",
+    )
+    assert synthesized_diagnostics["task_vector_norm"] > 0
+    assert any(not torch.allclose(synthesized[k], native[k], atol=1e-5, rtol=1e-5) for k in synthesized)
+
+
+def test_matched_synthesized_design_endpoint_subtraction_matches_delta_fit():
+    source_base, source_ft, target, data, pairing, target_sd = _setup(2, 4)
+    config = parse_direct_residual_config({
+        "endpoint_construction": "sequential_delta_on_synthesized_base",
+        "components": ["mlp.c_proj"],
+        "num_batches": 3,
+        "ridge_estimator": "empirical_bayes",
+    })
+    captured = capture_paired_boundary_activations(
+        source_base, source_ft, target, data, data, pairing,
+        num_batches=3, seed=config.seed, device="cpu",
+    )
+    mapped_base = {}
+    mapped_ft = {}
+    base_desired = {}
+    for j in range(pairing.target_depth):
+        i = pairing.pairing[j]
+        native = captured["target_base_outputs_by_position"][j]
+        s0 = _aligned(captured["source_base_outputs"][i], native)
+        s1 = _aligned(captured["source_ft_outputs"][i], native)
+        q, mu_s, mu_t = centered_rectangular_procrustes(_rows(s0).double(), _rows(native).double())
+        q, mu_s, mu_t = q.float(), mu_s.float(), mu_t.float()
+        mapped_base[j] = [(b - mu_s) @ q + mu_t for b in s0]
+        mapped_ft[j] = [(f - mu_s) @ q + mu_t for f in s1]
+        base_desired[j] = [m - t for m, t in zip(mapped_base[j], native, strict=True)]
+
+    base_correction, _ = fit_direct_residual(
+        target, target_sd, captured, base_desired, pairing, config=config, device="cpu",
+    )
+    synthesized = {k: v.clone() for k, v in target_sd.items()}
+    for key, correction in base_correction.items():
+        synthesized[key] += correction.to(synthesized[key])
+    target.load_state_dict(synthesized, strict=True)
+    requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
+    raw = capture_tokens(target, captured["target_batches"], requests, "cpu")
+    synthesized_outputs = {int(j): batches for j, batches in raw.items()}
+    target.load_state_dict(target_sd, strict=True)
+    stage2_captured = dict(captured)
+    stage2_captured["target_base_outputs_by_position"] = synthesized_outputs
+    endpoint_base = {
+        j: [m - h for m, h in zip(mapped_base[j], synthesized_outputs[j], strict=True)]
+        for j in range(pairing.target_depth)
+    }
+    endpoint_ft = {
+        j: [m - h for m, h in zip(mapped_ft[j], synthesized_outputs[j], strict=True)]
+        for j in range(pairing.target_depth)
+    }
+    source_delta = {
+        j: [ft - base for base, ft in zip(mapped_base[j], mapped_ft[j], strict=True)]
+        for j in range(pairing.target_depth)
+    }
+    correction_base, _ = fit_direct_residual(
+        target, synthesized, stage2_captured, endpoint_base, pairing, config=config, device="cpu",
+    )
+    correction_ft, _ = fit_direct_residual(
+        target, synthesized, stage2_captured, endpoint_ft, pairing, config=config, device="cpu",
+    )
+    correction_delta, _ = fit_direct_residual(
+        target, synthesized, stage2_captured, source_delta, pairing, config=config, device="cpu",
+    )
+    for key in correction_delta:
+        assert torch.allclose(
+            correction_ft[key] - correction_base[key], correction_delta[key], atol=2e-5, rtol=2e-5,
+        ), key
 
 
 REGIMES = [

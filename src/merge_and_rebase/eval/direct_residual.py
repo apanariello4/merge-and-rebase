@@ -540,14 +540,15 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         )
     if cfg.merge_mode not in {"per_task_then_merge", "merge_in_source_then_fit"}:
         raise ValueError("merge_mode must be 'per_task_then_merge' or 'merge_in_source_then_fit'")
-    if cfg.endpoint_construction not in {"native_delta", "sequential_source_endpoints"}:
-        raise ValueError("endpoint_construction must be 'native_delta' or 'sequential_source_endpoints'")
-    if cfg.endpoint_construction == "sequential_source_endpoints":
+    sequential_endpoint_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
+    if cfg.endpoint_construction not in {"native_delta", *sequential_endpoint_modes}:
+        raise ValueError("endpoint_construction must be 'native_delta', 'sequential_source_endpoints' or 'sequential_delta_on_synthesized_base'")
+    if cfg.endpoint_construction in sequential_endpoint_modes:
         if (tuple(cfg.components) != ("mlp.c_proj",) or cfg.component_target != "block_boundary"
                 or cfg.block_split != "none" or cfg.procrustes_source != "activation"
                 or cfg.tv_scaling != "none" or cfg.activation_storage != "resident"
                 or cfg.realization_diagnostics or cfg.merge_mode != "per_task_then_merge"):
-            raise ValueError("sequential_source_endpoints requires D-only, block_boundary, no block split or TV scaling, activation Procrustes, resident storage, no realization diagnostics, and per-task fits")
+            raise ValueError("sequential endpoint construction requires D-only, block_boundary, no block split or TV scaling, activation Procrustes, resident storage, no realization diagnostics, and per-task fits")
     if isinstance(cfg.seed, bool) or not isinstance(cfg.seed, int):
         raise ValueError("seed must be an integer")
     if cfg.block_split not in {"none", "backfit", "joint"}:
@@ -1104,15 +1105,16 @@ def fit_sequential_source_endpoints(
     device,
     family_adapter=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]], dict[str, Any]]:
-    """Fit source base and FT endpoints in sequence, returning their full difference.
+    """Fit the source base, mount its synthesis, then fit the fine-tuned stage.
 
     Q and its means are fitted once on source base/native target boundaries.
-    The second ridge fit sees the *mounted* synthesized base network. The
-    returned correction is also theta_ft_syn - theta_pre_syn in target space;
-    subtracting rounded full state dicts is avoided to retain precision.
+    Both endpoint modes retain the mounted synthesized base as the stage-two
+    design. ``sequential_source_endpoints`` fits the mapped FT endpoint against
+    that network's outputs; ``sequential_delta_on_synthesized_base`` instead
+    fits the mapped source update directly on that network's activations.
     """
-    if config.endpoint_construction != "sequential_source_endpoints":
-        raise ValueError("sequential endpoint fit requires endpoint_construction='sequential_source_endpoints'")
+    if config.endpoint_construction not in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
+        raise ValueError("sequential endpoint fit requires a sequential endpoint_construction")
     native_outputs = captured["target_base_outputs_by_position"]
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
@@ -1149,10 +1151,23 @@ def fit_sequential_source_endpoints(
             target_model, captured["target_batches"], requests, device, family_adapter=family_adapter
         )
         synthesized_outputs = {int(j): batches for j, batches in synthesized_raw.items()}
-        ft_desired = {
-            j: [m - t for m, t in zip(mapped_ft[j], synthesized_outputs[j], strict=True)]
-            for j in range(pairing.target_depth)
-        }
+        if config.endpoint_construction == "sequential_delta_on_synthesized_base":
+            # Preserve the stage-one synthesized pretrained model as the
+            # stage-two design H_syn, while fitting only the mapped source
+            # fine-tuning update.  The affine Procrustes means cancel between
+            # these two mapped endpoints.  This gives the zero-update
+            # invariant without changing the sequential hypothesis.
+            ft_desired = {
+                j: [ft - base for base, ft in zip(mapped_base[j], mapped_ft[j], strict=True)]
+                for j in range(pairing.target_depth)
+            }
+        else:
+            # Historical endpoint mode: fit the mapped FT endpoint against
+            # the synthesized network's current output.
+            ft_desired = {
+                j: [m - t for m, t in zip(mapped_ft[j], synthesized_outputs[j], strict=True)]
+                for j in range(pairing.target_depth)
+            }
         ft_captured = dict(captured)
         ft_captured["target_base_outputs_by_position"] = synthesized_outputs
         task_vector, ft_rows = fit_direct_residual(

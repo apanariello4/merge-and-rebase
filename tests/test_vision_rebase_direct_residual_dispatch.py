@@ -50,12 +50,16 @@ def _run_main_with_cfg(monkeypatch, tmp_path, cfg: dict) -> Exception:
     return excinfo.value
 
 
-def test_saved_sequential_vector_loader_checks_provenance(tmp_path):
+@pytest.mark.parametrize(
+    "endpoint_construction",
+    ["sequential_source_endpoints", "sequential_delta_on_synthesized_base"],
+)
+def test_saved_sequential_vector_loader_checks_provenance(tmp_path, endpoint_construction):
     key = "visual.transformer.resblocks.0.mlp.c_proj.weight"
     base = {key: torch.zeros(2, 2)}
     vector = {key: torch.ones(2, 2)}
     config = DirectResidualConfig(
-        endpoint_construction="sequential_source_endpoints", components=("mlp.c_proj",),
+        endpoint_construction=endpoint_construction, components=("mlp.c_proj",),
         activation_storage="resident",
     )
     path = tmp_path / "DTD_direct_residual_transported_native.pt"
@@ -297,6 +301,38 @@ def test_run_sequential_endpoint_pipeline_returns_new_vector():
     assert vector and all(".mlp.c_proj." in key for key in vector)
     assert {row["endpoint_stage"] for row in rows} == {"pretrained", "finetuned"}
     assert extra["sequential_endpoints"]["pretrained_correction_norm"] > 0
+    for key, value in base_sd.items():
+        assert torch.equal(target.state_dict()[key], value)
+
+
+def test_run_synthesized_base_delta_dispatch_preserves_zero_update():
+    torch.manual_seed(41)
+    source_base = _Model(5, 2).eval()
+    source_ft = _Model(5, 2).eval()
+    source_ft.load_state_dict(source_base.state_dict(), strict=True)
+    target = _Model(5, 4).eval()
+    data = _loader(seed=42)
+    base_sd = {k: v.clone() for k, v in target.state_dict().items()}
+    config = DirectResidualConfig(
+        num_batches=3,
+        endpoint_construction="sequential_delta_on_synthesized_base",
+        components=("mlp.c_proj",),
+        activation_storage="resident",
+    )
+    vector, _timing, rows, extra = _run_direct_residual_fit(
+        source_base_model=source_base,
+        source_ft_model=source_ft,
+        target_model=target,
+        target_base_sd=base_sd,
+        source_loader=data,
+        target_loader=data,
+        pairing=DiscreteLayerPairing.compute(2, 4),
+        config=config,
+        device="cpu",
+    )
+    assert vector and all(torch.count_nonzero(value) == 0 for value in vector.values())
+    assert extra["sequential_endpoints"]["pretrained_correction_norm"] > 0
+    assert {row["endpoint_stage"] for row in rows} == {"pretrained", "finetuned"}
     for key, value in base_sd.items():
         assert torch.equal(target.state_dict()[key], value)
 

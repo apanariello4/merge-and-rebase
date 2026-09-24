@@ -120,7 +120,7 @@ def _load_saved_sequential_tv(directory, task, target_base_sd, config):
     meta = json.loads(meta_path.read_text())
     expected = {
         "task": task,
-        "endpoint_construction": "sequential_source_endpoints",
+        "endpoint_construction": config.endpoint_construction,
         "target_base_sha256": _state_dict_sha256(target_base_sd),
         "calibration_seed": config.seed,
         "num_batches": config.num_batches,
@@ -1669,7 +1669,7 @@ def _direct_residual_fit_body(
     fit_mark = recorder.mark()
     fit_started = time.perf_counter()
     endpoint_diagnostics = None
-    if config.endpoint_construction == "sequential_source_endpoints":
+    if config.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
         target_corrections, diagnostics, endpoint_diagnostics = fit_sequential_source_endpoints(
             target_model, target_base_sd, captured, pairing, config=config, device=device,
         )
@@ -1946,8 +1946,9 @@ def main() -> None:
             # keeps that separation explicit rather than overloading
             # `method_params`'s existing per-method dispatch conventions.
             direct_residual_cfg = parse_direct_residual_config(cfg.get("direct_residual_params"))
-            if cfg.get("load_direct_residual_tvs_dir") and direct_residual_cfg.endpoint_construction != "sequential_source_endpoints":
-                raise ValueError("load_direct_residual_tvs_dir requires sequential_source_endpoints")
+            sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
+            if cfg.get("load_direct_residual_tvs_dir") and direct_residual_cfg.endpoint_construction not in sequential_modes:
+                raise ValueError("load_direct_residual_tvs_dir requires a sequential endpoint construction")
             if cfg.get("load_direct_residual_tvs_dir") and (
                 cfg.get("save_transported_artifacts") or cfg.get("save_transported_tvs_dir")
             ):
@@ -3298,11 +3299,11 @@ def main() -> None:
                 if save_transported_artifacts and save_transport_dir:
                     os.makedirs(save_transport_dir, exist_ok=True)
                     native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
-                    if direct_residual_like and direct_residual_cfg.endpoint_construction == "sequential_source_endpoints":
+                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
                         if os.path.exists(native_path) or os.path.exists(os.path.splitext(native_path)[0] + ".json"):
                             raise FileExistsError(f"refusing to overwrite sequential DR vector: {native_path}")
                     torch.save(to_cpu_fp32(transported_delta), native_path)
-                    if direct_residual_like and direct_residual_cfg.endpoint_construction == "sequential_source_endpoints":
+                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
                         meta_path = os.path.splitext(native_path)[0] + ".json"
                         metadata = {
                             "task": task,
