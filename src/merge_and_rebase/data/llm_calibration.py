@@ -90,7 +90,10 @@ def resolve_calibration_texts(
         optional `name`/`split`/`text_column`/`text_template`. A
         `text_template` such as ``"{question}\n{answer}"`` is formatted per row
         with the row's columns, so a dataset's reference responses can join the
-        prompt; it replaces `text_column`.
+        prompt; it replaces `text_column`. `shuffle: true` draws the rows in a
+        `seed`-shuffled order instead of taking the first ones, so different
+        seeds calibrate on different subsets (without it the seed has no
+        effect on an HF corpus that is used in full).
     calibration_split : Split to calibrate on. For an lm-harness source this
         selects the held-out slice ("val"/"validation") rather than a split
         that has to exist upstream, so it also works for single-split tasks.
@@ -123,6 +126,7 @@ def resolve_calibration_texts(
             calibration_dataset,
             calibration_split=calibration_split,
             n_sequences=n_sequences,
+            seed=seed,
         )
 
     if harness_tasks:
@@ -147,6 +151,7 @@ def _from_hf_dataset(
     *,
     calibration_split: str,
     n_sequences: int,
+    seed: int = 0,
 ) -> CalibrationTexts:
     import datasets
 
@@ -162,6 +167,7 @@ def _from_hf_dataset(
     split = str(spec.get("split", calibration_split))
     text_column = spec.get("text_column", None)
     text_template = spec.get("text_template", None)
+    shuffle = bool(spec.get("shuffle", False))
     if text_template is not None and text_column is not None:
         raise ValueError("calibration_dataset takes text_column or text_template, not both.")
 
@@ -170,6 +176,14 @@ def _from_hf_dataset(
         if name
         else datasets.load_dataset(str(path), split=split)
     )
+
+    rows = ds
+    order_label = ""
+    if shuffle:
+        order = list(range(len(ds)))
+        random.Random(seed).shuffle(order)
+        rows = (ds[i] for i in order)
+        order_label = f" shuffled(seed={seed})"
 
     if text_template is not None:
         import string
@@ -182,13 +196,13 @@ def _from_hf_dataset(
                 f"(columns: {ds.column_names})."
             )
         texts = []
-        for row in ds:
+        for row in rows:
             value = str(text_template).format(**{k: row[k] for k in fields})
             if value.strip():
                 texts.append(value)
             if len(texts) >= n_sequences:
                 break
-        return CalibrationTexts(texts, source=f"{path}[{split}] template {text_template!r}")
+        return CalibrationTexts(texts, source=f"{path}[{split}]{order_label} template {text_template!r}")
 
     column = text_column or _pick_text_column(ds.column_names)
     if column is None:
@@ -198,14 +212,14 @@ def _from_hf_dataset(
         )
 
     texts: list[str] = []
-    for row in ds:
+    for row in rows:
         value = row.get(column, None)
         if isinstance(value, str) and value.strip():
             texts.append(value)
         if len(texts) >= n_sequences:
             break
 
-    return CalibrationTexts(texts, source=f"{path}[{split}].{column}")
+    return CalibrationTexts(texts, source=f"{path}[{split}]{order_label}.{column}")
 
 
 def _pick_text_column(columns: Sequence[str]) -> str | None:

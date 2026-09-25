@@ -230,3 +230,27 @@ def test_gen_response_config_parsing():
     assert _parse_gen_response_cfg({"max_new_tokens": 64}, default_chat_template=False)["max_new_tokens"] == 64
     with pytest.raises(ValueError, match="unknown align_with_gen_response"):
         _parse_gen_response_cfg({"max_tokens": 64}, default_chat_template=False)
+
+
+# --- seeded HF draw -----------------------------------------------------------
+
+
+def test_unshuffled_hf_corpus_ignores_the_seed(fake_hf):
+    a = resolve_calibration_texts(calibration_dataset={"path": "x", "text_column": "question"}, n_sequences=2, seed=0)
+    b = resolve_calibration_texts(calibration_dataset={"path": "x", "text_column": "question"}, n_sequences=2, seed=17)
+    assert a.texts == b.texts == [r["question"] for r in _ROWS[:2]]
+
+
+def test_shuffle_draws_a_seeded_subset(fake_hf):
+    spec = {"path": "x", "text_column": "question", "shuffle": True}
+    draws = {seed: resolve_calibration_texts(calibration_dataset=spec, n_sequences=2, seed=seed).texts for seed in range(6)}
+    assert draws[3] == resolve_calibration_texts(calibration_dataset=spec, n_sequences=2, seed=3).texts
+    assert len({tuple(v) for v in draws.values()}) > 1
+    assert all(set(v) <= {r["question"] for r in _ROWS} and len(v) == 2 for v in draws.values())
+    assert "shuffled(seed=3)" in resolve_calibration_texts(calibration_dataset=spec, n_sequences=2, seed=3).source
+
+
+def test_shuffle_applies_to_text_templates_too(fake_hf):
+    spec = {"path": "x", "text_template": "{question}|{answer}", "shuffle": True}
+    texts = resolve_calibration_texts(calibration_dataset=spec, n_sequences=3, seed=5).texts
+    assert sorted(texts) == sorted(f"{r['question']}|{r['answer']}" for r in _ROWS)
