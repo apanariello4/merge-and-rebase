@@ -345,6 +345,11 @@ _ATTN_CAPTURE_KINDS = frozenset({"attn_proj", "attn_proj_input"})
 #: Which capture kind supplies each component's regression features.
 COMPONENT_INPUT_KIND = {"attn.out_proj": "attn_proj_input", "mlp.c_proj": "c_proj_input"}
 
+# Pre-fit effect tolerance, relative to the target's own output energy. A
+# materialized zero bias can switch the bf16 GEMM kernel for some shapes (1-2 ulp
+# drift, ~3e-6 measured on Qwen2.5-0.5B); a stale bank or mutated base is O(1).
+_PRISTINE_EFFECT_RTOL = 1e-4
+
 
 def _mha_query_key_value(args, kwargs):
     values = list(args[:3])
@@ -1057,6 +1062,7 @@ def _fit_direct_target_position(
         # back to CPU right after solve() below.
         stats = ResidualSufficientStatistics(device=device)
         desired_sq = 0.0
+        base_sq = 0.0
         effect_sq = 0.0
         for h, out, desired_batch, base_out in zip(
             captured["h"], captured["out"], desired_batches, target_output_batches, strict=True
@@ -1064,14 +1070,15 @@ def _fit_direct_target_position(
             effect = out - base_out
             error = desired_batch - effect
             desired_sq += float((desired_batch.double() ** 2).sum().item())
+            base_sq += float((base_out.double() ** 2).sum().item())
             effect_sq += float((effect.double() ** 2).sum().item())
             stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
         if assert_pristine_effect and component_index == 0:
             # E_j == D_j at the very first fit: the temporary model is still
-            # the untouched target base there, so the current effect is
-            # identically zero. A nonzero effect here means a stale reference
-            # bank or a mutated base, not a small numerical drift.
-            if effect_sq > 1e-12 * max(desired_sq, 1.0):
+            # the untouched target base there, so the current effect is zero up
+            # to rounding. A larger effect means a stale reference bank or a
+            # mutated base, not a small numerical drift.
+            if effect_sq > _PRISTINE_EFFECT_RTOL * max(base_sq, 1.0):
                 raise RuntimeError(
                     "Direct completion started from a target model that is not the native "
                     f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
@@ -1261,6 +1268,7 @@ def _fit_all_positions_independent(
                 effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
             stats = ResidualSufficientStatistics(device=device)
             desired_sq = 0.0
+            base_sq = 0.0
             effect_sq = 0.0
             for h, out, desired_batch, base_out in zip(
                 h_batches, out_batches, desired_batches[pos], target_output_batches[pos], strict=True
@@ -1268,11 +1276,12 @@ def _fit_all_positions_independent(
                 effect = out - base_out
                 error = desired_batch - effect
                 desired_sq += float((desired_batch.double() ** 2).sum().item())
+                base_sq += float((base_out.double() ** 2).sum().item())
                 effect_sq += float((effect.double() ** 2).sum().item())
                 stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
             # See the docstring: under independent mode this holds for every
             # (position, component) pair, not only a historically-first one.
-            if effect_sq > 1e-12 * max(desired_sq, 1.0):
+            if effect_sq > _PRISTINE_EFFECT_RTOL * max(base_sq, 1.0):
                 raise RuntimeError(
                     "Direct completion started from a target model that is not the native "
                     f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"

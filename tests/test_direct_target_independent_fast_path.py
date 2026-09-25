@@ -295,3 +295,51 @@ def test_forward_pass_count_drops_to_one_shared_sweep(monkeypatch):
     assert old_calls > new_calls
     # 4 positions x 2 components = 8 old sweeps collapsed into 1.
     assert old_calls == 8 and new_calls == 1
+
+
+def _perturbed_banks(target_output_batches, scale):
+    gen = torch.Generator().manual_seed(5)
+    return {
+        pos: [t * (1.0 + scale * torch.randn(t.shape, generator=gen)) for t in banks]
+        for pos, banks in target_output_batches.items()
+    }
+
+
+def _fit_both_paths(banks):
+    target, target_base_sd, positions, source_coordinates, desired_batches, _, batches = _fixture()
+    config = _config()
+    components = order_components(config.components)
+    per_position_target = deepcopy(target)
+    state = {k: v.detach().cpu().clone() for k, v in target_base_sd.items()}
+    per_position_target.load_state_dict(state, strict=True)
+    _fit_direct_target_position(
+        per_position_target, state, positions[0], source_coordinates[positions[0]],
+        desired_batches[positions[0]], banks[positions[0]], batches, components, config, "cpu",
+        assert_pristine_effect=True,
+    )
+    shared_target = deepcopy(target)
+    state = {k: v.detach().cpu().clone() for k, v in target_base_sd.items()}
+    shared_target.load_state_dict(state, strict=True)
+    _fit_all_positions_independent(
+        shared_target, state, positions, source_coordinates, desired_batches, banks, batches,
+        components, config, "cpu",
+    )
+
+
+def test_pristine_guard_tolerates_rounding_level_reference_drift():
+    # A materialized zero bias can change the bf16 GEMM kernel, so the reference
+    # bank and the pre-fit capture can differ by an ulp (Qwen2.5-0.5B down_proj
+    # at 512 rows: ~3e-6 relative energy).
+    _, _, _, _, _, target_output_batches, _ = _fixture()
+    _fit_both_paths(_perturbed_banks(target_output_batches, 4e-3))
+
+
+def test_pristine_guard_still_rejects_a_stale_reference_bank():
+    _, _, _, _, _, target_output_batches, _ = _fixture()
+    stale = _perturbed_banks(target_output_batches, 0.5)
+    try:
+        _fit_both_paths(stale)
+    except RuntimeError as exc:
+        assert "not the native base" in str(exc)
+    else:
+        raise AssertionError("a stale reference bank passed the pristine-effect guard")
