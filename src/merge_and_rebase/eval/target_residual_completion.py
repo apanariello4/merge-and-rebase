@@ -457,6 +457,13 @@ def _check_rows(h: Tensor, e: Tensor, h_name: str, e_name: str) -> None:
         raise ValueError("activation and residual row counts must match")
 
 
+# Above this condition number (2-norm, float64), ridge_estimator="none"
+# refuses to solve rather than return a numerically meaningless "exact" fit.
+# 1e8 is a conventional float64 well-posedness threshold (loses roughly half
+# of float64's ~15-16 decimal digits of precision to the solve).
+_RIDGE_NONE_CONDITION_THRESHOLD = 1e8
+
+
 def _clamped_eigh_inverse(sym: Tensor, *, eps: float = 1e-12) -> tuple[Tensor, Tensor, Tensor]:
     """Return ``(eigvals_clamped, eigvecs, pseudo_inverse)`` of a symmetric PSD matrix."""
     vals, vecs = torch.linalg.eigh(sym)
@@ -572,10 +579,16 @@ class ResidualSufficientStatistics:
     ) -> tuple[Tensor, dict[str, Any]]:
         if self.s is None or self.g is None or self.b is None or self.n_rows == 0:
             raise ValueError("cannot solve empty residual statistics")
+        # ridge_relative is still required to be a finite positive number even
+        # under ridge_estimator="none" (which never reads it): the field is
+        # shared config-schema surface with fixed_relative/empirical_bayes,
+        # and loosening this check for "none" would let a config author write
+        # an otherwise-invalid ridge_relative that silently becomes "correct"
+        # only because it happens to be paired with "none".
         if isinstance(ridge_relative, bool) or ridge_relative <= 0 or not math.isfinite(float(ridge_relative)):
             raise ValueError("ridge_relative must be finite and > 0")
-        if ridge_estimator not in {"fixed_relative", "empirical_bayes"}:
-            raise ValueError("ridge_estimator must be 'fixed_relative' or 'empirical_bayes'")
+        if ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
+            raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
         s = (self.s + self.s.T) * 0.5
         g = (self.g + self.g.T) * 0.5
         n = float(self.n_rows)
@@ -595,7 +608,31 @@ class ResidualSufficientStatistics:
 
         trace_sc = float(torch.trace(sc).item())
         trace_g = float(torch.trace(g).item())
-        if ridge_estimator == "empirical_bayes":
+        condition_number: float | None = None
+        if ridge_estimator == "none":
+            # Exact least squares: lambda = 0, straight off the (centered)
+            # normal equations -- no shrinkage at all. This is only a
+            # well-posed solve when the normal-equations system is actually
+            # invertible, so -- unlike the ridge-regularized estimators,
+            # which are well-defined even for a singular sc/g via the
+            # clamped-eigenvalue pseudo-inverse below -- a singular or
+            # numerically ill-conditioned system must fail loudly here rather
+            # than silently falling back to that pseudo-inverse's zeroed
+            # near-null directions, which would look like a valid exact
+            # solve but is not one.
+            effective_ridge_relative = 0.0
+            base = 0.0
+            cond_sc = float(torch.linalg.cond(sc).item()) if sc.shape[0] > 0 else 1.0
+            cond_g = float(torch.linalg.cond(g).item()) if g.shape[0] > 0 else 1.0
+            condition_number = max(cond_sc, cond_g)
+            if not math.isfinite(condition_number) or condition_number > _RIDGE_NONE_CONDITION_THRESHOLD:
+                raise ValueError(
+                    f"ridge_estimator='none': the normal-equations system is singular or "
+                    f"ill-conditioned (condition number {condition_number:.6e} exceeds the "
+                    f"{_RIDGE_NONE_CONDITION_THRESHOLD:.0e} threshold for an exact solve); use "
+                    "ridge_estimator='fixed_relative' or 'empirical_bayes' instead"
+                )
+        elif ridge_estimator == "empirical_bayes":
             if self.n_rows <= 1:
                 raise ValueError("empirical_bayes ridge requires at least two activation rows")
             # With empirical covariance Sigma_hat = S_c / (N - 1), the
@@ -648,6 +685,10 @@ class ResidualSufficientStatistics:
             "n_rows": self.n_rows,
             "ridge": lam,
             "ridge_estimator": ridge_estimator,
+            # Only populated for ridge_estimator="none" (the estimator that
+            # can actually fail on this quantity); None for the two
+            # regularized estimators, which are well-posed regardless.
+            "condition_number": condition_number,
             "configured_ridge_relative": float(ridge_relative),
             "effective_ridge_relative": effective_ridge_relative,
             "residual_norm_before": self.sum_e2**0.5,

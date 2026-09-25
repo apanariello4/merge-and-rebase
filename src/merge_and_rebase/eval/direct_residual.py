@@ -45,6 +45,7 @@ approximation.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -87,12 +88,15 @@ from .target_informed_runtime import (
 
 __all__ = [
     "DirectResidualConfig",
+    "apply_depth_pairing_override",
     "apply_tv_scaling",
     "capture_paired_boundary_activations",
     "compute_alignment_diagnostics",
     "compute_alignment_diagnostics_streaming",
     "compute_desired_effects",
     "compute_direct_residual_task_vector_stats",
+    "compute_fidelity_holdout_diagnostics",
+    "draw_fidelity_holdout_calibration",
     "fit_direct_residual",
     "fit_direct_residual_streaming",
     "measure_direct_residual_realization",
@@ -113,6 +117,86 @@ from .target_residual_completion import (
 )
 
 Tensor = torch.Tensor
+
+
+def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: str) -> DiscreteLayerPairing:
+    """Ablation: rewrite ``pairing.pairing`` per ``DirectResidualConfig.depth_pairing``.
+
+    Called by the caller (``vision_rebase._direct_residual_fit_body`` and its
+    ``merge_in_source_then_fit`` sibling) immediately after
+    ``DiscreteLayerPairing.compute(source_depth, target_depth)``, before any
+    capture. Every Direct Residual consumer -- ``capture_paired_boundary_
+    activations``, ``compute_desired_effects``, ``fit_direct_residual``, and
+    their streaming equivalents -- reads ``pairing.pairing[j]`` as the single
+    source of truth for BOTH which source block's activations define
+    ``D_j = (S_1 - S_0) Q_j`` and which source block ``Q_j`` itself aligns
+    target position ``j`` with (``compute_desired_effects`` fits ``Q_j`` from
+    ``source_base[pairing.pairing[j]]`` against ``target_base[j]``). So this
+    one swap, applied once at construction, changes pi(j) consistently
+    everywhere downstream without touching any of those call sites.
+
+    ``depth_pairing="relative"`` returns ``pairing`` unchanged (identity,
+    bit-for-bit -- the default, golden-hash-pinned path never calls this with
+    anything else).  The other three modes derive a new pairing tuple from
+    the ORIGINAL ``pairing.pairing`` (the closed-form relative pairing), not
+    from each other:
+
+      * ``"reversed"``:     ``pi_rev(j) = source_depth - 1 - pairing.pairing[j]``.
+      * ``"shift_plus1"``:  ``min(source_depth - 1, pairing.pairing[j] + 1)``.
+      * ``"shift_minus1"``: ``max(0, pairing.pairing[j] - 1)``.
+
+    Only valid for ``component_target="block_boundary"`` -- validated by
+    ``parse_direct_residual_config``, not here (this function has no config
+    to check against and is usable standalone, e.g. by tests).
+    """
+    if depth_pairing == "relative":
+        return pairing
+    source_depth = pairing.source_depth
+    if depth_pairing == "reversed":
+        new_pairing = tuple(source_depth - 1 - i for i in pairing.pairing)
+    elif depth_pairing == "shift_plus1":
+        new_pairing = tuple(min(source_depth - 1, i + 1) for i in pairing.pairing)
+    elif depth_pairing == "shift_minus1":
+        new_pairing = tuple(max(0, i - 1) for i in pairing.pairing)
+    else:
+        raise ValueError(
+            f"depth_pairing must be 'relative', 'reversed', 'shift_plus1' or 'shift_minus1', got {depth_pairing!r}"
+        )
+    return DiscreteLayerPairing(
+        source_depth=pairing.source_depth, target_depth=pairing.target_depth, pairing=new_pairing
+    )
+
+
+def _derive_block_seed(alignment_seed: int, position: int) -> int:
+    """Deterministic per-block seed for ``alignment_map='random_isometry'``.
+
+    A plain ``alignment_seed + position`` would work too, but hashing keeps
+    nearby positions' draws decorrelated (no shared low-order-bit structure
+    across an entire depth sweep) and keeps the derivation obviously
+    collision-free across the ``(alignment_seed, position)`` product space
+    used across a sweep of many runs.
+    """
+    digest = hashlib.sha256(
+        f"direct_residual_random_isometry:{int(alignment_seed)}:{int(position)}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big") % (2**31 - 1)
+
+
+def _random_isometry_map(shape: tuple[int, int], *, seed: int) -> Tensor:
+    """A random partial isometry of ``shape``, deterministic given ``seed``.
+
+    Uses the exact same construction ``_procrustes_from_cross`` uses to turn
+    a cross-covariance into the polar factor (SVD, then ``U @ Vh``) -- applied
+    to a seeded standard-normal matrix instead of a cross-covariance -- so
+    the result has the identical shape, orientation, and orthonormal-row/
+    -column structure ``centered_rectangular_procrustes``'s polar map would
+    have for the same (source, target) activation widths; only the direction
+    it points in is randomized. Returned in float64, matching every other
+    alignment map's fitting precision.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    gaussian = torch.randn(shape, generator=generator, dtype=torch.float64)
+    return _procrustes_from_cross(gaussian)
 
 
 def capture_paired_boundary_activations(
@@ -445,6 +529,37 @@ class DirectResidualConfig:
     # procrustes_source="activation" (gradient Procrustes needs task labels
     # and text features). The context is built in vision_rebase.py.
     calibration_data: str = "task_local"
+    # Ablation: which source block index pi(j) each target position j is
+    # paired with, overriding the DiscreteLayerPairing this module is handed
+    # -- BOTH which source block's activations define D_j and which source
+    # block Q_j aligns target position j with (see apply_depth_pairing_override;
+    # threaded in by the caller at pairing-construction time, before capture).
+    #   "relative"     (default) -- the pairing as computed, untouched
+    #                   (DiscreteLayerPairing.compute's i(j) = round(j*(D_s-1)
+    #                   /(D_t-1))). Bit-identical to pre-ablation code.
+    #   "reversed"     -- pi_rev(j) = D_s - 1 - pi(j).
+    #   "shift_plus1"  -- pi(j) + 1, clipped to [0, D_s - 1].
+    #   "shift_minus1" -- pi(j) - 1, clipped to [0, D_s - 1].
+    # Only valid with component_target="block_boundary" (see
+    # apply_depth_pairing_override's docstring for why: the closed-form
+    # position_source_contributions/position_paired_only_contributions span
+    # rules the output_local/output_total targets rely on are keyed to the
+    # untouched relative pairing).
+    depth_pairing: str = "relative"
+    # Ablation: alignment_map="random_isometry"'s per-position seed base.
+    # Each position j draws its Gaussian generator from a seed derived
+    # deterministically from (alignment_seed, j) -- see _derive_block_seed --
+    # so the same seed reproduces the same random map for a given depth
+    # pairing, and different positions never share a draw.
+    alignment_seed: int = 0
+    # Diagnostic (never read by any fit; see compute_fidelity_holdout_diagnostics).
+    # A disjoint, unlabeled held-out slice of the SAME task-local calibration
+    # split (drawn from the identical seeded permutation paired_calibration
+    # uses for the fit, at the immediately-following, non-overlapping index
+    # range) that measures, per target position, how well the fitted
+    # (unit-strength) task vector reproduces D_j on images the fit never saw.
+    fidelity_holdout: bool = False
+    fidelity_holdout_batches: int = 10
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -487,6 +602,10 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "activation_storage",
         "streaming_position_chunk",
         "calibration_data",
+        "depth_pairing",
+        "alignment_seed",
+        "fidelity_holdout",
+        "fidelity_holdout_batches",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -503,8 +622,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("ridge_relative must be finite")
     if cfg.ridge_relative <= 0:
         raise ValueError("ridge_relative must be > 0")
-    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes"}:
-        raise ValueError("ridge_estimator must be 'fixed_relative' or 'empirical_bayes'")
+    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
+        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
     if isinstance(cfg.strength, bool) or not isinstance(cfg.strength, (int, float)):
         raise ValueError("strength must be a finite real number")
     if not math.isfinite(float(cfg.strength)):
@@ -592,16 +711,18 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "(its per-component targets are fit directly from component activation banks), "
             "so there is no block-boundary Q_j for procrustes_source to redirect"
         )
-    if cfg.alignment_map not in {"polar", "ridge"}:
-        raise ValueError("alignment_map must be 'polar' or 'ridge'")
+    if cfg.alignment_map not in {"polar", "ridge", "random_isometry"}:
+        raise ValueError("alignment_map must be 'polar', 'ridge' or 'random_isometry'")
     if cfg.alignment_row_weighting not in {"uniform", "cls_balanced", "delta_magnitude"}:
         raise ValueError("alignment_row_weighting must be 'uniform', 'cls_balanced' or 'delta_magnitude'")
     if (cfg.alignment_map != "polar" or cfg.alignment_row_weighting != "uniform") and (
         cfg.procrustes_source != "activation" or cfg.component_target != "block_boundary"
     ):
         raise ValueError("non-default alignment options require activation alignment and component_target='block_boundary'")
-    if cfg.alignment_map == "ridge" and cfg.alignment_row_weighting != "uniform":
-        raise ValueError("alignment_map='ridge' requires alignment_row_weighting='uniform'")
+    if cfg.alignment_map in {"ridge", "random_isometry"} and cfg.alignment_row_weighting != "uniform":
+        raise ValueError(f"alignment_map={cfg.alignment_map!r} requires alignment_row_weighting='uniform'")
+    if isinstance(cfg.alignment_seed, bool) or not isinstance(cfg.alignment_seed, int):
+        raise ValueError("alignment_seed must be an integer")
     if (cfg.alignment_map != "polar" or cfg.alignment_row_weighting != "uniform") and cfg.residual_target != "transported_delta":
         raise ValueError("non-default alignment options require residual_target='transported_delta'")
     if cfg.tv_scaling not in {"none", "global", "per_block"}:
@@ -644,6 +765,20 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "Procrustes backpropagates the task's own labelled loss, which a task-independent calibration "
             "set does not provide"
         )
+    if cfg.depth_pairing not in {"relative", "reversed", "shift_plus1", "shift_minus1"}:
+        raise ValueError("depth_pairing must be 'relative', 'reversed', 'shift_plus1' or 'shift_minus1'")
+    if cfg.depth_pairing != "relative" and cfg.component_target != "block_boundary":
+        raise ValueError(
+            f"depth_pairing={cfg.depth_pairing!r} requires component_target='block_boundary': the "
+            "output_local/output_total span rules (position_source_contributions / "
+            "position_paired_only_contributions) are keyed to the untouched relative pairing"
+        )
+    if not isinstance(cfg.fidelity_holdout, bool):
+        raise TypeError("fidelity_holdout must be bool")
+    if isinstance(cfg.fidelity_holdout_batches, bool) or not isinstance(cfg.fidelity_holdout_batches, int):
+        raise ValueError("fidelity_holdout_batches must be a positive integer")
+    if cfg.fidelity_holdout_batches <= 0:
+        raise ValueError("fidelity_holdout_batches must be a positive integer")
     return cfg
 
 
@@ -656,6 +791,7 @@ def compute_desired_effects(
     procrustes_source: str = "activation",
     alignment_map: str = "polar",
     alignment_row_weighting: str = "uniform",
+    alignment_seed: int = 0,
     diagnostics_out: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
@@ -763,6 +899,10 @@ def compute_desired_effects(
                     "activation_gradient_procrustes_overlap": overlap,
                     "activation_gradient_map_distance": map_distance,
                     "activation_gradient_delta_disagreement": delta_disagreement,
+                    # See the activation branch below: kept for
+                    # compute_fidelity_holdout_diagnostics to reuse the SAME
+                    # fitted Q_j on held-out images without refitting.
+                    "q": q.detach().float().clone(),
                 }
             q = q.float()
             desired[j] = [(f - b) @ q for b, f in zip(source_base_batches, source_ft_batches, strict=True)]
@@ -770,12 +910,21 @@ def compute_desired_effects(
         q, mu_s, mu_t, alignment_diag = _fit_activation_map(
             source_base_batches, targets, source_ft_batches,
             alignment_map=alignment_map, row_weighting=alignment_row_weighting,
+            random_isometry_seed=_derive_block_seed(alignment_seed, j) if alignment_map == "random_isometry" else None,
         )
         if diagnostics_out is not None:
             diagnostics_out[j] = {
                 "procrustes_source": "activation",
                 "alignment_q_frobenius": float(torch.linalg.norm(q).item()),
                 "alignment_q_rank": int(torch.linalg.matrix_rank(q)),
+                # The fitted map/means themselves, kept for callers that need
+                # to re-apply the SAME Q_j/mu without refitting (e.g.
+                # compute_fidelity_holdout_diagnostics, which must evaluate
+                # D_j on held-out images using the fit's own Q_j, never a
+                # freshly refit one). Never read by any fit.
+                "q": q.detach().float().clone(),
+                "mu_s": mu_s.detach().float().clone(),
+                "mu_t": mu_t.detach().float().clone(),
                 **alignment_diag,
             }
         if residual_target == "transported_delta":
@@ -792,17 +941,20 @@ def compute_desired_effects(
 
 
 def _validate_alignment_options(alignment_map, row_weighting, procrustes_source="activation"):
-    if alignment_map not in {"polar", "ridge"}:
-        raise ValueError("alignment_map must be 'polar' or 'ridge'")
+    if alignment_map not in {"polar", "ridge", "random_isometry"}:
+        raise ValueError("alignment_map must be 'polar', 'ridge' or 'random_isometry'")
     if row_weighting not in {"uniform", "cls_balanced", "delta_magnitude"}:
         raise ValueError("alignment_row_weighting must be 'uniform', 'cls_balanced' or 'delta_magnitude'")
     if alignment_map != "polar" and row_weighting != "uniform":
-        raise ValueError("ridge alignment requires uniform row weighting")
+        raise ValueError(f"alignment_map={alignment_map!r} requires uniform row weighting")
     if (alignment_map != "polar" or row_weighting != "uniform") and procrustes_source != "activation":
         raise ValueError("non-default alignment options require procrustes_source='activation'")
 
 
-def _fit_activation_map(source_batches, target_batches, ft_batches, *, alignment_map="polar", row_weighting="uniform"):
+def _fit_activation_map(
+    source_batches, target_batches, ft_batches, *,
+    alignment_map="polar", row_weighting="uniform", random_isometry_seed: int | None = None,
+):
     """Fit an activation map, optionally weighting each image's token rows."""
     xs, ys = [], []
     for x, y in zip(source_batches, target_batches, strict=True):
@@ -813,6 +965,22 @@ def _fit_activation_map(source_batches, target_batches, ft_batches, *, alignment
     if alignment_map == "polar" and row_weighting == "uniform":
         q, mx, my = centered_rectangular_procrustes(_rows(xs), _rows(ys))
         return q, mx, my, {"alignment_map": "polar", "alignment_row_weighting": "uniform"}
+    if alignment_map == "random_isometry":
+        # random_isometry always requires uniform row weighting (validated by
+        # _validate_alignment_options), so the mean/centering is identical to
+        # the plain uniform-polar path above -- only the map Q itself, whose
+        # shape/orientation the fast path's centered_rectangular_procrustes
+        # call also determines, is replaced by a random partial isometry of
+        # that same shape.
+        if random_isometry_seed is None:
+            raise ValueError("alignment_map='random_isometry' requires random_isometry_seed")
+        q_polar, mx, my = centered_rectangular_procrustes(_rows(xs), _rows(ys))
+        q = _random_isometry_map(tuple(q_polar.shape), seed=random_isometry_seed)
+        return q, mx, my, {
+            "alignment_map": "random_isometry",
+            "alignment_row_weighting": "uniform",
+            "alignment_seed_used": int(random_isometry_seed),
+        }
     x = torch.cat(xs, dim=0)
     y = torch.cat(ys, dim=0)
     weights = torch.ones(x.shape[:2], dtype=torch.float64, device=x.device)
@@ -1504,6 +1672,7 @@ def prepare_direct_residual_streaming(
     source_ft_model=None,
     alignment_map: str = "polar",
     alignment_row_weighting: str = "uniform",
+    alignment_seed: int = 0,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
     ``compute_desired_effects``: accumulates each position's Procrustes cross-
@@ -1632,10 +1801,18 @@ def prepare_direct_residual_streaming(
                         g_s.reshape(-1, g_s.shape[-1]).double(), g_t.reshape(-1, g_t.shape[-1]).double()
                     )
 
-    def solve_map(acc):
+    def solve_map(acc, position):
         cross = acc.cross()
         if alignment_map == "polar":
             return _procrustes_from_cross(cross)
+        if alignment_map == "random_isometry":
+            # Same shape/orientation as the polar map above (both come from
+            # `cross`'s shape); only the direction is randomized, from the
+            # SAME per-block seed derivation the resident path uses, so
+            # streaming and resident produce the identical random map for
+            # the same alignment_seed (see test_direct_residual_random_
+            # isometry.py's streaming-parity check).
+            return _random_isometry_map(tuple(cross.shape), seed=_derive_block_seed(alignment_seed, position))
         assert acc.xx is not None
         trace = float(torch.trace(acc.xx).item())
         lam = trace / max(1, acc.n - 1)
@@ -1644,7 +1821,7 @@ def prepare_direct_residual_streaming(
         eye = torch.eye(acc.xx.shape[0], dtype=acc.xx.dtype, device=acc.xx.device)
         return torch.linalg.solve(acc.xx + lam * eye, cross)
 
-    activation_q64 = {j: solve_map(acc).cpu() for j, acc in accumulators.items()}
+    activation_q64 = {j: solve_map(acc, j).cpu() for j, acc in accumulators.items()}
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
     if gradient_mode:
         q_by_position = {}
@@ -2012,3 +2189,218 @@ def compute_alignment_diagnostics_streaming(
             "target_dim": acc["tgt_dim"],
         }
     return diagnostics
+
+
+def draw_fidelity_holdout_calibration(
+    source_loader,
+    target_loader,
+    *,
+    num_batches: int,
+    holdout_batches: int,
+    seed: int | None,
+) -> tuple[list, list, dict[str, Any]]:
+    """Draw a held-out batch set disjoint from the ``num_batches``-batch
+    calibration set ``capture_paired_boundary_activations``/``prepare_direct_
+    residual_streaming`` fit tau on, for ``DirectResidualConfig.fidelity_holdout``.
+
+    Both sets are slices of the SAME seeded permutation `paired_calibration`
+    draws (``num_batches`` requires a non-``None`` seed for this reason -- a
+    ``None``-seeded, dataset-order calibration set has no "next" slice to draw
+    a disjoint holdout from without risking overlap the dataset's own order
+    could reintroduce): calling `paired_calibration` once with
+    ``num_batches=num_batches + holdout_batches`` reproduces the identical
+    leading ``num_batches`` slice `capture_paired_boundary_activations`/
+    `prepare_direct_residual_streaming` already captured (same seed, same
+    deterministic ``torch.randperm`` order), and the immediately-following
+    ``holdout_batches`` slice is therefore guaranteed disjoint from it by
+    construction -- verified explicitly below anyway, from the sample indices
+    `paired_calibration` itself records, rather than merely assumed.
+
+    Returns ``(holdout_source_batches, holdout_target_batches, holdout_metadata)``;
+    ``holdout_metadata`` carries both slices' sample-index sha256 fingerprints.
+    """
+    if seed is None:
+        raise ValueError("fidelity_holdout requires a deterministic (non-None) calibration seed")
+    total_batches = int(num_batches) + int(holdout_batches)
+    all_source, all_target, metadata = paired_calibration(
+        source_loader, target_loader, num_batches=total_batches, seed=seed
+    )
+    if len(all_source) < total_batches:
+        raise ValueError(
+            f"fidelity_holdout_batches={holdout_batches} requires {total_batches} batches "
+            f"but only {len(all_source)} are available in the calibration split"
+        )
+    bs = metadata["batch_size"]
+    calibration_indices = metadata["indices"][: num_batches * bs]
+    holdout_indices = metadata["indices"][num_batches * bs : total_batches * bs]
+    if set(calibration_indices) & set(holdout_indices):
+        raise RuntimeError(
+            "fidelity_holdout: calibration and holdout sample indices are not disjoint "
+            "(this should be unreachable -- paired_calibration's permutation slices overlapped)"
+        )
+    holdout_metadata = {
+        "holdout_batches": int(holdout_batches),
+        "actual_holdout_batches": len(all_source) - num_batches,
+        "batch_size": bs,
+        "sampling_seed": seed,
+        "dataset_identity": metadata["dataset_identity"],
+        "calibration_indices_sha256": hashlib.sha256(repr(calibration_indices).encode()).hexdigest(),
+        "holdout_indices_sha256": hashlib.sha256(repr(holdout_indices).encode()).hexdigest(),
+        "calibration_holdout_disjoint": True,
+    }
+    return all_source[num_batches:total_batches], all_target[num_batches:total_batches], holdout_metadata
+
+
+def compute_fidelity_holdout_diagnostics(
+    source_base_model,
+    source_ft_model,
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    target_corrections: Mapping[str, Tensor],
+    source_loader,
+    target_loader,
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    q_by_position: Mapping[int, Tensor],
+    mu_s_by_position: Mapping[int, Tensor] | None,
+    mu_t_by_position: Mapping[int, Tensor] | None,
+    device,
+    family_adapter=None,
+) -> dict[str, Any]:
+    """``DirectResidualConfig.fidelity_holdout`` diagnostic: analysis-only,
+    never read by any fit and never mutates ``target_corrections``.
+
+    For BOTH the calibration split (the ``config.num_batches`` batches tau
+    was fit on) and a disjoint held-out split
+    (``draw_fidelity_holdout_calibration``, ``config.fidelity_holdout_batches``
+    batches immediately following it in the same seeded permutation), computes
+    per target position ``j`` (and, for ``e_local``, per fitted component):
+
+      * ``e_local``  = ``||(H_j Delta_W_j + 1 beta_j^T) @ effective_out_j -
+        D_j||_F / ||D_j||_F`` -- the component's OWN local linear-fit
+        residual, ``H_j`` the base target's component-input activations at
+        block ``j`` (``target_informed_runtime.COMPONENT_INPUT_KIND``),
+        ``D_j`` recomputed on this split with the SAME fitted ``Q_j`` (and,
+        for ``residual_target='transported_endpoint'``, the same ``mu_s``/
+        ``mu_t``) passed in via ``q_by_position``/``mu_s_by_position``/
+        ``mu_t_by_position`` -- never refit here.
+      * ``e_mounted`` = ``block_realized_target_error`` from
+        `measure_direct_residual_realization`, reused verbatim (mounts
+        ``target_corrections`` at unit strength -- alpha=1, matching
+        ``D_j`` being a unit-strength target -- runs the FULL nonlinear
+        target forward pass, and compares the block-boundary delta to the
+        same ``D_j``). With a single fitted component this is algebraically
+        identical to that component's own ``e_local`` (no other component's
+        effect to sum in); see
+        ``tests/test_direct_residual_fidelity_holdout_20260925.py``.
+
+    Every norm is reported alongside its ratio (``||D_j||`` and the raw
+    numerator), not only the ratio, per the diagnostic's spec.
+    """
+    if not config.fidelity_holdout:
+        raise ValueError("compute_fidelity_holdout_diagnostics called with fidelity_holdout=False")
+    positions = list(range(pairing.target_depth))
+    components = order_components(config.components)
+    shim = _layout_for(family_adapter)
+    distinct_source_indices = sorted(set(pairing.pairing))
+
+    holdout_source, holdout_target, holdout_meta = draw_fidelity_holdout_calibration(
+        source_loader, target_loader,
+        num_batches=config.num_batches, holdout_batches=config.fidelity_holdout_batches, seed=config.seed,
+    )
+    calibration_source, calibration_target, _calib_meta = paired_calibration(
+        source_loader, target_loader, num_batches=config.num_batches, seed=config.seed
+    )
+
+    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    out: dict[str, Any] = {
+        "holdout_indices_sha256": holdout_meta["holdout_indices_sha256"],
+        "calibration_indices_sha256": holdout_meta["calibration_indices_sha256"],
+        "calibration_holdout_disjoint": holdout_meta["calibration_holdout_disjoint"],
+        "holdout_batches": holdout_meta["actual_holdout_batches"],
+        "splits": {},
+    }
+    try:
+        target_model.load_state_dict(
+            {k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True
+        )
+        for split_name, (src_batches, tgt_batches) in (
+            ("calibration", (calibration_source, calibration_target)),
+            ("holdout", (holdout_source, holdout_target)),
+        ):
+            src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
+            tgt_requests: dict[str, tuple[int, str]] = {str(j): (j, "boundary") for j in positions}
+            for component in components:
+                for j in positions:
+                    tgt_requests[f"{j}.{component}.h"] = (j, COMPONENT_INPUT_KIND[component])
+            source_base_raw = capture_tokens(
+                source_base_model, src_batches, src_requests, device, family_adapter=family_adapter
+            )
+            source_ft_raw = capture_tokens(
+                source_ft_model, src_batches, src_requests, device, family_adapter=family_adapter
+            )
+            target_raw = capture_tokens(target_model, tgt_batches, tgt_requests, device, family_adapter=family_adapter)
+
+            desired: dict[int, list[Tensor]] = {}
+            for j in positions:
+                i = pairing.pairing[j]
+                t = target_raw[str(j)]
+                b = _aligned(source_base_raw[str(i)], t)
+                f = _aligned(source_ft_raw[str(i)], t)
+                q = q_by_position[j]
+                if config.residual_target == "transported_delta":
+                    desired[j] = [(fb - bb) @ q for bb, fb in zip(b, f, strict=True)]
+                else:
+                    mu_s = mu_s_by_position[j]
+                    mu_t = mu_t_by_position[j]
+                    desired[j] = [(fb - mu_s) @ q + mu_t - tb for fb, tb in zip(f, t, strict=True)]
+            target_base_outputs_by_position = {j: target_raw[str(j)] for j in positions}
+
+            realization = measure_direct_residual_realization(
+                target_model, target_base_state, target_corrections, positions,
+                tgt_batches, target_base_outputs_by_position, desired,
+                device=device, components=components, family_adapter=family_adapter,
+            )
+
+            e_local_by_position: dict[int, dict[str, Any]] = {}
+            e_mounted_by_position: dict[int, dict[str, Any]] = {}
+            for j in positions:
+                d_rows = _rows(desired[j]).double()
+                d_norm = float(torch.linalg.norm(d_rows).item())
+                mounted_ratio = float(realization[j]["block_realized_target_error"])
+                e_mounted_by_position[j] = {
+                    "e_mounted": mounted_ratio,
+                    "desired_norm": d_norm,
+                    "numerator": mounted_ratio * d_norm,
+                }
+                per_component: dict[str, Any] = {}
+                for component in components:
+                    key = shim.component_key(j, component, prefixed=True)
+                    delta_w = target_corrections.get(key)
+                    if delta_w is None:
+                        continue
+                    bias_key = _family_bias_key(key)
+                    delta_b = target_corrections.get(bias_key) if bias_key is not None else None
+                    h_rows = _rows(target_raw[f"{j}.{component}.h"]).double()
+                    pred = h_rows @ delta_w.double().T
+                    if delta_b is not None:
+                        pred = pred + delta_b.double()
+                    width = int(delta_w.shape[0])
+                    effective_out = _component_effective_out(shim, target_model, j, component, width).double()
+                    pred = pred @ effective_out
+                    numerator = float(torch.linalg.norm(pred - d_rows).item())
+                    per_component[component] = {
+                        "e_local": numerator / d_norm if d_norm > 0 else 0.0,
+                        "numerator": numerator,
+                        "desired_norm": d_norm,
+                    }
+                e_local_by_position[j] = per_component
+
+            out["splits"][split_name] = {
+                "e_local_by_position": e_local_by_position,
+                "e_mounted_by_position": e_mounted_by_position,
+            }
+    finally:
+        target_model.load_state_dict(entry_state, strict=True)
+    return out

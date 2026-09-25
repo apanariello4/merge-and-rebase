@@ -222,7 +222,8 @@ def test_run_direct_residual_fit_returns_scaled_delta_and_timing_brackets():
         }
     assert extra["tv_scaling"] is None
     assert set(extra) == {
-        "realization_by_position", "task_vector_stats", "alignment_diagnostics", "calibration", "tv_scaling"
+        "realization_by_position", "task_vector_stats", "alignment_diagnostics", "calibration", "tv_scaling",
+        "fidelity_holdout",
     }
     assert set(timing) == {"alignment_calibration", "correction_fit", "cost_phases"}
     cost = timing["cost_phases"]
@@ -278,7 +279,8 @@ def test_run_direct_residual_fit_strength_zero_is_native_target_base_control():
     assert set(extra["alignment_diagnostics"]) == set(range(pairing.target_depth))
     assert extra["tv_scaling"] is None
     assert set(extra) == {
-        "realization_by_position", "task_vector_stats", "alignment_diagnostics", "calibration", "tv_scaling"
+        "realization_by_position", "task_vector_stats", "alignment_diagnostics", "calibration", "tv_scaling",
+        "fidelity_holdout",
     }
 
 
