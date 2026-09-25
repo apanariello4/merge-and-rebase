@@ -192,10 +192,10 @@ class DecoderBlockExtender:
         if extension_density == "spread_mod":
             n_gaps = curr_layers - 1
             return [i % n_gaps for i in range(n_needed)]
-        if extension_density != "spread":
+        if extension_density not in {"spread", "spread_centered"}:
             raise ValueError(
-                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
-                f"Got: {extension_density}"
+                "Unsupported extension_density. Expected: spread, spread_centered, spread_mod, "
+                f"clump. Got: {extension_density}"
             )
 
         # Once there is at least one duplicate per block every block is an
@@ -205,7 +205,9 @@ class DecoderBlockExtender:
         # destructive than any other placement (Qwen2.5-1.5B 28 -> 36,
         # interpolate, no correction: wikitext-2 ppl 1847 with it vs 28 without).
         n_positions = curr_layers if n_needed >= curr_layers else max(1, curr_layers - 1)
-        return spread_anchor_schedule(n_needed, n_positions, insertion_order)
+        return spread_anchor_schedule(
+            n_needed, n_positions, insertion_order, centered=extension_density == "spread_centered"
+        )
 
     @staticmethod
     def _build_collapse_schedule(

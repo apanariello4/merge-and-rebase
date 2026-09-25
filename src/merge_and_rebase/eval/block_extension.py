@@ -63,7 +63,9 @@ def _deterministic_calibration_loader(loader, n_batches: int):
     )
 
 
-def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: str) -> list[int]:
+def spread_anchor_schedule(
+    n_anchors: int, n_positions: int, insertion_order: str, centered: bool = False
+) -> list[int]:
     """Anchor blocks for ``extension_density="spread"``, spaced evenly over the depth.
 
     ``spread`` used to take the first ``n_anchors`` entries of an ordered
@@ -83,6 +85,13 @@ def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: st
 
     ``insertion_order`` picks which end the anchors are laid out from;
     ``random`` keeps its meaning of an arbitrary (deliberately unspread) choice.
+
+    ``centered`` anchors each run at its midpoint instead of its start
+    (``extension_density="spread_centered"``). Run boundaries are unchanged, so
+    the same final-block exclusion above still holds; only where inside each
+    run the anchor sits moves. Reflecting ``bottom-top`` positions for
+    ``top-bottom`` still yields the midpoint of the mirrored run, since a run's
+    midpoint is invariant under the reversal.
     """
     if n_anchors <= 0 or n_positions <= 0:
         return []
@@ -101,7 +110,13 @@ def spread_anchor_schedule(n_anchors: int, n_positions: int, insertion_order: st
             f"Got: {insertion_order}"
         )
 
-    anchors = [(i * n_positions) // n_anchors for i in range(n_anchors)]
+    run_starts = [(i * n_positions) // n_anchors for i in range(n_anchors + 1)]
+    if centered:
+        anchors = [
+            (run_starts[i] + run_starts[i + 1] - 1) // 2 for i in range(n_anchors)
+        ]
+    else:
+        anchors = run_starts[:-1]
     if insertion_order == "top-bottom":
         anchors = [n_positions - 1 - a for a in anchors]
     return anchors
