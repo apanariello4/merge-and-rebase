@@ -1313,3 +1313,33 @@ def run_block_extension_llm(
     if layout_out is not None and extender.realized_layout is not None:
         layout_out.update(extender.realized_layout)
     return final_depth
+
+
+def run_discrete_index_match_llm(
+    *,
+    model: nn.Module,
+    target_layers_total: int,
+    family_adapter: Any,
+) -> int:
+    """Reindex a decoder in place to ``target_layers_total`` blocks, BiCo/THESEUS style.
+
+    Target block ``j`` becomes a verbatim copy of source block
+    ``round(j * (D_A - 1) / (D_B - 1))`` (`DiscreteLayerPairing`, the same
+    pairing the vision discrete_index_match control uses). No interpolation,
+    no calibration, no correction fit.
+    """
+    from ..rebase.discrete_layer_match import DiscreteLayerPairing
+
+    scope = family_adapter.transport_scope(model)
+    orig = scope.layers
+    pairing = DiscreteLayerPairing.compute(len(orig), int(target_layers_total))
+    # Deepcopy every position, even first uses: two positions sharing a module
+    # would share parameters, and the delta/transport would then alias them.
+    scope.layers = nn.ModuleList([deepcopy(orig[i]) for i in pairing.pairing])
+    DecoderBlockExtender._set_depth(model, scope, len(scope.layers))
+    config = getattr(model, "config", None)
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        config.layer_types = [layer_types[i] for i in pairing.pairing]
+    DecoderBlockExtender._reindex_layers(model, scope.layers)
+    return len(scope.layers)

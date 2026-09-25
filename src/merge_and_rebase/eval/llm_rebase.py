@@ -57,7 +57,7 @@ from ..rebase.capabilities import check_pair
 from ..rebase.model_families import infer_family
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from .block_extension import resolve_block_extension_config
-from .block_extension_llm import run_block_extension_llm
+from .block_extension_llm import run_block_extension_llm, run_discrete_index_match_llm
 from .llm_common import (
     default_prompt_for_task,
     head_class_ids_for_task,
@@ -169,8 +169,31 @@ def _prepare_resized_task_delta(
     config: Any,
     family_adapter: Any,
     device: str,
+    depth_alignment: str = "ariadne",
 ) -> _PreparedTaskDelta:
     """Resize one task pair and retain the exact source context for transport."""
+    if depth_alignment == "discrete_index_match":
+        # Faithful BiCo/THESEUS structural resize: reindex both models by the
+        # closed-form pairing, no interpolation and no fit, so the corrected and
+        # uncorrected deltas are the same object.
+        for model in (source_base_model, source_ft_model):
+            final_depth = run_discrete_index_match_llm(
+                model=model, target_layers_total=target_layers_total, family_adapter=family_adapter
+            )
+            if final_depth != target_layers_total:
+                raise RuntimeError(
+                    f"Discrete index match failed: final_depth={final_depth}, expected={target_layers_total}."
+                )
+        source_base = to_cpu_fp32(source_base_model.state_dict())
+        task_vector = TaskVector.from_checkpoints(source_base, to_cpu_fp32(source_ft_model.state_dict()), strict=False)
+        return _PreparedTaskDelta(
+            delta=task_vector.delta,
+            source_base=source_base,
+            transport_keys=set(family_adapter.transportable_keys(source_base)),
+            source_model=source_base_model,
+            uncorrected_delta=task_vector.delta,
+            extension_layout=None,
+        )
     # Reference resize with correction disabled, kept so the caller can compare
     # or substitute the uncorrected task vector. This costs a deepcopy and no
     # forward passes: with skip_correction the extension only duplicates blocks,
@@ -899,6 +922,14 @@ def main() -> None:
         # skip_correction=true, so an enabled run always has a correction to
         # complete.
         residual_completion_cfg = block_extension_cfg.target_residual_completion
+        # "ariadne" (default) resizes the source depth with the block-extension
+        # machinery; "discrete_index_match" is the faithful BiCo/THESEUS control
+        # (verbatim block copies by DiscreteLayerPairing, no interpolation/fit).
+        depth_alignment_mode = str(cfg.get("depth_alignment", "ariadne")).strip().lower()
+        if depth_alignment_mode not in {"ariadne", "discrete_index_match"}:
+            raise ValueError("depth_alignment must be one of: ariadne, discrete_index_match")
+        if depth_alignment_mode == "discrete_index_match" and residual_completion_cfg.enabled:
+            raise ValueError("depth_alignment='discrete_index_match' is incompatible with target_residual_completion.")
 
         source_depth = source_meta.num_hidden_layers if source_meta else 0
         target_depth = target_meta.num_hidden_layers if target_meta else 0
@@ -964,6 +995,7 @@ def main() -> None:
                 print(
                     f"Block extension preprocess: enabled "
                     f"(source_depth={source_depth} -> target_depth={target_depth}, "
+                    f"depth_alignment={depth_alignment_mode}, "
                     f"strategy={block_extension_cfg.extension_strategy}, "
                     f"n_batches_act={block_extension_cfg.n_batches_act})."
                 )
@@ -1360,6 +1392,7 @@ def main() -> None:
                     config=block_extension_cfg,
                     family_adapter=family_adapter_for_ext,
                     device=device,
+                    depth_alignment=depth_alignment_mode,
                 )
                 prepared_task.residual_references = task_residual_references
                 if residual_completion_cfg.enabled:
