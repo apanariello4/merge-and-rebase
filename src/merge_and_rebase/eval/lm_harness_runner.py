@@ -70,10 +70,17 @@ def _extract_metrics(results: dict[str, Any] | None) -> dict[str, float]:
     for task_name, task_results in results.get("results", {}).items():
         for key, value in task_results.items():
             # keys look like "exact_match,none", "acc_norm,none", "exact_match_stderr,none", ...
-            metric, _, _filter_name = str(key).partition(",")
+            metric, _, filter_name = str(key).partition(",")
             if metric in _NON_METRIC_KEYS or metric.endswith("_stderr") or not isinstance(value, int | float):
                 continue
-            out[f"{task_name}_{metric}"] = float(value)
+            # A task with several filters (gsm8k: "strict-match" and
+            # "flexible-extract") reports the same metric once per filter. Keying
+            # on the metric alone let the last filter silently overwrite the
+            # others, so gsm8k_exact_match was flexible-extract only. Name the
+            # filter unless it is the default "none", which keeps every
+            # single-filter task's key unchanged.
+            suffix = "" if filter_name in ("", "none") else f"_{filter_name}"
+            out[f"{task_name}_{metric}{suffix}"] = float(value)
     return out
 
 

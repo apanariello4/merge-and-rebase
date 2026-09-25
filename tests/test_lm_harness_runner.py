@@ -332,3 +332,24 @@ def test_harness_apply_chat_template_forwarded(monkeypatch) -> None:
     # One call per few-shot group, and the flag reaches every one of them.
     assert len(calls) == 2
     assert all(c["apply_chat_template"] is True for c in calls)
+
+
+
+def test_multi_filter_metrics_are_kept_apart():
+    """gsm8k reports exact_match under two filters; neither may overwrite the other."""
+    from merge_and_rebase.eval.lm_harness_runner import _extract_metrics
+
+    out = _extract_metrics({"results": {
+        "gsm8k": {
+            "alias": "gsm8k",
+            "exact_match,strict-match": 0.70, "exact_match_stderr,strict-match": 0.02,
+            "exact_match,flexible-extract": 0.76, "exact_match_stderr,flexible-extract": 0.02,
+        },
+        "minerva_math500": {"exact_match,none": 0.30, "math_verify,none": 0.40},
+    }})
+    assert out == {
+        "gsm8k_exact_match_strict-match": 0.70,
+        "gsm8k_exact_match_flexible-extract": 0.76,
+        "minerva_math500_exact_match": 0.30,
+        "minerva_math500_math_verify": 0.40,
+    }
