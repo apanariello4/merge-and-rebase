@@ -75,11 +75,13 @@ from .block_extension import (
 from .datasets.vision8_14_20 import SUITES
 from .direct_residual import (
     DirectResidualConfig,
+    apply_depth_pairing_override,
     apply_tv_scaling,
     capture_paired_boundary_activations,
     compute_alignment_diagnostics,
     compute_alignment_diagnostics_streaming,
     compute_desired_effects,
+    compute_fidelity_holdout_diagnostics,
     fit_direct_residual,
     fit_direct_residual_streaming,
     measure_streaming_realization_for,
@@ -1667,6 +1669,7 @@ def _direct_residual_fit_body(
             procrustes_source=config.procrustes_source,
             alignment_map=config.alignment_map,
             alignment_row_weighting=config.alignment_row_weighting,
+            alignment_seed=config.alignment_seed,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )
@@ -1698,7 +1701,13 @@ def _direct_residual_fit_body(
             procrustes_source=config.procrustes_source,
             alignment_map=config.alignment_map,
             alignment_row_weighting=config.alignment_row_weighting,
-            diagnostics_out=procrustes_diagnostics if gradient_mode else None,
+            alignment_seed=config.alignment_seed,
+            # fidelity_holdout needs the SAME fitted Q_j/mu this compute_desired_effects
+            # call produces, stored under diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]
+            # (see compute_desired_effects's docstring) -- collected here whether
+            # or not gradient_mode also needs it, so its own request never has to
+            # special-case which mode it's running under.
+            diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
         )
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
@@ -1828,6 +1837,40 @@ def _direct_residual_fit_body(
                 components=fitted_components,
             )
 
+    # fidelity_holdout diagnostic: analysis-only, computed strictly AFTER
+    # target_corrections (tau) is already fitted and fixed -- it only reads
+    # target_corrections, never feeds back into it -- so it cannot, by
+    # construction, change the task vector this run produces (see
+    # tests/test_direct_residual_fidelity_holdout_20260925.py's bit-identical
+    # -tau assertion). Excluded from cost accounting for the same reason
+    # realization_diagnostics is above: it is not part of the method's cost.
+    fidelity_holdout_diagnostics = None
+    with cost_excluded():
+        if bool(config.fidelity_holdout):
+            if streaming:
+                q_by_position = prepared["q_by_position"]
+                mu_s_by_position = {j: m.float() for j, m in prepared["source_mean_by_position"].items()}
+                mu_t_by_position = {j: m.float() for j, m in prepared["target_mean_by_position"].items()}
+            else:
+                q_by_position = {j: procrustes_diagnostics[j]["q"] for j in range(pairing.target_depth)}
+                mu_s_by_position = {j: procrustes_diagnostics[j]["mu_s"] for j in range(pairing.target_depth)}
+                mu_t_by_position = {j: procrustes_diagnostics[j]["mu_t"] for j in range(pairing.target_depth)}
+            fidelity_holdout_diagnostics = compute_fidelity_holdout_diagnostics(
+                source_base_model,
+                source_ft_model,
+                target_model,
+                target_base_sd,
+                target_corrections,
+                source_loader,
+                target_loader,
+                pairing,
+                config=config,
+                q_by_position=q_by_position,
+                mu_s_by_position=mu_s_by_position,
+                mu_t_by_position=mu_t_by_position,
+                device=device,
+            )
+
     strength = float(config.strength)
     with cost_phase("transport"):
         scaled_delta = (
@@ -1839,6 +1882,7 @@ def _direct_residual_fit_body(
         "alignment_diagnostics": alignment_diagnostics,
         "calibration": (prepared if streaming else captured)["calibration"],
         "tv_scaling": tv_scaling_diagnostics,
+        "fidelity_holdout": fidelity_holdout_diagnostics,
     }
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
@@ -2442,6 +2486,13 @@ def main() -> None:
         direct_residual_alignment_diagnostics: dict[str, dict[int, dict[str, float]]] = {}
         direct_residual_calibration_by_task: dict[str, Any] = {}
         direct_residual_tv_scaling: dict[str, dict[str, Any] | None] = {}
+        # depth_pairing ablation (see DirectResidualConfig.depth_pairing /
+        # apply_depth_pairing_override): the actually-used pairing tuple,
+        # recorded once (both DiscreteLayerPairing.compute call sites for
+        # direct_residual produce the identical source_depth/target_depth ->
+        # pi mapping for a given run, so this is written idempotently).
+        direct_residual_pairing_record: dict[str, Any] | None = None
+        direct_residual_fidelity_holdout: dict[str, Any] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -2645,7 +2696,15 @@ def main() -> None:
                 if direct_residual_calibration_ctx is not None
                 else task_context_by_name[merge_in_source_tasks[0]]
             )
-            direct_residual_pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+            direct_residual_pairing = apply_depth_pairing_override(
+                DiscreteLayerPairing.compute(source_depth, target_depth), direct_residual_cfg.depth_pairing
+            )
+            direct_residual_pairing_record = {
+                "source_depth": direct_residual_pairing.source_depth,
+                "target_depth": direct_residual_pairing.target_depth,
+                "depth_pairing": direct_residual_cfg.depth_pairing,
+                "pairing": list(direct_residual_pairing.pairing),
+            }
             (
                 direct_residual_merged_correction,
                 direct_residual_merged_timing,
@@ -2676,6 +2735,7 @@ def main() -> None:
                 direct_residual_alignment_diagnostics[t] = direct_residual_merged_extra["alignment_diagnostics"]
                 direct_residual_calibration_by_task[t] = direct_residual_merged_extra["calibration"]
                 direct_residual_tv_scaling[t] = direct_residual_merged_extra["tv_scaling"]
+                direct_residual_fidelity_holdout[t] = direct_residual_merged_extra["fidelity_holdout"]
 
         for task in tasks:
             task_ctx = task_context_by_name[task]
@@ -3256,7 +3316,15 @@ def main() -> None:
                     # method-dispatch resolution above -- so freshly building
                     # native copies here, rather than reusing those variables,
                     # is both correct and the only option).
-                    pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
+                    pairing = apply_depth_pairing_override(
+                        DiscreteLayerPairing.compute(source_depth, target_depth), direct_residual_cfg.depth_pairing
+                    )
+                    direct_residual_pairing_record = {
+                        "source_depth": pairing.source_depth,
+                        "target_depth": pairing.target_depth,
+                        "depth_pairing": direct_residual_cfg.depth_pairing,
+                        "pairing": list(pairing.pairing),
+                    }
                     if direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
                         if direct_residual_merged_correction is None or direct_residual_merged_timing is None:
                             raise RuntimeError(
@@ -3323,6 +3391,7 @@ def main() -> None:
                         direct_residual_alignment_diagnostics[task] = task_direct_residual_extra["alignment_diagnostics"]
                         direct_residual_calibration_by_task[task] = task_direct_residual_extra["calibration"]
                         direct_residual_tv_scaling[task] = task_direct_residual_extra["tv_scaling"]
+                        direct_residual_fidelity_holdout[task] = task_direct_residual_extra["fidelity_holdout"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -4515,6 +4584,15 @@ def main() -> None:
                     # per-task measurement (r_j traces, s_j / c, tau stats
                     # before/after).
                     "tv_scaling_by_task": direct_residual_tv_scaling,
+                    # depth_pairing ablation: the pi(j) tuple actually used
+                    # (post apply_depth_pairing_override), for the ablation
+                    # to compare against DirectResidualConfig.depth_pairing
+                    # in "config" above without recomputing it.
+                    "pairing": direct_residual_pairing_record,
+                    # fidelity_holdout diagnostic (analysis-only, never fed to
+                    # any fit): None per task unless
+                    # direct_residual_cfg.fidelity_holdout is set.
+                    "fidelity_holdout_by_task": direct_residual_fidelity_holdout,
                 }
                 if direct_residual_like
                 else None
