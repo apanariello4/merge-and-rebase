@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
@@ -82,6 +83,47 @@ def _extract_metrics(results: dict[str, Any] | None) -> dict[str, float]:
             suffix = "" if filter_name in ("", "none") else f"_{filter_name}"
             out[f"{task_name}_{metric}{suffix}"] = float(value)
     return out
+
+
+#: Opt-in: when set, every `run()` writes the generations lm-eval already
+#: collected to this directory. Off by default, since nothing here read them and
+#: a sweep calls `run()` once per alpha. It exists because a string-matched
+#: metric (harmbench_refusal) cannot be audited from its aggregate alone.
+SAMPLES_DIR_ENV = "MR_HARNESS_SAMPLES_DIR"
+
+_samples_call_index = 0
+
+
+def _dump_generation_samples(results: dict[str, Any] | None, out_dir: str) -> None:
+    """Write one JSONL per generate_until task: prompt, response, metrics.
+
+    Files are numbered by call order within the process, so in a sweep file
+    NNN matches the NNN-th entry of `search_results` (the final best-alpha
+    re-eval comes last). Each record carries its own metric values, so the
+    mapping can be checked against the aggregates. Loglikelihood tasks (arc,
+    mmlu) are skipped: their "responses" are scores, not text.
+    """
+    global _samples_call_index
+    import json
+
+    idx = _samples_call_index
+    _samples_call_index += 1
+    if not results or not results.get("samples"):
+        return
+    path = Path(out_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    for task_name, rows in results["samples"].items():
+        if not rows or not isinstance((rows[0].get("filtered_resps") or [None])[0], str):
+            continue
+        with open(path / f"{idx:03d}_{task_name}.jsonl", "w") as f:
+            for row in rows:
+                record = {
+                    "doc_id": row.get("doc_id"),
+                    "prompt": (row.get("arguments") or [[None]])[0][0],
+                    "response": row["filtered_resps"][0],
+                }
+                record.update({m: row.get(m) for m in row.get("metrics", [])})
+                f.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
 
 
 def _samples_for(
@@ -219,6 +261,8 @@ def run(
                     **_samples_for(samples, group_tasks),
                 )
             out.update(_extract_metrics(results))
+            if os.environ.get(SAMPLES_DIR_ENV):
+                _dump_generation_samples(results, os.environ[SAMPLES_DIR_ENV])
     finally:
         TaskConfig.to_dict = _original_to_dict
 

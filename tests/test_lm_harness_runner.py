@@ -353,3 +353,33 @@ def test_multi_filter_metrics_are_kept_apart():
         "minerva_math500_exact_match": 0.30,
         "minerva_math500_math_verify": 0.40,
     }
+
+
+def test_dump_generation_samples_writes_generations_only(tmp_path):
+    import json
+
+    from merge_and_rebase.eval import lm_harness_runner as runner
+
+    results = {
+        "samples": {
+            "harmbench_refusal": [
+                {
+                    "doc_id": 3,
+                    "arguments": [("<prompt>", {"max_gen_toks": 256})],
+                    "filtered_resps": ["I'm sorry, I can't."],
+                    "metrics": ["refusal"],
+                    "refusal": 1.0,
+                }
+            ],
+            "arc_challenge": [
+                {"doc_id": 0, "arguments": [("q", " a")], "filtered_resps": [(-1.2, False)], "metrics": ["acc"]}
+            ],
+        }
+    }
+    runner._samples_call_index = 7
+    runner._dump_generation_samples(results, str(tmp_path))
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["007_harmbench_refusal.jsonl"]
+    rec = json.loads((tmp_path / "007_harmbench_refusal.jsonl").read_text())
+    assert rec == {"doc_id": 3, "prompt": "<prompt>", "response": "I'm sorry, I can't.", "refusal": 1.0}
+    assert runner._samples_call_index == 8
