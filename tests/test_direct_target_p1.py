@@ -186,6 +186,23 @@ def test_direct_solve_matches_the_centered_ridge_closed_form():
     assert diag["ridge"] == pytest.approx(lam, rel=1e-9)
 
 
+def test_absolute_ridge_uses_one_raw_lambda_and_reports_trace_reference():
+    h, e = _banks(seed=19)
+    stats = ResidualSufficientStatistics()
+    stats.update(h, e, None, torch.eye(e.shape[1]))
+    raw_lambda = 7.25
+    _, diag = stats.solve(
+        ridge_relative=0.01,
+        ridge_mode="absolute",
+        ridge_absolute=raw_lambda,
+        exact_form=True,
+    )
+    assert diag["ridge"] == pytest.approx(raw_lambda)
+    assert diag["ridge_mode"] == "absolute"
+    assert diag["ridge_absolute"] == pytest.approx(raw_lambda)
+    assert diag["ridge_trace_normalized"] != pytest.approx(raw_lambda)
+
+
 def test_layerscale_enters_the_direct_fit_as_a_diagonal_output_map():
     """diag(gamma) must be inside the objective, not applied afterwards."""
     h, e = _banks(seed=5)

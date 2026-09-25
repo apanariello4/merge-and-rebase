@@ -1258,6 +1258,8 @@ def complete_residuals(
                 ridge_relative=config.ridge_relative,
                 ridge_estimator=config.ridge_estimator,
                 exact_form=config.exact_form,
+                ridge_mode=config.ridge_mode,
+                ridge_absolute=config.ridge_absolute,
             )
             correction = correction.cpu()
             diag["bias_correction"] = diag["bias_correction"].cpu()
@@ -1440,6 +1442,8 @@ def _fit_direct_target_position(
             ridge_relative=config.ridge_relative,
             ridge_estimator=config.ridge_estimator,
             exact_form=config.exact_form,
+            ridge_mode=config.ridge_mode,
+            ridge_absolute=config.ridge_absolute,
         )
         correction = correction.cpu()
         diag["bias_correction"] = diag["bias_correction"].cpu()
