@@ -170,6 +170,16 @@ class _PlannedTaskDataset(Dataset):
     def __len__(self) -> int:
         return len(self._records)
 
+    @property
+    def sample_ids(self) -> tuple[str, ...]:
+        """``task:index`` per row, in loader order.
+
+        The source and target views of one plan share ``records``, so their
+        ``sample_ids`` are equal exactly when they present the same images in
+        the same order -- the identity ``paired_calibration`` checks.
+        """
+        return tuple(f"{task}:{dataset_index}" for task, dataset_index in self._records)
+
     def __getitem__(self, index: int) -> tuple[Any, torch.Tensor]:
         task, dataset_index = self._records[index]
         value, raw_label = _split_sample(self._datasets[task][dataset_index])

@@ -34,6 +34,7 @@ from merge_and_rebase.eval.target_informed_runtime import (
     capture_residual_references,
     capture_tokens,
     complete_residuals_direct,
+    iter_capture_tokens,
     materialize_missing_projection_biases,
     scale_completion,
 )
@@ -991,6 +992,54 @@ def test_masked_direct_completion_fits_on_real_rows_only():
         results[mask_padding] = corrections
     key = next(iter(results[True]))
     assert not torch.allclose(results[True][key], results[False][key])
+
+
+def test_iter_capture_tokens_masks_like_capture_tokens():
+    """capture_tokens is a wrapper over iter_capture_tokens, so the mask must live there."""
+    model = _Decoder(depth=2)
+    batches = list(_padded_loader(batch_size=3))
+    request = {"b": (1, "boundary")}
+    masked = capture_tokens(model, batches, request, "cpu", family_adapter=_Adapter(), mask_padding=True)
+    streamed = [
+        values["b"]
+        for values in iter_capture_tokens(model, batches, request, "cpu", family_adapter=_Adapter(), mask_padding=True)
+    ]
+    assert len(streamed) == len(masked["b"])
+    for got, want in zip(streamed, masked["b"], strict=True):
+        torch.testing.assert_close(got, want)
+    # And the default still yields the padded [B, T, D] batches.
+    unmasked = next(iter(iter_capture_tokens(model, batches, request, "cpu", family_adapter=_Adapter())))
+    assert unmasked["b"].shape[:2] == (3, 5)
+
+
+@pytest.mark.parametrize("cascade_order", ["bottom_top", "top_bottom", "independent"])
+def test_masked_direct_completion_runs_under_every_cascade_order(cascade_order):
+    """The independent path fits through a different helper than the cascades."""
+    adapter = _Adapter()
+    source, source_ft, target, target_base_sd, layout = _fixture()
+    config = _config(mask_padding=True, num_batches=3, cascade_order=cascade_order)
+    materialize_missing_projection_biases(
+        target, target_base_sd, layout, family_adapter=adapter, components=config.components
+    )
+    refs = _padded_references(source, source_ft, target, config, adapter)
+    _corrections, diagnostics = complete_residuals_direct(
+        target, target_base_sd, refs, layout, _padded_loader(offset=100),
+        config=config, device="cpu", family_adapter=adapter,
+    )
+    assert len(diagnostics) == 4
+    for row in diagnostics:
+        assert row["residual_norm_after"] < row["residual_norm_before"]
+
+
+@pytest.mark.parametrize("cascade_order", ["bottom_top", "independent"])
+def test_absolute_ridge_reaches_every_cascade_order(cascade_order):
+    """ridge_mode='absolute' used to be dropped on the independent path."""
+    _corrections, diagnostics = _diagnostics_for(
+        cascade_order, ridge_mode="absolute", ridge_absolute=0.125
+    )
+    for row in diagnostics:
+        assert row["ridge_mode"] == "absolute", row["position"]
+        assert row["ridge"] == pytest.approx(0.125), row["position"]
 
 
 # --------------------------------------------------------------------------

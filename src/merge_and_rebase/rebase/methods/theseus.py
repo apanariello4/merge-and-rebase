@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from ...models.patch_openclip_attention import merge_openclip_vit_attn, split_openclip_vit_attn
+from ...utils.cost_accounting import cost_phase, cost_phase_decorator
 from ..base import TensorDict
 from ..registry import register
 
@@ -359,6 +360,7 @@ class ActivationStore:
         self.h_a_list: list[torch.Tensor] = []
         self.h_b_list: list[torch.Tensor] = []
 
+    @cost_phase_decorator("transformation")
     def update(self, batch_a: torch.Tensor, batch_b: torch.Tensor) -> None:
         a = batch_a.detach().cpu().to(torch.float64)
         b = batch_b.detach().cpu().to(torch.float64)
@@ -813,45 +815,46 @@ def collect_activations(
             if n_batches is not None and idx >= n_batches:
                 break
 
-            if family_adapter is not None:
-                source_inputs = family_adapter.extract_calibration_batch(source_batch)
-                target_inputs = family_adapter.extract_calibration_batch(target_batch)
-                s_inp = source_inputs.get("input_ids", source_batch)
-                t_inp = target_inputs.get("input_ids", target_batch)
-                if isinstance(s_inp, torch.Tensor):
-                    s_inp = s_inp.to(dev)
-                if isinstance(t_inp, torch.Tensor):
-                    t_inp = t_inp.to(dev)
-                s_attn = source_inputs.get("attention_mask", None)
-                t_attn = target_inputs.get("attention_mask", None)
-                if s_attn is not None:
-                    s_attn = s_attn.to(dev)
-                if t_attn is not None:
-                    t_attn = t_attn.to(dev)
+            with cost_phase("activation_collection"):
+                if family_adapter is not None:
+                    source_inputs = family_adapter.extract_calibration_batch(source_batch)
+                    target_inputs = family_adapter.extract_calibration_batch(target_batch)
+                    s_inp = source_inputs.get("input_ids", source_batch)
+                    t_inp = target_inputs.get("input_ids", target_batch)
+                    if isinstance(s_inp, torch.Tensor):
+                        s_inp = s_inp.to(dev)
+                    if isinstance(t_inp, torch.Tensor):
+                        t_inp = t_inp.to(dev)
+                    s_attn = source_inputs.get("attention_mask", None)
+                    t_attn = target_inputs.get("attention_mask", None)
+                    if s_attn is not None:
+                        s_attn = s_attn.to(dev)
+                    if t_attn is not None:
+                        t_attn = t_attn.to(dev)
 
-                source_model(**({"input_ids": s_inp, "attention_mask": s_attn} if s_attn is not None else {"input_ids": s_inp}))
-                target_model(**({"input_ids": t_inp, "attention_mask": t_attn} if t_attn is not None else {"input_ids": t_inp}))
-                row_mask = _content_row_mask(s_attn, t_attn)
-            else:
-                source_imgs = _extract_model_inputs(source_batch).to(dev)
-                target_imgs = _extract_model_inputs(target_batch).to(dev)
-                if source_imgs.shape[0] != target_imgs.shape[0]:
-                    raise ValueError(
-                        "Theseus calibration expects aligned batch sizes. "
-                        f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
-                    )
-                source_labels = source_batch[1] if isinstance(source_batch, (tuple, list)) and len(source_batch) > 1 else None
-                target_labels = target_batch[1] if isinstance(target_batch, (tuple, list)) and len(target_batch) > 1 else None
-                if torch.is_tensor(source_labels) and torch.is_tensor(target_labels):
-                    if source_labels.shape != target_labels.shape or not torch.equal(
-                        source_labels.detach().cpu(), target_labels.detach().cpu()
-                    ):
-                        raise ValueError("Theseus calibration loaders are not label-aligned.")
-                _encode_image(source_model, source_imgs)
-                if source_model_ft is not None:
-                    _encode_image(source_model_ft, source_imgs)
-                _encode_image(target_model, target_imgs)
-                row_mask = None
+                    source_model(**({"input_ids": s_inp, "attention_mask": s_attn} if s_attn is not None else {"input_ids": s_inp}))
+                    target_model(**({"input_ids": t_inp, "attention_mask": t_attn} if t_attn is not None else {"input_ids": t_inp}))
+                    row_mask = _content_row_mask(s_attn, t_attn)
+                else:
+                    source_imgs = _extract_model_inputs(source_batch).to(dev)
+                    target_imgs = _extract_model_inputs(target_batch).to(dev)
+                    if source_imgs.shape[0] != target_imgs.shape[0]:
+                        raise ValueError(
+                            "Theseus calibration expects aligned batch sizes. "
+                            f"Got {source_imgs.shape[0]} and {target_imgs.shape[0]}."
+                        )
+                    source_labels = source_batch[1] if isinstance(source_batch, (tuple, list)) and len(source_batch) > 1 else None
+                    target_labels = target_batch[1] if isinstance(target_batch, (tuple, list)) and len(target_batch) > 1 else None
+                    if torch.is_tensor(source_labels) and torch.is_tensor(target_labels):
+                        if source_labels.shape != target_labels.shape or not torch.equal(
+                            source_labels.detach().cpu(), target_labels.detach().cpu()
+                        ):
+                            raise ValueError("Theseus calibration loaders are not label-aligned.")
+                    _encode_image(source_model, source_imgs)
+                    if source_model_ft is not None:
+                        _encode_image(source_model_ft, source_imgs)
+                    _encode_image(target_model, target_imgs)
+                    row_mask = None
             consumed_batches += 1
 
             if source_activation_plan is not None:
@@ -1336,6 +1339,7 @@ def _report_apply_diagnostics(*, method_name: str, diagnostics: _ApplyDiagnostic
             print(f"[{method_name}] apply: transport examples={diagnostics.examples}")
 
 
+@cost_phase_decorator("transformation")
 def _precompute_transforms(
     *,
     target_model: torch.nn.Module,
@@ -1509,6 +1513,7 @@ def _precompute_transforms(
     return transforms_by_key, diagnostics
 
 
+@cost_phase_decorator("transformation")
 def _precompute_transforms_data_free(
     *,
     source_visual_base: Mapping[str, torch.Tensor],
