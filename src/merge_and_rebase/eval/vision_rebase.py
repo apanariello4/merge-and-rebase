@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import itertools
 import os
 import time
@@ -83,6 +84,7 @@ from .direct_residual import (
     compute_desired_effects,
     compute_fidelity_holdout_diagnostics,
     fit_direct_residual,
+    fit_sequential_source_endpoints,
     fit_direct_residual_streaming,
     measure_streaming_realization_for,
     parse_direct_residual_config,
@@ -110,6 +112,35 @@ from .target_residual_completion import (
 )
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
+
+
+def _load_saved_sequential_tv(directory, task, target_base_sd, config):
+    """Load a write-once sequential DR vector and verify its fit provenance."""
+    root = Path(directory)
+    path = root / f"{task}_direct_residual_transported_native.pt"
+    meta_path = root / f"{task}_direct_residual_transported_native.json"
+    meta = json.loads(meta_path.read_text())
+    expected = {
+        "task": task,
+        "endpoint_construction": config.endpoint_construction,
+        "target_base_sha256": _state_dict_sha256(target_base_sd),
+        "calibration_seed": config.seed,
+        "num_batches": config.num_batches,
+        "direct_residual_config": json.loads(json.dumps(asdict(config))),
+    }
+    for key, value in expected.items():
+        if meta.get(key) != value:
+            raise ValueError(f"saved DR vector {path}: {key}={meta.get(key)!r}, expected {value!r}")
+    vector = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(vector, dict) or not vector:
+        raise ValueError(f"saved DR vector {path} is empty or invalid")
+    for key, tensor in vector.items():
+        if (key not in target_base_sd or tensor.shape != target_base_sd[key].shape
+                or not torch.isfinite(tensor).all() or ".mlp.c_proj." not in key):
+            raise ValueError(f"saved DR vector {path} has invalid tensor {key}")
+    if _state_dict_sha256(vector) != meta.get("vector_sha256"):
+        raise ValueError(f"saved DR vector {path} failed its tensor hash check")
+    return vector, {**meta, "path": str(path), "metadata_path": str(meta_path)}
 
 
 def _set_deterministic_seed(seed: int) -> None:
@@ -1694,21 +1725,22 @@ def _direct_residual_fit_body(
             target_recipe=target_recipe,
             capture_source_ft_component_inputs=config.component_target == "output_total",
         )
-        desired = compute_desired_effects(
-            captured,
-            pairing,
-            residual_target=config.residual_target,
-            procrustes_source=config.procrustes_source,
-            alignment_map=config.alignment_map,
-            alignment_row_weighting=config.alignment_row_weighting,
-            alignment_seed=config.alignment_seed,
-            # fidelity_holdout needs the SAME fitted Q_j/mu this compute_desired_effects
-            # call produces, stored under diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]
-            # (see compute_desired_effects's docstring) -- collected here whether
-            # or not gradient_mode also needs it, so its own request never has to
-            # special-case which mode it's running under.
-            diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
-        )
+        if config.endpoint_construction == "native_delta":
+            desired = compute_desired_effects(
+                captured,
+                pairing,
+                residual_target=config.residual_target,
+                procrustes_source=config.procrustes_source,
+                alignment_map=config.alignment_map,
+                alignment_row_weighting=config.alignment_row_weighting,
+                alignment_seed=config.alignment_seed,
+                # fidelity_holdout needs the SAME fitted Q_j/mu this compute_desired_effects
+                # call produces, stored under diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]
+                # (see compute_desired_effects's docstring) -- collected here whether
+                # or not gradient_mode also needs it, so its own request never has to
+                # special-case which mode it's running under.
+                diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
+            )
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
@@ -1740,7 +1772,12 @@ def _direct_residual_fit_body(
 
     fit_mark = recorder.mark()
     fit_started = time.perf_counter()
-    if streaming:
+    endpoint_diagnostics = None
+    if config.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
+        target_corrections, diagnostics, endpoint_diagnostics = fit_sequential_source_endpoints(
+            target_model, target_base_sd, captured, pairing, config=config, device=device,
+        )
+    elif streaming:
         target_corrections, diagnostics = fit_direct_residual_streaming(
             target_model,
             target_base_sd,
@@ -1884,6 +1921,8 @@ def _direct_residual_fit_body(
         "tv_scaling": tv_scaling_diagnostics,
         "fidelity_holdout": fidelity_holdout_diagnostics,
     }
+    if endpoint_diagnostics is not None:
+        extra["sequential_endpoints"] = endpoint_diagnostics
     return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
 
 
@@ -2047,6 +2086,13 @@ def main() -> None:
             # keeps that separation explicit rather than overloading
             # `method_params`'s existing per-method dispatch conventions.
             direct_residual_cfg = parse_direct_residual_config(cfg.get("direct_residual_params"))
+            sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
+            if cfg.get("load_direct_residual_tvs_dir") and direct_residual_cfg.endpoint_construction not in sequential_modes:
+                raise ValueError("load_direct_residual_tvs_dir requires a sequential endpoint construction")
+            if cfg.get("load_direct_residual_tvs_dir") and (
+                cfg.get("save_transported_artifacts") or cfg.get("save_transported_tvs_dir")
+            ):
+                raise ValueError("cannot save transported artifacts while loading sequential DR vectors")
         else:
             method = get_method(method_name)
             block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
@@ -2493,6 +2539,8 @@ def main() -> None:
         # pi mapping for a given run, so this is written idempotently).
         direct_residual_pairing_record: dict[str, Any] | None = None
         direct_residual_fidelity_holdout: dict[str, Any] = {}
+        direct_residual_sequential_endpoints: dict[str, dict[str, Any] | None] = {}
+        loaded_direct_residual_tvs: dict[str, dict[str, Any]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
@@ -3325,7 +3373,12 @@ def main() -> None:
                         "depth_pairing": direct_residual_cfg.depth_pairing,
                         "pairing": list(pairing.pairing),
                     }
-                    if direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
+                    if cfg.get("load_direct_residual_tvs_dir"):
+                        transported_delta, loaded_meta = _load_saved_sequential_tv(
+                            cfg["load_direct_residual_tvs_dir"], task, target_base_sd, direct_residual_cfg
+                        )
+                        loaded_direct_residual_tvs[task] = loaded_meta
+                    elif direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
                         if direct_residual_merged_correction is None or direct_residual_merged_timing is None:
                             raise RuntimeError(
                                 "Direct Residual merge_in_source_then_fit correction was not precomputed "
@@ -3392,6 +3445,8 @@ def main() -> None:
                         direct_residual_calibration_by_task[task] = task_direct_residual_extra["calibration"]
                         direct_residual_tv_scaling[task] = task_direct_residual_extra["tv_scaling"]
                         direct_residual_fidelity_holdout[task] = task_direct_residual_extra["fidelity_holdout"]
+                        if "sequential_endpoints" in task_direct_residual_extra:
+                            direct_residual_sequential_endpoints[task] = task_direct_residual_extra["sequential_endpoints"]
 
                 if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
                     # Proposal 1 completes the transported task vector's
@@ -3479,7 +3534,22 @@ def main() -> None:
                 if save_transported_artifacts and save_transport_dir:
                     os.makedirs(save_transport_dir, exist_ok=True)
                     native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
+                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
+                        if os.path.exists(native_path) or os.path.exists(os.path.splitext(native_path)[0] + ".json"):
+                            raise FileExistsError(f"refusing to overwrite sequential DR vector: {native_path}")
                     torch.save(to_cpu_fp32(transported_delta), native_path)
+                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
+                        meta_path = os.path.splitext(native_path)[0] + ".json"
+                        metadata = {
+                            "task": task,
+                            "endpoint_construction": direct_residual_cfg.endpoint_construction,
+                            "target_base_sha256": _state_dict_sha256(target_base_sd),
+                            "vector_sha256": _state_dict_sha256(transported_delta),
+                            "calibration_seed": direct_residual_cfg.seed,
+                            "num_batches": direct_residual_cfg.num_batches,
+                            "direct_residual_config": asdict(direct_residual_cfg),
+                        }
+                        Path(meta_path).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
                     print(f"  {task}: saved transported TV -> {native_path}")
                     transported_artifacts[task] = [native_path]
                     if bool(cfg.get("save_transported_tvs_legacy", False)):
@@ -4593,6 +4663,8 @@ def main() -> None:
                     # any fit): None per task unless
                     # direct_residual_cfg.fidelity_holdout is set.
                     "fidelity_holdout_by_task": direct_residual_fidelity_holdout,
+                    "sequential_endpoints_by_task": direct_residual_sequential_endpoints,
+                    "loaded_vectors_by_task": loaded_direct_residual_tvs,
                 }
                 if direct_residual_like
                 else None
