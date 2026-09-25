@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import resource
 import time
 from collections.abc import Iterable, Mapping
 from copy import copy, deepcopy
@@ -1549,6 +1550,7 @@ def main() -> None:
                 "the source delta has no meaning and would rescale it by an arbitrary factor"
             )
         task_vector_norms: list[dict[str, float]] = []
+        fit_resource_report: list[dict[str, Any]] = []
         residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
         residual_calibration_rows: dict[str, dict[str, Any]] = {}
         materialized_bias_keys: set[str] = set()
@@ -1563,6 +1565,13 @@ def main() -> None:
             else:
                 label = f"task_{idx}"
             print(f"\n--- '{label}' ({idx + 1}/{len(prepared_tasks)}) ---")
+            # Mirrors vision_rebase.py's reset_peak_memory_stats() / synchronize()
+            # / max_memory_allocated() idiom, plus RSS (host) since the LLM path
+            # has no equivalent instrumentation yet. One fit per task (alpha
+            # scaling reuses it), so this is the fit's true peak, not a sum.
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.reset_peak_memory_stats()
+            host_rss_before_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             t0 = time.time()
 
             if run_block_extension_prestep:
@@ -1751,7 +1760,26 @@ def main() -> None:
                     **method_params,
                 )
             elapsed = time.time() - t0
-            print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.synchronize()
+                gpu_peak_bytes = float(torch.cuda.max_memory_allocated())
+            else:
+                gpu_peak_bytes = 0.0
+            # ru_maxrss is a whole-process high-water mark (monotonic, can't be
+            # reset), so this is the host RSS peak for everything up to and
+            # including this task's fit, not just the delta since t0.
+            host_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            fit_resource_report.append({
+                "label": label,
+                "fit_seconds": elapsed,
+                "gpu_peak_bytes": gpu_peak_bytes,
+                "host_rss_before_kb": host_rss_before_kb,
+                "host_peak_rss_kb": host_peak_kb,
+            })
+            print(
+                f"  transported {len(transported)} keys in {elapsed:.1f}s"
+                f" (gpu_peak={gpu_peak_bytes / 2**30:.2f} GiB, host_peak={host_peak_kb / 2**20:.2f} GiB)"
+            )
 
             # Norms are reported for every run, not only when matching is on, so
             # the scale effect of correction is visible in the summary.
@@ -1787,6 +1815,7 @@ def main() -> None:
         delta_stats = _summarize_merged_delta(merged_delta, target_base_sd)
         task_vector_report = {
             "transport_delta_source": delta_source,
+            "fit_resources": fit_resource_report,
             "delta_norm_match": norm_match or "none",
             "per_task": task_vector_norms,
             # Non-empty when a tuned body carried its own config and was built from it
