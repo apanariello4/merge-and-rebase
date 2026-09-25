@@ -1306,7 +1306,18 @@ def main() -> None:
                 # geometry. Shapes match either way, so nothing downstream notices.
                 config_mismatch = _tuned_config_mismatch(str(ckpt_ref), source_llm.model)
                 if config_mismatch:
-                    if not (residual_completion_cfg.enabled and residual_completion_cfg.mode == "direct_target"):
+                    # allow_tuned_config_mismatch: opt-in escape for plain-transport
+                    # baselines on such a pair, where the number is expected to be
+                    # poor and is wanted anyway. Recorded in tuned_config_overrides.
+                    allow_config_mismatch = bool(cfg.get("allow_tuned_config_mismatch", False))
+                    if allow_config_mismatch:
+                        print(
+                            f"  WARNING: allow_tuned_config_mismatch=true; transporting {ckpt_ref!r} "
+                            f"despite config mismatch at {sorted(config_mismatch)}"
+                        )
+                    if not allow_config_mismatch and not (
+                        residual_completion_cfg.enabled and residual_completion_cfg.mode == "direct_target"
+                    ):
                         # The direct arm regresses on the two source models'
                         # *activations* and drops the parameter delta with the
                         # passthrough keys, so a heterogeneous pair is meaningful
@@ -1320,7 +1331,8 @@ def main() -> None:
                             "its weights under the wrong positional geometry, and transporting a "
                             "parameter delta across a config change is not defined. Only "
                             "target_residual_completion.mode='direct_target' supports this pairing, "
-                            "because it uses activations alone."
+                            "because it uses activations alone (or set allow_tuned_config_mismatch=true "
+                            "to force a plain-transport baseline)."
                         )
                     tuned_config_overrides[str(task_label)] = config_mismatch
                     # Built from the tuned ref, so it carries its own config; the
