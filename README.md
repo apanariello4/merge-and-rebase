@@ -31,10 +31,28 @@ python -m merge_and_rebase.eval.vision_merge \
 
 This repository hosts the official implementation of:
 
-- **GradFix**: [Gradient-Sign Masking for Task Vector Transport Across Pre-Trained Models](https://arxiv.org/abs/2510.09658) (ICLR 2026).
-- **TAK**: [Dataless Weight Disentanglement in Task Arithmetic via Kronecker-Factored Approximate Curvature](https://arxiv.org/abs/2602.17385) (ICLR 2026).
-- **DELTA**: [Distilling Linearized Behavior into Non-Linear Fine-Tuning for Effective Task Arithmetic](https://arxiv.org/abs/2605.18993) (ICML 2026).
-- **Theseus**: [Transporting Task Vectors across Different Architectures without Training](https://arxiv.org/abs/2602.12952) (ICML 2026).
+| Method | Paper | Venue | Entry point | Configs |
+|---|---|---|---|---|
+| **GradFix** | [Gradient-Sign Masking for Task Vector Transport Across Pre-Trained Models](https://arxiv.org/abs/2510.09658) | ICLR 2026 | `merge_and_rebase.eval.vision_rebase` | [`configs/vision8_gradfix_hf.json`](configs/vision8_gradfix_hf.json) |
+| **TAK** | [Dataless Weight Disentanglement in Task Arithmetic via Kronecker-Factored Approximate Curvature](https://arxiv.org/abs/2602.17385) | ICLR 2026 | `merge_and_rebase.finetune.train_vision` | [`finetune/configs/TAK/`](src/merge_and_rebase/finetune/configs/TAK) |
+| **DELTA** | [Distilling Linearized Behavior into Non-Linear Fine-Tuning for Effective Task Arithmetic](https://arxiv.org/abs/2605.18993) | ICML 2026 | `merge_and_rebase.finetune.train_vision` | [`finetune/configs/DELTA/`](src/merge_and_rebase/finetune/configs/DELTA) (`Full FT/`, `LoRA/`) |
+| **Theseus** | [Transporting Task Vectors across Different Architectures without Training](https://arxiv.org/abs/2602.12952) | ICML 2026 | `merge_and_rebase.eval.vision_rebase` | [`configs/vision8_theseus_all.json`](configs/vision8_theseus_all.json) |
+
+Example launches:
+
+```bash
+# GradFix / Theseus: transport task vectors to a new base model
+python -m merge_and_rebase.eval.vision_rebase --config configs/vision8_gradfix_hf.json
+python -m merge_and_rebase.eval.vision_rebase --config configs/vision8_theseus_all.json
+
+# TAK / DELTA: fine-tune task vectors (configs named <method>-<backbone>-<suite>.yaml)
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/TAK/vision-tak-kfac-vitb16-vision8.yaml
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config "src/merge_and_rebase/finetune/configs/DELTA/Full FT/vision-delta-vitb16-vision8.yaml"
+```
+
+Fine-tuned TAK and DELTA checkpoints are then merged with `merge_and_rebase.eval.vision_merge` (see [Merging](docs/merging.md)).
 
 ## Documentation
 
