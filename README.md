@@ -27,6 +27,15 @@ python -m merge_and_rebase.eval.vision_merge \
   --config configs/vision8_task_arithmetic_hf_release.json
 ```
 
+## Official Implementations
+
+This repository hosts the official implementation of:
+
+- **GradFix**: [Gradient-Sign Masking for Task Vector Transport Across Pre-Trained Models](https://arxiv.org/abs/2510.09658) (ICLR 2026).
+- **TAK**: [Dataless Weight Disentanglement in Task Arithmetic via Kronecker-Factored Approximate Curvature](https://arxiv.org/abs/2602.17385) (ICLR 2026).
+- **DELTA**: [Distilling Linearized Behavior into Non-Linear Fine-Tuning for Effective Task Arithmetic](https://arxiv.org/abs/2605.18993) (ICML 2026).
+- **Theseus**: [Transporting Task Vectors across Different Architectures without Training](https://arxiv.org/abs/2602.12952) (ICML 2026).
+
 ## Documentation
 
 - [Documentation site](https://apanariello4.github.io/merge-and-rebase/): rendered guides, tutorials, and API reference.
