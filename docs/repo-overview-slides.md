@@ -419,6 +419,19 @@ This tells the repo to fine-tune only low-rank adapters on selected visual modul
 
 ---
 
+# **Method Presets: TAK and DELTA**
+
+Two research presets build on strategies + regularizers:
+
+- **TAK** (`configs/TAK/`): `linearized_ntk` + `parameterization: delta` + `kfac_ggn` curvature penalty from the other tasks
+- **DELTA** (`configs/DELTA/`): non-linear student, `composite` of
+  - `distillation` from an online linearized teacher along θ₀ + α·τ
+  - `ekfac_ggn` penalty on ImageNet21KP
+
+Full FT and LoRA variants, for ViT-B/32, B/16, and L/14 on vision8/14/20.
+
+---
+
 # **Text Pre-Stages**
 
 `train_vision.py` can optionally tune the text side before vision training.
@@ -1307,20 +1320,20 @@ So if you add a strategy, think “training policy module,” not just “optimi
 
 # **How To Add A Regularizer**
 
-Regularizers are a little different.
+Regularizers live in `finetune/regularizers/` and are registered by name.
 
-The extension point exists, but this repo currently ships:
+Built-ins:
 
-- `regularizers/base.py`
-- `regularizers/registry.py`
-
-There are no built-in regularizer implementation files yet.
+- `distillation`: teacher feature/logit matching, optionally along θ₀ + α·τ
+- `kfac_ggn`: K-FAC curvature penalty on τ over reference tasks (used by TAK)
+- `ekfac_ggn`: eigenvalue-corrected K-FAC variant
+- `composite`: sums several child regularizers (used by DELTA)
 
 ---
 
 # **Regularizer Template**
 
-A new regularizer would look like:
+A new regularizer implements the `Regularizer` protocol from `regularizers/base.py`:
 
 ```python
 from dataclasses import dataclass
@@ -1330,30 +1343,29 @@ from .registry import register
 class MyRegularizer:
     name: str = "my_regularizer"
 
-    def prepare_model(self, *, model, device, regularization_cfg=None, **kwargs):
-        pass
+    def finalize_model(self, *, model, device, regularization_cfg=None, **kwargs):
+        return {}                      # optional model patching
 
-    def configure(self, *, model, device, regularization_cfg=None, **kwargs):
-        def reg_fn(*, model, step, batch_index):
-            return 0.0 * next(model.parameters()).sum()
-        return reg_fn, {"extra_params": 0}
+    def prepare(self, *, model, device, regularization_cfg=None, **kwargs):
+        return prepared_state, {}      # expensive, once per task
+
+    def apply(self, prepared, *, model, step, batch_index, **kwargs):
+        return loss_tensor             # added to the task loss
 
 register(MyRegularizer())
 ```
 
 ---
 
-# **One Nuance About Regularizers**
+# **Registering It**
 
-Because there is no `regularizers/__init__.py` importing built-ins yet, adding a new regularizer may also require an import hook so the module is actually executed.
-
-In practice, you would likely add a small package import file similar to:
+Built-ins are imported for side-effect registration in `regularizers/__init__.py`. Add one line there:
 
 ```python
-from . import my_regularizer as _my_regularizer
+from . import my_regularizer as _my_regularizer  # noqa: F401
 ```
 
-or import the module explicitly from the training path.
+It then works standalone or as a child of `composite`.
 
 ---
 
