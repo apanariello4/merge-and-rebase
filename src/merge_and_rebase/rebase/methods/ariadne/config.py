@@ -11,14 +11,12 @@ from typing import Any
 COMPONENT_FORWARD_ORDER: tuple[str, ...] = ("attn.out_proj", "mlp.c_proj")
 
 
-#: Internal (non-residual-writing) components reachable only in output_* modes.
+#: Internal (non-residual-writing) components, reachable only in the retired output_* modes.
 INTERNAL_COMPONENTS: tuple[str, ...] = ("attn.q_proj", "attn.k_proj", "attn.v_proj", "mlp.c_fc")
 
 
-#: Canonical block-forward evaluation order across all six component names.
-#: Relative order of attn.out_proj and mlp.c_proj is unchanged from
-#: COMPONENT_FORWARD_ORDER, so any set drawn only from the historical two
-#: names orders identically to before.
+#: Canonical block-forward order over all six names; the relative order of attn.out_proj and mlp.c_proj
+#: matches COMPONENT_FORWARD_ORDER.
 CANONICAL_COMPONENT_ORDER: tuple[str, ...] = (
     "attn.q_proj",
     "attn.k_proj",
@@ -32,11 +30,8 @@ CANONICAL_COMPONENT_ORDER: tuple[str, ...] = (
 def order_components(components) -> tuple[str, ...]:
     """Return ``components`` in block-forward order.
 
-    The config names a *set* of write surfaces; the fit order is a property of
-    the architecture, not of how the config happened to list them. Any name
-    from ``CANONICAL_COMPONENT_ORDER`` (residual-writing or internal) is
-    accepted; unknown names are silently dropped, matching the historical
-    behaviour of filtering against a fixed order tuple.
+    The fit order is a property of the architecture, not of how the config listed them. Names outside
+    ``CANONICAL_COMPONENT_ORDER`` are silently dropped.
     """
     selected = set(components)
     return tuple(name for name in CANONICAL_COMPONENT_ORDER if name in selected)
@@ -45,193 +40,77 @@ def order_components(components) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class DirectResidualConfig:
     ridge_relative: float = 0.01
-    # Mirrors ResidualCompletionConfig.ridge_estimator: the shared solver body
-    # (_fit_direct_target_position / _fit_all_positions_independent) reads
-    # this attribute unconditionally, so it has to exist here too even though
-    # Direct Residual has never swept it. "fixed_relative" reproduces this
-    # module's only-ever-exercised historical ridge.
+    # Read unconditionally by the shared solver (mirrors ResidualCompletionConfig); 'fixed_relative' = historical ridge.
     ridge_estimator: str = "fixed_relative"
     strength: float = 1.0
     num_batches: int = 10
     components: tuple[str, ...] = ("attn.out_proj", "mlp.c_proj")
-    # Kept only for config-schema parity with ResidualCompletionConfig; Direct
-    # Residual never mounts a correction before fitting the next one, so there
-    # is no cascade for this field to order. See the module docstring and
-    # tests/test_direct_residual_cascade_order.py.
+    # Schema parity only: positions are fit independently (nothing cascades), so this orders nothing.
     cascade_order: str = "independent"
     exact_form: bool = True
     missing_bias: str = "error"
-    # "per_task_then_merge": fit one correction per source task, merge the
-    # resulting target-space corrections afterwards (the ordinary path).
-    # "merge_in_source_then_fit": merge task deltas on the native source base
-    # first, then fit exactly once against the merged (source_base,
-    # source_merged) pair. This module supports either uniformly -- neither
-    # capture_paired_boundary_activations nor fit_direct_residual makes any
-    # assumption about how many tasks contributed to source_ft_model, so the
-    # merge-once orchestration lives entirely in the caller (vision_rebase.py).
+    # 'per_task_then_merge' (default): one correction per task, merged afterwards. 'merge_in_source_then_fit':
+    # merge task deltas on the source base, fit once (orchestrated by the caller, vision_rebase.py).
     merge_mode: str = "per_task_then_merge"
-    # Fit a source-like base endpoint, then fit the FT endpoint on that
-    # mounted target. The returned task vector is their target-space difference.
+    # 'native_delta' (default), or a 'sequential_*' mode: fit a source-like base endpoint, then the FT endpoint on it.
     endpoint_construction: str = "native_delta"
     seed: int = 89
-    # Which target each component's fit is asked to reproduce. Only
-    # "block_boundary" is supported: every requested component (out_proj and
-    # c_proj alike) is fit against the SAME block-boundary target D_j. The
-    # former "output_local"/"output_total" options were retired (closed dead
-    # ends) in the release cleanup and are rejected at parse time.
+    # Only 'block_boundary' is supported (every component fit against the same D_j); output_* options were retired.
     component_target: str = "block_boundary"
-    # Analysis-only. Never read by any fit; only adds diagnostic fields to the
-    # per-component rows. False reproduces the exact historical row schema.
+    # Analysis-only: adds diagnostic fields to the per-component rows; False keeps the historical row schema.
     realization_diagnostics: bool = False
-    # Only valid with component_target="block_boundary" and components subset
-    # of {"attn.out_proj", "mlp.c_proj"}.
-    #   "none"    -- historical behaviour: every requested component is fit
-    #                independently against the SAME block-boundary target D_j
-    #                (golden-hash pinned).
-    #   "backfit" -- intra-block Gauss-Seidel: each component is refit against
-    #                the residual left over once every OTHER component's
-    #                current fit is mounted on a local (never the live target
-    #                model) copy of the block and replayed on the pristine
-    #                captured block input X_j^0. See
-    #                ariadne.ablations._fit_block_boundary_backfit.
-    #   "joint"   -- closed-form joint ridge over the stacked (attn.out_proj,
-    #                mlp.c_proj) features, solved in one linear-algebra step
-    #                under the first-order approximation that the MLP does
-    #                not respond to a change in attn.out_proj. Only valid for
-    #                components subset of {"attn.out_proj", "mlp.c_proj"};
-    #                with a single component this reduces to (is literally
-    #                the same fit as) block_split="none". See
-    #                ariadne.ablations._fit_block_boundary_joint.
+    # Needs component_target='block_boundary' and components within {attn.out_proj, mlp.c_proj}.
+    # 'none' (default): each component fit independently against the same D_j (golden-hash pinned).
+    # 'backfit' (ablation, not used in current experiments): intra-block Gauss-Seidel, ablations._fit_block_boundary_backfit.
+    # 'joint': closed-form joint ridge on the stacked features, assuming the MLP does not respond to attn.out_proj;
+    #          equals 'none' for a single component (ablations._fit_block_boundary_joint).
     block_split: str = "none"
     backfit_max_iters: int = 20
-    # Stop when the relative decrease of the safeguarded block objective J(Delta)
-    # (data-fit term plus each component's own round-1-frozen ridge penalty; see
-    # ariadne.ablations._fit_block_boundary_backfit) between consecutive
-    # full sweeps drops below this. J is measured, not linearized, on every
-    # sweep AND accepted/rejected at every Gauss-Seidel sub-step, so it is
-    # non-increasing by construction -- see the same docstring.
+    # Backfit stop: relative decrease of the safeguarded block objective J between sweeps (non-increasing by construction).
     backfit_tol: float = 1e-4
-    # What each position's target D_j is built from, out of the SAME centered
-    # Procrustes fit Q_j: S_{j,0} -> T_j^0 (`centered_rectangular_procrustes`).
-    #   "transported_delta"   -- historical, default behaviour: D_j = (S_1 -
-    #                            S_0) Q_j, the fine-tuning delta transported
-    #                            through Q_j. Bit-identical to pre-ablation
-    #                            code, golden-hash pinned.
-    #   "transported_endpoint" -- D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0: apply
-    #                            the centered source->target map to the
-    #                            fine-tuned source endpoint, then subtract the
-    #                            target zero-shot endpoint. Differs from the
-    #                            delta target by exactly the Procrustes
-    #                            residual E_j = (S_0 - mu_s) Q_j - (T_j^0 -
-    #                            mu_t); see compute_alignment_diagnostics.
-    #                            Requires component_target=
-    #                            "block_boundary" (the endpoint form is only
-    #                            defined against the block-boundary target).
+    # Target built from the centered Procrustes fit Q_j (S_{j,0} -> T_j^0):
+    # 'transported_delta' (default): D_j = (S_1 - S_0) Q_j, golden-hash pinned.
+    # 'transported_endpoint': D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0; differs from the delta target by the Procrustes
+    #     residual E_j (see compute_alignment_diagnostics). Needs block_boundary and procrustes_source='activation'.
     residual_target: str = "transported_delta"
-    # Which statistic Q_j (the per-position Procrustes alignment map) is fit
-    # on -- D_j = (S_ft - S_base) @ Q_j is unchanged in form either way; only
-    # what Q_j is fit against changes.
-    #   "activation" -- the historical, default behaviour: Q_j is fit on the
-    #                   (source_base, target_base) block-boundary ACTIVATION
-    #                   banks. Bit-identical to pre-ablation code, golden-hash
-    #                   pinned (see tests/test_direct_residual_gradient_
-    #                   procrustes.py).
-    #   "gradient"  -- Q_j is fit on the block-boundary GRADIENT banks
-    #                   dL/dT_i (source base) and dL/dT_j (target base),
-    #                   L = BiCo's own zero-shot contrastive CE
-    #                   (models.grad_recipes.clip_contrastive_recipe), on the
-    #                   same paired calibration batches -- see
-    #                   ariadne.capture.capture_block_gradients and
-    #                   capture_paired_boundary_activations's
-    #                   procrustes_source parameter. Vision only. Only valid
-    #                   with component_target="block_boundary".
+    # Statistic Q_j is fit on (D_j = (S_ft - S_base) @ Q_j either way):
+    # 'activation' (default): source/target base boundary activations, golden-hash pinned.
+    # 'gradient': boundary gradients dL/dT of BiCo's zero-shot contrastive CE (capture_block_gradients);
+    #     vision only, needs component_target='block_boundary'.
     procrustes_source: str = "activation"
-    # Activation-map family and calibration row weights. Defaults preserve
-    # the historical centered polar factor exactly.
+    # Activation-map family and calibration row weights; defaults reproduce the historical centered polar factor.
     alignment_map: str = "polar"
     alignment_row_weighting: str = "uniform"
-    # Label-free rescaling of the unit-strength task vector, applied AFTER
-    # fit_direct_residual assembles tau but BEFORE the caller's per-task
-    # alpha-search. Motivation: block_boundary O+D realizes ||delta T_j|| far
-    # from ||D_j|| (see measure_direct_residual_realization's
-    # joint_delta_norm_over_desired), which pushes alpha-search onto a
-    # badly-resolved region of its grid.
-    #   "none"      -- historical behaviour: tau is untouched (golden-hash
-    #                   pinned; see tests/test_direct_residual_tv_scaling.py).
-    #   "global"    -- tau <- tau / c, c = median_j(||delta T_j|| / ||D_j||)
-    #                   measured with all of tau mounted at unit strength in
-    #                   one sweep. See apply_tv_scaling.
-    #   "per_block" -- per-block-boundary-position scalars s_j, found by
-    #                   tv_scaling_iters rounds of a simultaneous (Jacobi-
-    #                   style) update s_j <- s_j / r_j, r_j measured from one
-    #                   mounted sweep of the CURRENT scaled combination. See
-    #                   apply_tv_scaling.
-    # Only block_split="none" is supported; parse_direct_residual_config
-    # rejects tv_scaling != "none" combined with block_split in
-    # {"backfit", "joint"} rather than silently mis-scaling a per-block-split
-    # fit whose interaction with this measurement has not been verified.
+    # Label-free rescaling of tau after fit_direct_residual, before the caller's per-task alpha search (apply_tv_scaling):
+    # 'none' (default, golden-hash pinned); 'global': tau / median_j(||dT_j|| / ||D_j||);
+    # 'per_block': per-position scalars s_j from tv_scaling_iters simultaneous (Jacobi) rounds.
+    # Rejected with block_split != 'none' (interaction with the measurement unverified).
     tv_scaling: str = "none"
-    # Number of simultaneous (Jacobi) update rounds for tv_scaling="per_block".
-    # Unused (but still validated) for "none"/"global".
+    # Jacobi rounds for tv_scaling='per_block'; validated but unused otherwise.
     tv_scaling_iters: int = 3
-    # "resident" (default): capture_paired_boundary_activations/fit_direct_residual
-    # hold full per-batch activation banks in host RAM for every position at
-    # once (see the module docstring); bit-identical to pre-ablation code.
-    # "streaming": prepare_direct_residual_streaming/fit_direct_residual_streaming
-    # accumulate Procrustes and ridge sufficient statistics batch-by-batch,
-    # keeping host RAM O(1) in num_batches, at the cost of requiring
-    # component_target='block_boundary' and block_split='none' (see
-    # parse_direct_residual_config); realization_diagnostics, tv_scaling and
-    # fidelity_holdout are supported under streaming too.
+    # 'resident' (default): full per-batch activation banks in host RAM, bit-identical to pre-ablation code.
+    # 'streaming': sufficient statistics accumulated per batch (host RAM O(1) in num_batches); needs
+    # component_target='block_boundary' and block_split='none'.
     activation_storage: str = "resident"
-    # Only meaningful with activation_storage="streaming": split
-    # fit_direct_residual_streaming's target positions into chunks of this
-    # size (each chunk gets its own capture sweep) to bound host RAM further
-    # when num_positions * num_components is itself large. None (default)
-    # fits every position in one chunk.
+    # Streaming only: fit target positions in chunks of this size (one capture sweep each) to bound host RAM; None = one chunk.
     streaming_position_chunk: int | None = None
-    # Which images every Direct Residual fit collects its activations on.
-    #   "task_local" (default) -- each per-task fit uses that task's own train
-    #                             loaders; merge_in_source_then_fit uses the
-    #                             first contributing task's. Bit-identical to
-    #                             pre-field code.
-    #   "tiny_imagenet"        -- one task-independent paired context
-    #                             (zh-plus/tiny-imagenet, split "valid") shared
-    #                             by every fit.
-    #   "vision8_mix"          -- one exactly balanced Vision8 train context
-    #                             (batch_size / 8 images per task per batch)
-    #                             shared by every fit.
-    # Only the fit's calibration changes: the per-task alpha search and the
-    # evaluation stay on each task's own splits. Non-default values require
-    # procrustes_source="activation" (gradient Procrustes needs task labels
-    # and text features). The context is built in vision_rebase.py.
+    # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
+    # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
+    # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
+    # 'vision8_mix': one shared, exactly balanced Vision8 train context (batch_size / 8 per task per batch).
+    # Non-default values require procrustes_source='activation'. The context is built in vision_rebase.py.
     calibration_data: str = "task_local"
-    # Ablation: which source block index pi(j) each target position j is
-    # paired with, overriding the DiscreteLayerPairing this module is handed
-    # -- BOTH which source block's activations define D_j and which source
-    # block Q_j aligns target position j with (see apply_depth_pairing_override;
-    # threaded in by the caller at pairing-construction time, before capture).
-    #   "relative"     (default) -- the pairing as computed, untouched
-    #                   (DiscreteLayerPairing.compute's i(j) = round(j*(D_s-1)
-    #                   /(D_t-1))). Bit-identical to pre-ablation code.
-    #   "reversed"     -- pi_rev(j) = D_s - 1 - pi(j).
-    #   "shift_plus1"  -- pi(j) + 1, clipped to [0, D_s - 1].
-    #   "shift_minus1" -- pi(j) - 1, clipped to [0, D_s - 1].
-    # Only valid with component_target="block_boundary" (see
-    # apply_depth_pairing_override's docstring for why).
+    # Ablation overriding the source block pi(j) paired with each target position j (affects both D_j and Q_j;
+    # apply_depth_pairing_override, applied at pairing-construction time). Needs component_target='block_boundary'.
+    # 'relative' (default): pairing as computed, untouched (bit-identical to pre-ablation code). 'reversed': D_s - 1 - pi(j).
+    # 'shift_plus1' / 'shift_minus1': pi(j) +/- 1, clipped to [0, D_s - 1].
     depth_pairing: str = "relative"
-    # Ablation: alignment_map="random_isometry"'s per-position seed base.
-    # Each position j draws its Gaussian generator from a seed derived
-    # deterministically from (alignment_seed, j) -- see _derive_block_seed --
-    # so the same seed reproduces the same random map for a given depth
-    # pairing, and different positions never share a draw.
+    # alignment_map='random_isometry': per-position seed base; position j's generator is seeded from
+    # (alignment_seed, j) via _derive_block_seed, so positions never share a draw and reruns reproduce.
     alignment_seed: int = 0
-    # Diagnostic (never read by any fit; see compute_fidelity_holdout_diagnostics).
-    # A disjoint, unlabeled held-out slice of the SAME task-local calibration
-    # split (drawn from the identical seeded permutation paired_calibration
-    # uses for the fit, at the immediately-following, non-overlapping index
-    # range) that measures, per target position, how well the fitted
-    # (unit-strength) task vector reproduces D_j on images the fit never saw.
+    # Diagnostic, never read by a fit (compute_fidelity_holdout_diagnostics): a disjoint, unlabeled held-out slice
+    # of the same task-local calibration split (next index range of paired_calibration's seeded permutation)
+    # measuring, per position, how well the unit-strength task vector reproduces D_j on unseen images.
     fidelity_holdout: bool = False
     fidelity_holdout_batches: int = 10
 
@@ -262,13 +141,9 @@ def resolve_direct_residual_preset(value: Mapping[str, Any] | None) -> str | Non
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
     """Parse and validate the Direct Residual configuration schema.
 
-    Mirrors `target_residual_completion.parse_residual_completion_config`'s
-    validation style: an explicit allowed-key set, unknown keys refused,
-    type/range checks with clear messages. Direct Residual's config is
-    deliberately narrower than `ResidualCompletionConfig` -- no
-    `target_scope`, `mode`, `target_trajectory`, or `direct_passthrough`,
-    since none of those ARIADNE-protocol concepts apply once there is no
-    realized-extension layout to describe.
+    Explicit allowed-key set (unknown keys refused) and type/range checks, in the style of
+    `target_residual_completion.parse_residual_completion_config`. Narrower than `ResidualCompletionConfig`:
+    no `target_scope`, `mode`, `target_trajectory` or `direct_passthrough` (no realized-extension layout).
     """
     if value is None:
         return DirectResidualConfig()
@@ -353,14 +228,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
     if unsupported:
         raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}")
-    # Unlike target_residual_completion.parse_residual_completion_config
-    # (P1), which requires 'mlp.c_proj' to anchor the sequential cascade,
-    # Direct Residual never cascades -- every position is independently
-    # fit against the pristine target base (see the module docstring) --
-    # so there is no "unanchored" out_proj-only fit the way there would
-    # be for a cascaded completion. Any non-empty, repeat-free subset of
-    # COMPONENT_FORWARD_ORDER is legal here, including {'attn.out_proj'}
-    # alone (DT-O).
+    # Unlike parse_residual_completion_config (which needs 'mlp.c_proj' to anchor its cascade), nothing cascades
+    # here (every position is fit independently against the pristine target base), so any non-empty,
+    # repeat-free subset of COMPONENT_FORWARD_ORDER is legal, including {'attn.out_proj'} alone.
     if cfg.cascade_order not in {"independent", "bottom_top", "top_bottom"}:
         raise ValueError("cascade_order must be 'independent', 'bottom_top' or 'top_bottom'")
     if cfg.missing_bias not in {"error", "materialize", "skip"}:

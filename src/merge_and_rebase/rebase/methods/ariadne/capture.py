@@ -33,14 +33,11 @@ def _dataset_identity(dataset):
 def _stable_dataset_identity(dataset) -> str:
     """Process-independent identity string of a calibration dataset (for run metadata).
 
-    `_dataset_identity` ends in ``("object", id(dataset), len)`` for datasets that carry neither a split
-    fingerprint nor ``sample_ids`` -- right for the in-process source/target pairing check (it requires the
-    SAME dataset object), but not reproducible across processes, so it must not be written to run summaries.
-    This variant is content-based wherever the dataset exposes content (Subset indices, split fingerprint,
-    sample ids -- the latter two and the Subset indices are hashed rather than listed) and otherwise falls
-    back to ``module.Class`` plus length, never an object id. It is what ``extra["calibration"]
-    ["dataset_identity"]`` records and what the later same-dataset checks in ``target_informed_runtime``
-    compare against.
+    Unlike `_dataset_identity` (which may end in ``id(dataset)``, valid only for the in-process same-object
+    pairing check), this is content-based (Subset indices / sample ids hashed, split fingerprint) and falls back
+    to ``module.Class`` plus length, never an object id, so it is reproducible across processes. It is what
+    ``extra["calibration"]["dataset_identity"]`` records and what the later same-dataset checks in
+    ``target_informed_runtime`` compare against.
     """
     if isinstance(dataset, Subset):
         indices = hashlib.sha256(repr([int(i) for i in dataset.indices]).encode()).hexdigest()
@@ -79,13 +76,9 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
     source_batches, target_batches = [], []
     for a, b in zip(source, target, strict=True):
-        # Vision batches are (images, labels) and the labels are model-agnostic,
-        # so they must match example for example. Text batches are mappings
-        # whose contents are tokenizer-specific by construction -- the same
-        # prompt yields different ids under the source and target tokenizers --
-        # so there is nothing comparable to assert here. The examples are
-        # already pinned: both Subsets index the same `order` into datasets
-        # whose _dataset_identity had to agree above.
+        # Vision batches are (images, labels); labels are model-agnostic and must match example for example.
+        # Text batches are tokenizer-specific mappings (ids differ by construction), so nothing is comparable;
+        # the examples are pinned by the shared `order` and the _dataset_identity check above.
         if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)) and len(a) > 1 and len(b) > 1:
             if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
                 raise ValueError("Calibration labels disagree for supposedly identical images")
@@ -104,12 +97,9 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
 
 
 def _assert_layerscale_identity(shim, block, *, context, requirement="block_split='joint'"):
-    """Refuse a nontrivial LayerScale under ``block_split='joint'`` (see
-    ``_fit_block_boundary_joint``).
+    """Refuse a nontrivial LayerScale under ``block_split='joint'`` (see ``_fit_block_boundary_joint``).
 
-    The joint fit solves with ``t_out = I``: any nonidentity ``ls_1``/
-    ``ls_2`` would silently drop a scale the block actually applies, so the
-    target write surface would no longer be unambiguous.
+    The joint fit solves with ``t_out = I``: a non-identity ``ls_1``/``ls_2`` would be silently dropped.
     """
     inner = shim.block_module(block)
     for name in ("ls_1", "ls_2"):
@@ -135,13 +125,9 @@ def _mha_query_key_value(args, kwargs):
 def _stock_mha_out_proj_input(module, args, kwargs):
     """Rows that ``out_proj`` consumes inside a stock ``nn.MultiheadAttention``.
 
-    torch applies the output projection *functionally* inside
-    ``F.multi_head_attention_forward``, straight from ``out_proj.weight``, so the
-    ``out_proj`` submodule is never called and a forward hook on it never fires.
-    Rerunning the same attention with an identity output projection recovers
-    exactly the rows it would have consumed; the caller verifies that by pushing
-    them back through the real projection and comparing against the module's own
-    output, so this can never silently capture the wrong tensor.
+    torch applies the output projection functionally, so the ``out_proj`` submodule is never called and a
+    forward hook on it never fires. Rerunning the attention with an identity projection recovers exactly those
+    rows; the caller verifies this against the module's own output (`_verify_recomputed_attention_input`).
     """
     query, key, value = _mha_query_key_value(args, kwargs)
     batch_first = bool(getattr(module, "batch_first", False))
@@ -196,10 +182,9 @@ def _stock_mha_out_proj_input(module, args, kwargs):
 
 
 def _verify_recomputed_attention_input(module, rows, module_output):
-    """Push the recomputed rows back through the real projection and compare.
+    """Push the recomputed rows back through the real ``out_proj`` and compare (atol/rtol 1e-4).
 
-    Cheap (one matmul against a full attention) and it turns any future change in
-    torch's attention internals into a loud failure instead of a wrong fit.
+    Cheap, and turns a future change in torch's attention internals into a loud failure, not a wrong fit.
     """
     reference = module_output[0] if isinstance(module_output, tuple) else module_output
     replayed = F.linear(rows, module.out_proj.weight, module.out_proj.bias)
@@ -215,10 +200,7 @@ def _register_capture_hooks(
 ) -> list:
     """Register one forward hook per capture request, calling ``store(name, tensor)``.
 
-    Every branch (boundary/block_input, the ``nn.MultiheadAttention`` recompute
-    path, the self-attention query check, mlp_input, proj, plain ``*_input``
-    kinds) is preserved exactly from the historical ``capture_tokens`` body.
-    Returns the list of handles the caller must ``.remove()``.
+    Returns the handles the caller must ``.remove()``.
     """
     handles = []
     for key, (index, kind) in requests.items():
@@ -231,10 +213,9 @@ def _register_capture_hooks(
             module = block
         elif kind in _ATTN_CAPTURE_KINDS:
             attention = layout.attn_module(blocks[index])
-            # A stock nn.MultiheadAttention applies out_proj functionally, so
-            # a hook on that submodule would never fire and the "fired once
-            # per batch" check below would reject the whole capture. Hook the
-            # attention itself and recover the projection's rows exactly.
+            # A stock nn.MultiheadAttention applies out_proj functionally, so a hook on that submodule never
+            # fires (and the "once per batch" check would reject the capture): hook the attention itself and
+            # recover the projection's rows exactly.
             recompute = isinstance(attention, nn.MultiheadAttention)
             module = attention if recompute else layout.attn_proj_module(blocks[index])
         elif query_capture:
@@ -280,16 +261,12 @@ def _register_capture_hooks(
 def iter_capture_tokens(
     model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None, store_device="cpu"
 ):
-    """Yield one ``{key: tensor}`` dict per batch instead of accumulating all of them.
+    """Yield one ``{key: [B,T,D] float32 tensor}`` dict per batch instead of accumulating all of them.
 
-    Same hook/module resolution as ``capture_tokens`` (see ``_register_capture_hooks``),
-    but hooks are registered and removed around EACH batch rather than once for the
-    whole sweep -- this lets several generators over the same model object run in
-    lockstep (e.g. one per source/finetuned/target model) without cross-firing.
-    ``store_device="cpu"`` keeps the historical ``tokens.float().cpu().clone()`` store
-    op; any other value stores via ``tokens.float().to(store_device).clone()``.
-    Restores the model's device/train mode on normal completion, early
-    ``.close()``, garbage collection, or an exception raised mid-sweep.
+    Same hook resolution as `capture_tokens`, but hooks are registered and removed around EACH batch, so several
+    generators over the same model object can run in lockstep without cross-firing. ``store_device="cpu"`` stores
+    ``tokens.float().cpu().clone()``; any other value stores via ``tokens.float().to(store_device).clone()``.
+    Restores the model's device/train mode on completion, early ``.close()``, GC, or an exception mid-sweep.
     """
     layout = _layout_for(family_adapter)
     blocks = layout.blocks(model)
@@ -327,12 +304,10 @@ def iter_capture_tokens(
 
 @torch.no_grad()
 def capture_tokens(model, batches, requests: Mapping[str, tuple[int, str]], device, *, family_adapter=None):
-    """Capture B,T,D tensors, releasing hooks and restoring placement on errors.
+    """Capture ``{key: [per-batch [B,T,D] tensors]}``, releasing hooks and restoring placement on errors.
 
-    family_adapter=None keeps the original CLIP paths; passing one selects the
-    HF-decoder equivalents (see _DecoderLayout). The "c_proj" capture kinds keep
-    their names on both paths -- on a decoder they resolve to mlp.down_proj,
-    which plays the same residual-writing role.
+    ``family_adapter=None`` selects the CLIP paths; passing one selects the HF-decoder equivalents
+    (`_DecoderLayout`). The "c_proj" kinds keep their names on both and resolve to ``mlp.down_proj`` on a decoder.
     """
     output = {key: [] for key in requests}
     for batch_values in iter_capture_tokens(model, batches, requests, device, family_adapter=family_adapter):
@@ -352,35 +327,17 @@ def capture_block_gradients(
     *,
     family_adapter=None,
 ):
-    """Capture block-boundary gradients ``dL/dT_j`` for the gradient-aligned
-    Procrustes source (``DirectResidualConfig.procrustes_source="gradient"``).
+    """Capture block-output gradients ``dL/dT_j`` for ``procrustes_source="gradient"``.
 
-    For every batch, runs one forward+backward pass of
-    ``recipe(model, batch) -> (scalar_loss, named_params)`` (a
-    ``models.grad_recipes.GradRecipe``, e.g. ``clip_contrastive_recipe`` --
-    mean-reduced CE, exactly BiCo's statistic) and stores each requested
-    resblock's ``grad_output[0]`` -- the gradient of the loss with respect to
-    that block's OUTPUT, i.e. the same tensor `capture_tokens`'s ``"boundary"``
-    kind captures in the forward pass -- as CPU float32, in the same
-    `_to_tokens` ``[B,T,D]`` token layout. ``requests`` maps an arbitrary key
-    to a resblock index (there is only one capture kind here, so no
-    ``(index, kind)`` pair is needed).
+    Per batch, runs forward+backward of ``recipe(model, batch) -> (scalar_loss, named_params)`` (a
+    ``models.grad_recipes.GradRecipe``, mean-reduced CE as in BiCo) and stores each requested block's
+    ``grad_output[0]`` (the same tensor as `capture_tokens`'s ``"boundary"`` kind) as CPU float32 ``[B,T,D]``.
+    ``requests`` maps a key to a block index.
 
-    Mirrors `rebase.methods.bico._collect_batch`'s forward+backward pattern:
-    ``model.zero_grad(set_to_none=True)`` both before and after each batch's
-    backward pass, so no parameter gradient is ever retained. Every
-    parameter's ``requires_grad`` is temporarily forced ``True`` for the
-    capture (so the backward graph reaches every block even when the model is
-    normally used frozen/inference-only) and restored -- together with
-    ``training`` mode and device placement -- on return, including on any
-    exception. This function never mutates a parameter's *value*, only reads
-    gradients off the graph; callers that want a belt-and-braces check can
-    compare ``model.state_dict()`` before/after (see
-    ``tests/test_direct_residual_gradient_procrustes.py``).
-
-    Vision only: raises `NotImplementedError` for a non-``None``
-    ``family_adapter``, since block-boundary gradient capture has no decoder
-    equivalent yet.
+    Follows `rebase.methods.bico._collect_batch`: ``zero_grad(set_to_none=True)`` before and after each
+    backward, so no parameter gradient is retained. ``requires_grad`` is forced ``True`` for the capture and
+    restored, together with train mode and device, on return or exception. Parameter values are never mutated.
+    Vision only: ``NotImplementedError`` for a non-``None`` ``family_adapter``.
     """
     if family_adapter is not None:
         raise NotImplementedError("capture_block_gradients is vision-only")
@@ -520,43 +477,21 @@ def capture_paired_boundary_activations(
     source_recipe=None,
     target_recipe=None,
 ) -> dict[str, Any]:
-    """Capture native boundary activations for every position Direct Residual fits.
+    """Capture native boundary activations for every position Ariadne fits.
 
-    For every target position ``j`` in ``range(pairing.target_depth)``,
-    captures ``source_base``/``source_ft`` boundary activations at
-    ``pairing.pairing[j]`` -- deduplicated, since under extend many target
-    positions share one source index and there is no reason to run the same
-    forward pass twice -- and ``target_base`` boundary activations at ``j``
-    itself. Uses `capture_tokens`/`paired_calibration` from
-    `target_informed_runtime` unchanged: both already operate on
-    ``(model, batches, requests)``/``(source_loader, target_loader)``, never
-    on an ARIADNE realized-extension layout, so nothing here reaches into
-    that machinery.
+    For every target position ``j`` in ``range(pairing.target_depth)``, captures ``source_base``/``source_ft``
+    boundary activations at ``pairing.pairing[j]`` (deduplicated: under extend several target positions share
+    one source index) and ``target_base`` activations at ``j``, via `capture_tokens`/`paired_calibration`.
+    No model is resized and no correction is fitted; the models are used at their native depths.
 
-    No structural resize of any model happens (the three models passed in are
-    used exactly as given, at their native depths) and no correction is
-    fitted -- this function only captures activation banks.
+    ``procrustes_source="gradient"`` additionally captures block-boundary gradients (``dL/dT_i`` on
+    ``source_base_model`` at each distinct paired source index, ``dL/dT_j`` on ``target_base_model`` at every
+    position) with `capture_block_gradients`, using ``source_recipe``/``target_recipe`` (both required) on the
+    SAME paired batches; ``source_ft_model`` is never differentiated. Stored under
+    ``"source_base_gradients"``/``"target_base_gradients"``, keyed by index. Vision only.
 
-    ``procrustes_source="gradient"`` (``DirectResidualConfig.procrustes_source``)
-    additionally captures block-boundary GRADIENTS -- ``dL/dT_i`` on
-    ``source_base_model`` at every distinct paired source index, and
-    ``dL/dT_j`` on ``target_base_model`` at every target position -- via
-    ``ariadne.capture.capture_block_gradients``, using
-    ``source_recipe``/``target_recipe`` (each model's own
-    ``models.grad_recipes.clip_contrastive_recipe``, exactly BiCo's
-    recipe/statistic) on the SAME paired calibration batches the activation
-    banks above use. ``source_ft_model`` is never used for gradients (BiCo
-    only ever differentiates through base models). Stored under
-    ``"source_base_gradients"``/``"target_base_gradients"``, keyed by index
-    like the activation banks. Both recipes are required in gradient mode.
-    Vision only: `capture_block_gradients` raises `NotImplementedError` for a
-    non-``None`` ``family_adapter``.
-
-    The returned dict also carries the replayed target-side calibration
-    batches (under ``"target_batches"``) so `fit_direct_residual` can re-run
-    forward passes against the (possibly partially-corrected) target model
-    during the solve without needing the original `target_loader` again.
-
+    The result also carries the replayed target-side batches (``"target_batches"``) so `fit_direct_residual`
+    can re-run forward passes on the partially-corrected target model without the original `target_loader`.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -569,10 +504,8 @@ def capture_paired_boundary_activations(
     source_batches, target_batches, metadata = paired_calibration(
         source_loader, target_loader, num_batches=num_batches, seed=seed
     )
-    # Deduplicate: under extend, many target positions share one source
-    # index, and capturing it twice would be wasted compute and (worse) a
-    # second, potentially non-identical activation bank for the same index
-    # if anything upstream were ever non-deterministic.
+    # Deduplicate: under extend many target positions share one source index; capturing it twice would waste
+    # compute and risk a second, non-identical bank for the same index if anything upstream were nondeterministic.
     distinct_source_indices = sorted(set(pairing.pairing))
     source_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
     target_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}

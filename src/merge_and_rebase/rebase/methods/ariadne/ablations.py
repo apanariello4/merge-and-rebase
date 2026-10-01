@@ -27,16 +27,11 @@ Tensor = torch.Tensor
 
 
 def _replay_block_components(shim, local_block, x_batches, components, device):
-    """Run ``local_block`` directly (no full-model forward) over ``x_batches``,
-    hooking each of ``components`` (``attn.out_proj`` / ``mlp.c_proj`` only) for
-    its own input, plus the block's own output.
+    """Run ``local_block`` directly over ``x_batches``, hooking the input of each of ``components``
+    (``attn.out_proj`` / ``mlp.c_proj``) plus the block output.
 
-    ``local_block`` is a standalone (already-unwrapped) block module -- e.g. a
-    ``copy.deepcopy`` of ``shim.block_module(...)`` -- called with a single
-    positional tensor, mirroring how ``_VisionLayout.forward``/``_encode_image``
-    invoke every block during an ordinary full-model sweep. Returns
-    ``(component_h_batches, out_batches)``, both CPU float32, same convention as
-    ``capture_tokens``.
+    ``local_block`` is a standalone block called with one positional tensor, as in a full-model sweep.
+    Returns ``(component_h_batches, out_batches)``, CPU float32, same convention as ``capture_tokens``.
     """
     handles = []
     component_h: dict[str, list[torch.Tensor]] = {c: [] for c in components}
@@ -44,9 +39,8 @@ def _replay_block_components(shim, local_block, x_batches, components, device):
         if "attn.out_proj" in components:
             attn = shim.attn_module(local_block)
             if isinstance(attn, nn.MultiheadAttention):
-                # A stock nn.MultiheadAttention applies out_proj functionally
-                # (see capture_tokens' own docstring): hook the attention
-                # itself and recompute the rows it fed the projection.
+                # Stock nn.MultiheadAttention applies out_proj functionally: hook the attention
+                # and recompute the rows it fed the projection.
                 def attn_hook(mod, args, kwargs, value, *, store=component_h["attn.out_proj"]):
                     rows = _stock_mha_out_proj_input(mod, args, kwargs)
                     _verify_recomputed_attention_input(mod, rows, value)
@@ -54,9 +48,8 @@ def _replay_block_components(shim, local_block, x_batches, components, device):
 
                 handles.append(attn.register_forward_hook(attn_hook, with_kwargs=True))
             else:
-                # A plain (non-MHA) attention wrapper calls out_proj as an
-                # ordinary submodule, so a direct forward hook on it fires
-                # normally -- same fallback capture_tokens itself takes.
+                # Plain attention wrapper: out_proj is an ordinary submodule, hook it directly
+                # (same fallback as capture_tokens).
                 proj = shim.attn_proj_module(local_block)
 
                 def proj_hook(_m, inputs, _value, *, store=component_h["attn.out_proj"]):
@@ -99,24 +92,11 @@ def _mount_all_deltas(shim, local_block, order, base, deltas):
 
 
 def _backfit_data_fit_sq(shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas):
-    """``||D_j - (block_j(X_j^0; deltas mounted) - T_j^0)||_F^2`` -- the (un-linearized,
-    measured on the actual local block replay) data-fit term of the safeguarded
-    backfit objective ``J(Delta)``. See ``_fit_block_boundary_backfit``'s docstring.
+    """``||D_j - (block_j(X_j^0; deltas mounted) - T_j^0)||_F^2``: data-fit term of the backfit objective J(Delta).
 
-    ``local_block64`` is a dedicated float64 replica of the block (see
-    ``_fit_block_boundary_backfit``), used ONLY for this measurement -- never
-    for the candidate sub-solves, whose CPU-float32 delta convention is
-    unaffected. The accept/backtrack decision this feeds compares two J
-    values that can be arbitrarily close near a fixed point (a near-singular
-    Gauss-Seidel design, e.g., can leave genuine per-sweep improvements far
-    below float32's ~1e-7 relative precision); evaluating in the module's own
-    float32 would let ordinary float32 rounding noise in the forward pass
-    flip the accept/reject decision and stall the sweep well short of
-    convergence -- exactly the kind of numerical noise a *safeguard*
-    (whose entire job is a reliable ``<`` comparison) must not be sensitive
-    to. ``_mount_component``'s own ``.to(module.weight.dtype)`` upcasts the
-    float32 base/delta tensors to float64 automatically since
-    ``local_block64``'s parameters are float64.
+    ``local_block64`` is a dedicated float64 replica used ONLY for this measurement: the accept/backtrack
+    comparison of two nearly equal J values must not be flipped by float32 forward-pass rounding noise.
+    ``_mount_component`` upcasts the float32 base/delta tensors to float64 automatically.
     """
     _mount_all_deltas(shim, local_block64, order, base, deltas)
     t_all = [local_block64(x.to(device).double()).detach().cpu().clone() for x in x_batches]
@@ -127,12 +107,9 @@ def _backfit_data_fit_sq(shim, local_block64, device, x_batches, d_batches, t0_b
 
 
 def _backfit_ridge_penalty(order, deltas, lambdas):
-    """``sum_c lambda_c * ||Delta W_c||_F^2`` -- the exact penalty
-    ``ResidualSufficientStatistics.solve`` minimizes for the weight (the bias is
-    fit unpenalized; see ``_fit_block_boundary_backfit``'s docstring), evaluated
-    with each component's FROZEN round-1 ``lambda_c`` from ``lambdas``. A
-    component with no ``lambdas`` entry yet (never solved) contributes 0, which
-    is always exact since its delta is still zero at that point.
+    """``sum_c lambda_c * ||Delta W_c||_F^2``: the exact weight penalty ``ResidualSufficientStatistics.solve``
+    minimizes (bias unpenalized), with each component's FROZEN round-1 ``lambda_c`` from ``lambdas``.
+    A component with no entry yet contributes 0 (exact: its delta is still zero).
     """
     total = 0.0
     for c in order:
@@ -167,87 +144,29 @@ def _fit_block_boundary_backfit(
     device,
     family_adapter=None,
 ) -> dict[int, tuple[dict, list]]:
-    """Intra-block Gauss-Seidel backfitting for ``component_target='block_boundary'``,
-    ``block_split='backfit'`` (Direct Residual only; see ``DirectResidualConfig``).
+    """Intra-block Gauss-Seidel backfit for ``component_target='block_boundary'``, ``block_split='backfit'``.
 
-    Every position is independent (the upstream target model is pristine, as
-    everywhere else under independent mode), and every component within one
-    position shares the SAME block-boundary target ``D_j`` -- exactly as
-    ``_fit_all_positions_independent`` -- but instead of regressing each
-    component independently against the full ``D_j`` (leaving a "double
-    target" when more than one component is requested), this refits each
-    component against the RESIDUAL left over once every other component's
-    current fit is actually mounted and the block is replayed:
+    Ablation arm (not used in current experiments; kept); vision-only. Positions are independent (pristine upstream
+    target). Within a position all components share the block target ``D_j``; each component is refit against
+    the residual left with the other components mounted on a replayed local block copy:
 
         E_c = D_j - (block_j(X_j^0; others mounted, c at its native base) - T_j^0)
 
-    Gauss-Seidel over ``components`` (canonical forward order), from scratch
-    every sweep (no warm start -- ``ResidualSufficientStatistics`` solves a
-    fresh ridge system each time, exactly as every other direct-target fit
-    does).
+    Safeguarded (monotone) objective, measured on the actual block replay:
 
-    Monotone safeguarded backfitting. Each Gauss-Seidel sub-step refits
-    component ``c`` against ``E_c`` above, but ``c``'s update also changes
-    the OTHER component's effect through the block's own nonlinear path
-    (``attn.out_proj -> ln_2 -> GELU -> mlp.c_proj``'s input, on ViT), so the
-    sub-step candidate is not an exact block-coordinate minimizer of the true
-    objective and nothing prevents it from increasing that objective. This is
-    fixed by measuring the true, un-linearized per-block objective on the
-    local block replay,
+        J(Delta) = ||D_j - (block_j(X_j^0; Delta mounted) - T_j^0)||_F^2 + sum_c lambda_c ||Delta W_c||_F^2.
 
-        J(Delta) = ||D_j - (block_j(X_j^0; Delta mounted) - T_j^0)||_F^2
-                   + sum_c lambda_c * ||Delta W_c||_F^2,
+    ``lambda_c`` is ``solve``'s ``diag["ridge"]`` FROZEN at its first-sweep value so J is a fixed function of
+    Delta (bias unpenalized). Each sub-step computes the candidate from scratch (no warm start), accepts it only
+    if J decreases, else backtracks Delta_c = old + eta (new - old) (weight and bias) for eta = 1, 1/2, ..., 1/256;
+    if none decreases J, Delta_c keeps its old value (eta recorded as 0). Sweeps stop when the relative J decrease
+    over a sweep is below ``config.backfit_tol`` or at ``config.backfit_max_iters``. The relative residual ``r`` is
+    logged every sweep (``backfit_residual_trace``) but does not drive stopping.
 
-    and only ever accepting a change that decreases it. ``lambda_c`` is each
-    component's ridge coefficient -- ``ResidualSufficientStatistics.solve``'s
-    ``diag["ridge"]`` -- FROZEN at the value its round-1 (first sweep) solve
-    returns, not recomputed every sweep: the whole point of a monotone
-    descent objective is that it is a fixed function of ``Delta``, so a
-    ridge that itself drifts sweep to sweep (as it does inside ``solve``,
-    since it is a function of that sweep's own H_c statistics, which change
-    as other components' deltas move) would make "J decreased" incomparable
-    across sweeps. ``lambda_c`` penalizes ``Delta W_c`` (the weight only) at
-    the SAME scale ``solve`` itself minimizes: its normal equations are
-    ``S_c X G + lambda X = B_c``, i.e. the stationarity condition of
-    ``||A X L - E||_F^2 + lambda ||X||_F^2`` with the bias fit unpenalized
-    (``solve``'s ``beta`` is derived with no ridge term) -- so
-    ``lambda_c * ||Delta W_c||_F^2`` is exactly what that component's own
-    sub-solve minimizes, with ``Delta W_c`` the returned weight correction
-    itself (``solve`` returns ``x.T``, and the penalty ``lambda ||x||_F^2``
-    is transpose-invariant).
-
-    Each sub-step computes the candidate ``Delta_c^new`` exactly as the
-    unsafeguarded rule did, then accepts it only if ``J`` decreases;
-    otherwise backtracks ``Delta_c = Delta_c^old + eta (Delta_c^new -
-    Delta_c^old)`` (weight AND bias together) for ``eta = 1, 1/2, 1/4, ...``
-    down to ``1/256`` (an initial full step plus up to 8 halvings); if no
-    ``eta`` decreases ``J``, ``Delta_c`` is left at ``Delta_c^old``
-    (recorded as an accepted ``eta`` of 0). ``J`` is therefore non-increasing
-    by construction, at every sub-step and therefore every sweep. Sweeping
-    stops when the relative decrease of ``J`` over a full sweep (measured
-    once, with every current delta mounted, after each sweep's Gauss-Seidel
-    pass) drops below ``config.backfit_tol``, or at
-    ``config.backfit_max_iters`` sweeps. The plain relative residual
-    ``r = ||D_j - (block_j(X_j^0; ALL current deltas mounted) - T_j^0)||_F /
-    ||D_j||_F`` is still measured and logged every sweep as a diagnostic
-    (``backfit_residual_trace``), but no longer drives the stopping rule.
-
-    With a single component, the first sweep's ``E_c`` reduces exactly to
-    ``D_j`` (no other component is mounted, so the replay term is
-    ``T_j^0 - T_j^0 = 0``), so the fit is byte-for-byte the single-component
-    call of ``_fit_all_positions_independent`` PROVIDED the replayed
-    ``H_c``/output from the local block copy on the captured pristine
-    ``X_j^0`` bitwise reproduce what a direct hook on the live target model
-    would have captured -- asserted below (see ``block_replay_bitwise`` in the
-    returned diagnostics) rather than assumed. With one component there is
-    also nothing to backtrack against on later sweeps: the candidate is
-    always accepted at ``eta=1`` (see the docstring of
-    ``_fit_block_boundary_backfit``'s test coverage), since a single
-    component's own sub-solve is an exact minimizer of ``J`` restricted to
-    that component with every OTHER (nonexistent) component fixed.
-
-    The full target model is never mutated: every mount happens on a
-    ``copy.deepcopy`` of the block, discarded at the end of each position.
+    With one component the first-sweep ``E_c`` equals ``D_j``, so the fit equals the single-component
+    ``_fit_all_positions_independent`` call PROVIDED the replayed ``H_c``/output bitwise reproduce the live
+    target-model capture; this is checked, not assumed (``block_replay_bitwise`` in the diagnostics).
+    The target model is never mutated: mounts happen on a ``copy.deepcopy`` of the block, discarded per position.
     """
     if family_adapter is not None:
         raise NotImplementedError("block_split='backfit' is vision-only")
@@ -263,9 +182,8 @@ def _fit_block_boundary_backfit(
     if not order:
         raise ValueError("components must not be empty")
 
-    # Capture the pristine block input X_j^0 for every position in ONE target
-    # sweep -- new capture kind, the forward-hook INPUT of the block module
-    # itself (the same module "boundary" hooks for its OUTPUT).
+    # Capture the pristine block input X_j^0 for every position in ONE target sweep
+    # (forward-hook INPUT of the block module).
     block_input_requests = {f"{pos}.block_input": (pos, "block_input") for pos in positions}
     block_inputs = capture_tokens(target_model, batches, block_input_requests, device, family_adapter=family_adapter)
 
@@ -277,22 +195,11 @@ def _fit_block_boundary_backfit(
         block = shim.blocks(target_model)[pos]
         local_block = copy.deepcopy(shim.block_module(block)).to(device).eval()
 
-        # Device convention: every "delta" tensor this function accumulates
-        # (base[c], deltas[c], and everything derived from them) lives on CPU
-        # float32, exactly like ResidualSufficientStatistics.solve()'s own
-        # output (`correction = correction.cpu()` below) and like
-        # _fit_all_positions_independent's `current_state` bookkeeping.
-        # `local_block` itself is moved to `device` (mirroring how the live
-        # target model would sit on a training device at runtime), so its
-        # parameters -- and therefore _component_weight_bias's raw read of
-        # them -- are on `device`. Without the explicit `.cpu()` here, `base[c]`
-        # would silently inherit that device, and `base[c2][0] + w2` below (w2
-        # is always a CPU delta) would mix a CUDA tensor with a CPU one -- a
-        # RuntimeError on CUDA that a CPU-only run can never surface, since
-        # cpu + cpu never errors regardless of provenance. _mount_component
-        # is the only place a base/delta tensor is moved back onto `device`
-        # (via its own `.to(module.weight.device)`), so mounting stays correct
-        # regardless of what device `local_block` lives on.
+        # Device convention: base/deltas (and everything derived) live on CPU float32, like
+        # ResidualSufficientStatistics.solve() output and _fit_all_positions_independent's current_state.
+        # base[c] needs the explicit .cpu(): otherwise it inherits local_block's device and
+        # `base[c2][0] + w2` (CPU delta) would raise on CUDA, which a CPU-only run never surfaces.
+        # _mount_component is the only place tensors move back onto `device`.
         base: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {}
         for c in order:
             w, b, row_slice = _component_weight_bias(shim, local_block, c)
@@ -300,11 +207,8 @@ def _fit_block_boundary_backfit(
                 raise RuntimeError("block_split='backfit' components must not be packed (row_slice must be None)")
             base[c] = (w.detach().cpu().clone(), None if b is None else b.detach().cpu().clone())
         scale_modules = {c: shim.component_scale_module(local_block, c) for c in order}
-        # A dedicated float64 replica, used ONLY by the monotone safeguard's own
-        # J(Delta) measurement (see _backfit_data_fit_sq's docstring) -- never
-        # for candidate generation, so the returned corrections' CPU-float32
-        # convention is untouched. Deepcopied here while `local_block` is still
-        # pristine (nothing has been mounted onto it yet).
+        # Float64 replica for the J(Delta) measurement only (see _backfit_data_fit_sq); copied
+        # while local_block is still pristine.
         local_block64 = copy.deepcopy(local_block).double().eval()
 
         def reset_all(local_block=local_block, order=order, base=base):
@@ -346,9 +250,7 @@ def _fit_block_boundary_backfit(
         per_component_h: dict[str, list] = {}
         per_component_effective_out: dict[str, torch.Tensor] = {}
         per_component_eta_history: dict[str, list[float]] = {c: [] for c in order}
-        # Backtracking line-search factors: an initial full step, then up to 8
-        # halvings (see the docstring). eta=0 (keep the old delta) is the
-        # implicit fallback when none of these decrease J.
+        # Backtracking factors: full step, then up to 8 halvings; eta=0 (keep old delta) is the implicit fallback.
         backtrack_etas = [1.0] + [1.0 / (2**k) for k in range(1, 9)]
         for sweep in range(1, int(config.backfit_max_iters) + 1):
             n_sweeps = sweep
@@ -389,13 +291,8 @@ def _fit_block_boundary_backfit(
                 per_component_h[c] = h_batches
                 per_component_effective_out[c] = effective_out
 
-                # Freeze lambda_c at its round-1 (first-solve) value: J must stay
-                # a FIXED function of Delta across the whole backfit for "J
-                # decreased" to be comparable sweep to sweep (see the docstring).
-                # solve()'s own internal ridge is recomputed every sweep from
-                # that sweep's H_c -- that only shapes the CANDIDATE proposed
-                # below, never the objective the safeguard accepts or rejects
-                # against.
+                # Freeze lambda_c at its first-sweep value so J stays a FIXED function of Delta;
+                # solve()'s per-sweep ridge only shapes the candidate, not the accept test.
                 if sweep == 1:
                     lambdas[c] = float(diag["ridge"])
 
@@ -429,10 +326,7 @@ def _fit_block_boundary_backfit(
                         break
                 deltas[c] = accepted_delta
                 per_component_eta_history[c].append(accepted_eta)
-            # Measure the full-sweep objective and diagnostic residual with every
-            # current delta mounted -- the same mount _backfit_objective performs,
-            # done once more here only because we also want the plain (ridge-free)
-            # data-fit norm `r` for the diagnostic trace.
+            # Full-sweep J and ridge-free data-fit norm r (diagnostic) with every current delta mounted.
             j_now, data_fit_sq = _backfit_objective(
                 shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas, lambdas
             )
@@ -525,19 +419,12 @@ def _fit_block_boundary_backfit(
 
 
 class _JointBlockRidgeStatistics:
-    """Streaming Gram/cross accumulator for the closed-form joint (O, D)-stacked
-    ridge fit ``block_split='joint'`` uses (see ``_fit_block_boundary_joint``).
+    """Streaming Gram/cross accumulator for the joint (O, D)-stacked ridge fit of ``block_split='joint'``.
 
-    Mirrors ``ResidualSufficientStatistics`` at ``t_in=None, t_out=I`` (the only
-    configuration ``block_split='joint'`` ever needs -- LayerScale is asserted
-    ``nn.Identity`` before this class is ever touched), generalized from one
-    ridge scalar to a per-block-diagonal ridge vector over the STACKED feature
-    dimension ``sum(dims)``. Accumulates the ``(d_total, d_total)`` Gram and
-    ``(d_total, d_out)`` cross statistics batch by batch in float64, never
-    materializing a design matrix with as many rows as calibration tokens (the
-    Gram/cross tensors are the only ``O(d^2)``-sized state this class holds --
-    ``d_total = d_O + d_D`` is a few thousand for ViT-L/14, not the token
-    count).
+    Mirrors ``ResidualSufficientStatistics`` at ``t_in=None, t_out=I`` (LayerScale is asserted Identity before
+    use) with a block-diagonal ridge vector over the stacked feature dim ``sum(dims)``. Accumulates the
+    ``(d_total, d_total)`` Gram and ``(d_total, d_out)`` cross statistics in float64 batch by batch; no
+    token-sized design matrix is materialized.
     """
 
     def __init__(self, dims: list[int], d_out: int, device=None) -> None:
@@ -580,20 +467,11 @@ class _JointBlockRidgeStatistics:
         self.n_rows += int(a.shape[0])
 
     def solve(self, lambdas: list[float]) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Exact centered normal-equation solve with a block-diagonal ridge.
+        """Exact centered normal-equation solve ``(S_c + diag(lambda)) X = B_c`` with a block-diagonal ridge.
 
-        Returns ``(x, beta, diag)`` with ``x`` shaped ``(d_total, d_out)`` (the
-        stacked, UNTRANSPOSED weight -- callers split it by ``self.dims`` and
-        transpose each block to the usual ``(out, in)`` weight convention) and
-        ``beta`` the shared ``(d_out,)`` intercept solved jointly with ``x``
-        (not ridge-penalized, matching ``ResidualSufficientStatistics.solve``'s
-        own convention).
-
-        Equivalent to rescaling features by ``1/sqrt(lambda_c)`` per block and
-        solving with unit ridge (the textbook reduction of a block-diagonal
-        ridge to a scalar one), but implemented directly on the centered normal
-        equations ``(S_c + diag(lambda)) X = B_c`` -- exact in float64, no
-        rescale/un-rescale round trip.
+        Returns ``(x, beta, diag)``: ``x`` is ``(d_total, d_out)``, stacked and UNTRANSPOSED (callers split it by
+        ``self.dims`` and transpose each block to ``(out, in)``); ``beta`` is the shared ``(d_out,)`` intercept,
+        not ridge-penalized (as in ``ResidualSufficientStatistics.solve``). Float64 throughout.
         """
         if len(lambdas) != len(self.dims):
             raise ValueError("lambdas must supply one ridge coefficient per stacked component")
@@ -617,9 +495,8 @@ class _JointBlockRidgeStatistics:
         reg = sc + torch.diag(lam_vec)
         x = torch.linalg.solve(reg, bc)
         beta = mu_e - x.T @ mu_a
-        # Exact total ||A x + 1 beta^T - E||_F^2 from raw (uncentered) sufficient
-        # statistics -- same decomposition as ResidualSufficientStatistics.
-        # _residual_sq, specialized to t_out=I (g=I, lmat=I).
+        # Exact ||A x + 1 beta^T - E||_F^2 from raw sufficient statistics, as in
+        # ResidualSufficientStatistics._residual_sq with t_out=I (g=I, lmat=I).
         predicted_sq = torch.trace(x.T @ s @ x).item()
         cross_term = 2.0 * torch.sum(x * self.cross).item()
         resid_no_bias = self.sum_e2 - cross_term + predicted_sq
@@ -648,64 +525,26 @@ def _fit_block_boundary_joint(
     device,
     family_adapter=None,
 ) -> dict[int, tuple[dict, list]]:
-    """Closed-form joint ridge fit for ``component_target='block_boundary'``,
-    ``block_split='joint'`` (Direct Residual only; see ``DirectResidualConfig``).
+    """Closed-form joint ridge fit for ``component_target='block_boundary'``, ``block_split='joint'`` (ablation).
 
-    Where ``block_split='none'`` fits every requested component INDEPENDENTLY
-    against the same block-boundary target ``D_j`` (double-counting the target
-    when more than one component is requested) and ``block_split='backfit'``
-    resolves that by iterative Gauss-Seidel replay of the block's own
-    nonlinearity, ``'joint'`` instead solves ONE closed-form ridge in a single
-    linear-algebra step, under the explicit first-order approximation that the
-    MLP does not respond to a change in ``attn.out_proj`` (``J_M = 0``): with
-    ``H_O``/``H_D`` the pristine ``attn.out_proj``/``mlp.c_proj`` inputs (the
-    SAME captures ``_fit_all_positions_independent`` uses) and
-    ``D_j`` the block-boundary desired effect,
+    Solves ONE ridge under the first-order approximation that the MLP does not respond to a change in
+    ``attn.out_proj``; with ``H_O``/``H_D`` the pristine ``attn.out_proj``/``mlp.c_proj`` inputs (same captures
+    as ``_fit_all_positions_independent``) and ``D_j`` the block-boundary desired effect,
 
-        min_{Wo,Wd,beta} ||H_O Wo^T + H_D Wd^T + 1 beta^T - D_j||_F^2
-                          + lambda_O ||Wo||_F^2 + lambda_D ||Wd||_F^2.
+        min_{Wo,Wd,beta} ||H_O Wo^T + H_D Wd^T + 1 beta^T - D_j||_F^2 + lambda_O ||Wo||_F^2 + lambda_D ||Wd||_F^2.
 
-    Only valid for ``components`` a non-empty subset of
-    ``{"attn.out_proj", "mlp.c_proj"}`` (enforced by
-    ``config.parse_direct_residual_config``).
+    ``components`` must be a non-empty subset of ``{"attn.out_proj", "mlp.c_proj"}`` (enforced by
+    ``config.parse_direct_residual_config``). Positions are independent and pristine, so ``E_j == D_j``.
 
-    **lambda_c convention.** Each component's ridge coefficient is EXACTLY the
-    value its OWN standalone ``block_split='none'`` fit would use --
-    ``ResidualSufficientStatistics.solve(...)``'s own ``diag["ridge"]``,
-    computed from that component's own ``H_c`` and the ridge_relative/
-    ridge_estimator/exact_form config, penalizing ``Delta W_c`` (the weight
-    only; the joint intercept below is unpenalized) at the identical scale
-    ``solve`` itself would use it at alone -- see
-    ``tests/test_direct_residual_joint.py``'s ``test_lambda_matches_single_
-    component_solver`` for the regression pinning this.
-
-    **Bias convention.** The joint intercept is not identifiable between the
-    two components' biases (only their sum enters the objective). The WHOLE
-    fitted intercept is assigned to ``mlp.c_proj.bias`` -- the block's LAST
-    residual writer -- and ``attn.out_proj.bias`` is left untouched (a zero
-    delta): ``attn.out_proj``'s bias also feeds the MLP's input on the real
-    (nonlinear) block, which this first-order joint model ignores by
-    construction, so it must not absorb any share of the block-level
-    intercept a purely-linear model derived. With a single requested component
-    this convention is moot -- see below.
-
-    **LayerScale.** Asserted ``nn.Identity`` on both ``ls_1``/``ls_2`` before
-    any solve (``_assert_layerscale_identity``): a nontrivial LayerScale would
-    give the two writers different output gammas, which the stacked-feature
-    derivation above assumes away.
-
-    **Single-component reduction.** With one requested component, this
-    function does not build a (degenerate, one-block) joint system at all --
-    it returns that component's own standalone ``block_split='none'`` solve
-    directly (the same ``ResidualSufficientStatistics`` call this function
-    computes ``lambda_c`` from in the first place), so single-component
-    ``block_split='joint'`` is not merely numerically close to
-    ``block_split='none'`` but literally the same function call.
-
-    Every position is independent and pristine (nothing is ever mounted
-    between fits, matching every other Direct Residual path), so ``E_j ==
-    D_j`` identically and this reuses ``capture_tokens``'s combined-request,
-    one-sweep capture exactly like ``_fit_all_positions_independent``.
+    lambda_c: exactly the value the component's standalone ``block_split='none'`` fit would use
+    (``ResidualSufficientStatistics.solve`` ``diag["ridge"]``); pinned by
+    ``tests/test_direct_residual_joint.py::test_joint_lambda_matches_single_component_solver_ridge``.
+    Bias: the intercept is not identifiable between the two biases; the WHOLE intercept goes to the LAST residual
+    writer (``mlp.c_proj.bias``) and ``attn.out_proj.bias`` gets a zero delta (its bias feeds the MLP on the real
+    nonlinear block, which this first-order model ignores).
+    LayerScale: asserted ``nn.Identity`` on ``ls_1``/``ls_2`` (``_assert_layerscale_identity``).
+    Single component: returns that component's standalone ``block_split='none'`` solve verbatim (the same
+    ``ResidualSufficientStatistics`` call), not merely a numerically close fit.
     """
     shim = _layout_for(family_adapter)
     residual_writers = set(COMPONENT_FORWARD_ORDER)
@@ -734,9 +573,8 @@ def _fit_block_boundary_joint(
         d_batches = desired_batches[pos]
         t0_batches = target_output_batches[pos]
 
-        # The block hasn't been touched yet at this position (independent
-        # mode, pristine by construction): the pre-fit effect is the SAME for
-        # every component, so it is measured once rather than per component.
+        # Block is pristine at this position (independent mode): the pre-fit effect is shared by
+        # all components, so it is measured once.
         desired_sq = 0.0
         effect_sq = 0.0
         error_batches = []
@@ -782,11 +620,8 @@ def _fit_block_boundary_joint(
         position_corrections: dict[str, torch.Tensor] = {}
         block_rows: list[dict[str, Any]] = []
         if len(order) == 1:
-            # See the docstring: the bias-split convention below is only
-            # meaningful with both writers present, so a single requested
-            # component just IS the standalone block_split='none' fit -- the
-            # identical ResidualSufficientStatistics call computed above for
-            # lambda_c, reused verbatim rather than resolved.
+            # Single component: just the standalone block_split='none' fit (see docstring), reusing
+            # the solve above.
             (component,) = order
             correction, diag = single_component_fit[component]
             key = shim.component_key(pos, component, prefixed=True)
@@ -831,12 +666,8 @@ def _fit_block_boundary_joint(
             results[pos] = (position_corrections, block_rows)
             continue
 
-        # Genuine joint (>=2 component) stacked solve. `dims` is each
-        # component's own INPUT feature width (H_c's last dim -- e.g.
-        # mlp.c_proj's input is d_model*mlp_ratio, NOT its output width
-        # `widths[c]`, which is d_model like every other residual writer's
-        # OUTPUT). d_out is read off the block's own boundary output bank
-        # (the shared regression target every component's H_c writes into).
+        # Genuine joint (>=2 components) solve. dims = each component's INPUT feature width (H_c last dim;
+        # mlp.c_proj: d_model*mlp_ratio, not its output width); d_out from the block boundary output bank.
         dims = [int(h_batches_by_component[c][0].shape[-1]) for c in order]
         d_out = int(out_batches[0].shape[-1])
         joint_stats = _JointBlockRidgeStatistics(dims, d_out, device=device)
@@ -861,9 +692,7 @@ def _fit_block_boundary_joint(
             position_corrections[key] = correction
             current_state[key] = current_state[key] + correction.to(current_state[key])
             bias_key = f"{key[: -len('.weight')]}.bias"
-            # See the docstring: the whole joint intercept goes to the LAST
-            # residual writer (mlp.c_proj in the historical two-writer case);
-            # every other component's bias gets an exact zero delta.
+            # Whole joint intercept goes to the LAST residual writer; others get an exact zero bias delta.
             bias_correction = beta if component == last_writer else torch.zeros_like(beta)
             skip_bias = _apply_bias_correction(config, current_state, bias_key, bias_correction, position_corrections)
             _single_correction, single_diag = single_component_fit[component]
@@ -914,12 +743,10 @@ def _fit_block_boundary_joint(
 
 
 def _apply_bias_correction(config, current_state, bias_key, bias_correction, position_corrections) -> bool:
-    """Shared ``missing_bias`` handling for a single component's bias delta
-    (extracted from the ``block_split in {'none', 'backfit'}`` paths so
-    ``block_split='joint'`` follows the exact same ``error``/``materialize``/
-    ``skip`` contract). Mutates ``position_corrections`` in place with the
-    accepted bias delta (unless skipped) and returns whether the bias was
-    skipped.
+    """Shared ``missing_bias`` handling for one component's bias delta (error/materialize/skip contract).
+
+    Updates ``position_corrections`` and ``current_state`` with the accepted bias delta (unless skipped);
+    returns whether the bias was skipped.
     """
     if bias_key not in current_state:
         if config.missing_bias == "materialize":
@@ -951,9 +778,7 @@ def _apply_bias_correction(config, current_state, bias_key, bias_correction, pos
     return False
 
 
-# Below-epsilon ||D_j|| positions have no reliable ratio r_j = ||delta T_j|| /
-# ||D_j||; per_block's guard keeps s_j frozen for that position/iteration
-# rather than dividing by (near) zero.
+# ||D_j|| below this has no reliable ratio r_j; per_block keeps s_j frozen for that position/iteration.
 _TV_SCALING_D_NORM_EPS = 1e-8
 
 
@@ -967,15 +792,10 @@ def _tau_frobenius_norm(sd: Mapping[str, Tensor]) -> float:
 def _position_delta(
     shim, position: int, components: tuple[str, ...], target_corrections: Mapping[str, Tensor]
 ) -> dict[str, Tensor]:
-    """The subset of ``target_corrections`` (weight + bias, unsliced) that
-    belongs to block-boundary position ``position``.
+    """The subset of ``target_corrections`` (weight + bias, unsliced) belonging to block position ``position``.
 
-    Each ``(position, component)`` pair maps to a distinct physical
-    state-dict key (one set of projection matrices per block), so, unlike
-    ``ariadne.diagnostics._family_delta_state`` (which slices packed
-    q/k/v rows to isolate one COMPONENT out of several sharing one physical
-    parameter), no row-slicing is needed here to isolate one POSITION: a
-    key present in ``target_corrections`` belongs to exactly one position.
+    Each (position, component) maps to a distinct state-dict key, so no row-slicing is needed (unlike
+    ``ariadne.diagnostics._family_delta_state`` for packed q/k/v rows).
     """
     out: dict[str, Tensor] = {}
     for component in components:
@@ -1002,36 +822,23 @@ def apply_tv_scaling(
     family_adapter=None,
     measure_fn=None,
 ) -> tuple[dict[str, Tensor], dict[str, Any]]:
-    """Label-free rescaling of a unit-strength Direct Residual task vector.
+    """Label-free rescaling of a unit-strength Direct Residual task vector (``config.tv_scaling``).
 
-    ``measure_fn(delta) -> {j: realization row}`` replaces the resident measurement when
-    given (the streaming path passes `measure_direct_residual_realization_streaming`
-    bound to its own calibration sweep); ``captured``/``desired`` are then unused.
+    Measurement primitive: ``measure_direct_residual_realization`` (mount, capture block-boundary outputs over the
+    SAME calibration batches as the fit, compare to the pristine base and to ``D_j``, restore-and-hash-verify);
+    ``r_j = joint_delta_norm_over_desired = ||delta T_j||_F / (||D_j||_F + eps)`` for the mounted delta.
+    ``measure_fn(delta) -> {j: realization row}`` replaces it when given (streaming path, bound to its own
+    calibration sweep); ``captured``/``desired`` are then unused.
 
-    Reuses ``measure_direct_residual_realization`` (mount, capture
-    block-boundary outputs over the SAME calibration batches
-    ``capture_paired_boundary_activations`` collected for the fit, compare to
-    the pristine target base and to the block-boundary desired effect
-    ``D_j``, restore-and-hash-verify) as the sole measurement primitive:
-    ``r_j = joint_delta_norm_over_desired`` is ``||delta T_j||_F /
-    (||D_j||_F + eps)`` for whatever delta is currently mounted.
-
-    ``config.tv_scaling == "none"`` is a strict no-op (returns
-    ``target_corrections`` unchanged, by value) -- callers must gate on this
-    themselves for the golden-hash-pinned default path, but calling this
-    function directly with ``tv_scaling="none"`` is also safe.
-
-    Returns ``(scaled_corrections, diagnostics)``. ``diagnostics`` is
-    intended to be recorded verbatim (or nested) under the Direct Residual
-    run-summary section's additive ``tv_scaling_by_task`` key.
+    ``tv_scaling == "none"`` is a strict no-op (returns ``target_corrections`` by value); callers must still gate
+    on it themselves for the golden-hash-pinned default path. Other modes require ``block_split == 'none'``.
+    Returns ``(scaled_corrections, diagnostics)``; diagnostics are recorded verbatim (or nested) under the run
+    summary's additive ``tv_scaling_by_task`` key.
     """
     if config.tv_scaling == "none":
         return dict(target_corrections), {"mode": "none"}
     if config.block_split != "none":
-        # parse_direct_residual_config should already have rejected this
-        # combination; re-check here so a caller that builds a
-        # DirectResidualConfig by hand (bypassing the parser) cannot reach
-        # the unverified interaction either.
+        # Also rejected by parse_direct_residual_config; re-checked for hand-built configs.
         raise ValueError(
             f"apply_tv_scaling: tv_scaling={config.tv_scaling!r} requires block_split='none' "
             f"(got block_split={config.block_split!r})"
@@ -1084,10 +891,8 @@ def apply_tv_scaling(
         }
         return final, diagnostics
 
-    # config.tv_scaling == "per_block": per-position scalars s_j, found by a
-    # simultaneous (Jacobi-style) fixed-point update -- every s_j is updated
-    # from the SAME mounted-combination measurement sweep, never sequentially
-    # (Gauss-Seidel) against a partially-updated combination.
+    # per_block: scalars s_j via a simultaneous (Jacobi) fixed-point update: every s_j comes from the
+    # SAME mounted-combination measurement, never sequentially (Gauss-Seidel).
     pos_delta = {j: _position_delta(shim, j, components, target_corrections) for j in positions}
     s = {j: 1.0 for j in positions}
     r_traces: list[dict[int, float | None]] = []
@@ -1137,10 +942,7 @@ def apply_tv_scaling(
         "iters": int(config.tv_scaling_iters),
         "r_traces": r_traces,
         "s_traces": s_traces,
-        # max_j|r_j - 1| per iteration; "did it decrease vs the previous
-        # iteration" is derivable from this trace directly (max_dev_trace[k]
-        # < max_dev_trace[k-1]), reported as its own list rather than
-        # collapsed to one bool so an oscillating trace is visible verbatim.
+        # max_j|r_j - 1| per iteration, kept as a list so an oscillating trace is visible.
         "max_dev_trace": max_dev_trace,
         "guard_log": guard_log,
         "tau_stats_before": tau_stats_before,

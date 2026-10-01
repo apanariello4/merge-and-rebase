@@ -51,10 +51,8 @@ _SEQUENTIAL_ENDPOINTS = {"sequential_source_endpoints", "sequential_delta_on_syn
 class AriadnePrepared:
     """Result of AriadneRebase.prepare.
 
-    task_vector is the fitted correction at config.strength (what the
-    historical _direct_residual_fit_body returned as scaled_delta);
-    unit_task_vector is the unit-strength correction (after any tv_scaling),
-    from which apply(..., strength=s) rescales.
+    task_vector is the fitted correction at config.strength; unit_task_vector is the unit-strength
+    correction (after any tv_scaling), from which apply(..., strength=s) rescales.
     """
 
     task_vector: dict[str, torch.Tensor]
@@ -90,64 +88,30 @@ def _fit_body(
 ]:
     """Run Ariadne's capture -> desired-effect -> fit -> scale pipeline once.
 
-    Mirrors the exact ``torch.cuda.reset_peak_memory_stats()`` /
-    ``torch.cuda.synchronize()`` / ``torch.cuda.max_memory_allocated()`` /
-    ``time.perf_counter()`` idiom the existing ``transport_timings`` bracket
-    uses, split into two brackets: one around alignment/capture
-    (``capture_paired_boundary_activations`` + ``compute_desired_effects``,
-    the "calibration" half) and one around the ridge solve itself
-    (``fit_direct_residual``). ``theta_j_corrected = theta_j_native +
-    strength * correction_j`` is applied here (not inside
-    ``fit_direct_residual``, which always fits at unit strength) so that
-    ``strength=0`` is an exact native-target-base control, matching
-    ``target_informed_runtime.scale_completion``'s ``gamma=0`` contract --
-    replicated directly rather than called through ``scale_completion``
-    itself, since that helper requires every corrected key to already be
-    present in its ``baseline`` argument, and Direct Residual's baseline is
-    the empty ``transported_delta={}`` (there is no transport step to have
-    populated it).
+    Returns ``(scaled_delta, timing, diagnostics, extra, target_corrections)``. ``target_corrections`` is the
+    unit-strength correction (after any tv_scaling); ``scaled_delta = strength * correction`` is applied here, not
+    inside the fit (which always fits at unit strength), so ``strength=0`` is an exact native-target-base control
+    (empty dict), matching ``scale_completion``'s ``gamma=0``. ``scale_completion`` is not called because it
+    requires every corrected key to already be in its baseline, and Ariadne has no transport step to populate it.
 
-    Returns ``(scaled_delta, timing, diagnostics, extra)`` where ``timing`` has
-    ``"alignment_calibration"``/``"correction_fit"`` sub-dicts, each shaped
-    like a ``transport_timings[task]`` entry, and ``extra`` is
-    ``{"realization_by_position": ..., "task_vector_stats": ...,
-    "alignment_diagnostics": ...}``. The first two are ``None`` unless
-    ``config.realization_diagnostics`` is set, and are computed from the
-    unscaled, unit-strength ``target_corrections`` ``fit_direct_residual``
-    returns -- i.e. before ``strength`` is applied -- matching the plan's
-    "AFTER the task vector tau (unit strength, as returned by the fit) is
-    assembled" requirement. ``alignment_diagnostics`` is always present (keyed
-    by target position): it comes from a separate, untimed call to
-    ``compute_alignment_diagnostics`` -- deliberately outside both the
-    ``alignment_calibration`` and ``correction_fit`` timing/peak-memory
-    brackets, so its own float64 recomputation cost never contaminates either
-    (see the inline comment at the call site) -- is analysis-only, and never
-    feeds any fit regardless of ``config.residual_target``. Neither
-    realization-diagnostics call mutates ``target_model``'s entry state (both
-    restore it internally and assert so via a state-dict hash).
+    ``timing`` has ``alignment_calibration`` (capture + desired effects) and ``correction_fit`` (ridge solve)
+    sub-dicts shaped like ``transport_timings[task]`` entries, each with seconds, peak device memory and peak host
+    RSS (VmHWM). Peaks are read through ``recorder.mark()``/``peaks_since`` so the recorder's per-segment counter
+    resets never corrupt them.
 
-    When ``config.procrustes_source == "gradient"``, builds source/target
-    ``clip_contrastive_recipe`` gradient recipes exactly like the BiCo branch
-    of ``vision_rebase`` (same classifier/classnames/build-cfg/text-features arguments) and
-    passes them into ``capture_paired_boundary_activations`` so ``Q_j`` is
-    fit on block-boundary gradients instead of activations; the six extra
-    kwargs (``clf_source``, ``clf_target``, ``classnames``,
-    ``source_build_cfg_task``, ``build_cfg_task``, ``source_text_features``/
-    ``target_text_features``) are required only in that mode. The
-    activation-vs-gradient Procrustes overlap diagnostic is merged into each
-    position's diagnostics row by position.
+    ``extra`` holds realization_by_position / task_vector_stats (None unless ``config.realization_diagnostics``;
+    computed from the unit-strength corrections, before ``strength``), alignment_diagnostics (analysis-only, never
+    feeds a fit, computed in an untimed call outside both brackets), calibration, tv_scaling, fidelity_holdout and,
+    for sequential endpoints, sequential_endpoints. Diagnostics do not mutate ``target_model``'s entry state
+    (restored internally and asserted via a state-dict hash).
 
-    ``config.activation_storage`` branches between the resident path above
-    (full per-batch banks, unchanged) and the streaming path
-    (``prepare_direct_residual_streaming`` + ``fit_direct_residual_streaming``,
-    O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
-    accepts ``realization_diagnostics`` under streaming too (the streaming
-    realization measurement, ``measure_streaming_realization_for``). Both paths additionally record each bracket's exact peak host RSS
-    (``{bracket}_peak_host_rss_bytes``, VmHWM reset at the bracket start via
-    ``recorder``; see utils.cost_accounting) so campaigns can see streaming's
-    host memory stay flat as ``num_batches`` grows while resident's does not.
-    Every bracket peak is read through ``recorder.mark()``/``peaks_since`` so the
-    recorder's per-segment counter resets never corrupt it.
+    ``procrustes_source == "gradient"``: builds source/target ``clip_contrastive_recipe`` recipes like the BiCo
+    branch of ``vision_rebase`` so ``Q_j`` is fit on block-boundary gradients; ``clf_source``, ``clf_target``,
+    ``classnames``, ``source_build_cfg_task``, ``build_cfg_task`` and the text features are required only in that
+    mode. The activation-vs-gradient overlap diagnostic is merged into each position's diagnostics row.
+
+    ``config.activation_storage`` selects the resident path (full per-batch banks) or the streaming path
+    (O(1)-in-``num_batches`` host RAM); ``realization_diagnostics`` is supported under both.
     """
     alignment_mark = recorder.mark()
     alignment_started = time.perf_counter()
@@ -157,8 +121,7 @@ def _fit_body(
     prepared = None
     gradient_mode = config.procrustes_source == "gradient"
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
-    # Scalar-only per-position rows merged into the diagnostics rows in BOTH storage paths (rank
-    # diagnostics of the cross-covariance the map was solved from; see procrustes_rank_diagnostics).
+    # Scalar-only per-position rows merged into the diagnostics rows in BOTH storage paths (cross-covariance rank).
     rank_diagnostics: dict[int, dict[str, Any]] = {}
     source_recipe = target_recipe = None
     if gradient_mode:
@@ -237,11 +200,8 @@ def _fit_body(
                 alignment_map=config.alignment_map,
                 alignment_row_weighting=config.alignment_row_weighting,
                 alignment_seed=config.alignment_seed,
-                # fidelity_holdout needs the SAME fitted Q_j/mu this compute_desired_effects
-                # call produces, stored under diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]
-                # (see compute_desired_effects's docstring) -- collected here whether
-                # or not gradient_mode also needs it, so its own request never has to
-                # special-case which mode it's running under.
+                # fidelity_holdout needs the SAME fitted Q_j/mu produced by this call
+                # (diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]), whether or not gradient_mode needs it.
                 diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
                 rank_out=rank_diagnostics,
             )
@@ -252,19 +212,11 @@ def _fit_body(
         "alignment_calibration_peak_host_rss_bytes": alignment_calibration_host_peak,
     }
 
-    # Deliberately outside BOTH the alignment_calibration bracket above (just
-    # closed) and the correction_fit bracket below (not yet opened):
-    # compute_alignment_diagnostics recomputes the same centered Procrustes
-    # fit a second time purely for analysis, with several float64 N x d_t
-    # temporaries (N in the tens of thousands of rows). Folding it into
-    # either bracket would inflate that bracket's recorded seconds/peak-
-    # memory bytes -- even in the default residual_target="transported_delta"
-    # path -- contaminating any cross-code-generation cost comparison for a
-    # quantity these diagnostics never feed into.
-    # Both compute_alignment_diagnostics variants describe the ACTIVATION-space map the fit
-    # actually used (the configured alignment_map and row weighting, not a fresh uniform polar
-    # fit); under procrustes_source="gradient" that is not the Q_j the fit used, so it is not
-    # reported there (None) rather than reported for the wrong map.
+    # Deliberately outside BOTH the alignment_calibration bracket (closed) and the correction_fit bracket (not yet
+    # open): compute_alignment_diagnostics refits the centered Procrustes map in float64 purely for analysis, and
+    # folding it into either bracket would inflate recorded seconds/peak memory, contaminating cost comparisons.
+    # It describes the ACTIVATION-space map the fit used (configured alignment_map and row weighting); under
+    # procrustes_source="gradient" that is not the Q_j the fit used, so it stays None there.
     alignment_diagnostics = None
     with cost_excluded():
         if streaming and gradient_mode:
@@ -382,12 +334,9 @@ def _fit_body(
     )
     tv_scaling_diagnostics = None
     if config.tv_scaling != "none":
-        # Label-free, applied AFTER the unit-strength tau is assembled but
-        # BEFORE the caller's per-task alpha-search (and therefore before the
-        # realization_diagnostics/task_vector_stats block below, so both
-        # report the FINAL tau that alpha-search actually sees). tv_scaling
-        # defaults to "none" (a strict no-op, see apply_tv_scaling), so this
-        # branch never executes for the historical, golden-hash-pinned path.
+        # Label-free; applied AFTER the unit-strength tau is assembled and BEFORE the per-task alpha-search (and
+        # before the diagnostics block below, so both report the FINAL tau). "none" is a strict no-op, so the
+        # default path is unchanged.
         target_corrections, tv_scaling_diagnostics = apply_tv_scaling(
             target_model,
             target_base_sd,
@@ -406,15 +355,9 @@ def _fit_body(
     with cost_excluded():
         if bool(config.realization_diagnostics):
             positions = list(range(pairing.target_depth))
-            # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed
-            # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
-            # presence check keyed only off "is this key in target_corrections"
-            # cannot tell which of q/k/v were actually fit -- e.g. a v-only
-            # run's in_proj_weight key exists in target_corrections
-            # with only its v-rows nonzero, and checking q/k against that same
-            # key would falsely report them "present" too. Passing exactly
-            # order_components(config.components) sidesteps this: only names the
-            # caller actually asked to fit are ever checked.
+            # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed q/k/v share ONE state-dict key
+            # (attn.in_proj_weight), so key presence cannot tell which of q/k/v were fit. Passing exactly
+            # order_components(config.components) checks only the components actually requested.
             fitted_components = order_components(config.components)
             if streaming:
                 realization_by_position = streaming_measure(target_corrections)
@@ -439,13 +382,8 @@ def _fit_body(
                 family_adapter=family_adapter,
             )
 
-    # fidelity_holdout diagnostic: analysis-only, computed strictly AFTER
-    # target_corrections (tau) is already fitted and fixed -- it only reads
-    # target_corrections, never feeds back into it -- so it cannot, by
-    # construction, change the task vector this run produces (see
-    # tests/test_direct_residual_fidelity_holdout_20260925.py's bit-identical
-    # -tau assertion). Excluded from cost accounting for the same reason
-    # realization_diagnostics is above: it is not part of the method's cost.
+    # fidelity_holdout: analysis-only, computed strictly AFTER target_corrections (tau) is fitted and fixed; it only
+    # reads tau, so it cannot change the task vector (bit-identical-tau test). Excluded from cost accounting.
     fidelity_holdout_diagnostics = None
     with cost_excluded():
         if bool(config.fidelity_holdout):

@@ -19,32 +19,17 @@ Tensor = torch.Tensor
 def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: str) -> DiscreteLayerPairing:
     """Ablation: rewrite ``pairing.pairing`` per ``DirectResidualConfig.depth_pairing``.
 
-    Called by the caller (``vision_rebase._direct_residual_fit_body`` and its
-    ``merge_in_source_then_fit`` sibling) immediately after
-    ``DiscreteLayerPairing.compute(source_depth, target_depth)``, before any
-    capture. Every Direct Residual consumer -- ``capture_paired_boundary_
-    activations``, ``compute_desired_effects``, ``fit_direct_residual``, and
-    their streaming equivalents -- reads ``pairing.pairing[j]`` as the single
-    source of truth for BOTH which source block's activations define
-    ``D_j = (S_1 - S_0) Q_j`` and which source block ``Q_j`` itself aligns
-    target position ``j`` with (``compute_desired_effects`` fits ``Q_j`` from
-    ``source_base[pairing.pairing[j]]`` against ``target_base[j]``). So this
-    one swap, applied once at construction, changes pi(j) consistently
-    everywhere downstream without touching any of those call sites.
+    Called right after ``DiscreteLayerPairing.compute`` and before any capture. Every consumer
+    (capture, ``compute_desired_effects``, fit, and their streaming equivalents) reads
+    ``pairing.pairing[j]`` as the single source of truth for both which source block defines
+    ``D_j = (S_1 - S_0) Q_j`` and which one ``Q_j`` aligns target ``j`` with, so one swap here
+    changes pi(j) consistently everywhere.
 
-    ``depth_pairing="relative"`` returns ``pairing`` unchanged (identity,
-    bit-for-bit -- the default, golden-hash-pinned path never calls this with
-    anything else).  The other three modes derive a new pairing tuple from
-    the ORIGINAL ``pairing.pairing`` (the closed-form relative pairing), not
-    from each other:
-
-      * ``"reversed"``:     ``pi_rev(j) = source_depth - 1 - pairing.pairing[j]``.
-      * ``"shift_plus1"``:  ``min(source_depth - 1, pairing.pairing[j] + 1)``.
-      * ``"shift_minus1"``: ``max(0, pairing.pairing[j] - 1)``.
-
-    Only valid for ``component_target="block_boundary"`` -- validated by
-    ``parse_direct_residual_config``, not here (this function has no config
-    to check against and is usable standalone, e.g. by tests).
+    ``"relative"`` returns ``pairing`` unchanged (bit-for-bit; the default, golden-hash-pinned
+    path). The other modes derive from the ORIGINAL relative pairing, not from each other:
+    ``"reversed"``: ``source_depth - 1 - pi(j)``; ``"shift_plus1"``: ``min(source_depth - 1, pi(j) + 1)``;
+    ``"shift_minus1"``: ``max(0, pi(j) - 1)``. Only valid for ``component_target="block_boundary"``
+    (validated by ``parse_direct_residual_config``, not here).
     """
     if depth_pairing == "relative":
         return pairing
@@ -67,11 +52,7 @@ def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: s
 def _derive_block_seed(alignment_seed: int, position: int) -> int:
     """Deterministic per-block seed for ``alignment_map='random_isometry'``.
 
-    A plain ``alignment_seed + position`` would work too, but hashing keeps
-    nearby positions' draws decorrelated (no shared low-order-bit structure
-    across an entire depth sweep) and keeps the derivation obviously
-    collision-free across the ``(alignment_seed, position)`` product space
-    used across a sweep of many runs.
+    Hashed (not ``alignment_seed + position``) so nearby positions' draws are decorrelated.
     """
     digest = hashlib.sha256(f"direct_residual_random_isometry:{int(alignment_seed)}:{int(position)}".encode()).digest()
     return int.from_bytes(digest[:8], "big") % (2**31 - 1)
@@ -80,14 +61,8 @@ def _derive_block_seed(alignment_seed: int, position: int) -> int:
 def _random_isometry_map(shape: tuple[int, int], *, seed: int) -> Tensor:
     """A random partial isometry of ``shape``, deterministic given ``seed``.
 
-    Uses the exact same construction ``_procrustes_from_cross`` uses to turn
-    a cross-covariance into the polar factor (SVD, then ``U @ Vh``) -- applied
-    to a seeded standard-normal matrix instead of a cross-covariance -- so
-    the result has the identical shape, orientation, and orthonormal-row/
-    -column structure ``centered_rectangular_procrustes``'s polar map would
-    have for the same (source, target) activation widths; only the direction
-    it points in is randomized. Returned in float64, matching every other
-    alignment map's fitting precision.
+    Built like ``_procrustes_from_cross`` (SVD, ``U @ Vh``) on a seeded standard-normal matrix, so
+    shape and orthonormal structure match the polar map for the same widths. Returned in float64.
     """
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     gaussian = torch.randn(shape, generator=generator, dtype=torch.float64)
@@ -109,57 +84,24 @@ def compute_desired_effects(
 ) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
 
-    Generalizes `target_informed_runtime._capture_residual_references`'s
-    inner Procrustes computation from ARIADNE's two-code-path ancestry-group
-    iteration (one-to-many groups for extend, many-to-one span tracking for
-    shrink -- both needed because ARIADNE tracks *which* source block a
-    position descends from, for provenance) to a single flat loop. Direct
-    Residual doesn't need that bookkeeping: one cardinality (one target
-    position <- exactly one source position, for every regime) handles
-    extend, shrink, and same-arch uniformly.
+    Fits the centered Procrustes ``Q_j, mu_s, mu_t = centered_rectangular_procrustes(S_{j,0} -> T_j^0)``
+    per target position and returns per-batch ``D_j`` lists (one flat loop; one source position per
+    target position, for extend, shrink and same-arch alike).
 
-    ``residual_target`` selects what ``D_j`` is built from, given the SAME
-    centered Procrustes fit ``Q_j, mu_s, mu_t = centered_rectangular_procrustes
-    (S_{j,0} -> T_j^0)``:
+    ``residual_target``: ``"transported_delta"`` (default) gives ``D_j = (S_1 - S_0) Q_j``, byte-identical
+    to the pre-ablation code (expression and op order); ``"transported_endpoint"`` gives
+    ``D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0``. They differ by the Procrustes residual ``E_j``, whose
+    diagnostics live in ``compute_alignment_diagnostics`` (kept out of this function's cost).
 
-      * ``"transported_delta"`` (default): ``D_j = (S_1 - S_0) Q_j``, exactly
-        the historical expression and op order -- byte-identical to the
-        pre-ablation code.
-      * ``"transported_endpoint"``: ``D_j = (S_1 - mu_s) Q_j + mu_t - T_j^0``
-        per batch, applying the centered map to the fine-tuned source
-        endpoint and subtracting the target zero-shot endpoint.
+    ``procrustes_source="activation"`` (default) is bit-identical to the pre-ablation code.
+    ``"gradient"`` fits ``Q_j`` on the block-boundary gradient banks (``"source_base_gradients"`` /
+    ``"target_base_gradients"``) with the same helper, centering and ``_aligned`` interpolation; ``D_j`` keeps
+    the same form (gradients are only the alignment statistic, never the regression target).
 
-    The two differ by exactly the Procrustes residual ``E_j = (S_0 - mu_s)
-    Q_j - (T_j^0 - mu_t)`` -- the thing the fit minimizes; see
-    `compute_alignment_diagnostics` for that residual's diagnostics, kept
-    deliberately separate (and out of this function's cost) -- see its
-    docstring for why.
-
-    ``procrustes_source="activation"`` (default) is bit-identical to the
-    pre-ablation code: ``Q_j`` is fit on the (source_base, target_base)
-    ACTIVATION banks, exactly as before. ``procrustes_source="gradient"``
-    changes only the statistic ``Q_j`` is fit on -- to the block-boundary
-    GRADIENT banks `capture_paired_boundary_activations` captured under
-    ``"source_base_gradients"``/``"target_base_gradients"`` -- using the same
-    helper, the same centering and the same ``_aligned`` token interpolation.
-    ``D_j = (source_ft_i - source_base_i) @ Q_j`` is unchanged in form in both
-    modes: a gradient difference is never used as the regression target,
-    only as the alignment statistic.
-
-    When ``diagnostics_out`` is provided (a caller-owned, initially-empty
-    dict), it is populated per position with analysis-only fields -- never
-    read by any fit. In gradient mode this includes the activation-space
-    ``Q`` computed purely for comparison (``"activation_gradient_procrustes_
-    overlap"`` = :math:`\\lVert Q_{act}^\\top Q_{grad}\\rVert_F^2 / d_{\\min}`)
-    and ``"procrustes_rank"`` (the numerical rank of the centered
-    cross-covariance the gradient ``Q`` was solved from).
-
-    ``rank_out`` (also caller-owned, initially empty) receives, per position and in
-    every mode, only the cheap scalar rank diagnostics of the cross-covariance the map
-    was solved from (``RANK_DIAGNOSTIC_KEYS``: ``procrustes_rank``, ``procrustes_min_dim``,
-    ``procrustes_q_non_unique``) -- no tensors, so it is safe to merge into diagnostics
-    rows unconditionally. The rank comes from the SVD that produces the polar factor
-    itself (no extra decomposition on the default path); ``Q`` is bit-identical.
+    ``diagnostics_out`` (caller-owned, empty dict) receives analysis-only per-position fields, never read by
+    any fit; in gradient mode this includes activation-vs-gradient ``Q`` comparisons. ``rank_out`` (same
+    contract) receives only the scalar ``RANK_DIAGNOSTIC_KEYS`` in every mode; the rank comes from the polar
+    SVD itself (no extra decomposition on the default path) and ``Q`` is bit-identical.
     """
     if procrustes_source not in {"activation", "gradient"}:
         raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
@@ -229,15 +171,12 @@ def compute_desired_effects(
                 )
                 diagnostics_out[j] = {
                     "procrustes_source": "gradient",
-                    # Rank of the centered gradient cross-covariance, taken from the SVD that
-                    # produced q (same tolerance as torch.linalg.matrix_rank on that matrix).
+                    # Rank from the SVD that produced q.
                     **grad_rank_diag,
                     "activation_gradient_procrustes_overlap": overlap,
                     "activation_gradient_map_distance": map_distance,
                     "activation_gradient_delta_disagreement": delta_disagreement,
-                    # See the activation branch below: kept for
-                    # compute_fidelity_holdout_diagnostics to reuse the SAME
-                    # fitted Q_j on held-out images without refitting.
+                    # Kept so compute_fidelity_holdout_diagnostics reuses the SAME fitted Q_j.
                     "q": q.detach().float().clone(),
                 }
             q = q.float()
@@ -258,11 +197,8 @@ def compute_desired_effects(
                 "procrustes_source": "activation",
                 "alignment_q_frobenius": float(torch.linalg.norm(q).item()),
                 "alignment_q_rank": int(torch.linalg.matrix_rank(q)),
-                # The fitted map/means themselves, kept for callers that need
-                # to re-apply the SAME Q_j/mu without refitting (e.g.
-                # compute_fidelity_holdout_diagnostics, which must evaluate
-                # D_j on held-out images using the fit's own Q_j, never a
-                # freshly refit one). Never read by any fit.
+                # Fitted map/means, kept so held-out diagnostics re-apply the SAME Q_j/mu (never a
+                # refit). Never read by any fit.
                 "q": q.detach().float().clone(),
                 "mu_s": mu_s.detach().float().clone(),
                 "mu_t": mu_t.detach().float().clone(),
@@ -319,12 +255,8 @@ def _fit_activation_map(
             },
         )
     if alignment_map == "random_isometry":
-        # random_isometry always requires uniform row weighting (validated by
-        # _validate_alignment_options), so the mean/centering is identical to
-        # the plain uniform-polar path above -- only the map Q itself, whose
-        # shape/orientation the fast path's centered_rectangular_procrustes
-        # call also determines, is replaced by a random partial isometry of
-        # that same shape.
+        # Requires uniform weighting (validated), so centering matches the uniform-polar path;
+        # only Q is replaced by a random partial isometry of the same shape.
         if random_isometry_seed is None:
             raise ValueError("alignment_map='random_isometry' requires random_isometry_seed")
         q_polar, mx, my, rank = centered_rectangular_procrustes(_rows(xs), _rows(ys), return_rank=True)
@@ -337,8 +269,7 @@ def _fit_activation_map(
                 "alignment_map": "random_isometry",
                 "alignment_row_weighting": "uniform",
                 "alignment_seed_used": int(random_isometry_seed),
-                # Rank of the cross-covariance the polar factor WOULD be taken from; the random
-                # isometry itself does not depend on it, hence polar_derived=False.
+                # Rank of the cross-covariance the polar factor WOULD use (polar_derived=False).
                 **procrustes_rank_diagnostics(rank, q.shape[0], q.shape[1], polar_derived=False),
             },
         )
@@ -405,48 +336,25 @@ def compute_alignment_diagnostics(
 ) -> dict[int, dict[str, float]]:
     """Per-position alignment diagnostics of the CONFIGURED activation map. Analysis-only.
 
-    Recomputes the SAME deterministic activation-map fit ``compute_
-    desired_effects`` computes internally (a pure function of the captured
-    rows, so this is a second, independent call, not a cached one), then
-    reports the residual it minimizes and a few derived quantities -- never
-    anything fed back into a fit.
+    Refits the SAME deterministic activation map ``compute_desired_effects`` uses (a second call, not a
+    cache) and reports the residual it minimizes; nothing here is fed back into a fit.
 
-    ``alignment_map`` / ``alignment_row_weighting`` / ``alignment_seed`` must be the
-    values the fit used. For the default (``polar``, ``uniform``) the historical
-    uniform centered-Procrustes expression below is kept verbatim (bit-identical
-    values); otherwise the map ``Q_j`` and the (weighted) means ``mu_s``/``mu_t``
-    come from `_fit_activation_map`, the very function ``compute_desired_effects``
-    fits with (so the ridge / random-isometry map and the cls_balanced /
-    delta_magnitude weighted means are the ones actually used), exactly as
-    `compute_alignment_diagnostics_streaming` does from its accumulators. The
-    error / delta norms themselves stay plain (unweighted) Frobenius norms in both paths.
+    ``alignment_map`` / ``alignment_row_weighting`` / ``alignment_seed`` must be the values the fit used. For
+    the default (``polar``, ``uniform``) the historical uniform centered-Procrustes expression is kept verbatim
+    (bit-identical); otherwise ``Q_j`` and the weighted means come from ``_fit_activation_map``, as in
+    ``compute_alignment_diagnostics_streaming``. Error / delta norms are plain (unweighted) Frobenius norms.
 
-    Deliberately NOT called from ``compute_desired_effects`` or folded into
-    its cost: the caller (`vision_rebase._run_direct_residual_fit`) times and
-    peak-memory-profiles the delta/endpoint construction as its own
-    "alignment_calibration" bracket, and this function's float64 N x d_t
-    temporaries (N in the tens of thousands of rows) would otherwise inflate
-    that bracket's recorded seconds/peak-memory even in the default
-    ``residual_target="transported_delta"`` path -- contaminating any
-    cross-code-generation cost comparison for a number this function's own
-    diagnostics never influence. Call it as a separate, untimed (or
-    separately timed) step instead.
+    Deliberately NOT called from ``compute_desired_effects``: the caller times and peak-memory-profiles that
+    step as its own "alignment_calibration" bracket, and this function's float64 N x d_t temporaries would
+    inflate it and contaminate cross-code-generation cost comparisons. Call it as a separate step.
 
-    Per position ``j``, all in float64 on the concatenated (all-batch) rows:
-    ``procrustes_error_norm`` = ``||E_j||`` where ``E_j = (S_0 - mu_s) Q_j -
-    (T^0 - mu_t)``; ``procrustes_relative_error`` = ``||E_j|| / ||T^0 -
-    mu_t||`` (0 if the denominator is 0); ``delta_target_norm`` = ``||(S_1 -
-    S_0) Q_j||``; ``endpoint_minus_delta_over_delta`` = ``||E_j|| /
-    delta_target_norm`` (0 if the denominator is 0) -- how the transported-
-    delta and transported-endpoint targets actually differ, scaled against
-    the delta itself (not against ``T^0``, which is typically much larger
-    than a fine-tuning delta); ``procrustes_error_in_range_norm`` /
-    ``procrustes_error_out_of_range_norm`` = ``||E_j Q_j^T Q_j||`` /
-    ``||E_j (I - Q_j^T Q_j)||`` (the latter is exactly 0 when ``d_t <=
-    d_s``, since ``Q_j^T Q_j`` is only a proper projector -- rank ``d_s`` --
-    when ``d_t > d_s``); ``mean_offset_norm`` = ``||mu_s Q_j - mu_t||``
-    (documents what the literal, non-affine ``S Q`` form would have added).
-    Also ``source_dim``, ``target_dim``.
+    Per position ``j``, float64 on all-batch rows, with ``E_j = (S_0 - mu_s) Q_j - (T^0 - mu_t)``:
+    ``procrustes_error_norm`` = ``||E_j||``; ``procrustes_relative_error`` = ``||E_j|| / ||T^0 - mu_t||``;
+    ``delta_target_norm`` = ``||(S_1 - S_0) Q_j||``; ``endpoint_minus_delta_over_delta`` =
+    ``||E_j|| / delta_target_norm`` (both ratios are 0 if the denominator is 0);
+    ``procrustes_error_in_range_norm`` / ``procrustes_error_out_of_range_norm`` = ``||E_j Q_j^T Q_j||`` /
+    ``||E_j (I - Q_j^T Q_j)||`` (the latter is exactly 0 when ``d_t <= d_s``); ``mean_offset_norm`` =
+    ``||mu_s Q_j - mu_t||``; plus ``source_dim``, ``target_dim``.
     """
     source_base = captured["source_base_outputs"]
     source_ft = captured["source_ft_outputs"]
@@ -478,7 +386,9 @@ def compute_alignment_diagnostics(
                 source_ft_batches,
                 alignment_map=alignment_map,
                 row_weighting=alignment_row_weighting,
-                random_isometry_seed=_derive_block_seed(alignment_seed, j) if alignment_map == "random_isometry" else None,
+                random_isometry_seed=_derive_block_seed(alignment_seed, j)
+                if alignment_map == "random_isometry"
+                else None,
             )
 
         e = (s0_rows - mu_s64) @ q64 - (t0_rows - mu_t64)

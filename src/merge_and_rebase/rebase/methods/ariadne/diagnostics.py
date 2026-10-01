@@ -35,29 +35,15 @@ def compute_direct_residual_task_vector_stats(
     *,
     family_adapter=None,
 ) -> dict[str, Any]:
-    """Analysis-only task-vector stats for one Direct Residual task vector.
+    """Analysis-only task-vector stats; nothing is refitted and no forward pass runs.
 
-    ``target_corrections`` is the unscaled (unit-strength) task vector
-    ``fit_direct_residual`` returns. Every quantity here is derived purely
-    from that dict and the pristine target base state -- nothing is
-    re-fitted and no forward pass runs.
-
-    ``n_modified_parameters`` counts touched numel per ``(position,
-    component)`` pair actually present in ``target_corrections`` -- rather
-    than per physical tensor -- so a packed ``in_proj_weight``/``in_proj_bias``
-    correction that only ever wrote one q/k/v row-third (e.g. a
-    run requesting only ``attn.v_proj``)
-    is counted as ``d * d_in (+ d for bias)``, not ``3x`` that. Two distinct
-    components can never double-count the same rows: each packed component
-    owns a disjoint row slice by construction (``_PACKED_QKV_SLICE``).
-    ``n_modified_tensors`` instead counts physical tensors (dict keys), so a
-    packed parameter touched by more than one component is counted once.
-
-    ``tau_norm_over_touched_base`` divides by the Frobenius norm of the base
-    values at exactly the touched slices (row-aware for packed q/k/v);
-    ``tau_norm_over_all_base`` divides by the Frobenius norm of the ENTIRE
-    base state dict (every floating-point tensor), giving the task vector's
-    size relative to the whole model rather than only what it touched.
+    ``target_corrections`` is the unscaled (unit-strength) task vector from ``fit_direct_residual``.
+    ``n_modified_parameters`` counts touched numel per ``(position, component)`` pair present in
+    ``target_corrections`` (a packed q/k/v correction that wrote one row-third counts ``d * d_in`` (+ ``d`` bias),
+    not 3x); packed components own disjoint row slices (``_PACKED_QKV_SLICE``), so nothing double-counts.
+    ``n_modified_tensors`` counts physical tensors (dict keys). ``tau_norm_over_touched_base`` divides by the
+    Frobenius norm of the base at exactly the touched slices (row-aware for packed q/k/v);
+    ``tau_norm_over_all_base`` by that of every floating-point tensor in the base state dict.
     """
     shim = _layout_for(family_adapter)
     tau_norm_sq = 0.0
@@ -72,16 +58,9 @@ def compute_direct_residual_task_vector_stats(
     all_base_norm = all_base_sq**0.5
 
     touched_base_sq = 0.0
-    # WARNING: q/k/v share ONE physical state-dict key (in_proj_weight/
-    # in_proj_bias). A presence check keyed only off "is this key in
-    # target_corrections" cannot by itself tell which of q/k/v were actually
-    # fit -- e.g. a v-only run's in_proj_weight key exists with only its
-    # v-rows nonzero, and iterating over q/k too (if they were included in
-    # `components` despite never having been fit) would double- or triple-
-    # count the very rows this function exists to avoid over-counting.
-    # Callers MUST pass exactly the fitted family list (e.g.
-    # `order_components(config.components)`), never a broader default, once
-    # more than one of q/k/v could plausibly be absent.
+    # WARNING: q/k/v share ONE physical key (in_proj_weight/bias), so key presence cannot tell which of q/k/v were
+    # fit. Callers MUST pass exactly the fitted family list (e.g. `order_components(config.components)`), never a
+    # broader default, or rows are over-counted.
     n_modified_parameters = 0
     for pos in positions:
         for component in components:
@@ -170,67 +149,28 @@ def measure_direct_residual_realization(
     components: tuple[str, ...] = CANONICAL_COMPONENT_ORDER,
     family_adapter=None,
 ) -> dict[int, dict[str, Any]]:
-    """Measure how well the fitted, unit-strength task vector ``tau`` actually
-    realizes each position's desired block-boundary effect ``D_j``, on the
-    FULL (nonlinear) target model -- as opposed to the fit's own internal
-    linear-prediction diagnostics (``_realization_diagnostic_fields``), which
-    never run a real forward pass through the block's nonlinearity.
+    """Measure how well the unit-strength task vector ``tau`` realizes each position's desired block-boundary
+    effect ``D_j`` on the FULL (nonlinear) target model, unlike the fit's own linear-prediction diagnostics
+    (``_realization_diagnostic_fields``).
 
-    For the ``joint`` variant (all of ``tau`` mounted at once) and one variant
-    per component family actually present in ``tau`` (a row-sliced,
-    zero-elsewhere packed correction for q/k/v, the whole weight+bias
-    otherwise), this mounts ``target_base_state + tau_variant``, captures the
-    block-boundary output at every position in ``positions`` over ``batches``,
-    and compares ``delta_j = T_j^variant - T_j^0`` against ``D_j`` (block-
-    boundary desired effect; the same one the fit targets via
-    ``compute_desired_effects``, which only depends on the always-captured
-    boundary banks).
+    For the ``joint`` variant (all of ``tau``) and one variant per component family present in ``tau`` (row-sliced,
+    zero-elsewhere for packed q/k/v), mounts ``target_base_state + tau_variant``, captures block-boundary outputs at
+    ``positions`` over ``batches`` and compares ``delta_j = T_j^variant - T_j^0`` against ``D_j`` (the same
+    ``compute_desired_effects`` target the fit uses). Per position returns:
+      * ``block_realized_target_error``: ``||delta_j^joint - D_j||_F / (||D_j||_F + eps)``.
+      * ``joint_delta_norm_over_desired``: ``||delta_j^joint||_F / (||D_j||_F + eps)``.
+      * ``component_interaction_error``: ``||delta_j^joint - sum_c delta_j^(c)||_F / (||delta_j^joint||_F + eps)``,
+        ``None`` with a single family.
+      * ``per_family_delta_norm_over_desired``: ``{component: ||delta_j^(c)||_F / (||D_j||_F + eps)}``.
 
-    Per position ``j`` this returns:
-      * ``block_realized_target_error``: ``||delta_j^joint - D_j||_F /
-        (||D_j||_F + eps)``.
-      * ``joint_delta_norm_over_desired``: ``||delta_j^joint||_F /
-        (||D_j||_F + eps)``.
-      * ``component_interaction_error``: ``||delta_j^joint - sum_c
-        delta_j^(c)||_F / (||delta_j^joint||_F + eps)``, or ``None`` when only
-        one family is present (there is then nothing to compare the joint
-        variant against -- it IS that one family).
-      * ``per_family_delta_norm_over_desired``: ``{component: ||delta_j^(c)||_F
-        / (||D_j||_F + eps)}`` for every family present.
+    WARNING on ``components``: q/k/v share ONE state-dict key (``in_proj_weight``/``in_proj_bias``), so key presence
+    cannot tell which were fit (a v-only run would falsely report q/k present). Callers MUST pass exactly the fitted
+    family list (e.g. ``order_components(config.components)``), never the broad ``CANONICAL_COMPONENT_ORDER``
+    default -- see ``vision_rebase._run_direct_residual_fit``.
 
-    WARNING on ``components``: q/k/v share ONE physical state-dict key
-    (``in_proj_weight``/``in_proj_bias``). Presence-checking a family only by
-    "is its key in ``target_corrections``" cannot by itself tell which of
-    q/k/v were actually fit -- e.g. a v-only run's ``in_proj_weight`` key
-    exists in ``target_corrections`` with only its v-rows nonzero, and if
-    ``components`` also named q/k (despite neither ever being fit) they would
-    be falsely reported "present" too. Callers MUST pass exactly the fitted
-    family list (e.g. ``order_components(config.components)``), never the
-    broad ``CANONICAL_COMPONENT_ORDER`` default, whenever more than one of
-    q/k/v could plausibly be absent -- see
-    ``vision_rebase._run_direct_residual_fit``.
-
-    Memory bound: at most one variant's all-position boundary banks are held
-    at a time (mounted, captured, reduced to a per-batch delta, and
-    discarded), PLUS three running accumulators that survive across variants:
-    the joint variant's own per-position delta bank (needed at the end for
-    every family's interaction-error comparison), a running per-position sum
-    of every family's delta bank (accumulated in place, one family at a time,
-    so the sum of many families never requires holding more than one family's
-    banks at once), and scalar running sums of squared norms. This is a
-    batch-inner, variant-outer loop (all positions and batches captured
-    together per variant, one variant fully finished before the next starts)
-    rather than a batch-outer loop, since ``capture_tokens`` already captures
-    every requested position from one shared forward sweep and splitting that
-    sweep per batch would multiply the number of forward passes by
-    ``len(batches)`` for no memory benefit (a single batch's own multi-
-    position banks are already the smallest unit ``capture_tokens`` produces).
-
-    The target model's entry state (whatever it held when this function was
-    called, expected to be the pristine target base) is restored exactly in a
-    ``finally``, and asserted via a state-dict hash before/after -- this
-    function must never be observable by a caller as having left any residue
-    on ``target_model``.
+    Memory: variant-outer loop; one variant's banks at a time plus accumulators (joint delta bank, running sum of
+    family deltas, scalar squared norms). The entry state of ``target_model`` is restored in a ``finally`` and
+    checked by state-dict hash: no residue may be left on ``target_model``.
     """
     shim = _layout_for(family_adapter)
     entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
@@ -331,16 +271,12 @@ def measure_direct_residual_realization_streaming(
 ) -> dict[int, dict[str, Any]]:
     """Streaming counterpart of `measure_direct_residual_realization` (same row schema).
 
-    Instead of holding every variant's all-position boundary banks, runs ONE lockstep
-    sweep over the calibration batches: the pristine target (``target_model`` loaded with
-    ``target_base_state``), one deep copy of it per variant (joint ``tau`` plus one per
-    component family present, each mounted as ``base + tau_variant``), and whatever source
-    generators ``source_iters_fn()`` returns. Per batch, ``desired_fn(k, source_values,
-    t0)`` recomputes ``{pos: D_j}`` (the streaming path never keeps a ``D_j`` bank), and
-    every reported norm is accumulated as a per-batch sum of squares, so the result
-    equals the resident one up to floating-point summation order (the per-batch
-    arithmetic is identical; ``D_j`` itself differs only through the Chan-accumulated
-    Procrustes map). The entry state of ``target_model`` is restored and hash-checked.
+    Runs ONE lockstep sweep over the calibration batches: the pristine target, one deep copy per variant (joint
+    ``tau`` plus one per family present, mounted as ``base + tau_variant``) and the generators from
+    ``source_iters_fn()``. Per batch ``desired_fn(k, source_values, t0)`` recomputes ``{pos: D_j}`` and norms
+    accumulate as per-batch sums of squares, so results equal the resident path up to floating-point summation
+    order (``D_j`` differs only via the Chan-accumulated Procrustes map). The entry state of ``target_model`` is
+    restored and hash-checked.
     """
     shim = _layout_for(family_adapter)
     entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
@@ -440,25 +376,13 @@ def draw_fidelity_holdout_calibration(
     holdout_batches: int,
     seed: int | None,
 ) -> tuple[list, list, dict[str, Any]]:
-    """Draw a held-out batch set disjoint from the ``num_batches``-batch
-    calibration set ``capture_paired_boundary_activations``/``prepare_direct_
-    residual_streaming`` fit tau on, for ``DirectResidualConfig.fidelity_holdout``.
+    """Draw a held-out batch set disjoint from the ``num_batches`` calibration set tau was fit on.
 
-    Both sets are slices of the SAME seeded permutation `paired_calibration`
-    draws (``num_batches`` requires a non-``None`` seed for this reason -- a
-    ``None``-seeded, dataset-order calibration set has no "next" slice to draw
-    a disjoint holdout from without risking overlap the dataset's own order
-    could reintroduce): calling `paired_calibration` once with
-    ``num_batches=num_batches + holdout_batches`` reproduces the identical
-    leading ``num_batches`` slice `capture_paired_boundary_activations`/
-    `prepare_direct_residual_streaming` already captured (same seed, same
-    deterministic ``torch.randperm`` order), and the immediately-following
-    ``holdout_batches`` slice is therefore guaranteed disjoint from it by
-    construction -- verified explicitly below anyway, from the sample indices
-    `paired_calibration` itself records, rather than merely assumed.
-
-    Returns ``(holdout_source_batches, holdout_target_batches, holdout_metadata)``;
-    ``holdout_metadata`` carries both slices' sample-index sha256 fingerprints.
+    Both sets are slices of the SAME seeded ``paired_calibration`` permutation, so a non-``None`` ``seed`` is
+    required: ``paired_calibration(num_batches + holdout_batches)`` reproduces the identical leading ``num_batches``
+    slice and the next ``holdout_batches`` slice is disjoint by construction (still verified from the recorded
+    sample indices). Returns ``(holdout_source_batches, holdout_target_batches, holdout_metadata)``; the metadata
+    carries both slices' sample-index sha256 fingerprints.
     """
     if seed is None:
         raise ValueError("fidelity_holdout requires a deterministic (non-None) calibration seed")
@@ -509,35 +433,21 @@ def compute_fidelity_holdout_diagnostics(
     device,
     family_adapter=None,
 ) -> dict[str, Any]:
-    """``DirectResidualConfig.fidelity_holdout`` diagnostic: analysis-only,
-    never read by any fit and never mutates ``target_corrections``.
+    """``DirectResidualConfig.fidelity_holdout`` diagnostic: analysis-only, never read by any fit and never mutates
+    ``target_corrections``.
 
-    For BOTH the calibration split (the ``config.num_batches`` batches tau
-    was fit on) and a disjoint held-out split
-    (``draw_fidelity_holdout_calibration``, ``config.fidelity_holdout_batches``
-    batches immediately following it in the same seeded permutation), computes
-    per target position ``j`` (and, for ``e_local``, per fitted component):
+    For BOTH the calibration split and a disjoint held-out split (``draw_fidelity_holdout_calibration``), per target
+    position ``j`` (and, for ``e_local``, per fitted component):
+      * ``e_local``  = ``||(H_j Delta_W_j + 1 beta_j^T) @ effective_out_j - D_j||_F / ||D_j||_F``, the component's
+        own local linear-fit residual; ``H_j`` is the base target's component input at block ``j``
+        (``COMPONENT_INPUT_KIND``). ``D_j`` is recomputed on this split with the SAME fitted ``Q_j`` (and, for
+        ``residual_target='transported_endpoint'``, the same ``mu_s``/``mu_t``) from ``q_by_position``/
+        ``mu_s_by_position``/``mu_t_by_position`` -- never refit here.
+      * ``e_mounted`` = ``block_realized_target_error`` from `measure_direct_residual_realization` (mounts
+        ``target_corrections`` at unit strength, alpha=1, full nonlinear forward). With a single fitted component
+        it equals that component's ``e_local`` algebraically.
 
-      * ``e_local``  = ``||(H_j Delta_W_j + 1 beta_j^T) @ effective_out_j -
-        D_j||_F / ||D_j||_F`` -- the component's OWN local linear-fit
-        residual, ``H_j`` the base target's component-input activations at
-        block ``j`` (``ariadne.layouts.COMPONENT_INPUT_KIND``),
-        ``D_j`` recomputed on this split with the SAME fitted ``Q_j`` (and,
-        for ``residual_target='transported_endpoint'``, the same ``mu_s``/
-        ``mu_t``) passed in via ``q_by_position``/``mu_s_by_position``/
-        ``mu_t_by_position`` -- never refit here.
-      * ``e_mounted`` = ``block_realized_target_error`` from
-        `measure_direct_residual_realization`, reused verbatim (mounts
-        ``target_corrections`` at unit strength -- alpha=1, matching
-        ``D_j`` being a unit-strength target -- runs the FULL nonlinear
-        target forward pass, and compares the block-boundary delta to the
-        same ``D_j``). With a single fitted component this is algebraically
-        identical to that component's own ``e_local`` (no other component's
-        effect to sum in); see
-        ``tests/test_direct_residual_fidelity_holdout_20260925.py``.
-
-    Every norm is reported alongside its ratio (``||D_j||`` and the raw
-    numerator), not only the ratio, per the diagnostic's spec.
+    Every norm is reported alongside its ratio (``||D_j||`` and the raw numerator).
     """
     if not config.fidelity_holdout:
         raise ValueError("compute_fidelity_holdout_diagnostics called with fidelity_holdout=False")

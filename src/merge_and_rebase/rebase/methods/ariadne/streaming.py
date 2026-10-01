@@ -32,11 +32,8 @@ Tensor = torch.Tensor
 class _StreamingCrossCovariance:
     """Chan's pairwise online accumulator for a centered cross-covariance.
 
-    Equivalent to accumulating every row into one bank and computing
-    ``(X - mean_x).T @ (Y - mean_y)`` directly (what
-    `centered_rectangular_procrustes` does), but in O(1) batches rather than
-    O(num_batches) host memory. Kept on ``device`` (float64) throughout;
-    inputs are expected already cast to float64 by the caller.
+    Equivalent to ``(X - mean_x).T @ (Y - mean_y)`` over all rows at once (as `centered_rectangular_procrustes`
+    computes it) in O(1)-in-batches memory. Kept on ``device`` in float64; inputs must already be float64.
     """
 
     def __init__(self, device=None, *, track_source_gram: bool = False) -> None:
@@ -132,46 +129,26 @@ def prepare_direct_residual_streaming(
     alignment_seed: int = 0,
     fidelity_alignment_diagnostics: bool = False,
 ) -> dict[str, Any]:
-    """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
-    ``compute_desired_effects``: accumulates each position's Procrustes cross-
-    covariance batch-by-batch instead of holding every batch's boundary bank
-    resident, then solves the SVD once per position at the end.
+    """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` + ``compute_desired_effects``.
 
-    Uses the identical `paired_calibration` call as the resident path (same
-    ``num_batches``/``seed`` -> identical sample IDs) and the identical
-    `_aligned` token-interpolation helper, so the only difference from the
-    resident path is *when* the Procrustes map is extracted from the
-    accumulated cross-covariance (once at the end here, vs. from a fully
-    materialized row bank there) -- both compute ``_procrustes_from_cross``
-    over mathematically the same centered cross-covariance matrix.
+    Accumulates each position's Procrustes cross-covariance batch by batch (no resident boundary banks) and solves
+    once per position at the end. Uses the identical `paired_calibration` call (same ``num_batches``/``seed`` ->
+    identical sample IDs) and `_aligned` helper as the resident path, so the only difference is when the map is
+    extracted from the (mathematically identical) centered cross-covariance.
 
-    ``procrustes_source="gradient"`` additionally runs the per-batch
-    `iter_capture_block_gradients` generators (source base at the paired
-    indices, target base at every position, each with its own recipe) in
-    lockstep and fits ``Q_j`` on the Chan-accumulated centered GRADIENT
-    cross-covariance, exactly the statistic the resident path fits it on. The
-    activation accumulators always run: they provide the target fingerprints,
-    the activation means ``mu_s``/``mu_t`` (``residual_target=
-    "transported_endpoint"``) and the activation-space map used by the
-    alignment diagnostics and the gradient-vs-activation overlap diagnostic.
+    ``procrustes_source="gradient"`` also runs the `iter_capture_block_gradients` generators in lockstep and fits
+    ``Q_j`` on the accumulated centered GRADIENT cross-covariance, as the resident path does. The activation
+    accumulators always run: they give the target fingerprints, the means ``mu_s``/``mu_t``
+    (``residual_target="transported_endpoint"``) and the activation-space map used by the diagnostics.
 
-    Returns a dict consumed by `fit_direct_residual_streaming`: the fitted
-    per-position Procrustes maps (``"q_by_position"``), a per-(batch,
-    position) determinism fingerprint of the target boundary activations
-    (``"fingerprints"``) that Pass B uses to detect a target model mutated
-    between passes, the activation-space maps and means, the replayed
-    calibration batches for both sides, and the calibration metadata.
-
-    ``"procrustes_diagnostics"`` is the per-position dict merged into the diagnostics rows
-    (scalars only, mirroring the resident path's rows): always the rank diagnostics of the
-    cross-covariance the map was solved from (``procrustes_rank``, ``procrustes_min_dim``,
-    ``procrustes_q_non_unique``) and ``procrustes_source``; in gradient mode additionally the
-    activation-vs-gradient overlap and map distance; with ``fidelity_alignment_diagnostics``
-    (set by the caller for ``fidelity_holdout``, the only case in which the resident path
-    collects them) also ``alignment_map``, ``alignment_row_weighting``, ``alignment_q_frobenius``,
-    ``alignment_q_rank`` and the map-specific scalars. The resident path additionally stores the
-    tensors ``q``/``mu_s``/``mu_t`` in those rows; here they stay in ``q_by_position`` /
-    ``source_mean_by_position`` / ``target_mean_by_position`` (no d x d tensor is duplicated into rows).
+    Returns a dict consumed by `fit_direct_residual_streaming`: ``q_by_position``, per-(batch, position)
+    ``fingerprints`` of the target boundary activations (Pass B uses them to detect a target model mutated between
+    passes), activation-space maps and means, the replayed calibration batches and the calibration metadata.
+    ``procrustes_diagnostics`` is the scalar-only per-position dict merged into the diagnostics rows: always the
+    rank diagnostics of the cross-covariance solved from and ``procrustes_source``; in gradient mode also the
+    activation-vs-gradient overlap and map distance; with ``fidelity_alignment_diagnostics`` also the alignment_*
+    scalars. The q/mu_s/mu_t tensors are not duplicated into rows (unlike the resident path); they stay in
+    ``q_by_position`` / ``source_mean_by_position`` / ``target_mean_by_position``.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -281,12 +258,8 @@ def prepare_direct_residual_streaming(
                 scalars["weighted_cross_frobenius"] = float(torch.linalg.norm(cross).item() / acc.weight)
             return q, rank, True, scalars
         if alignment_map == "random_isometry":
-            # Same shape/orientation as the polar map above (both come from
-            # `cross`'s shape); only the direction is randomized, from the
-            # SAME per-block seed derivation the resident path uses, so
-            # streaming and resident produce the identical random map for
-            # the same alignment_seed (see test_direct_residual_random_
-            # isometry.py's streaming-parity check).
+            # Same per-block seed derivation as the resident path, so streaming and resident produce the identical
+            # random map for the same alignment_seed; only the direction is randomized.
             q = _random_isometry_map(tuple(cross.shape), seed=_derive_block_seed(alignment_seed, position))
             scalars = {
                 "alignment_map": "random_isometry",
@@ -339,7 +312,9 @@ def prepare_direct_residual_streaming(
                 "procrustes_source": "gradient",
                 **procrustes_rank_diagnostics(grad_rank, q64.shape[0], q64.shape[1]),
                 "activation_gradient_procrustes_overlap": float(((activation_q64[j].T @ q64).norm() ** 2) / d_min),
-                "activation_gradient_map_distance": float(torch.linalg.norm(activation_q64[j] - q64) / (2.0 * d_min) ** 0.5),
+                "activation_gradient_map_distance": float(
+                    torch.linalg.norm(activation_q64[j] - q64) / (2.0 * d_min) ** 0.5
+                ),
             }
     else:
         q_by_position = {j: q.float() for j, q in activation_q64.items()}
@@ -374,29 +349,19 @@ def fit_direct_residual_streaming(
     device,
     family_adapter=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
-    """Streaming (Pass B) equivalent of ``fit_direct_residual``: fits every
-    target position's residual-writing components from chunked capture
-    sweeps that accumulate `ResidualSufficientStatistics` batch-by-batch,
-    instead of ``_fit_all_positions_independent``'s single fully-materialized
-    capture. Requires ``config.activation_storage == 'streaming'`` semantics
-    to already be validated by `parse_direct_residual_config`
-    (``component_target='block_boundary'``, ``block_split='none'``,
-    ``realization_diagnostics=False``).
+    """Streaming (Pass B) equivalent of ``fit_direct_residual``.
 
-    Mirrors ``fit_direct_residual``'s wrapper exactly: same position checks,
-    same forced ``cascade_order='independent'``, same
-    save/load/restore-in-``finally`` of the target model's state, and the
-    same final ``source_coordinate`` -> ``source_position`` diagnostic
-    renaming, in position order.
+    Fits every position's residual-writing components from chunked capture sweeps that accumulate
+    `ResidualSufficientStatistics` batch by batch. Requires the config already validated by
+    `parse_direct_residual_config` for ``activation_storage='streaming'`` (``component_target='block_boundary'``,
+    ``block_split='none'``). Realization diagnostics are measured separately by the caller (``method.py``).
 
-    Each chunk of ``config.streaming_position_chunk`` positions (``None`` ->
-    one chunk of all positions) gets its own lockstep sweep over three
-    ``iter_capture_tokens`` generators (source_base, source_ft, target),
-    re-deriving ``desired = (f - b) @ q_j`` per batch from `prepared`'s
-    Procrustes maps instead of reading a resident ``desired`` bank, and
-    checking the just-captured target boundary against `prepared`'s
-    fingerprint before trusting it as ``base_out`` (there is no resident
-    ``target_base_outputs_by_position`` bank to diff against directly).
+    Mirrors ``fit_direct_residual``'s wrapper: same position checks, forced ``cascade_order='independent'``,
+    save/load/restore-in-``finally`` of the target model's state, and ``source_coordinate`` -> ``source_position``
+    renaming in position order. Each chunk of ``config.streaming_position_chunk`` positions (``None`` -> all) gets
+    a lockstep sweep over source_base / source_ft / target `iter_capture_tokens` generators, re-deriving
+    ``desired = (f - b) @ q_j`` per batch from `prepared`'s maps and checking the captured target boundary against
+    `prepared`'s fingerprint before using it as ``base_out`` (no resident base-output bank to diff against).
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")

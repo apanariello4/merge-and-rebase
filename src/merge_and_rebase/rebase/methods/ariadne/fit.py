@@ -34,30 +34,16 @@ def fit_direct_residual(
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Fit every target position's residual-writing components independently.
 
-    A thin wrapper around
-    `ariadne.fit._fit_all_positions_independent` (the shared
-    independent-mode fast path also used by ``complete_residuals_direct``) --
-    called once for every ``j in range(pairing.target_depth)`` at once, with
-    ``source_coordinate = pairing.pairing[j]``, from a single shared target
-    forward sweep rather than one sweep per position.
+    Wraps `_fit_all_positions_independent` for all ``j in range(pairing.target_depth)`` at once
+    (``source_coordinate = pairing.pairing[j]``) from one shared target forward sweep. Always runs with independent
+    (no-cascade) semantics regardless of ``config.cascade_order`` (a schema-parity no-op here; see
+    ``tests/test_direct_residual_cascade_order.py``): nothing is mounted between fits.
 
-    Every call is forced to run with independent (no-cascade) semantics,
-    regardless of ``config.cascade_order``: Direct Residual mounts nothing
-    between fits, cross-position or intra-position, by construction (see the
-    module docstring). ``cascade_order`` is accepted in `DirectResidualConfig`
-    only for schema parity and is provably a no-op here -- see
-    ``tests/test_direct_residual_cascade_order.py``.
+    Fits at unit strength (gamma=1) and returns the raw correction; the caller applies
+    `target_informed_runtime.scale_completion`, so ``strength=0`` is an exact native-target-base control.
 
-    ``theta_j_corrected = theta_j_native + strength * correction_j`` is NOT
-    applied by this function: it fits at unit strength (gamma=1), exactly as
-    `complete_residuals_direct` does, and returns the raw correction. The
-    caller applies `target_informed_runtime.scale_completion` afterwards, so
-    ``strength=0`` is an exact native-target-base control by the same
-    contract `complete_residuals_direct` already has.
-
-    Returns ``(target_corrections, diagnostics)``. ``target_corrections``
-    only contains the fitted ``attn.out_proj``/``mlp.c_proj`` weight+bias
-    keys -- nothing outside `config.components` is touched.
+    Returns ``(target_corrections, diagnostics)``; ``target_corrections`` only holds the weight+bias keys of
+    `config.components`.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -69,10 +55,7 @@ def fit_direct_residual(
             "desired effects do not exactly match the pairing's target positions: "
             f"expected={sorted(range(pairing.target_depth))}, found={sorted(desired)}"
         )
-    # Force independent (no-mount) semantics for the shared solver regardless
-    # of what cascade_order the caller's config happens to carry -- see the
-    # docstring above and the module docstring for why this is always
-    # correct for Direct Residual, not merely a default.
+    # Force independent (no-mount) semantics for the shared solver regardless of config.cascade_order.
     solver_config = replace(config, cascade_order="independent") if config.cascade_order != "independent" else config
     original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     target_corrections: dict[str, Tensor] = {}
@@ -117,10 +100,7 @@ def fit_direct_residual(
                 family_adapter=family_adapter,
             )
         else:
-            # Every position is guaranteed pristine here (nothing is ever
-            # mounted between fits, cross-position or intra-position), so all
-            # of them share one target forward sweep instead of one per
-            # position -- see _fit_all_positions_independent's docstring.
+            # All positions are pristine (nothing is mounted between fits): share one target forward sweep.
             fitted = _fit_all_positions_independent(
                 target_model,
                 current_state,
@@ -139,10 +119,7 @@ def fit_direct_residual(
             target_corrections.update(position_corrections)
             for row in block_rows:
                 row["source_position"] = row.pop("source_coordinate")
-                # Analysis-only: which statistic Q_j was fit on. Never read by
-                # any fit -- the row schema is otherwise unchanged, so this is
-                # additive for every existing consumer (golden hashes are over
-                # target_corrections, not these diagnostics rows).
+                # Analysis-only: which statistic Q_j was fit on; never read by any fit (golden hashes cover corrections).
                 row["procrustes_source"] = config.procrustes_source
                 diagnostics.append(row)
     finally:
@@ -215,18 +192,14 @@ def fit_sequential_source_endpoints(
         )
         synthesized_outputs = {int(j): batches for j, batches in synthesized_raw.items()}
         if config.endpoint_construction == "sequential_delta_on_synthesized_base":
-            # Preserve the stage-one synthesized pretrained model as the
-            # stage-two design H_syn, while fitting only the mapped source
-            # fine-tuning update.  The affine Procrustes means cancel between
-            # these two mapped endpoints.  This gives the zero-update
-            # invariant without changing the sequential hypothesis.
+            # Keep the stage-one synthesized base as the stage-two design H_syn and fit only the mapped source update;
+            # the affine Procrustes means cancel between the two mapped endpoints (zero-update invariant).
             ft_desired = {
                 j: [ft - base for base, ft in zip(mapped_base[j], mapped_ft[j], strict=True)]
                 for j in range(pairing.target_depth)
             }
         else:
-            # Historical endpoint mode: fit the mapped FT endpoint against
-            # the synthesized network's current output.
+            # Historical endpoint mode: fit the mapped FT endpoint against the synthesized network's output.
             ft_desired = {
                 j: [m - t for m, t in zip(mapped_ft[j], synthesized_outputs[j], strict=True)]
                 for j in range(pairing.target_depth)
@@ -271,10 +244,8 @@ def fit_sequential_source_endpoints(
         target_model.load_state_dict(entry_state, strict=True)
 
 
-# Above this condition number (2-norm, float64), ridge_estimator="none"
-# refuses to solve rather than return a numerically meaningless "exact" fit.
-# 1e8 is a conventional float64 well-posedness threshold (loses roughly half
-# of float64's ~15-16 decimal digits of precision to the solve).
+# Above this 2-norm float64 condition number, ridge_estimator="none" refuses to solve rather than return a
+# numerically meaningless "exact" fit (a conventional float64 well-posedness threshold).
 _RIDGE_NONE_CONDITION_THRESHOLD = 1e8
 
 
@@ -289,12 +260,8 @@ def _clamped_eigh_inverse(sym: Tensor, *, eps: float = 1e-12) -> tuple[Tensor, T
 class ResidualSufficientStatistics:
     """Streaming statistics for the source-space Sylvester solve.
 
-    ``device``, when given, moves every batch's inputs onto it before the
-    float64 Gram accumulation in ``update()``: the accumulated statistics
-    (and therefore ``solve()``'s ``eigh``/``linalg.solve``) then live on that
-    device instead of wherever the caller's activations happened to be. Left
-    ``None`` (the default), nothing moves, matching the historical CPU-only
-    behaviour exactly -- so every existing caller and test is unaffected.
+    ``device``, when given, moves each batch onto it before the float64 Gram accumulation in ``update()``, so the
+    statistics (and ``solve()``) live there; ``None`` (default) moves nothing (historical CPU behaviour).
     """
 
     def __init__(self, device: torch.device | str | None = None) -> None:
@@ -313,14 +280,9 @@ class ResidualSufficientStatistics:
     def update(self, h: Tensor, e: Tensor, t_in: Tensor | None, t_out: Tensor) -> None:
         """Accumulate one batch.
 
-        ``t_in=None`` means an identity input map: the fitted weight then lives
-        in the *target* input coordinates of ``h`` itself and no input-side
-        reprojection happens.  This is the ``direct_target`` mode, where there
-        is no parameter transport to respect on the input side; it is spelled
-        as ``None`` rather than an explicit identity so that the ``d_mlp``-sized
-        identity matmul is never materialized (4096x4096 per batch on a
-        ViT-L/14 target).  The solve itself is unchanged -- with ``t_in = I``
-        the normal equations reduce exactly to ``A = H``.
+        ``t_in=None`` means an identity input map (``direct_target`` mode): the weight lives in the target input
+        coordinates of ``h`` and the normal equations reduce to ``A = H``. It is spelled ``None`` so the
+        ``d_mlp``-sized identity matmul (4096x4096 per batch on ViT-L/14) is never materialized.
         """
         _check_rows(h, e, "h", "e")
         if h.ndim != 2 or e.ndim != 2 or t_out.ndim != 2 or (t_in is not None and t_in.ndim != 2):
@@ -395,12 +357,8 @@ class ResidualSufficientStatistics:
     ) -> tuple[Tensor, dict[str, Any]]:
         if self.s is None or self.g is None or self.b is None or self.n_rows == 0:
             raise ValueError("cannot solve empty residual statistics")
-        # ridge_relative is still required to be a finite positive number even
-        # under ridge_estimator="none" (which never reads it): the field is
-        # shared config-schema surface with fixed_relative/empirical_bayes,
-        # and loosening this check for "none" would let a config author write
-        # an otherwise-invalid ridge_relative that silently becomes "correct"
-        # only because it happens to be paired with "none".
+        # ridge_relative must be finite and positive even for ridge_estimator="none" (which never reads it): the
+        # field is shared schema surface, and relaxing the check would let an invalid value pass silently.
         if isinstance(ridge_relative, bool) or ridge_relative <= 0 or not math.isfinite(float(ridge_relative)):
             raise ValueError("ridge_relative must be finite and > 0")
         if ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
@@ -435,16 +393,9 @@ class ResidualSufficientStatistics:
         trace_g = float(torch.trace(g).item())
         condition_number: float | None = None
         if ridge_estimator == "none":
-            # Exact least squares: lambda = 0, straight off the (centered)
-            # normal equations -- no shrinkage at all. This is only a
-            # well-posed solve when the normal-equations system is actually
-            # invertible, so -- unlike the ridge-regularized estimators,
-            # which are well-defined even for a singular sc/g via the
-            # clamped-eigenvalue pseudo-inverse below -- a singular or
-            # numerically ill-conditioned system must fail loudly here rather
-            # than silently falling back to that pseudo-inverse's zeroed
-            # near-null directions, which would look like a valid exact
-            # solve but is not one.
+            # Exact least squares (lambda = 0) on the centered normal equations. Unlike the ridge estimators
+            # (pseudo-inverse, defined for singular sc/g), a singular or ill-conditioned system must fail loudly
+            # here: the zeroed near-null directions would masquerade as a valid exact solve.
             effective_ridge_relative = 0.0
             base = 0.0
             cond_sc = float(torch.linalg.cond(sc).item()) if sc.shape[0] > 0 else 1.0
@@ -460,21 +411,15 @@ class ResidualSufficientStatistics:
         elif ridge_estimator == "empirical_bayes":
             if self.n_rows <= 1:
                 raise ValueError("empirical_bayes ridge requires at least two activation rows")
-            # With empirical covariance Sigma_hat = S_c / (N - 1), the
-            # empirical-Bayes precision denominator is
-            #   S_c + trace(Sigma_hat) I.
-            # Therefore the scalar ridge is trace(S_c) / (N - 1), which is
-            # the historical relative parameterization evaluated at the
-            # component-specific value d_in / (N - 1).
+            # Empirical Bayes: with Sigma_hat = S_c / (N - 1) the precision denominator is S_c + trace(Sigma_hat) I,
+            # so the scalar ridge is trace(S_c) / (N - 1) (relative parameterization with d_in / (N - 1)).
             effective_ridge_relative = float(self.m_source) / float(self.n_rows - 1)
             base = trace_sc / float(self.n_rows - 1)
         else:
             effective_ridge_relative = float(ridge_relative)
             base = effective_ridge_relative * trace_sc / float(self.m_source)
         trace_normalized_lam = base * (trace_g / float(self.d_source)) if exact_form else base
-        # ridge_mode="absolute" is validated above to require
-        # ridge_estimator="fixed_relative", so this override never fights
-        # the "none"/"empirical_bayes" branches above.
+        # ridge_mode="absolute" is validated to require ridge_estimator="fixed_relative".
         lam = float(ridge_absolute) if ridge_mode == "absolute" else trace_normalized_lam
 
         es, us, sc_inv = _clamped_eigh_inverse(sc)
@@ -491,11 +436,8 @@ class ResidualSufficientStatistics:
         if exact_form:
             beta = g_inv @ (t_out64 @ mu_e - g @ (x.T @ mu_a))
         else:
-            # Bare torch.zeros defaults to CPU. t_out64/x/mu_a are on whatever
-            # device the caller ran on (CUDA for device_transform="gpu"), and
-            # _residual_sq below does t_out64.T @ beta -- a CPU/CUDA mismatch
-            # that only reduced-form (exact_form=False) fits reach, since the
-            # exact-form branch derives beta from GPU tensors already.
+            # Explicit device: bare torch.zeros is CPU, but t_out64/x/mu_a may be CUDA (device_transform="gpu") and
+            # _residual_sq does t_out64.T @ beta; only exact_form=False reaches this branch.
             beta = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
 
         residual_sq = self._residual_sq(x, beta, t_out64, mu_a, mu_e)
@@ -514,9 +456,7 @@ class ResidualSufficientStatistics:
             "n_rows": self.n_rows,
             "ridge": lam,
             "ridge_estimator": ridge_estimator,
-            # Only populated for ridge_estimator="none" (the estimator that
-            # can actually fail on this quantity); None for the two
-            # regularized estimators, which are well-posed regardless.
+            # Only populated for ridge_estimator="none"; None for the (always well-posed) regularized estimators.
             "condition_number": condition_number,
             "configured_ridge_relative": float(ridge_relative),
             "effective_ridge_relative": effective_ridge_relative,
@@ -532,9 +472,8 @@ class ResidualSufficientStatistics:
             "correction_norm": float(torch.linalg.norm(x).item()),
             "bias_norm": float(torch.linalg.norm(beta).item()),
             "exact_form": exact_form,
-            # Source-coordinate c_proj.bias delta, transported exactly like the
-            # weight's output side (t_out.T @ bias_correction, matching
-            # theseus._transport_bias's `delta_vec @ t_out` convention).
+            # Source-coordinate c_proj.bias delta, transported like the weight's output side
+            # (t_out.T @ bias_correction, matching theseus._transport_bias's `delta_vec @ t_out`).
             "bias_correction": beta.to(torch.float32),
         }
         return x.T.to(torch.float32), diag
@@ -543,18 +482,13 @@ class ResidualSufficientStatistics:
 def _realization_diagnostic_fields(
     h_batches, correction, bias_for_pred, effective_out, weight_before, desired_norm, residual_norm_after, *, stats=None
 ):
-    """Analysis-only per-component fit fields, gated on ``realization_
-    diagnostics`` (never read by any fit -- see the callers). Shared by every
-    block_boundary fit path (``_fit_all_positions_independent``,
-    ``_fit_block_boundary_backfit``) with the fields
-    ``fit_relative_residual``, ``target_norm``, ``update_norm``,
-    ``relative_update_norm`` (denominator = the pre-correction weight slice),
-    ``realized_target_norm_ratio``.
+    """Analysis-only per-component fit fields, gated on ``realization_diagnostics`` (never read by any fit).
 
-    ``realized_target_norm_ratio`` is computed EXACTLY from the accumulated
-    fit (``H @ correction^T + bias``, pushed through the SAME ``effective_out``
-    -- LayerScale -- the solve itself used), reusing the already-resident
-    ``h_batches`` bank rather than a second capture sweep.
+    Shared by every block_boundary fit path. Fields: ``fit_relative_residual``, ``target_norm``, ``update_norm``,
+    ``relative_update_norm`` (denominator = pre-correction weight slice) and ``realized_target_norm_ratio``,
+    computed EXACTLY from the accumulated fit (``H @ correction^T + bias`` pushed through the SAME
+    ``effective_out`` -- LayerScale -- the solve used) from the resident ``h_batches`` bank, with no second
+    capture sweep.
     """
     update_norm = float(torch.linalg.norm(correction).item())
     weight_norm = float(torch.linalg.norm(weight_before).item())
@@ -593,64 +527,22 @@ def _fit_all_positions_independent(
     device,
     family_adapter=None,
 ) -> dict[int, tuple[dict, list]]:
-    """Fit every ``(position, component)`` pair for ``cascade_order='independent'``
-    from ONE shared target forward sweep instead of one sweep per pair.
+    """Fit every ``(position, component)`` pair for ``cascade_order='independent'`` from ONE shared target sweep.
 
-    Under ``cascade_order="independent"`` the target model is never mutated
-    between fits -- the only mount site
-    (``if config.cascade_order != "independent": target_model.load_state_dict(...)``
-    in ``_fit_direct_target_position``) is unconditionally skipped, both across
-    positions and across components within one position. Every ``(position,
-    component)`` pair therefore observes the identical, pristine
-    ``target_model`` state that ``current_state`` already describes, which
-    makes ``_fit_direct_target_position``'s per-pair ``capture_tokens`` calls
-    (one full calibration sweep each, up to ``len(positions) *
-    len(components)`` of them) redundant: they all capture from the same
-    model. This function captures once and reuses the banks for every solve.
+    Under independent mode the target model is never mutated between fits (the mount in
+    ``_fit_direct_target_position`` is skipped), so every pair sees the same pristine ``target_model`` that
+    ``current_state`` describes and a single ``capture_tokens`` sweep serves all solves: one ``"out"`` (boundary)
+    request per position and one ``"h"`` request per pair (``COMPONENT_INPUT_KIND[component]``).
 
-    ``capture_tokens`` already accepts a combined ``requests`` dict spanning
-    many ``(position, kind)`` pairs and turns it into one set of hooks fired
-    by one sweep over ``batches`` (see its docstring/implementation); nothing
-    below it needed to change; this function is only a restructuring of the
-    *caller* side. One ``"out"`` (boundary) request is registered per
-    position, shared by every component at that position -- the block's own
-    boundary output does not depend on which component's input is being
-    fitted -- and one ``"h"`` request per ``(position, component)`` pair for
-    that component's regression features
-    (``COMPONENT_INPUT_KIND[component]``).
+    Per-pair solving is byte-identical to ``_fit_direct_target_position``'s independent-mode body (same
+    ``ResidualSufficientStatistics`` accumulation, ridge solve, ``missing_bias`` handling and ``block_rows`` fields,
+    including ``measured_residual_norm_after`` on every component but the position's last, which is the next
+    component's own pre-fit residual). The pristine-effect assertion runs for ALL pairs; it can only raise on a bug
+    (stale reference bank or mutated base), never change a returned number. Intra-position "replay" (mounting
+    attn.out_proj before mlp.c_proj) is deliberately NOT implemented: it would change independent-mode numerics.
 
-    Per-``(position, component)`` solving is otherwise byte-identical to
-    ``_fit_direct_target_position``'s independent-mode body: same
-    ``ResidualSufficientStatistics`` online accumulation (already a streaming
-    accumulator; nothing here changes how it accumulates, only how many
-    forward sweeps feed it), same ridge solve, same ``missing_bias`` handling,
-    same ``block_rows`` diagnostic fields -- including the (under independent
-    mode, vacuous but historically populated) ``measured_residual_norm_after``
-    field on every component but the position's last: since nothing is ever
-    mounted, that field is simply the next component's own pre-fit residual,
-    identical in both the old per-pair-capture path and this one.
-
-    The pristine-effect assertion is strengthened relative to
-    ``_fit_direct_target_position``: that function can only assert it for
-    ``component_index == 0`` of whichever position the caller nominates as
-    "first" (a real cascade only ever *starts* pristine). Under true
-    independent semantics there is no privileged "first" position -- every
-    ``(position, component)`` pair sees the pristine base -- so this function
-    asserts it unconditionally for all of them. This is a strictly stronger
-    correctness check with no effect on the fitted values themselves: it can
-    only ever raise on a bug (a stale reference bank or a mutated base), never
-    change a number that was going to be returned.
-
-    Intra-position "replay" (the user's brief step 6, mounting attn.out_proj
-    locally before fitting mlp.c_proj) is deliberately NOT implemented: under
-    independent mode there is no intra-position mount to replay in the first
-    place (the same skipped-mount conditional gates it), so there is no
-    sequential attention->MLP effect for a replay to preserve. Building it
-    would change independent-mode's numerics, not merely speed it up.
-
-    Returns ``{position: (position_corrections, block_rows)}``, matching what
-    ``len(positions)`` separate ``_fit_direct_target_position`` calls would
-    each have returned for the identical inputs.
+    Returns ``{position: (position_corrections, block_rows)}``, as ``len(positions)`` separate
+    ``_fit_direct_target_position`` calls would for identical inputs.
     """
     if config.cascade_order != "independent":
         raise ValueError("_fit_all_positions_independent requires cascade_order='independent'")
@@ -717,14 +609,11 @@ def _finalize_independent_component(
     block_rows,
     h_batches=None,
 ):
-    """Everything after one component's accumulation loop in
-    ``_fit_all_positions_independent``: the pristine-effect check, the ridge
-    solve, state/bookkeeping updates, missing-bias handling, and the block_row
-    diagnostic (plus optional realization diagnostics). Mutates
-    ``position_corrections``, ``current_state`` and ``block_rows`` in place.
+    """Everything after one component's accumulation loop in ``_fit_all_positions_independent``: pristine-effect
+    check, ridge solve, state/bookkeeping updates, missing-bias handling and the block_row diagnostic (plus optional
+    realization diagnostics). Mutates ``position_corrections``, ``current_state`` and ``block_rows`` in place.
     """
-    # See the docstring: under independent mode this holds for every
-    # (position, component) pair, not only a historically-first one.
+    # Pristine-effect check holds for every (position, component) pair under independent mode.
     if effect_sq > 1e-12 * max(desired_sq, 1.0):
         raise RuntimeError(
             "Direct completion started from a target model that is not the native "
@@ -739,12 +628,8 @@ def _finalize_independent_component(
     diag["bias_correction"] = diag["bias_correction"].cpu()
     weight_before = current_state[key].detach().clone()
     if block_rows:
-        # Same bookkeeping as _fit_direct_target_position: the previous
-        # component's row records this component's own pre-fit residual
-        # under its historical name. Under independent mode nothing
-        # mounted in between, so this is not a "post-mount" measurement
-        # -- see the docstring -- but it is the identical value the old
-        # per-pair-capture path would have recorded.
+        # As in _fit_direct_target_position: the previous component's row records this component's pre-fit residual
+        # as ``measured_residual_norm_after`` (not a post-mount measurement; nothing is mounted).
         block_rows[-1]["measured_residual_norm_after"] = diag["residual_norm_before"]
     if correction.shape != current_state[key].shape or not torch.isfinite(correction).all():
         raise RuntimeError("Direct residual completion produced an invalid projection")

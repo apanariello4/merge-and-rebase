@@ -9,14 +9,9 @@ from ....models.vision_utils import _encode_image
 from ..theseus import _interp_2d_tokens
 
 # --- architecture abstraction -------------------------------------------------
-#
-# Proposal 1's solver is architecture-agnostic; only this orchestration layer
-# reached into CLIP's module tree. These two shims name the four things that
-# actually differ between a ViT and an HF decoder -- where the blocks live,
-# which projection writes the residual, how to run a batch, and what that
-# projection is called in the state dict -- so the same completion runs on both
-# without duplicating the orchestration. Vision behaviour is unchanged: passing
-# family_adapter=None selects the original CLIP paths verbatim.
+# Only this layer touches the model's module tree: the two layouts name where blocks live, which
+# projection writes the residual, how to run a batch, and the state-dict key. family_adapter=None
+# selects the original CLIP paths verbatim (vision behaviour unchanged).
 
 
 class _VisionLayout:
@@ -158,14 +153,10 @@ def _layout_for(family_adapter):
     return _VisionLayout() if family_adapter is None else _DecoderLayout(family_adapter)
 
 
-#: Capture kinds understood by ``capture_tokens``. The ``*_input`` kinds take the
-#: hooked module's input, the others its output.  ``attn_input`` is the query
-#: argument of the attention call (ln_1's output, shared by q/k/v); ``mlp_input``
-#: is the forward-hook input of ``mlp.c_fc`` (shared by c_fc). ``block_input`` is
-#: the forward-hook input of the block module itself (the pristine block-level
-#: input ``X_j^0`` intra-block backfitting replays against), i.e. the same
-#: module as ``"boundary"`` but its input rather than its output. All are
-#: vision-layout only.
+#: Capture kinds understood by ``capture_tokens``; ``*_input`` kinds hook the module's input, the rest
+#: its output. ``attn_input`` is ln_1's output (shared by q/k/v); ``mlp_input`` is the input of
+#: ``mlp.c_fc``; ``block_input`` is the pristine block input ``X_j^0`` (same module as ``"boundary"``,
+#: input rather than output). All vision-layout only.
 _CAPTURE_KINDS = frozenset(
     {
         "boundary",
