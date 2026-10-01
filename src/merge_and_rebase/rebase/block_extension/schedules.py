@@ -234,3 +234,102 @@ def build_reduction_layout(chain: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         "inserted_blocks": (),
         "final_blocks": tuple(final_blocks),
     }
+
+
+def vision_collapse_schedule(
+    curr_layers: int,
+    n_to_remove: int,
+    insertion_order: str,
+    extension_density: str,
+):
+    if n_to_remove <= 0:
+        return []
+    if curr_layers < 2:
+        raise ValueError("Cannot collapse blocks when the model depth is less than 2.")
+
+    max_anchor = curr_layers - 2
+    if extension_density == "clump":
+        if insertion_order == "top-bottom":
+            return [max_anchor] * n_to_remove
+        if insertion_order == "random":
+            return [int(np.random.randint(0, max_anchor + 1)) for _ in range(n_to_remove)]
+        if insertion_order != "bottom-top":
+            raise ValueError(
+                f"Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. Got: {insertion_order}"
+            )
+        return [0] * n_to_remove
+
+    if extension_density == "spread":
+        return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
+
+    if extension_density != "spread_mod":
+        raise ValueError(
+            f"Unsupported extension_density. Expected one of: spread, spread_mod, clump. Got: {extension_density}"
+        )
+
+    if n_to_remove == 1:
+        anchors = [0]
+    else:
+        anchors = [int(round(v)) for v in np.linspace(0, max_anchor, num=n_to_remove)]
+
+    if insertion_order == "bottom-top":
+        return anchors
+    if insertion_order == "top-bottom":
+        return [max_anchor - a for a in anchors]
+    if insertion_order == "random":
+        anchors = list(anchors)
+        np.random.shuffle(anchors)
+        return anchors
+    raise ValueError(
+        f"Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. Got: {insertion_order}"
+    )
+
+
+def vision_locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
+    for pos, item in enumerate(chain):
+        orig_idxs = item["orig_idxs"]
+        if orig_idxs[0] <= anchor_orig_idx <= orig_idxs[-1]:
+            return min(pos, len(chain) - 2)
+    raise ValueError(f"Could not locate collapse anchor {anchor_orig_idx} in the current block chain.")
+
+
+def decoder_collapse_schedule(
+    curr_layers: int,
+    n_to_remove: int,
+    insertion_order: str,
+    extension_density: str,
+) -> list[int]:
+    if n_to_remove <= 0:
+        return []
+    if curr_layers < 2:
+        raise ValueError("Cannot collapse blocks when the model depth is less than 2.")
+
+    max_anchor = curr_layers - 2
+    if extension_density == "clump":
+        if insertion_order == "top-bottom":
+            return [max_anchor] * n_to_remove
+        if insertion_order == "random":
+            return [int(np.random.randint(0, max_anchor + 1)) for _ in range(n_to_remove)]
+        if insertion_order != "bottom-top":
+            raise ValueError(
+                f"Unsupported insertion_order. Expected: bottom-top, top-bottom, random. Got: {insertion_order}"
+            )
+        return [0] * n_to_remove
+
+    if extension_density == "spread_mod":
+        n_gaps = curr_layers - 1
+        return [i % n_gaps for i in range(n_to_remove)]
+
+    if extension_density != "spread":
+        raise ValueError(
+            f"Unsupported extension_density. Expected: spread, spread_mod, clump. Got: {extension_density}"
+        )
+
+    return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
+
+
+def decoder_locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
+    for i, item in enumerate(chain):
+        if anchor_orig_idx in item["orig_idxs"]:
+            return i
+    raise ValueError(f"Could not locate anchor_orig_idx={anchor_orig_idx} in chain.")

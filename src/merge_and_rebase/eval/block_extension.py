@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 try:
@@ -19,6 +18,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from ..models.vision_utils import _encode_image
+from ..rebase.block_extension.adapters import _InProjCapture  # noqa: F401  (re-exported for existing importers)
 from ..rebase.block_extension.config import (  # noqa: F401  (re-exported for existing importers)
     _ANNOTATION_PARAMS,
     _MISPLACED_TOP_LEVEL_KEYS,
@@ -46,6 +46,8 @@ from ..rebase.block_extension.schedules import (  # noqa: F401  (re-exported for
     disjoint_collapse_schedule,
     plan_inserted_positions,
     spread_anchor_schedule,
+    vision_collapse_schedule,
+    vision_locate_collapse_pos,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,26 +84,6 @@ def _deterministic_calibration_loader(loader, n_batches: int):
             getattr(loader, "persistent_workers", False) and loader.num_workers > 0
         ),
     )
-
-
-class _InProjCapture:
-    def __init__(self, attn: nn.Module):
-        self.attn = attn
-        self.outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self._orig_forward = attn.forward
-        attn.forward = self._patched_forward
-
-    def _patched_forward(self, query, key=None, value=None, **kwargs):
-        qkv = F.linear(query, self.attn.in_proj_weight, self.attn.in_proj_bias)
-        q, k, v = qkv.chunk(3, dim=-1)
-        # Q/K/V captures can dominate GPU memory at larger calibration
-        # budgets.  They are regression inputs, not tensors for subsequent
-        # GPU computation, so transfer them immediately.
-        self.outputs.append((q.detach().cpu(), k.detach().cpu(), v.detach().cpu()))
-        return self._orig_forward(query, key=key, value=value, **kwargs)
-
-    def restore(self):
-        self.attn.forward = self._orig_forward
 
 
 class BlockExtender:
@@ -1137,58 +1119,11 @@ class BlockExtender:
         insertion_order: str,
         extension_density: str,
     ):
-        if n_to_remove <= 0:
-            return []
-        if curr_layers < 2:
-            raise ValueError("Cannot collapse blocks when the model depth is less than 2.")
-
-        max_anchor = curr_layers - 2
-        if extension_density == "clump":
-            if insertion_order == "top-bottom":
-                return [max_anchor] * n_to_remove
-            if insertion_order == "random":
-                return [int(np.random.randint(0, max_anchor + 1)) for _ in range(n_to_remove)]
-            if insertion_order != "bottom-top":
-                raise ValueError(
-                    "Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. "
-                    f"Got: {insertion_order}"
-                )
-            return [0] * n_to_remove
-
-        if extension_density == "spread":
-            return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
-
-        if extension_density != "spread_mod":
-            raise ValueError(
-                "Unsupported extension_density. Expected one of: spread, spread_mod, clump. "
-                f"Got: {extension_density}"
-            )
-
-        if n_to_remove == 1:
-            anchors = [0]
-        else:
-            anchors = [int(round(v)) for v in np.linspace(0, max_anchor, num=n_to_remove)]
-
-        if insertion_order == "bottom-top":
-            return anchors
-        if insertion_order == "top-bottom":
-            return [max_anchor - a for a in anchors]
-        if insertion_order == "random":
-            anchors = list(anchors)
-            np.random.shuffle(anchors)
-            return anchors
-        raise ValueError(
-            "Unsupported insertion_order. Expected one of: bottom-top, top-bottom, random. "
-            f"Got: {insertion_order}"
-        )
+        return vision_collapse_schedule(curr_layers, n_to_remove, insertion_order, extension_density)
 
     @staticmethod
     def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
-        for pos, item in enumerate(chain):
-            orig_idxs = item["orig_idxs"]
-            if orig_idxs[0] <= anchor_orig_idx <= orig_idxs[-1]:
-                return min(pos, len(chain) - 2)
-        raise ValueError(f"Could not locate collapse anchor {anchor_orig_idx} in the current block chain.")
+        return vision_locate_collapse_pos(chain, anchor_orig_idx)
 
     @torch.no_grad()
     def extend_and_calibrate(

@@ -15,6 +15,7 @@ try:
 except Exception:
     tqdm = None
 
+from ..rebase.block_extension.schedules import decoder_collapse_schedule, decoder_locate_collapse_pos
 from .block_extension import (
     BlockExtensionConfig,
     _deterministic_calibration_loader,
@@ -214,41 +215,11 @@ class DecoderBlockExtender:
         insertion_order: str,
         extension_density: str,
     ) -> list[int]:
-        if n_to_remove <= 0:
-            return []
-        if curr_layers < 2:
-            raise ValueError("Cannot collapse blocks when the model depth is less than 2.")
-
-        max_anchor = curr_layers - 2
-        if extension_density == "clump":
-            if insertion_order == "top-bottom":
-                return [max_anchor] * n_to_remove
-            if insertion_order == "random":
-                return [int(np.random.randint(0, max_anchor + 1)) for _ in range(n_to_remove)]
-            if insertion_order != "bottom-top":
-                raise ValueError(
-                    f"Unsupported insertion_order. Expected: bottom-top, top-bottom, random. Got: {insertion_order}"
-                )
-            return [0] * n_to_remove
-
-        if extension_density == "spread_mod":
-            n_gaps = curr_layers - 1
-            return [i % n_gaps for i in range(n_to_remove)]
-
-        if extension_density != "spread":
-            raise ValueError(
-                "Unsupported extension_density. Expected: spread, spread_mod, clump. "
-                f"Got: {extension_density}"
-            )
-
-        return spread_anchor_schedule(n_to_remove, max_anchor + 1, insertion_order)
+        return decoder_collapse_schedule(curr_layers, n_to_remove, insertion_order, extension_density)
 
     @staticmethod
     def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
-        for i, item in enumerate(chain):
-            if anchor_orig_idx in item["orig_idxs"]:
-                return i
-        raise ValueError(f"Could not locate anchor_orig_idx={anchor_orig_idx} in chain.")
+        return decoder_locate_collapse_pos(chain, anchor_orig_idx)
 
     @torch.no_grad()
     def _interpolate_block_weights(self, target_block: nn.Module, source_block: nn.Module, alpha: float = 0.5):
