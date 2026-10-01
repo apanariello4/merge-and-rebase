@@ -82,7 +82,7 @@ from .block_extension import (
 )
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
-from .rebase_metrics import normalized_accuracy_ratio
+from .rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)
 from .source_lmc import (  # noqa: F401  (re-exported for tests)
     _ZERO_SHOT_CACHE_DIR,
     _evaluate_all_task_star_lmc,
@@ -104,6 +104,10 @@ from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
     validate_residual_completion_depth_direction,
+)
+from .vision_alpha_search import (  # noqa: F401  (re-exported for tests)
+    _average_defined,
+    _norm_acc,
 )
 from .vision_artifacts import (  # noqa: F401  (re-exported for tests)
     _legacy_visual_delta,
@@ -173,15 +177,6 @@ def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
     if ".aligner." in k:
         return False
     return k.startswith("visual.")
-
-
-def _norm_acc(result_acc: float, baseline_acc: float) -> float:
-    return normalized_accuracy_ratio(result_acc, baseline_acc)
-
-
-def _average_defined(values: list[float]) -> float:
-    defined = [float(v) for v in values if float(v) == float(v)]
-    return average_scores(defined) if defined else float("nan")
 
 
 _BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
