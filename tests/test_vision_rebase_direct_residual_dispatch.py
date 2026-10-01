@@ -125,10 +125,13 @@ def test_invalid_ariadne_only_option_is_inert_for_direct_residual(monkeypatch, t
     assert "tuned checkpoints" in str(exc)
 
 
-def test_direct_residual_method_object_has_no_registry_entry():
-    from merge_and_rebase.rebase.registry import list_methods
+def test_direct_residual_is_registry_alias_of_ariadne():
+    """Registered as an alias of Ariadne (same object); vision_rebase still never calls get_method for it."""
+    from merge_and_rebase.rebase.registry import canonical_method_name, get_method, list_methods
 
-    assert "direct_residual" not in list_methods()
+    assert "direct_residual" in list_methods()
+    assert canonical_method_name("direct_residual") == "ariadne"
+    assert get_method("direct_residual") is get_method("ariadne")
 
 
 # ---- _run_direct_residual_fit: the real capture -> desired-effect -> fit ->

@@ -6,12 +6,16 @@ from dataclasses import dataclass
 import torch
 
 from .model_families.base import ModelFamilyMetadata
+from .registry import canonical_method_name
 
 
 @dataclass(frozen=True)
 class _PairSupport:
     cross_size: bool = False
     required: bool = True
+    # Optional method-specific explanation used instead of the generic message when
+    # ``required`` is False.
+    unavailable_reason: str | None = None
 
 
 _METHOD_SUPPORT: dict[str, _PairSupport] = {
@@ -22,7 +26,34 @@ _METHOD_SUPPORT: dict[str, _PairSupport] = {
     "orthogonal_shift": _PairSupport(cross_size=False),
     "gradfix": _PairSupport(cross_size=False),
     "transfusion": _PairSupport(cross_size=False, required=False),
+    # "direct_residual" is a registry alias of "ariadne" and resolves to this entry.
+    "ariadne": _PairSupport(
+        cross_size=True,
+        required=False,
+        unavailable_reason="Ariadne for text/decoder models is not available yet (vision only).",
+    ),
 }
+
+
+def _support_for(method_name: str) -> _PairSupport | None:
+    return _METHOD_SUPPORT.get(canonical_method_name(method_name))
+
+
+def supports_cross_size(method_name: str) -> bool:
+    """Whether the method can rebase across different hidden/intermediate sizes."""
+    support = _support_for(method_name)
+    if support is None:
+        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(_METHOD_SUPPORT)}")
+    return support.cross_size
+
+
+def is_text_supported(method_name: str) -> bool:
+    """Whether the method is wired for text/decoder rebasing."""
+    support = _support_for(method_name)
+    if support is None:
+        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(_METHOD_SUPPORT)}")
+    return support.required
+
 
 # Families that don't share a model_type but are the same "hf_decoder" shape
 # (model.layers.N.self_attn/mlp.* naming) closely enough for activation-driven
@@ -42,7 +73,7 @@ def check_pair(
     target_state_dict: Mapping[str, torch.Tensor] | None = None,
     allow_depth_mismatch: bool = False,
 ) -> None:
-    support = _METHOD_SUPPORT.get(method_name)
+    support = _support_for(method_name)
     if support is None:
         raise ValueError(
             f"Unknown rebase method '{method_name}'. "
@@ -50,6 +81,11 @@ def check_pair(
         )
 
     if not support.required:
+        if support.unavailable_reason is not None:
+            raise ValueError(
+                f"Method '{method_name}' is not available for text/decoder rebasing: {support.unavailable_reason} "
+                f"Supported: {sorted(n for n, s in _METHOD_SUPPORT.items() if s.required)}"
+            )
         raise ValueError(
             f"Method '{method_name}' is not available for text/decoder rebasing in v1. "
             f"Supported: {sorted(n for n, s in _METHOD_SUPPORT.items() if s.required)}"

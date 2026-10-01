@@ -54,6 +54,7 @@ from ..models.text_lm import TextBuildConfig, TextLM
 from ..rebase import get_method
 from ..rebase.capabilities import check_pair
 from ..rebase.model_families import infer_family
+from ..rebase.registry import canonical_method_name
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from .block_extension import resolve_block_extension_config
 from .block_extension_llm import run_block_extension_llm
@@ -643,6 +644,9 @@ def main() -> None:
 
         method_name = str(cfg.get("method", "theseus"))
         method = get_method(method_name)
+        if canonical_method_name(method_name) == "ariadne":
+            # Registered (vision) but not wired for decoders yet: fail before loading any model.
+            check_pair(method_name, None, None)
         method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
         if "n_batches" in method_params:
             raise ValueError(

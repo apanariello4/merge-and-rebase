@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .registry import canonical_method_name
+
 
 def resolve_rebase_method_config(cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     method_name = str(cfg.get("method", "gradfix"))
@@ -20,6 +22,8 @@ def resolve_rebase_method_config(cfg: dict[str, Any]) -> tuple[str, dict[str, An
 
 
 def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) -> str:
+    if canonical_method_name(method_name) == "ariadne":
+        return "Ariadne"
     if method_name == "gradfix":
         mask_mode = str(method_params.get("mask_mode", "normal"))
         vote = str(method_params.get("vote", "mean"))

@@ -65,6 +65,7 @@ from .components import (
 from .config import (
     DirectResidualConfig,
     parse_direct_residual_config,
+    resolve_direct_residual_preset,
 )
 from .diagnostics import (
     compute_direct_residual_task_vector_stats,
@@ -82,6 +83,7 @@ from .linalg import (
     centered_rectangular_procrustes,
     centered_ridge_alignment,
 )
+from .method import AriadnePrepared, AriadneRebase
 from .scaling import (
     apply_tv_scaling,
 )
@@ -93,6 +95,8 @@ from .streaming import (
 )
 
 __all__ = [
+    "AriadnePrepared",
+    "AriadneRebase",
     "COMPONENT_FORWARD_ORDER",
     "DirectResidualConfig",
     "ResidualSufficientStatistics",
@@ -121,4 +125,5 @@ __all__ = [
     "paired_calibration",
     "parse_direct_residual_config",
     "prepare_direct_residual_streaming",
+    "resolve_direct_residual_preset",
 ]

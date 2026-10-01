@@ -57,32 +57,21 @@ from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
 from ..rebase.methods.ariadne import (
-    DirectResidualConfig,
+    AriadneRebase,
     apply_depth_pairing_override,
-    apply_tv_scaling,
-    capture_paired_boundary_activations,
-    compute_alignment_diagnostics,
-    compute_alignment_diagnostics_streaming,
-    compute_desired_effects,
-    compute_direct_residual_task_vector_stats,
-    compute_fidelity_holdout_diagnostics,
-    fit_direct_residual,
-    fit_direct_residual_streaming,
-    fit_sequential_source_endpoints,
-    measure_direct_residual_realization,
-    measure_streaming_realization_for,
     parse_direct_residual_config,
-    prepare_direct_residual_streaming,
+    resolve_direct_residual_preset,
 )
 from ..rebase.methods.ariadne.hashing import _task_vector_sha256
 from ..rebase.methods.theseus import InterpolatedBlockActivations
+from ..rebase.registry import canonical_method_name
 from ..rebase.runtime import (
     format_rebase_method_label,
     resolve_rebase_method_config,
 )
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
-from ..utils.cost_accounting import PhaseCostRecorder, cost_excluded, cost_phase, recording
+from ..utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from .block_extension import (
     BlockExtensionConfig,
     block_extension_protocol,
@@ -107,7 +96,6 @@ from .target_informed_runtime import (
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
-    order_components,
     validate_residual_completion_depth_direction,
 )
 
@@ -1545,373 +1533,24 @@ def _maybe_complete_direct_p1_task_vector(
 
 
 def _run_direct_residual_fit(**kwargs: Any):
-    """Run `_direct_residual_fit_body` under its own `PhaseCostRecorder`.
+    """Run the Ariadne fit (`AriadneRebase.prepare`) under its own `PhaseCostRecorder`.
 
-    Same arguments and return value as `_direct_residual_fit_body`, plus
-    ``timing["cost_phases"]``: the recorder summary splitting this fit's wall time,
-    CUDA peak and host peak RSS into activation_collection / transformation /
-    transport (analysis-only diagnostics are excluded; see utils.cost_accounting).
+    Thin wrapper kept for the existing call sites: same keyword arguments as
+    `_direct_residual_fit_body` (minus the recorder), returning
+    ``(scaled_delta, timing, diagnostics, extra)`` with ``timing["cost_phases"]``
+    the recorder summary splitting this fit's wall time, CUDA peak and host peak
+    RSS into activation_collection / transformation / transport (analysis-only
+    diagnostics are excluded; see utils.cost_accounting). The pipeline itself
+    lives in `merge_and_rebase.rebase.methods.ariadne.method`.
     """
-    with recording(PhaseCostRecorder(kwargs["device"])) as recorder:
-        scaled_delta, timing, diagnostics, extra = _direct_residual_fit_body(recorder, **kwargs)
-    timing["cost_phases"] = recorder.summary()
-    return scaled_delta, timing, diagnostics, extra
+    prepared = AriadneRebase().prepare(**kwargs)
+    return prepared.task_vector, prepared.timing, prepared.diagnostics, prepared.extra
 
 
-def _direct_residual_fit_body(
-    recorder: PhaseCostRecorder,
-    *,
-    source_base_model: torch.nn.Module,
-    source_ft_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    target_base_sd: dict[str, torch.Tensor],
-    source_loader: Any,
-    target_loader: Any,
-    pairing: DiscreteLayerPairing,
-    config: DirectResidualConfig,
-    device: str,
-    clf_source: Any = None,
-    clf_target: Any = None,
-    classnames: list[str] | None = None,
-    source_build_cfg_task: Any = None,
-    build_cfg_task: Any = None,
-    source_text_features: torch.Tensor | None = None,
-    target_text_features: torch.Tensor | None = None,
-) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]]]:
-    """Run Direct Residual's capture -> desired-effect -> fit -> scale pipeline once.
-
-    Mirrors the exact ``torch.cuda.reset_peak_memory_stats()`` /
-    ``torch.cuda.synchronize()`` / ``torch.cuda.max_memory_allocated()`` /
-    ``time.perf_counter()`` idiom the existing ``transport_timings`` bracket
-    uses, split into two brackets: one around alignment/capture
-    (``capture_paired_boundary_activations`` + ``compute_desired_effects``,
-    the "calibration" half) and one around the ridge solve itself
-    (``fit_direct_residual``). ``theta_j_corrected = theta_j_native +
-    strength * correction_j`` is applied here (not inside
-    ``fit_direct_residual``, which always fits at unit strength) so that
-    ``strength=0`` is an exact native-target-base control, matching
-    ``target_informed_runtime.scale_completion``'s ``gamma=0`` contract --
-    replicated directly rather than called through ``scale_completion``
-    itself, since that helper requires every corrected key to already be
-    present in its ``baseline`` argument, and Direct Residual's baseline is
-    the empty ``transported_delta={}`` (there is no transport step to have
-    populated it).
-
-    Returns ``(scaled_delta, timing, diagnostics, extra)`` where ``timing`` has
-    ``"alignment_calibration"``/``"correction_fit"`` sub-dicts, each shaped
-    like a ``transport_timings[task]`` entry, and ``extra`` is
-    ``{"realization_by_position": ..., "task_vector_stats": ...,
-    "alignment_diagnostics": ...}``. The first two are ``None`` unless
-    ``config.realization_diagnostics`` is set, and are computed from the
-    unscaled, unit-strength ``target_corrections`` ``fit_direct_residual``
-    returns -- i.e. before ``strength`` is applied -- matching the plan's
-    "AFTER the task vector tau (unit strength, as returned by the fit) is
-    assembled" requirement. ``alignment_diagnostics`` is always present (keyed
-    by target position): it comes from a separate, untimed call to
-    ``compute_alignment_diagnostics`` -- deliberately outside both the
-    ``alignment_calibration`` and ``correction_fit`` timing/peak-memory
-    brackets, so its own float64 recomputation cost never contaminates either
-    (see the inline comment at the call site) -- is analysis-only, and never
-    feeds any fit regardless of ``config.residual_target``. Neither
-    realization-diagnostics call mutates ``target_model``'s entry state (both
-    restore it internally and assert so via a state-dict hash).
-
-    When ``config.procrustes_source == "gradient"``, builds source/target
-    ``clip_contrastive_recipe`` gradient recipes exactly like the BiCo branch
-    above (same classifier/classnames/build-cfg/text-features arguments) and
-    passes them into ``capture_paired_boundary_activations`` so ``Q_j`` is
-    fit on block-boundary gradients instead of activations; the six extra
-    kwargs (``clf_source``, ``clf_target``, ``classnames``,
-    ``source_build_cfg_task``, ``build_cfg_task``, ``source_text_features``/
-    ``target_text_features``) are required only in that mode. The
-    activation-vs-gradient Procrustes overlap diagnostic is merged into each
-    position's diagnostics row by position.
-
-    ``config.activation_storage`` branches between the resident path above
-    (full per-batch banks, unchanged) and the streaming path
-    (``prepare_direct_residual_streaming`` + ``fit_direct_residual_streaming``,
-    O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
-    already rejected any streaming config for which realization diagnostics
-    would be reachable, so that block below only ever runs for the resident
-    path. Both paths additionally record each bracket's exact peak host RSS
-    (``{bracket}_peak_host_rss_bytes``, VmHWM reset at the bracket start via
-    ``recorder``; see utils.cost_accounting) so campaigns can see streaming's
-    host memory stay flat as ``num_batches`` grows while resident's does not.
-    Every bracket peak is read through ``recorder.mark()``/``peaks_since`` so the
-    recorder's per-segment counter resets never corrupt it.
-    """
-    alignment_mark = recorder.mark()
-    alignment_started = time.perf_counter()
-    streaming = config.activation_storage == "streaming"
-    captured = None
-    desired = None
-    prepared = None
-    gradient_mode = config.procrustes_source == "gradient"
-    procrustes_diagnostics: dict[int, dict[str, Any]] = {}
-    source_recipe = target_recipe = None
-    if gradient_mode:
-        missing = [
-            name
-            for name, value in (
-                ("clf_source", clf_source),
-                ("clf_target", clf_target),
-                ("classnames", classnames),
-                ("source_build_cfg_task", source_build_cfg_task),
-                ("build_cfg_task", build_cfg_task),
-            )
-            if value is None
-        ]
-        if missing:
-            raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
-        from ..models.grad_recipes import clip_contrastive_recipe
-
-        source_recipe = clip_contrastive_recipe(
-            clf_source,
-            classnames,
-            source_build_cfg_task,
-            device=device,
-            text_features=source_text_features,
-        )
-        target_recipe = clip_contrastive_recipe(
-            clf_target,
-            classnames,
-            build_cfg_task,
-            device=device,
-            text_features=target_text_features,
-        )
-    if streaming:
-        prepared = prepare_direct_residual_streaming(
-            source_base_model,
-            target_model,
-            source_loader,
-            target_loader,
-            pairing,
-            num_batches=config.num_batches,
-            seed=config.seed,
-            device=device,
-            source_ft_model=source_ft_model,
-            procrustes_source=config.procrustes_source,
-            alignment_map=config.alignment_map,
-            alignment_row_weighting=config.alignment_row_weighting,
-            alignment_seed=config.alignment_seed,
-            source_recipe=source_recipe,
-            target_recipe=target_recipe,
-        )
-        procrustes_diagnostics.update(prepared["procrustes_diagnostics"])
-    else:
-        captured = capture_paired_boundary_activations(
-            source_base_model,
-            source_ft_model,
-            target_model,
-            source_loader,
-            target_loader,
-            pairing,
-            num_batches=config.num_batches,
-            seed=config.seed,
-            device=device,
-            procrustes_source=config.procrustes_source,
-            source_recipe=source_recipe,
-            target_recipe=target_recipe,
-        )
-        if config.endpoint_construction == "native_delta":
-            desired = compute_desired_effects(
-                captured,
-                pairing,
-                residual_target=config.residual_target,
-                procrustes_source=config.procrustes_source,
-                alignment_map=config.alignment_map,
-                alignment_row_weighting=config.alignment_row_weighting,
-                alignment_seed=config.alignment_seed,
-                # fidelity_holdout needs the SAME fitted Q_j/mu this compute_desired_effects
-                # call produces, stored under diagnostics_out[j]["q"]/["mu_s"]/["mu_t"]
-                # (see compute_desired_effects's docstring) -- collected here whether
-                # or not gradient_mode also needs it, so its own request never has to
-                # special-case which mode it's running under.
-                diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
-            )
-    alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
-    alignment_timing = {
-        "alignment_calibration_seconds": time.perf_counter() - alignment_started,
-        "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
-        "alignment_calibration_peak_host_rss_bytes": alignment_calibration_host_peak,
-    }
-
-    # Deliberately outside BOTH the alignment_calibration bracket above (just
-    # closed) and the correction_fit bracket below (not yet opened):
-    # compute_alignment_diagnostics recomputes the same centered Procrustes
-    # fit a second time purely for analysis, with several float64 N x d_t
-    # temporaries (N in the tens of thousands of rows). Folding it into
-    # either bracket would inflate that bracket's recorded seconds/peak-
-    # memory bytes -- even in the default residual_target="transported_delta"
-    # path -- contaminating any cross-code-generation cost comparison for a
-    # quantity these diagnostics never feed into.
-    # compute_alignment_diagnostics describes the ACTIVATION-space Procrustes fit;
-    # under procrustes_source="gradient" that is not the Q_j the fit used, so it
-    # is not reported there (None) rather than reported for the wrong map.
-    alignment_diagnostics = None
-    with cost_excluded():
-        if config.procrustes_source == "activation":
-            if streaming:
-                alignment_diagnostics = compute_alignment_diagnostics_streaming(
-                    source_base_model, source_ft_model, target_model, target_base_sd, prepared, pairing, device=device
-                )
-            else:
-                alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
-
-    fit_mark = recorder.mark()
-    fit_started = time.perf_counter()
-    endpoint_diagnostics = None
-    if config.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
-        target_corrections, diagnostics, endpoint_diagnostics = fit_sequential_source_endpoints(
-            target_model, target_base_sd, captured, pairing, config=config, device=device,
-        )
-    elif streaming:
-        target_corrections, diagnostics = fit_direct_residual_streaming(
-            target_model,
-            target_base_sd,
-            source_base_model,
-            source_ft_model,
-            prepared,
-            pairing,
-            config=config,
-            device=device,
-        )
-    else:
-        target_corrections, diagnostics = fit_direct_residual(
-            target_model,
-            target_base_sd,
-            captured,
-            desired,
-            pairing,
-            config=config,
-            device=device,
-        )
-    fit_peak_memory_bytes, correction_fit_host_peak = recorder.peaks_since(fit_mark)
-    fit_timing = {
-        "correction_fit_seconds": time.perf_counter() - fit_started,
-        "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
-        "correction_fit_peak_host_rss_bytes": correction_fit_host_peak,
-    }
-    if procrustes_diagnostics:
-        for row in diagnostics:
-            extra = procrustes_diagnostics.get(int(row.get("position", -1)))
-            if extra:
-                row.update(extra)
-
-    streaming_measure = (
-        measure_streaming_realization_for(
-            target_model, target_base_sd, source_base_model, source_ft_model, prepared, pairing,
-            config=config, device=device,
-        )
-        if streaming
-        else None
-    )
-    tv_scaling_diagnostics = None
-    if config.tv_scaling != "none":
-        # Label-free, applied AFTER the unit-strength tau is assembled but
-        # BEFORE the caller's per-task alpha-search (and therefore before the
-        # realization_diagnostics/task_vector_stats block below, so both
-        # report the FINAL tau that alpha-search actually sees). tv_scaling
-        # defaults to "none" (a strict no-op, see apply_tv_scaling), so this
-        # branch never executes for the historical, golden-hash-pinned path.
-        target_corrections, tv_scaling_diagnostics = apply_tv_scaling(
-            target_model,
-            target_base_sd,
-            target_corrections,
-            list(range(pairing.target_depth)),
-            captured,
-            desired,
-            config=config,
-            device=device,
-            measure_fn=streaming_measure,
-        )
-
-    realization_by_position = None
-    task_vector_stats = None
-    with cost_excluded():
-        if bool(config.realization_diagnostics):
-            positions = list(range(pairing.target_depth))
-            # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed
-            # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
-            # presence check keyed only off "is this key in target_corrections"
-            # cannot tell which of q/k/v were actually fit -- e.g. a v-only
-            # run's in_proj_weight key exists in target_corrections
-            # with only its v-rows nonzero, and checking q/k against that same
-            # key would falsely report them "present" too. Passing exactly
-            # order_components(config.components) sidesteps this: only names the
-            # caller actually asked to fit are ever checked.
-            fitted_components = order_components(config.components)
-            if streaming:
-                realization_by_position = streaming_measure(target_corrections)
-            else:
-                realization_by_position = measure_direct_residual_realization(
-                    target_model,
-                    target_base_sd,
-                    target_corrections,
-                    positions,
-                    captured["target_batches"],
-                    captured["target_base_outputs_by_position"],
-                    desired,
-                    device=device,
-                    components=fitted_components,
-                )
-            task_vector_stats = compute_direct_residual_task_vector_stats(
-                target_corrections,
-                target_base_sd,
-                positions,
-                components=fitted_components,
-            )
-
-    # fidelity_holdout diagnostic: analysis-only, computed strictly AFTER
-    # target_corrections (tau) is already fitted and fixed -- it only reads
-    # target_corrections, never feeds back into it -- so it cannot, by
-    # construction, change the task vector this run produces (see
-    # tests/test_direct_residual_fidelity_holdout_20260925.py's bit-identical
-    # -tau assertion). Excluded from cost accounting for the same reason
-    # realization_diagnostics is above: it is not part of the method's cost.
-    fidelity_holdout_diagnostics = None
-    with cost_excluded():
-        if bool(config.fidelity_holdout):
-            if streaming:
-                q_by_position = prepared["q_by_position"]
-                mu_s_by_position = {j: m.float() for j, m in prepared["source_mean_by_position"].items()}
-                mu_t_by_position = {j: m.float() for j, m in prepared["target_mean_by_position"].items()}
-            else:
-                q_by_position = {j: procrustes_diagnostics[j]["q"] for j in range(pairing.target_depth)}
-                mu_s_by_position = {j: procrustes_diagnostics[j]["mu_s"] for j in range(pairing.target_depth)}
-                mu_t_by_position = {j: procrustes_diagnostics[j]["mu_t"] for j in range(pairing.target_depth)}
-            fidelity_holdout_diagnostics = compute_fidelity_holdout_diagnostics(
-                source_base_model,
-                source_ft_model,
-                target_model,
-                target_base_sd,
-                target_corrections,
-                source_loader,
-                target_loader,
-                pairing,
-                config=config,
-                q_by_position=q_by_position,
-                mu_s_by_position=mu_s_by_position,
-                mu_t_by_position=mu_t_by_position,
-                device=device,
-            )
-
-    strength = float(config.strength)
-    with cost_phase("transport"):
-        scaled_delta = (
-            {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
-        )
-    extra = {
-        "realization_by_position": realization_by_position,
-        "task_vector_stats": task_vector_stats,
-        "alignment_diagnostics": alignment_diagnostics,
-        "calibration": (prepared if streaming else captured)["calibration"],
-        "tv_scaling": tv_scaling_diagnostics,
-        "fidelity_holdout": fidelity_holdout_diagnostics,
-    }
-    if endpoint_diagnostics is not None:
-        extra["sequential_endpoints"] = endpoint_diagnostics
-    return scaled_delta, {"alignment_calibration": alignment_timing, "correction_fit": fit_timing}, diagnostics, extra
+def _direct_residual_fit_body(recorder: PhaseCostRecorder, **kwargs: Any):
+    """Same fit as `_run_direct_residual_fit`, under a caller-owned recorder (no ``cost_phases``)."""
+    prepared = AriadneRebase().prepare(recorder=recorder, **kwargs)
+    return prepared.task_vector, prepared.timing, prepared.diagnostics, prepared.extra
 
 
 def main() -> None:
@@ -2053,16 +1692,19 @@ def main() -> None:
             cfg["block_extension_enabled"] = True
 
         method_name, method_params = resolve_rebase_method_config(cfg)
-        # Direct Residual is deliberately NOT registered in the rebase method
-        # registry (rebase/registry.py): it needs whole model objects and
-        # dataloaders for paired activation capture, not a state-dict-delta
-        # transport() call, so `get_method` would raise KeyError for it. It
-        # also must never let `resolve_block_extension_config(cfg)` run over
-        # `cfg` -- ARIADNE's config gates have no business accepting or
-        # rejecting a Direct Residual config, since Direct Residual never
-        # reaches a single ARIADNE code path. See the module docstring of
-        # `direct_residual.py` and tests/test_vision_rebase_direct_residual_dispatch.py.
-        direct_residual_like = method_name == "direct_residual"
+        # Ariadne (formerly Direct Residual; "direct_residual" is a registry alias of
+        # "ariadne" and both spellings take exactly this path) is registered, but it
+        # needs whole model objects and dataloaders for paired activation capture,
+        # not a state-dict-delta transport() call, so this entrypoint never calls
+        # `get_method` for it (its `transport` raises NotImplementedError). It also
+        # must never let `resolve_block_extension_config(cfg)` run over `cfg` --
+        # BRACE's config gates have no business accepting or rejecting an Ariadne
+        # config, since Ariadne never reaches a single BRACE code path. See the
+        # module docstring of `direct_residual.py` and
+        # tests/test_vision_rebase_direct_residual_dispatch.py. `method_name` stays
+        # exactly what the config said (it is recorded verbatim in the run summary);
+        # only the dispatch decision goes through the canonical name.
+        direct_residual_like = canonical_method_name(method_name) == "ariadne"
         if direct_residual_like:
             method = SimpleNamespace(name=method_name)
             block_extension_enabled = False
@@ -2073,7 +1715,13 @@ def main() -> None:
             # a call Direct Residual never makes). A dedicated top-level key
             # keeps that separation explicit rather than overloading
             # `method_params`'s existing per-method dispatch conventions.
-            direct_residual_cfg = parse_direct_residual_config(cfg.get("direct_residual_params"))
+            if cfg.get("direct_residual_params") is not None and cfg.get("ariadne_params") is not None:
+                raise ValueError("config has both 'direct_residual_params' and its alias 'ariadne_params'; use one")
+            direct_residual_raw_params = (
+                cfg["ariadne_params"] if cfg.get("ariadne_params") is not None else cfg.get("direct_residual_params")
+            )
+            direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
+            direct_residual_preset = resolve_direct_residual_preset(direct_residual_raw_params)
             sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
             if cfg.get("load_direct_residual_tvs_dir") and direct_residual_cfg.endpoint_construction not in sequential_modes:
                 raise ValueError("load_direct_residual_tvs_dir requires a sequential endpoint construction")
@@ -2085,6 +1733,7 @@ def main() -> None:
             method = get_method(method_name)
             block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
             direct_residual_cfg = None
+            direct_residual_preset = None
         method_label = format_rebase_method_label(method_name, method_params)
         theseus_like_method = method_name in {"theseus", "theseus_reference"}
         blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
@@ -4617,6 +4266,12 @@ def main() -> None:
             "direct_residual": (
                 {
                     "config": asdict(direct_residual_cfg),
+                    # Canonical registry name ("direct_residual" is an alias of "ariadne");
+                    # the top-level "method" keeps whatever spelling the config used.
+                    "canonical_method": canonical_method_name(method_name),
+                    # Present only when the params mapping selected a named preset
+                    # (the preset's fields are already resolved into "config").
+                    **({"preset": direct_residual_preset} if direct_residual_preset is not None else {}),
                     # Which images every fit calibrated on (see
                     # DirectResidualConfig.calibration_data): the dataset and,
                     # for vision8_mix, the balanced plan's fingerprint.

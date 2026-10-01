@@ -38,6 +38,7 @@ from ..rebase.methods.ariadne.components import (  # noqa: F401
 from ..rebase.methods.ariadne.config import (  # noqa: F401
     DirectResidualConfig,
     parse_direct_residual_config,
+    resolve_direct_residual_preset,
 )
 from ..rebase.methods.ariadne.diagnostics import (  # noqa: F401
     compute_direct_residual_task_vector_stats,
@@ -71,6 +72,7 @@ from ..rebase.methods.ariadne.linalg import (  # noqa: F401
     centered_rectangular_procrustes,
     centered_ridge_alignment,
 )
+from ..rebase.methods.ariadne.method import AriadnePrepared, AriadneRebase  # noqa: F401
 from ..rebase.methods.ariadne.scaling import (  # noqa: F401
     _TV_SCALING_D_NORM_EPS,
     _position_delta,

@@ -203,6 +203,29 @@ class DirectResidualConfig:
     fidelity_holdout_batches: int = 10
 
 
+# Named bundles of config fields, selected with the optional ``"preset"`` key of the
+# params mapping. A preset only sets the fields listed here (explicit keys in the same
+# mapping override them); every other field keeps the dataclass default, and
+# per-experiment budgets (``num_batches``, ``seed``) are never part of a preset.
+_PRESETS: dict[str, dict[str, Any]] = {
+    "ariadne": {
+        "components": ("mlp.c_proj",),
+        "activation_storage": "streaming",
+        "ridge_estimator": "empirical_bayes",
+    },
+}
+
+
+def resolve_direct_residual_preset(value: Mapping[str, Any] | None) -> str | None:
+    """Return the validated ``"preset"`` name in a params mapping, or None when absent."""
+    if value is None or not isinstance(value, Mapping) or "preset" not in value:
+        return None
+    name = value["preset"]
+    if not isinstance(name, str) or name not in _PRESETS:
+        raise ValueError(f"unknown direct_residual preset {name!r}; valid presets: {sorted(_PRESETS)}")
+    return name
+
+
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
     """Parse and validate the Direct Residual configuration schema.
 
@@ -218,6 +241,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         return DirectResidualConfig()
     if not isinstance(value, Mapping):
         raise TypeError("direct_residual config must be a mapping")
+    preset = resolve_direct_residual_preset(value)
+    if preset is not None:
+        value = {k: v for k, v in value.items() if k != "preset"}
     allowed = {
         "ridge_relative",
         "ridge_estimator",
@@ -252,7 +278,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"unknown direct_residual fields: {sorted(unknown)}")
-    payload = dict(value)
+    payload = {**(_PRESETS[preset] if preset is not None else {}), **value}
     if "components" in payload and isinstance(payload["components"], list):
         payload["components"] = tuple(payload["components"])
     cfg = DirectResidualConfig(**payload)
