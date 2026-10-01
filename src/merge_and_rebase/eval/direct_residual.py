@@ -8,7 +8,7 @@ transport at all -- but reaches it through a depth/width-alignment mechanism
 that has nothing to do with ARIADNE's block-extension apparatus.
 
 Where ARIADNE only ever aligns a target that is exactly ``2x`` a source's
-depth (via ``validate_target_protocol``'s hard doubling gate, and the
+depth (via its depth-doubling protocol gate, and the
 bottom-top spread/duplicate insertion that produces an ``ancestry`` map), this
 module pairs an arbitrary source depth with an arbitrary target depth through
 the flat, closed-form ``DiscreteLayerPairing`` (``i(j) = round(j*(D_A-1)/

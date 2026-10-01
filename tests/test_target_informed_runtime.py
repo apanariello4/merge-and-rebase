@@ -16,7 +16,6 @@ from merge_and_rebase.eval.target_informed_runtime import (
     complete_residuals,
     load_cache,
     paired_calibration,
-    parse_target_shared_config,
     projection_transforms,
     save_cache,
     scale_completion,
@@ -469,9 +468,3 @@ def test_cache_rejects_wrong_provenance_and_overwrite(tmp_path):
         load_cache(path, {"task": "test", "target_hash": "different"})
     with pytest.raises(FileExistsError):
         save_cache(path, {})
-
-
-@pytest.mark.parametrize("raw", [{"target_weight": float("nan")}, {"target_weight": -1}, {"num_batches": 0}, {"added_blocks": "last4"}])
-def test_shared_config_rejects_invalid_values(raw):
-    with pytest.raises(ValueError):
-        parse_target_shared_config(raw)

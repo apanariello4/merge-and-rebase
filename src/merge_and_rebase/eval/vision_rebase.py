@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import itertools
+import json
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -84,8 +84,8 @@ from .direct_residual import (
     compute_desired_effects,
     compute_fidelity_holdout_diagnostics,
     fit_direct_residual,
-    fit_sequential_source_endpoints,
     fit_direct_residual_streaming,
+    fit_sequential_source_endpoints,
     measure_streaming_realization_for,
     parse_direct_residual_config,
     prepare_direct_residual_streaming,

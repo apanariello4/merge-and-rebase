@@ -276,3 +276,15 @@ docs/*.aux
 /scripts/
 /configs/final/
 /tests/test_target_informed_campaign.py
+
+# Campaign configs are local experiment material (CLAUDE.md). Only reviewed
+# configs are tracked: those already in Git, plus configs/examples/. Anything
+# else must be force-added deliberately in a dedicated commit.
+/configs/**/*.json
+/configs/**/*.yaml
+!/configs/examples/
+!/configs/examples/**
+# Campaign design notes and local editor settings.
+/direct_target_p1_implementation_and_config_plan.md
+/docs/proposal_1_method.tex
+/.vscode/

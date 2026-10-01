@@ -11,10 +11,7 @@ Proposal 2 (target-informed shared correction) is NOT implemented here. Its
 authoritative, tested implementation lives in `block_extension.py`
 (`TargetSharedCorrection`, `_capture_target_component_references`,
 `_blend_target_reference`), keyed off the nested
-`block_extension_params.target_shared_correction` config group. The
-`TargetSharedConfig`/`parse_target_shared_config` pair in this module is a
-separate, older top-level-config validator used by `validate_target_protocol`
-and `cache_identity`; it does not drive any execution path in this module.
+`block_extension_params.target_shared_correction` config group.
 """
 
 from __future__ import annotations
@@ -24,8 +21,6 @@ import copy
 import hashlib
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -47,111 +42,6 @@ from .target_residual_completion import (
     fit_joint_cproj_correction,
     order_components,
 )
-
-
-# Config-validation scaffolding only: block_extension.py holds the authoritative
-# proposal-2 (target-informed shared correction) implementation and its own config
-# parsing (`_as_target_shared_correction`, keyed off
-# `block_extension_params.target_shared_correction`). This dataclass/parser pair
-# validates the separate top-level `target_shared_correction` config key that
-# `validate_target_protocol` and `cache_identity` still consult; it has no
-# execution path of its own in this module.
-@dataclass(frozen=True)
-class TargetSharedConfig:
-    enabled: bool = False
-    added_blocks: str = "all"
-    component: str = "c_proj"
-    target_weight: float = 0.0
-    num_batches: int = 5
-
-
-def parse_target_shared_config(raw: Mapping[str, Any] | None) -> TargetSharedConfig:
-    if raw is None:
-        return TargetSharedConfig()
-    if not isinstance(raw, Mapping):
-        raise ValueError("target_shared_correction must be a mapping")
-    unknown = set(raw) - set(TargetSharedConfig.__dataclass_fields__)
-    if unknown:
-        raise ValueError(f"Unknown target_shared_correction fields: {sorted(unknown)}")
-    cfg = TargetSharedConfig(**raw)
-    if not isinstance(cfg.enabled, bool):
-        raise ValueError("target_shared_correction.enabled must be boolean")
-    if cfg.added_blocks != "all" or cfg.component != "c_proj":
-        raise ValueError("Target shared correction supports all added c_proj components")
-    if isinstance(cfg.num_batches, bool) or not isinstance(cfg.num_batches, int) or cfg.num_batches < 1:
-        raise ValueError("target_shared_correction.num_batches must be a positive integer")
-    if isinstance(cfg.target_weight, bool) or not isinstance(cfg.target_weight, (int, float)):
-        raise ValueError("target_weight must be a finite nonnegative number")
-    if not math.isfinite(cfg.target_weight) or cfg.target_weight < 0:
-        raise ValueError("target_weight must be a finite nonnegative number")
-    return cfg
-
-
-def validate_target_protocol(cfg, block_cfg, source_depth, target_depth, method_name, merge_mode):
-    """Reject unsupported experiments instead of silently dropping their options."""
-    from .target_residual_completion import parse_residual_completion_config
-
-    shared = parse_target_shared_config(cfg.get("target_shared_correction"))
-    residual = parse_residual_completion_config(cfg.get("target_residual_completion"))
-    joint = bool(block_cfg.joint_blockwise_correction.enabled)
-    direct_p1 = bool(block_cfg.direct_p1_correction.enabled)
-    active = (
-        shared.enabled or residual.enabled or joint or direct_p1 or bool(cfg.get("capture_target_residual_reference"))
-    )
-    if not active:
-        return
-    if method_name not in {"theseus", "bico"}:
-        raise ValueError("Target-informed BRACE supports Theseus and BICO only")
-    if source_depth < 1 or target_depth != 2 * source_depth:
-        raise ValueError("Target-informed BRACE currently requires doubling the source depth")
-    if merge_mode not in {"none", "rebase_then_merge", "brace_transport_then_merge"}:
-        raise ValueError("Target-informed BRACE requires per-task transport before merging")
-    if not cfg.get("block_extension_enabled", True):
-        raise ValueError("Target-informed BRACE requires block extension")
-    if (
-        block_cfg.insertion_order != "bottom-top"
-        or block_cfg.extension_density not in {"spread", "spread_mod"}
-        or block_cfg.extension_strategy != "duplicate_per_weight"
-    ):
-        raise ValueError("Target-informed BRACE requires bottom-top spread duplicate insertion")
-    if block_cfg.blocks_to_add not in (None, source_depth):
-        raise ValueError("blocks_to_add must match the depth-doubling protocol")
-    identity_p1 = (
-        residual.enabled and block_cfg.skip_correction and block_cfg.inserted_block_mode == "residual_identity"
-    )
-    if block_cfg.lmc_mode != "shared":
-        raise ValueError("Target-informed methods require lmc_mode='shared'")
-    if not identity_p1 and (block_cfg.skip_correction or block_cfg.inserted_block_mode != "ariadne"):
-        raise ValueError(
-            "Target-informed methods extend the ordinary Shared BRACE arm, except for the explicit "
-            "residual_identity + Proposal-1 ablation"
-        )
-    if identity_p1 and shared.enabled:
-        raise ValueError("residual_identity + Proposal 1 cannot also enable target_shared_correction")
-    if joint and shared.enabled:
-        raise ValueError("Option 3 and target_shared_correction cannot be enabled together")
-    if direct_p1 and shared.enabled:
-        raise ValueError("Direct P1 correction and target_shared_correction cannot be enabled together")
-    if block_cfg.calibration_split != "val" or block_cfg.calibration_dataset is not None or block_cfg.calibration_task:
-        raise ValueError("Target-informed references require task-local validation calibration")
-    if block_cfg.transport_activation_mode != "model" or block_cfg.share_ft_refs:
-        raise ValueError("Target-informed BRACE requires base references and model transport activations")
-    if block_cfg.insertion_target_mode != "direct":
-        raise ValueError("Target-informed correction uses the published direct component targets")
-    if shared.enabled and shared.target_weight > 0 and shared.num_batches != block_cfg.n_batches_act:
-        raise ValueError("Target shared references must use the BRACE calibration batch count")
-    if str((cfg.get("block_extension_params") or {}).get("calibration_protocol", "task_local")).startswith(
-        "vision8_mix"
-    ):
-        raise ValueError("Mixed-dataset target references are outside this task-local experiment")
-    if cfg.get("native_target_tasks") or cfg.get("base_construction", "per_task") != "per_task":
-        raise ValueError("Target-informed experiments require all-source tasks on the native target base")
-    if cfg.get("patched_attn") or cfg.get("attn_patch_cfg"):
-        raise ValueError("Target-informed experiments require the ordinary unpatched ViT checkpoints")
-    if cfg.get("load_transported_tvs_dir") and (
-        cfg.get("source_lmc_eval") or cfg.get("cross_task_lmc_pairs") or cfg.get("all_task_lmc_eval")
-    ):
-        raise ValueError("Cached target vectors cannot supply source endpoint diagnostics")
 
 
 def _dataset_identity(dataset):
@@ -4016,62 +3906,6 @@ def scale_completion(baseline, completion, strength):
             raise ValueError(f"Completion key does not match baseline: {key}")
         result[key] = baseline[key] + strength * correction.to(baseline[key])
     return result
-
-
-def cache_identity(cfg, task, target_hash):
-    from .block_extension import resolve_block_extension_config
-
-    checkpoint = Path(cfg["tuned_ckpts"][task]).resolve()
-    stat = checkpoint.stat()
-    keys = (
-        "source_clip_model",
-        "source_clip_pretrained",
-        "target_clip_model",
-        "target_clip_pretrained",
-        "method",
-        "method_params",
-        "seed",
-        "val_fraction",
-        "batch_size",
-        "dtype",
-    )
-    protocol = {k: cfg.get(k) for k in keys}
-    protocol["block_extension_params"] = asdict(resolve_block_extension_config(cfg)[1])
-    shared = parse_target_shared_config(cfg.get("target_shared_correction"))
-    protocol["target_shared_correction"] = asdict(shared) if shared.enabled and shared.target_weight > 0 else None
-    implementation = hashlib.sha256()
-    root = Path(__file__).resolve().parents[1]
-    for relative in (
-        "eval/block_extension.py",
-        "eval/target_informed_runtime.py",
-        "eval/target_residual_completion.py",
-        "rebase/methods/theseus.py",
-        "rebase/methods/bico.py",
-    ):
-        implementation.update((root / relative).read_bytes())
-    return {
-        "schema_version": 1,
-        "task": task,
-        "target_hash": target_hash,
-        "checkpoint": {
-            "path": str(checkpoint),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "sha256": _checkpoint_hash(str(checkpoint), stat.st_size, stat.st_mtime_ns),
-        },
-        "implementation_sha256": implementation.hexdigest(),
-        "protocol": protocol,
-    }
-
-
-@lru_cache(maxsize=64)
-def _checkpoint_hash(path, size, mtime_ns):
-    del size, mtime_ns  # Included in the cache key so changed checkpoints are rehashed.
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def save_cache(path, payload):
