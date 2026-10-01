@@ -21,26 +21,28 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    apply_tv_scaling,
-    capture_paired_boundary_activations,
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import (
     compute_alignment_diagnostics,
-    compute_alignment_diagnostics_streaming,
     compute_desired_effects,
-    fit_direct_residual,
+)
+from merge_and_rebase.rebase.methods.ariadne.capture import (
+    capture_block_gradients,
+    capture_paired_boundary_activations,
+    iter_capture_block_gradients,
+)
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
+from merge_and_rebase.rebase.methods.ariadne.diagnostics import measure_direct_residual_realization
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods.ariadne.independent import _realized_pred_sq_from_stats
+from merge_and_rebase.rebase.methods.ariadne.linalg import ResidualSufficientStatistics
+from merge_and_rebase.rebase.methods.ariadne.scaling import apply_tv_scaling
+from merge_and_rebase.rebase.methods.ariadne.streaming import (
+    compute_alignment_diagnostics_streaming,
     fit_direct_residual_streaming,
-    measure_direct_residual_realization,
     measure_streaming_realization_for,
     prepare_direct_residual_streaming,
 )
-from merge_and_rebase.eval.target_informed_runtime import (
-    ResidualSufficientStatistics,
-    _realized_pred_sq_from_stats,
-    capture_block_gradients,
-    iter_capture_block_gradients,
-)
-from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.utils.cost_accounting import PhaseCostRecorder, recording
 
 
@@ -248,7 +250,8 @@ def test_alignment_variants_match_resident_streaming(source_depth, target_depth,
     corr_r, _rows_r, captured, _desired_r, _diag = _resident(setup, DirectResidualConfig(**common))
     corr_s, _rows_s, prepared = _streaming(setup, DirectResidualConfig(**common))
     _assert_corr_close(corr_r, corr_s)
-    from merge_and_rebase.eval.direct_residual import _aligned, _fit_activation_map
+    from merge_and_rebase.rebase.methods.ariadne.alignment import _fit_activation_map
+    from merge_and_rebase.rebase.methods.ariadne.layouts import _aligned
 
     for j in range(setup[4].target_depth):
         i = setup[4].pairing[j]
@@ -263,8 +266,8 @@ def test_alignment_variants_match_resident_streaming(source_depth, target_depth,
 
 
 def test_delta_magnitude_weights_are_per_image_scale_normalized_and_grid_aligned():
-    from merge_and_rebase.eval.direct_residual import _fit_activation_map
     from merge_and_rebase.eval.target_informed_runtime import _interp_2d_tokens
+    from merge_and_rebase.rebase.methods.ariadne.alignment import _fit_activation_map
 
     torch.manual_seed(171)
     # float64 so the invariance is checked exactly, not up to float32 rounding of the rescaled delta.

@@ -28,18 +28,16 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    capture_paired_boundary_activations,
-    compute_desired_effects,
-    fit_direct_residual,
-)
-from merge_and_rebase.eval.target_informed_runtime import (
+from merge_and_rebase.eval.vision_rebase import _state_dict_sha256
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
+from merge_and_rebase.rebase.methods.ariadne.diagnostics import (
     compute_direct_residual_task_vector_stats,
     measure_direct_residual_realization,
 )
-from merge_and_rebase.eval.vision_rebase import _state_dict_sha256
-from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
 
 DEVICES = [
     "cpu",
@@ -451,7 +449,7 @@ def _open_clip_direction_setup(direction, seed=101):
     from open_clip.transformer import VisionTransformer
     from torch.utils.data import TensorDataset as _TD
 
-    from merge_and_rebase.eval.target_informed_runtime import paired_calibration  # noqa: F401 (imported for parity)
+    from merge_and_rebase.rebase.methods.ariadne.capture import paired_calibration  # noqa: F401 (imported for parity)
 
     class _CLIPLike(torch.nn.Module):
         def __init__(self, visual):

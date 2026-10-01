@@ -10,12 +10,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    _fit_activation_map,
-    parse_direct_residual_config,
-)
-from merge_and_rebase.eval.target_residual_completion import centered_ridge_alignment
+from merge_and_rebase.rebase.methods.ariadne.alignment import _fit_activation_map
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.linalg import centered_ridge_alignment
 
 
 def test_defaults_are_historical_polar_uniform():

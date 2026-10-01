@@ -29,9 +29,9 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval import vision_rebase
-from merge_and_rebase.eval.direct_residual import DirectResidualConfig
 from merge_and_rebase.eval.vision_rebase import _run_direct_residual_fit
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
 
 
 def _run_main_with_cfg(monkeypatch, tmp_path, cfg: dict) -> Exception:

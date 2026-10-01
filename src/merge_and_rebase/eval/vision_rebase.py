@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import itertools
 import json
 import os
@@ -57,6 +56,25 @@ from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
+from ..rebase.methods.ariadne import (
+    DirectResidualConfig,
+    apply_depth_pairing_override,
+    apply_tv_scaling,
+    capture_paired_boundary_activations,
+    compute_alignment_diagnostics,
+    compute_alignment_diagnostics_streaming,
+    compute_desired_effects,
+    compute_direct_residual_task_vector_stats,
+    compute_fidelity_holdout_diagnostics,
+    fit_direct_residual,
+    fit_direct_residual_streaming,
+    fit_sequential_source_endpoints,
+    measure_direct_residual_realization,
+    measure_streaming_realization_for,
+    parse_direct_residual_config,
+    prepare_direct_residual_streaming,
+)
+from ..rebase.methods.ariadne.hashing import _task_vector_sha256
 from ..rebase.methods.theseus import InterpolatedBlockActivations
 from ..rebase.runtime import (
     format_rebase_method_label,
@@ -74,22 +92,6 @@ from .block_extension import (
     select_loader,
 )
 from .datasets.vision8_14_20 import SUITES
-from .direct_residual import (
-    DirectResidualConfig,
-    apply_depth_pairing_override,
-    apply_tv_scaling,
-    capture_paired_boundary_activations,
-    compute_alignment_diagnostics,
-    compute_alignment_diagnostics_streaming,
-    compute_desired_effects,
-    compute_fidelity_holdout_diagnostics,
-    fit_direct_residual,
-    fit_direct_residual_streaming,
-    fit_sequential_source_endpoints,
-    measure_streaming_realization_for,
-    parse_direct_residual_config,
-    prepare_direct_residual_streaming,
-)
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
 from .target_informed_runtime import (
@@ -99,8 +101,6 @@ from .target_informed_runtime import (
     complete_joint_blockwise,
     complete_residuals,
     complete_residuals_direct,
-    compute_direct_residual_task_vector_stats,
-    measure_direct_residual_realization,
     projection_transforms,
     scale_completion,
 )
@@ -1068,16 +1068,9 @@ def _visual_key_fingerprint(sd: Mapping[str, torch.Tensor]) -> dict[str, Any]:
     }
 
 
-def _state_dict_sha256(sd: Mapping[str, torch.Tensor]) -> str:
-    """Stable CPU hash used to prove that the native target base was not mutated."""
-    digest = hashlib.sha256()
-    for key in sorted(sd):
-        value = sd[key].detach().cpu().contiguous()
-        digest.update(key.encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(memoryview(value.numpy()))
-    return digest.hexdigest()
+# Stable CPU hash used to prove that the native target base was not mutated.
+# Same algorithm (sorted keys, dtype, shape, raw bytes) as the Ariadne task-vector hash.
+_state_dict_sha256 = _task_vector_sha256
 
 
 def _ckpt_visual_base_coverage(

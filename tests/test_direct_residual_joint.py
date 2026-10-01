@@ -30,18 +30,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    capture_paired_boundary_activations,
-    compute_desired_effects,
-    fit_direct_residual,
-    parse_direct_residual_config,
-)
-from merge_and_rebase.eval.target_informed_runtime import (
-    _JointBlockRidgeStatistics,
-    paired_calibration,
-)
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods.ariadne.blockwise import _JointBlockRidgeStatistics
+from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations, paired_calibration
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
 
 DEVICES = [
     "cpu",

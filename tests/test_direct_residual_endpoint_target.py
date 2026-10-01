@@ -32,16 +32,15 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    capture_paired_boundary_activations,
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import (
     compute_alignment_diagnostics,
     compute_desired_effects,
-    fit_direct_residual,
-    parse_direct_residual_config,
 )
-from merge_and_rebase.eval.target_residual_completion import centered_rectangular_procrustes
-from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods.ariadne.linalg import centered_rectangular_procrustes
 
 # --------------------------------------------------------------------------
 # Golden hashes for the untouched transported_delta path, recorded at HEAD

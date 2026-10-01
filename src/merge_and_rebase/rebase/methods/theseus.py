@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from ...models.patch_openclip_attention import merge_openclip_vit_attn, split_openclip_vit_attn
+from ...models.vision_utils import _encode_image
 from ...utils.cost_accounting import cost_phase, cost_phase_decorator
 from ..base import TensorDict
 from ..registry import register
@@ -76,14 +77,6 @@ def _extract_output_tensor(output: Any) -> torch.Tensor:
         if torch.is_tensor(first):
             return first
     raise TypeError("Unsupported module output while collecting Theseus activations.")
-
-
-def _encode_image(model: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
-    if hasattr(model, "encode_image") and callable(model.encode_image):
-        return model.encode_image(images)
-    if hasattr(model, "visual") and callable(model.visual):
-        return model.visual(images)
-    return model(images)
 
 
 def _visual_module(model: torch.nn.Module) -> torch.nn.Module:

@@ -20,6 +20,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
+from ..models.vision_utils import _encode_image
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
@@ -2734,14 +2735,6 @@ def _as_optional_dict_float(value: Any) -> dict[str, float] | None:
     if not isinstance(value, Mapping):
         raise ValueError("Expected a dict for component_ridge.")
     return {str(k): float(v) for k, v in value.items()}
-
-
-def _encode_image(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
-    if hasattr(model, "encode_image") and callable(model.encode_image):
-        return model.encode_image(images)
-    if hasattr(model, "visual") and callable(model.visual):
-        return model.visual(images)
-    return model(images)
 
 
 def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) -> Any:

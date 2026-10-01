@@ -28,17 +28,14 @@ import torch
 from open_clip.transformer import VisionTransformer
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    capture_paired_boundary_activations,
-    compute_desired_effects,
-    fit_direct_residual,
-    parse_direct_residual_config,
-)
-from merge_and_rebase.eval.target_informed_runtime import _aligned, _rows, capture_block_gradients
-from merge_and_rebase.eval.target_residual_completion import centered_rectangular_procrustes
 from merge_and_rebase.models.grad_recipes import clip_contrastive_recipe
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods.ariadne.capture import capture_block_gradients, capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods.ariadne.layouts import _aligned, _rows
+from merge_and_rebase.rebase.methods.ariadne.linalg import centered_rectangular_procrustes
 
 DEVICES = [
     "cpu",

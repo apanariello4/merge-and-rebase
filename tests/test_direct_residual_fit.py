@@ -14,19 +14,16 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    _aligned,
-    _rows,
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods.ariadne.capture import (
     capture_paired_boundary_activations,
     capture_tokens,
-    centered_rectangular_procrustes,
-    compute_desired_effects,
-    fit_direct_residual,
-    fit_sequential_source_endpoints,
-    parse_direct_residual_config,
 )
-from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual, fit_sequential_source_endpoints
+from merge_and_rebase.rebase.methods.ariadne.layouts import _aligned, _rows
+from merge_and_rebase.rebase.methods.ariadne.linalg import centered_rectangular_procrustes
 
 
 class _Attention(torch.nn.Module):

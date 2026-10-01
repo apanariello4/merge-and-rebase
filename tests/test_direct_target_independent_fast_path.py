@@ -36,15 +36,12 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval import target_informed_runtime as runtime
-from merge_and_rebase.eval.target_informed_runtime import (
-    _fit_all_positions_independent,
-    _fit_direct_target_position,
-    capture_tokens,
-)
-from merge_and_rebase.eval.target_residual_completion import (
-    ResidualCompletionConfig,
-    order_components,
-)
+from merge_and_rebase.eval.target_informed_runtime import _fit_direct_target_position
+from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
+from merge_and_rebase.rebase.methods.ariadne import independent as ariadne_independent
+from merge_and_rebase.rebase.methods.ariadne.capture import capture_tokens
+from merge_and_rebase.rebase.methods.ariadne.components import order_components
+from merge_and_rebase.rebase.methods.ariadne.independent import _fit_all_positions_independent
 
 
 class _Attention(torch.nn.Module):
@@ -251,7 +248,10 @@ def test_forward_pass_count_drops_to_one_shared_sweep(monkeypatch):
         calls["n"] += 1
         return real_capture_tokens(*args, **kwargs)
 
+    # ``_fit_direct_target_position`` resolves ``capture_tokens`` in the runtime module,
+    # ``_fit_all_positions_independent`` in the Ariadne independent-kernel module.
     monkeypatch.setattr(runtime, "capture_tokens", counting_capture_tokens)
+    monkeypatch.setattr(ariadne_independent, "capture_tokens", counting_capture_tokens)
 
     old_target = deepcopy(target)
     old_current_state = {k: v.detach().cpu().clone() for k, v in target_base_sd.items()}
@@ -278,7 +278,7 @@ def test_forward_pass_count_drops_to_one_shared_sweep(monkeypatch):
     new_target = deepcopy(target)
     new_current_state = {k: v.detach().cpu().clone() for k, v in target_base_sd.items()}
     new_target.load_state_dict(new_current_state, strict=True)
-    runtime._fit_all_positions_independent(
+    _fit_all_positions_independent(
         new_target,
         new_current_state,
         positions,
