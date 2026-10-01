@@ -13,6 +13,7 @@ prepare takes live models and calibration loaders.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -35,10 +36,13 @@ from .diagnostics import (
 from .fit import fit_direct_residual, fit_sequential_source_endpoints
 from .streaming import (
     compute_alignment_diagnostics_streaming,
+    compute_gradient_delta_disagreement_streaming,
     fit_direct_residual_streaming,
     measure_streaming_realization_for,
     prepare_direct_residual_streaming,
 )
+
+logger = logging.getLogger(__name__)
 
 _SEQUENTIAL_ENDPOINTS = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
 
@@ -137,9 +141,8 @@ def _fit_body(
     (full per-batch banks, unchanged) and the streaming path
     (``prepare_direct_residual_streaming`` + ``fit_direct_residual_streaming``,
     O(1)-in-``num_batches`` host RAM); ``parse_direct_residual_config`` has
-    already rejected any streaming config for which realization diagnostics
-    would be reachable, so that block below only ever runs for the resident
-    path. Both paths additionally record each bracket's exact peak host RSS
+    accepts ``realization_diagnostics`` under streaming too (the streaming
+    realization measurement, ``measure_streaming_realization_for``). Both paths additionally record each bracket's exact peak host RSS
     (``{bracket}_peak_host_rss_bytes``, VmHWM reset at the bracket start via
     ``recorder``; see utils.cost_accounting) so campaigns can see streaming's
     host memory stay flat as ``num_batches`` grows while resident's does not.
@@ -154,6 +157,9 @@ def _fit_body(
     prepared = None
     gradient_mode = config.procrustes_source == "gradient"
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    # Scalar-only per-position rows merged into the diagnostics rows in BOTH storage paths (rank
+    # diagnostics of the cross-covariance the map was solved from; see procrustes_rank_diagnostics).
+    rank_diagnostics: dict[int, dict[str, Any]] = {}
     source_recipe = target_recipe = None
     if gradient_mode:
         missing = [
@@ -201,6 +207,7 @@ def _fit_body(
             alignment_map=config.alignment_map,
             alignment_row_weighting=config.alignment_row_weighting,
             alignment_seed=config.alignment_seed,
+            fidelity_alignment_diagnostics=bool(config.fidelity_holdout),
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )
@@ -236,6 +243,7 @@ def _fit_body(
                 # or not gradient_mode also needs it, so its own request never has to
                 # special-case which mode it's running under.
                 diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
+                rank_out=rank_diagnostics,
             )
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
@@ -253,11 +261,27 @@ def _fit_body(
     # memory bytes -- even in the default residual_target="transported_delta"
     # path -- contaminating any cross-code-generation cost comparison for a
     # quantity these diagnostics never feed into.
-    # compute_alignment_diagnostics describes the ACTIVATION-space Procrustes fit;
-    # under procrustes_source="gradient" that is not the Q_j the fit used, so it
-    # is not reported there (None) rather than reported for the wrong map.
+    # Both compute_alignment_diagnostics variants describe the ACTIVATION-space map the fit
+    # actually used (the configured alignment_map and row weighting, not a fresh uniform polar
+    # fit); under procrustes_source="gradient" that is not the Q_j the fit used, so it is not
+    # reported there (None) rather than reported for the wrong map.
     alignment_diagnostics = None
     with cost_excluded():
+        if streaming and gradient_mode:
+            # Resident gradient mode computes the activation-vs-gradient delta disagreement inside
+            # compute_desired_effects; streaming needs one extra (untimed) sweep for it, because
+            # both maps are only known after Pass A. Merged into the rows below like the rest.
+            for j, value in compute_gradient_delta_disagreement_streaming(
+                source_base_model,
+                source_ft_model,
+                target_model,
+                target_base_sd,
+                prepared,
+                pairing,
+                device=device,
+                family_adapter=family_adapter,
+            ).items():
+                procrustes_diagnostics[j]["activation_gradient_delta_disagreement"] = value
         if config.procrustes_source == "activation":
             if streaming:
                 alignment_diagnostics = compute_alignment_diagnostics_streaming(
@@ -271,7 +295,13 @@ def _fit_body(
                     family_adapter=family_adapter,
                 )
             else:
-                alignment_diagnostics = compute_alignment_diagnostics(captured, pairing)
+                alignment_diagnostics = compute_alignment_diagnostics(
+                    captured,
+                    pairing,
+                    alignment_map=config.alignment_map,
+                    alignment_row_weighting=config.alignment_row_weighting,
+                    alignment_seed=config.alignment_seed,
+                )
 
     fit_mark = recorder.mark()
     fit_started = time.perf_counter()
@@ -315,9 +345,23 @@ def _fit_body(
         "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
         "correction_fit_peak_host_rss_bytes": correction_fit_host_peak,
     }
-    if procrustes_diagnostics:
+    # Streaming's procrustes_diagnostics already carries the rank keys; resident's carries them only in
+    # gradient / fidelity_holdout mode (as the full diagnostics_out dict), so merge rank_diagnostics first.
+    row_diagnostics = {
+        j: {**rank_diagnostics.get(j, {}), **procrustes_diagnostics.get(j, {})}
+        for j in set(rank_diagnostics) | set(procrustes_diagnostics)
+    }
+    non_unique = sorted(j for j, d in row_diagnostics.items() if d.get("procrustes_q_non_unique"))
+    if non_unique:
+        logger.warning(
+            "Ariadne: the Procrustes cross-covariance is rank-deficient at target position(s) %s "
+            "(rank < min(d_source, d_target), see the procrustes_rank / procrustes_min_dim row fields), so the "
+            "polar factor Q is not unique there; the fitted Q is unchanged (diagnostic flag only).",
+            non_unique,
+        )
+    if row_diagnostics:
         for row in diagnostics:
-            extra = procrustes_diagnostics.get(int(row.get("position", -1)))
+            extra = row_diagnostics.get(int(row.get("position", -1)))
             if extra:
                 row.update(extra)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -27,6 +28,33 @@ def _dataset_identity(dataset):
     if ids is not None:
         return tuple(str(i) for i in ids)
     return ("object", id(dataset), len(dataset))
+
+
+def _stable_dataset_identity(dataset) -> str:
+    """Process-independent identity string of a calibration dataset (for run metadata).
+
+    `_dataset_identity` ends in ``("object", id(dataset), len)`` for datasets that carry neither a split
+    fingerprint nor ``sample_ids`` -- right for the in-process source/target pairing check (it requires the
+    SAME dataset object), but not reproducible across processes, so it must not be written to run summaries.
+    This variant is content-based wherever the dataset exposes content (Subset indices, split fingerprint,
+    sample ids -- the latter two and the Subset indices are hashed rather than listed) and otherwise falls
+    back to ``module.Class`` plus length, never an object id. It is what ``extra["calibration"]
+    ["dataset_identity"]`` records and what the later same-dataset checks in ``target_informed_runtime``
+    compare against.
+    """
+    if isinstance(dataset, Subset):
+        indices = hashlib.sha256(repr([int(i) for i in dataset.indices]).encode()).hexdigest()
+        return f"Subset(indices_sha256={indices};n={len(dataset.indices)};{_stable_dataset_identity(dataset.dataset)})"
+    split = getattr(dataset, "split", None)
+    fingerprint = getattr(split, "_fingerprint", None)
+    if fingerprint is not None:
+        return f"split_fingerprint={fingerprint};n={len(dataset)}"
+    ids = getattr(dataset, "sample_ids", None)
+    if ids is not None:
+        digest = hashlib.sha256(repr([str(i) for i in ids]).encode()).hexdigest()
+        return f"sample_ids_sha256={digest};n={len(ids)}"
+    cls = type(dataset)
+    return f"{cls.__module__}.{cls.__qualname__};n={len(dataset)}"
 
 
 def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
@@ -65,7 +93,7 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
         target_batches.append(b)
     metadata = {
         "indices": order,
-        "dataset_identity": repr(_dataset_identity(source_loader.dataset)),
+        "dataset_identity": _stable_dataset_identity(source_loader.dataset),
         "requested_batches": num_batches,
         "actual_batches": len(source_batches),
         "batch_size": source_loader.batch_size,

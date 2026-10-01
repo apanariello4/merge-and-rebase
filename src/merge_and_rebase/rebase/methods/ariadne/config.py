@@ -180,8 +180,9 @@ class DirectResidualConfig:
     # "streaming": prepare_direct_residual_streaming/fit_direct_residual_streaming
     # accumulate Procrustes and ridge sufficient statistics batch-by-batch,
     # keeping host RAM O(1) in num_batches, at the cost of requiring
-    # component_target='block_boundary', block_split='none' and
-    # realization_diagnostics=False (see parse_direct_residual_config).
+    # component_target='block_boundary' and block_split='none' (see
+    # parse_direct_residual_config); realization_diagnostics, tv_scaling and
+    # fidelity_holdout are supported under streaming too.
     activation_storage: str = "resident"
     # Only meaningful with activation_storage="streaming": split
     # fit_direct_residual_streaming's target positions into chunks of this

@@ -12,7 +12,14 @@ import torch
 
 from ....utils.cost_accounting import cost_phase_decorator
 from ...discrete_layer_match import DiscreteLayerPairing
-from .alignment import _derive_block_seed, _procrustes_from_cross, _random_isometry_map, _validate_alignment_options
+from .alignment import (
+    _cross_rank,
+    _derive_block_seed,
+    _procrustes_from_cross,
+    _random_isometry_map,
+    _validate_alignment_options,
+    procrustes_rank_diagnostics,
+)
 from .capture import iter_capture_block_gradients, iter_capture_tokens, paired_calibration
 from .config import DirectResidualConfig, order_components
 from .diagnostics import measure_direct_residual_realization_streaming
@@ -123,6 +130,7 @@ def prepare_direct_residual_streaming(
     alignment_map: str = "polar",
     alignment_row_weighting: str = "uniform",
     alignment_seed: int = 0,
+    fidelity_alignment_diagnostics: bool = False,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` +
     ``compute_desired_effects``: accumulates each position's Procrustes cross-
@@ -153,6 +161,17 @@ def prepare_direct_residual_streaming(
     (``"fingerprints"``) that Pass B uses to detect a target model mutated
     between passes, the activation-space maps and means, the replayed
     calibration batches for both sides, and the calibration metadata.
+
+    ``"procrustes_diagnostics"`` is the per-position dict merged into the diagnostics rows
+    (scalars only, mirroring the resident path's rows): always the rank diagnostics of the
+    cross-covariance the map was solved from (``procrustes_rank``, ``procrustes_min_dim``,
+    ``procrustes_q_non_unique``) and ``procrustes_source``; in gradient mode additionally the
+    activation-vs-gradient overlap and map distance; with ``fidelity_alignment_diagnostics``
+    (set by the caller for ``fidelity_holdout``, the only case in which the resident path
+    collects them) also ``alignment_map``, ``alignment_row_weighting``, ``alignment_q_frobenius``,
+    ``alignment_q_rank`` and the map-specific scalars. The resident path additionally stores the
+    tensors ``q``/``mu_s``/``mu_t`` in those rows; here they stay in ``q_by_position`` /
+    ``source_mean_by_position`` / ``target_mean_by_position`` (no d x d tensor is duplicated into rows).
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -252,9 +271,15 @@ def prepare_direct_residual_streaming(
                     )
 
     def solve_map(acc, position):
+        """Return ``(q, rank, polar_derived, map_scalars)`` for one position."""
         cross = acc.cross()
         if alignment_map == "polar":
-            return _procrustes_from_cross(cross)
+            q, rank = _procrustes_from_cross(cross, return_rank=True)
+            scalars: dict[str, Any] = {"alignment_map": "polar", "alignment_row_weighting": alignment_row_weighting}
+            if alignment_row_weighting != "uniform":
+                # Resident normalises the row weights to total mass 1; Chan's weights sum to the image count.
+                scalars["weighted_cross_frobenius"] = float(torch.linalg.norm(cross).item() / acc.weight)
+            return q, rank, True, scalars
         if alignment_map == "random_isometry":
             # Same shape/orientation as the polar map above (both come from
             # `cross`'s shape); only the direction is randomized, from the
@@ -262,28 +287,59 @@ def prepare_direct_residual_streaming(
             # streaming and resident produce the identical random map for
             # the same alignment_seed (see test_direct_residual_random_
             # isometry.py's streaming-parity check).
-            return _random_isometry_map(tuple(cross.shape), seed=_derive_block_seed(alignment_seed, position))
+            q = _random_isometry_map(tuple(cross.shape), seed=_derive_block_seed(alignment_seed, position))
+            scalars = {
+                "alignment_map": "random_isometry",
+                "alignment_row_weighting": "uniform",
+                "alignment_seed_used": int(_derive_block_seed(alignment_seed, position)),
+            }
+            return q, _cross_rank(cross), False, scalars
         assert acc.xx is not None
         trace = float(torch.trace(acc.xx).item())
         lam = trace / max(1, acc.n - 1)
+        scalars = {
+            "alignment_map": "ridge",
+            "alignment_row_weighting": "uniform",
+            "ridge": lam,
+            "source_trace": trace,
+        }
         if trace == 0:
-            return torch.zeros_like(cross)
+            return torch.zeros_like(cross), _cross_rank(cross), False, scalars
         eye = torch.eye(acc.xx.shape[0], dtype=acc.xx.dtype, device=acc.xx.device)
-        return torch.linalg.solve(acc.xx + lam * eye, cross)
+        return torch.linalg.solve(acc.xx + lam * eye, cross), _cross_rank(cross), False, scalars
 
-    activation_q64 = {j: solve_map(acc, j).cpu() for j, acc in accumulators.items()}
+    solved = {j: solve_map(acc, j) for j, acc in accumulators.items()}
+    activation_q64 = {j: v[0].cpu() for j, v in solved.items()}
     procrustes_diagnostics: dict[int, dict[str, Any]] = {}
+    for j, (q64, rank, polar_derived, scalars) in solved.items():
+        row = {
+            "procrustes_source": "activation",
+            **procrustes_rank_diagnostics(rank, q64.shape[0], q64.shape[1], polar_derived=polar_derived),
+        }
+        if fidelity_alignment_diagnostics:
+            row.update(
+                {
+                    "alignment_q_frobenius": float(torch.linalg.norm(activation_q64[j]).item()),
+                    "alignment_q_rank": int(torch.linalg.matrix_rank(activation_q64[j])),
+                    **scalars,
+                }
+            )
+        procrustes_diagnostics[j] = row
+    gradient_q64: dict[int, Tensor] = {}
     if gradient_mode:
         q_by_position = {}
         for j, acc in grad_accumulators.items():
             cross = acc.cross()
-            q64 = _procrustes_from_cross(cross).cpu()
+            q64, grad_rank = _procrustes_from_cross(cross, return_rank=True)
+            q64 = q64.cpu()
+            gradient_q64[j] = q64
             q_by_position[j] = q64.float()
             d_min = min(q64.shape)
             procrustes_diagnostics[j] = {
                 "procrustes_source": "gradient",
-                "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
+                **procrustes_rank_diagnostics(grad_rank, q64.shape[0], q64.shape[1]),
                 "activation_gradient_procrustes_overlap": float(((activation_q64[j].T @ q64).norm() ** 2) / d_min),
+                "activation_gradient_map_distance": float(torch.linalg.norm(activation_q64[j] - q64) / (2.0 * d_min) ** 0.5),
             }
     else:
         q_by_position = {j: q.float() for j, q in activation_q64.items()}
@@ -294,6 +350,7 @@ def prepare_direct_residual_streaming(
         "alignment_row_weighting": alignment_row_weighting,
         "procrustes_diagnostics": procrustes_diagnostics,
         "activation_q64_by_position": activation_q64,
+        "gradient_q64_by_position": gradient_q64,
         "source_mean_by_position": {j: acc.mean_x.cpu() for j, acc in accumulators.items()},
         "target_mean_by_position": {j: acc.mean_y.cpu() for j, acc in accumulators.items()},
         "fingerprints": fingerprints,
@@ -489,6 +546,8 @@ def fit_direct_residual_streaming(
                 target_corrections.update(position_corrections)
                 for row in block_rows:
                     row["source_position"] = row.pop("source_coordinate")
+                    # Same analysis-only tag the resident path sets in fit_direct_residual.
+                    row["procrustes_source"] = prepared.get("procrustes_source", "activation")
                     diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)
@@ -569,6 +628,86 @@ def measure_streaming_realization_for(
     return measure
 
 
+@contextlib.contextmanager
+def _pristine_target_sweep(
+    source_base_model, source_ft_model, target_model, target_base_state, prepared, pairing, *, device, family_adapter
+):
+    """Lockstep sweep (source base ``sb``, source FT ``sf``, pristine target ``tgt``) over the calibration batches.
+
+    Yields an iterator of per-batch ``{"sb": ..., "sf": ..., "tgt": ...}`` capture dicts (boundary activations
+    keyed by str(source index) for ``sb``/``sf`` and str(target position) for ``tgt``). The target model is put in
+    its pristine base state for the sweep and its entry state is restored on exit.
+    """
+    positions = list(range(pairing.target_depth))
+    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    try:
+        target_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
+        requests = {str(j): (j, "boundary") for j in positions}
+        gens = _streaming_source_iters(source_base_model, source_ft_model, prepared, pairing, device, family_adapter)
+        gens["tgt"] = iter_capture_tokens(
+            target_model,
+            prepared["target_batches"],
+            requests,
+            device,
+            family_adapter=family_adapter,
+            store_device=device,
+        )
+        names = list(gens)
+        with contextlib.ExitStack() as stack:
+            for gen in gens.values():
+                stack.enter_context(contextlib.closing(gen))
+            yield (dict(zip(names, values, strict=True)) for values in zip(*(gens[n] for n in names), strict=True))
+    finally:
+        target_model.load_state_dict(entry_state, strict=True)
+
+
+@torch.no_grad()
+def compute_gradient_delta_disagreement_streaming(
+    source_base_model,
+    source_ft_model,
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    device,
+    family_adapter=None,
+) -> dict[int, float]:
+    """Streaming counterpart of the resident ``activation_gradient_delta_disagreement`` (gradient mode).
+
+    ``||dS (Q_act - Q_grad)||_F / (||dS Q_act||_F + 1e-12)`` per position, ``dS = S_1 - S_0`` over all
+    calibration rows, with both float64 maps taken from `prepared` (known after Pass A, so the norms are
+    accumulated per batch as sums of squares: no Gram matrix, O(1) host memory). Analysis-only; call it
+    outside the timed brackets. The target model's entry state is restored.
+    """
+    positions = list(range(pairing.target_depth))
+    q_act = prepared["activation_q64_by_position"]
+    q_grad = prepared["gradient_q64_by_position"]
+    sums = {j: [0.0, 0.0] for j in positions}
+    with _pristine_target_sweep(
+        source_base_model,
+        source_ft_model,
+        target_model,
+        target_base_state,
+        prepared,
+        pairing,
+        device=device,
+        family_adapter=family_adapter,
+    ) as sweep:
+        for by_name in sweep:
+            for j in positions:
+                i = pairing.pairing[j]
+                t_cpu = by_name["tgt"][str(j)].cpu()
+                b = _aligned([by_name["sb"][str(i)].cpu()], [t_cpu])[0]
+                f = _aligned([by_name["sf"][str(i)].cpu()], [t_cpu])[0]
+                delta = (f - b).reshape(-1, b.shape[-1]).double()
+                d_act = delta @ q_act[j].double()
+                d_grad = delta @ q_grad[j].double()
+                sums[j][0] += float(((d_act - d_grad) ** 2).sum().item())
+                sums[j][1] += float((d_act**2).sum().item())
+    return {j: float(num**0.5 / (den**0.5 + 1e-12)) for j, (num, den) in sums.items()}
+
+
 @torch.no_grad()
 def compute_alignment_diagnostics_streaming(
     source_base_model,
@@ -595,45 +734,35 @@ def compute_alignment_diagnostics_streaming(
     mu_s = prepared["source_mean_by_position"]
     mu_t = prepared["target_mean_by_position"]
     sums = {j: {"e": 0.0, "t": 0.0, "delta": 0.0, "in": 0.0, "out": 0.0, "src_dim": 0, "tgt_dim": 0} for j in positions}
-    entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
-    try:
-        target_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
-        requests = {str(j): (j, "boundary") for j in positions}
-        gens = _streaming_source_iters(source_base_model, source_ft_model, prepared, pairing, device, family_adapter)
-        gens["tgt"] = iter_capture_tokens(
-            target_model,
-            prepared["target_batches"],
-            requests,
-            device,
-            family_adapter=family_adapter,
-            store_device=device,
-        )
-        names = list(gens)
-        with contextlib.ExitStack() as stack:
-            for gen in gens.values():
-                stack.enter_context(contextlib.closing(gen))
-            for values in zip(*(gens[n] for n in names), strict=True):
-                by_name = dict(zip(names, values, strict=True))
-                for j in positions:
-                    i = pairing.pairing[j]
-                    t_cpu = by_name["tgt"][str(j)].cpu()
-                    b = _aligned([by_name["sb"][str(i)].cpu()], [t_cpu])[0]
-                    f = _aligned([by_name["sf"][str(i)].cpu()], [t_cpu])[0]
-                    s0 = b.reshape(-1, b.shape[-1]).double()
-                    s1 = f.reshape(-1, f.shape[-1]).double()
-                    t0 = t_cpu.reshape(-1, t_cpu.shape[-1]).double()
-                    q = q64[j].double()
-                    e = (s0 - mu_s[j]) @ q - (t0 - mu_t[j])
-                    e_in = (e @ q.T) @ q
-                    acc = sums[j]
-                    acc["e"] += float((e**2).sum().item())
-                    acc["t"] += float(((t0 - mu_t[j]) ** 2).sum().item())
-                    acc["delta"] += float((((s1 - s0) @ q) ** 2).sum().item())
-                    acc["in"] += float((e_in**2).sum().item())
-                    acc["out"] += float(((e - e_in) ** 2).sum().item())
-                    acc["src_dim"], acc["tgt_dim"] = int(s0.shape[-1]), int(t0.shape[-1])
-    finally:
-        target_model.load_state_dict(entry_state, strict=True)
+    with _pristine_target_sweep(
+        source_base_model,
+        source_ft_model,
+        target_model,
+        target_base_state,
+        prepared,
+        pairing,
+        device=device,
+        family_adapter=family_adapter,
+    ) as sweep:
+        for by_name in sweep:
+            for j in positions:
+                i = pairing.pairing[j]
+                t_cpu = by_name["tgt"][str(j)].cpu()
+                b = _aligned([by_name["sb"][str(i)].cpu()], [t_cpu])[0]
+                f = _aligned([by_name["sf"][str(i)].cpu()], [t_cpu])[0]
+                s0 = b.reshape(-1, b.shape[-1]).double()
+                s1 = f.reshape(-1, f.shape[-1]).double()
+                t0 = t_cpu.reshape(-1, t_cpu.shape[-1]).double()
+                q = q64[j].double()
+                e = (s0 - mu_s[j]) @ q - (t0 - mu_t[j])
+                e_in = (e @ q.T) @ q
+                acc = sums[j]
+                acc["e"] += float((e**2).sum().item())
+                acc["t"] += float(((t0 - mu_t[j]) ** 2).sum().item())
+                acc["delta"] += float((((s1 - s0) @ q) ** 2).sum().item())
+                acc["in"] += float((e_in**2).sum().item())
+                acc["out"] += float(((e - e_in) ** 2).sum().item())
+                acc["src_dim"], acc["tgt_dim"] = int(s0.shape[-1]), int(t0.shape[-1])
     diagnostics: dict[int, dict[str, float]] = {}
     for j in positions:
         acc = sums[j]

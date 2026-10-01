@@ -189,13 +189,13 @@ tensors), `alignment` (maps), `summary`/`diagnostics`/`brace_and_delta`/`layout`
 | `dr_od_streaming_eb:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `c472d2b55cd53b7230bc37ab872e7cdddb6e49f1cc5f1dd9c02229b806e58b0b` |
 | `dr_od_streaming_eb:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `552f60a1ce474bb04de0283f4f97310c03886d8b19692af0996ea31303b77966` |
 | `dr_od_streaming_eb:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `9f759855432ed43cd619b11eb35d487f696f2dcba5848520d922f2918376c342` |
-| `dr_orchestration_main_streaming_eb:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `18c46657227748a8d853c478e4206144da4b776ffb38873098905a486c27dba8` |
+| `dr_orchestration_main_streaming_eb:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `1686a7afde96ab90d0ca062e69f28d0a75a3f51f09f79db7b275e2573aa6c7ec` |
 | `dr_orchestration_main_streaming_eb:extend:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
-| `dr_orchestration_main_streaming_eb:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `47c560421cc09c7e87a15004a59eda638f8a2e2d80aae879df2144eac2c32fb0` |
+| `dr_orchestration_main_streaming_eb:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `0a4c6c11ff8ac3619b7f11bb0d835de0fd8006c8329e9727f4d1ad28673b8984` |
 | `dr_orchestration_main_streaming_eb:shrink:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
-| `dr_orchestration_od_resident_fixed_relative:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `ee55a24e6b76151127d944a674c34e7cd65309a0c44d6bbc9bcd7474eca59159` |
+| `dr_orchestration_od_resident_fixed_relative:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `ba8c4447a4f3aba99a2640c8728eb5aaa8c055441ba8dafffcb6ef7efbcb7d6a` |
 | `dr_orchestration_od_resident_fixed_relative:extend:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
-| `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `35fee9670ff99777a7be08a3a8f8ad14c012d2d7de6261f6514a21270a5d8066` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `82656c63449b965c653663f63107e1a47ea0dfc86c8e76179b3dfecafa9be8ee` |
 | `dr_orchestration_od_resident_fixed_relative:shrink:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
 | `dr_random_isometry_resident:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `9d77ebb184f6ac41583b52fea44d1ab9b12f9ba5c9fb4668a57d619b2af3e8da` |
 | `dr_random_isometry_resident:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `67cf0ee866c51175f41ba8838b85b19be6b6f097857b33de4182c9cf7df07067` |
@@ -233,3 +233,34 @@ tensors), `alignment` (maps), `summary`/`diagnostics`/`brace_and_delta`/`layout`
 | `vision_rebase_theseus_brace_prestep:shrink:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `d5db7ff6e25218727f88a85543dca479c172ea4afc7589fc25249c675f964b7d` |
 | `vision_rebase_theseus_no_prestep:samedepth:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `1fe61eed751c59c39920bfe4e530af9bbae8cc00ab3132bd1c4e54f0dcb14647` |
 | `vision_rebase_theseus_no_prestep:samedepth:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `9a71d4f4531618193315ae6547580fa29076f057285c3beaed20da39ef6771e4` |
+
+## Declared changes
+
+### 2026-10-01 -- Ariadne diagnostics/schema fixes (task vectors, alignment maps and q unchanged)
+
+Only the four `summary` hashes below changed; every `task_vector`, `alignment`, `diagnostics`
+and `brace_and_delta` hash is byte-identical to the previous table. The `summary` part is
+`hash_json({"diagnostics": rows, "extra": extra})` of `vision_rebase._run_direct_residual_fit`,
+so it moves whenever the diagnostics-row schema gains keys, even though no number moved.
+
+Reason (all four cases): the per-position diagnostics rows gained the rank diagnostics of the
+cross-covariance the Procrustes map was solved from -- `procrustes_rank`, `procrustes_min_dim`,
+`procrustes_q_non_unique` -- in both storage paths (fix: flag non-unique polar factors, no
+numeric change). The streaming case (`dr_orchestration_main_streaming_eb`) additionally gained
+the row key `procrustes_source` (row-key parity with the resident path). No existing value in
+any row or in `extra` changed (default polar / uniform alignment diagnostics are bit-identical;
+verified key by key against the pre-change code). `extra["calibration"]["dataset_identity"]` now
+holds a process-independent identity instead of a Python object id; it is dropped by `hash_json`
+(`VOLATILE_KEYS`), so it does not affect any hash (and the `id()` remark in `_hashing.py` /
+the Hasher bullet above is historical).
+
+| Case | Old hash | New hash |
+|---|---|---|
+| `dr_orchestration_main_streaming_eb:extend:task_vector` | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
+| `dr_orchestration_main_streaming_eb:extend:summary` | `18c46657227748a8d853c478e4206144da4b776ffb38873098905a486c27dba8` | `1686a7afde96ab90d0ca062e69f28d0a75a3f51f09f79db7b275e2573aa6c7ec` |
+| `dr_orchestration_main_streaming_eb:shrink:task_vector` | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
+| `dr_orchestration_main_streaming_eb:shrink:summary` | `47c560421cc09c7e87a15004a59eda638f8a2e2d80aae879df2144eac2c32fb0` | `0a4c6c11ff8ac3619b7f11bb0d835de0fd8006c8329e9727f4d1ad28673b8984` |
+| `dr_orchestration_od_resident_fixed_relative:extend:task_vector` | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
+| `dr_orchestration_od_resident_fixed_relative:extend:summary` | `ee55a24e6b76151127d944a674c34e7cd65309a0c44d6bbc9bcd7474eca59159` | `ba8c4447a4f3aba99a2640c8728eb5aaa8c055441ba8dafffcb6ef7efbcb7d6a` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:task_vector` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `35fee9670ff99777a7be08a3a8f8ad14c012d2d7de6261f6514a21270a5d8066` | `82656c63449b965c653663f63107e1a47ea0dfc86c8e76179b3dfecafa9be8ee` |

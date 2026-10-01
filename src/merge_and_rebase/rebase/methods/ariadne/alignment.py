@@ -105,6 +105,7 @@ def compute_desired_effects(
     alignment_row_weighting: str = "uniform",
     alignment_seed: int = 0,
     diagnostics_out: dict[int, dict[str, Any]] | None = None,
+    rank_out: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, list[Tensor]]:
     """``D_j`` = Procrustes-aligned target effect at ``pairing.pairing[j]``.
 
@@ -152,6 +153,13 @@ def compute_desired_effects(
     overlap"`` = :math:`\\lVert Q_{act}^\\top Q_{grad}\\rVert_F^2 / d_{\\min}`)
     and ``"procrustes_rank"`` (the numerical rank of the centered
     cross-covariance the gradient ``Q`` was solved from).
+
+    ``rank_out`` (also caller-owned, initially empty) receives, per position and in
+    every mode, only the cheap scalar rank diagnostics of the cross-covariance the map
+    was solved from (``RANK_DIAGNOSTIC_KEYS``: ``procrustes_rank``, ``procrustes_min_dim``,
+    ``procrustes_q_non_unique``) -- no tensors, so it is safe to merge into diagnostics
+    rows unconditionally. The rank comes from the SVD that produces the polar factor
+    itself (no extra decomposition on the default path); ``Q`` is bit-identical.
     """
     if procrustes_source not in {"activation", "gradient"}:
         raise ValueError(f"procrustes_source must be 'activation' or 'gradient', got {procrustes_source!r}")
@@ -191,7 +199,12 @@ def compute_desired_effects(
             aligned_source_grad = _aligned(source_base_grad[i], target_base_grad[j])
             grad_source_rows = _rows(aligned_source_grad).double()
             grad_target_rows = _rows(target_base_grad[j]).double()
-            q, _mu_gs, _mu_gt = centered_rectangular_procrustes(grad_source_rows, grad_target_rows)
+            q, _mu_gs, _mu_gt, grad_rank = centered_rectangular_procrustes(
+                grad_source_rows, grad_target_rows, return_rank=True
+            )
+            grad_rank_diag = procrustes_rank_diagnostics(grad_rank, q.shape[0], q.shape[1])
+            if rank_out is not None:
+                rank_out[j] = grad_rank_diag
             if diagnostics_out is not None:
                 q_act, _mu_s, _mu_t = centered_rectangular_procrustes(
                     _rows(source_base_batches).double(), _rows(targets).double()
@@ -214,12 +227,11 @@ def compute_desired_effects(
                 delta_disagreement = float(
                     torch.linalg.norm(delta_act - delta_grad) / (torch.linalg.norm(delta_act) + 1e-12)
                 )
-                gs_centered = grad_source_rows - grad_source_rows.mean(dim=0)
-                gt_centered = grad_target_rows - grad_target_rows.mean(dim=0)
-                cross = gs_centered.T @ gt_centered
                 diagnostics_out[j] = {
                     "procrustes_source": "gradient",
-                    "procrustes_rank": int(torch.linalg.matrix_rank(cross)),
+                    # Rank of the centered gradient cross-covariance, taken from the SVD that
+                    # produced q (same tolerance as torch.linalg.matrix_rank on that matrix).
+                    **grad_rank_diag,
                     "activation_gradient_procrustes_overlap": overlap,
                     "activation_gradient_map_distance": map_distance,
                     "activation_gradient_delta_disagreement": delta_disagreement,
@@ -239,6 +251,8 @@ def compute_desired_effects(
             row_weighting=alignment_row_weighting,
             random_isometry_seed=_derive_block_seed(alignment_seed, j) if alignment_map == "random_isometry" else None,
         )
+        if rank_out is not None:
+            rank_out[j] = {k: alignment_diag[k] for k in RANK_DIAGNOSTIC_KEYS}
         if diagnostics_out is not None:
             diagnostics_out[j] = {
                 "procrustes_source": "activation",
@@ -293,8 +307,17 @@ def _fit_activation_map(
     # Keep the historical uniform polar call, including its exact reduction
     # order, so default configurations retain their golden hashes.
     if alignment_map == "polar" and row_weighting == "uniform":
-        q, mx, my = centered_rectangular_procrustes(_rows(xs), _rows(ys))
-        return q, mx, my, {"alignment_map": "polar", "alignment_row_weighting": "uniform"}
+        q, mx, my, rank = centered_rectangular_procrustes(_rows(xs), _rows(ys), return_rank=True)
+        return (
+            q,
+            mx,
+            my,
+            {
+                "alignment_map": "polar",
+                "alignment_row_weighting": "uniform",
+                **procrustes_rank_diagnostics(rank, q.shape[0], q.shape[1]),
+            },
+        )
     if alignment_map == "random_isometry":
         # random_isometry always requires uniform row weighting (validated by
         # _validate_alignment_options), so the mean/centering is identical to
@@ -304,7 +327,7 @@ def _fit_activation_map(
         # that same shape.
         if random_isometry_seed is None:
             raise ValueError("alignment_map='random_isometry' requires random_isometry_seed")
-        q_polar, mx, my = centered_rectangular_procrustes(_rows(xs), _rows(ys))
+        q_polar, mx, my, rank = centered_rectangular_procrustes(_rows(xs), _rows(ys), return_rank=True)
         q = _random_isometry_map(tuple(q_polar.shape), seed=random_isometry_seed)
         return (
             q,
@@ -314,6 +337,9 @@ def _fit_activation_map(
                 "alignment_map": "random_isometry",
                 "alignment_row_weighting": "uniform",
                 "alignment_seed_used": int(random_isometry_seed),
+                # Rank of the cross-covariance the polar factor WOULD be taken from; the random
+                # isometry itself does not depend on it, hence polar_derived=False.
+                **procrustes_rank_diagnostics(rank, q.shape[0], q.shape[1], polar_derived=False),
             },
         )
     x = torch.cat(xs, dim=0)
@@ -344,8 +370,18 @@ def _fit_activation_map(
     cross = xf.T @ (yf * wf[:, None])
     if alignment_map == "ridge":
         q, _, _, diag = centered_ridge_alignment(xf, yf)
-        return q, mu_x, mu_y, {"alignment_map": "ridge", "alignment_row_weighting": "uniform", **diag}
-    q = _procrustes_from_cross(cross)
+        return (
+            q,
+            mu_x,
+            mu_y,
+            {
+                "alignment_map": "ridge",
+                "alignment_row_weighting": "uniform",
+                **diag,
+                **procrustes_rank_diagnostics(_cross_rank(cross), q.shape[0], q.shape[1], polar_derived=False),
+            },
+        )
+    q, rank = _procrustes_from_cross(cross, return_rank=True)
     return (
         q,
         mu_x,
@@ -354,20 +390,36 @@ def _fit_activation_map(
             "alignment_map": "polar",
             "alignment_row_weighting": row_weighting,
             "weighted_cross_frobenius": float(torch.linalg.norm(cross).item()),
+            **procrustes_rank_diagnostics(rank, q.shape[0], q.shape[1]),
         },
     )
 
 
 def compute_alignment_diagnostics(
-    captured: Mapping[str, Any], pairing: DiscreteLayerPairing
+    captured: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    alignment_map: str = "polar",
+    alignment_row_weighting: str = "uniform",
+    alignment_seed: int = 0,
 ) -> dict[int, dict[str, float]]:
-    """Per-position centered-Procrustes alignment diagnostics. Analysis-only.
+    """Per-position alignment diagnostics of the CONFIGURED activation map. Analysis-only.
 
-    Recomputes the SAME deterministic centered Procrustes fit ``compute_
-    desired_effects`` computes internally (`centered_rectangular_procrustes`
-    is a pure function of the captured rows, so this is a second, independent
-    call, not a cached one), then reports the residual it minimizes and a few
-    derived quantities -- never anything fed back into a fit.
+    Recomputes the SAME deterministic activation-map fit ``compute_
+    desired_effects`` computes internally (a pure function of the captured
+    rows, so this is a second, independent call, not a cached one), then
+    reports the residual it minimizes and a few derived quantities -- never
+    anything fed back into a fit.
+
+    ``alignment_map`` / ``alignment_row_weighting`` / ``alignment_seed`` must be the
+    values the fit used. For the default (``polar``, ``uniform``) the historical
+    uniform centered-Procrustes expression below is kept verbatim (bit-identical
+    values); otherwise the map ``Q_j`` and the (weighted) means ``mu_s``/``mu_t``
+    come from `_fit_activation_map`, the very function ``compute_desired_effects``
+    fits with (so the ridge / random-isometry map and the cls_balanced /
+    delta_magnitude weighted means are the ones actually used), exactly as
+    `compute_alignment_diagnostics_streaming` does from its accumulators. The
+    error / delta norms themselves stay plain (unweighted) Frobenius norms in both paths.
 
     Deliberately NOT called from ``compute_desired_effects`` or folded into
     its cost: the caller (`vision_rebase._run_direct_residual_fit`) times and
@@ -404,6 +456,8 @@ def compute_alignment_diagnostics(
             "Captured target references do not exactly match the pairing's target positions: "
             f"expected={sorted(range(pairing.target_depth))}, found={sorted(target_by_position)}"
         )
+    _validate_alignment_options(alignment_map, alignment_row_weighting)
+    default_map = alignment_map == "polar" and alignment_row_weighting == "uniform"
     alignment_diagnostics: dict[int, dict[str, float]] = {}
     for j in range(pairing.target_depth):
         i = pairing.pairing[j]
@@ -415,7 +469,17 @@ def compute_alignment_diagnostics(
         s0_rows = _rows(source_base_batches).double()
         s1_rows = _rows(source_ft_batches).double()
         t0_rows = _rows(targets).double()
-        q64, mu_s64, mu_t64 = centered_rectangular_procrustes(s0_rows, t0_rows)
+        if default_map:
+            q64, mu_s64, mu_t64 = centered_rectangular_procrustes(s0_rows, t0_rows)
+        else:
+            q64, mu_s64, mu_t64, _ = _fit_activation_map(
+                source_base_batches,
+                targets,
+                source_ft_batches,
+                alignment_map=alignment_map,
+                row_weighting=alignment_row_weighting,
+                random_isometry_seed=_derive_block_seed(alignment_seed, j) if alignment_map == "random_isometry" else None,
+            )
 
         e = (s0_rows - mu_s64) @ q64 - (t0_rows - mu_t64)
         procrustes_error_norm = float(torch.linalg.norm(e))
@@ -445,8 +509,8 @@ def compute_alignment_diagnostics(
 
 @cost_phase_decorator("transformation")
 def centered_rectangular_procrustes(
-    source_rows: Tensor, target_rows: Tensor, *, eps: float = 1e-8
-) -> tuple[Tensor, Tensor, Tensor]:
+    source_rows: Tensor, target_rows: Tensor, *, eps: float = 1e-8, return_rank: bool = False
+):
     """Return the polar factor of the centered source/target cross-covariance.
 
     ``source_rows`` is ``[N, d_source]`` and ``target_rows`` is
@@ -456,6 +520,9 @@ def centered_rectangular_procrustes(
     shrink maps it maximizes cross-covariance alignment, but generally does
     not minimize that least-squares objective because ``||X Q||`` varies with
     the selected source subspace.
+
+    With ``return_rank=True`` a fourth element, the numerical rank of the centered cross-covariance
+    (from the same SVD), is appended; ``q`` and the means are unchanged bit for bit.
     """
     _check_rows(source_rows, target_rows, "source_rows", "target_rows")
     if source_rows.shape[0] == 0:
@@ -469,6 +536,9 @@ def centered_rectangular_procrustes(
     src_mean = source_rows.mean(dim=0)
     tgt_mean = target_rows.mean(dim=0)
     cross = (source_rows - src_mean).T @ (target_rows - tgt_mean)
+    if return_rank:
+        q, rank = _procrustes_from_cross(cross, return_rank=True)
+        return q, src_mean, tgt_mean, rank
     q = _procrustes_from_cross(cross)
     return q, src_mean, tgt_mean
 
@@ -503,11 +573,52 @@ def centered_ridge_alignment(
     return mapping, mx, my, {"ridge": lam, "source_trace": tr}
 
 
+def _numerical_rank(singular_values: Tensor, shape: tuple[int, int]) -> int:
+    """Numerical rank with ``torch.linalg.matrix_rank``'s default tolerance (``max(shape) * eps * s_max``)."""
+    if singular_values.numel() == 0:
+        return 0
+    tol = singular_values.max() * max(shape) * torch.finfo(singular_values.dtype).eps
+    return int((singular_values > tol).sum().item())
+
+
+def _cross_rank(cross: Tensor) -> int:
+    """Numerical rank of a cross-covariance (one extra ``svdvals``; used where no polar SVD is run)."""
+    return _numerical_rank(torch.linalg.svdvals(cross), tuple(cross.shape))
+
+
+def procrustes_rank_diagnostics(rank: int, source_dim: int, target_dim: int, *, polar_derived: bool = True) -> dict:
+    """Per-position rank diagnostics of the cross-covariance a Procrustes map was solved from.
+
+    ``procrustes_q_non_unique`` is True when the polar factor ``U V^T`` is not unique, i.e. the
+    cross-covariance has numerical rank below ``min(d_source, d_target)`` (the null directions of
+    ``U``/``V`` can be rotated freely without changing the SVD). It is only meaningful (and only
+    ever True) when the fitted map actually is that polar factor (``polar_derived``): ridge and
+    random-isometry maps are reported with their rank but ``procrustes_q_non_unique=False``.
+    Analysis-only: never read by any fit, and the fitted Q is NOT altered by a non-unique flag.
+    """
+    min_dim = int(min(source_dim, target_dim))
+    return {
+        "procrustes_rank": int(rank),
+        "procrustes_min_dim": min_dim,
+        "procrustes_q_non_unique": bool(polar_derived and int(rank) < min_dim),
+    }
+
+
+RANK_DIAGNOSTIC_KEYS = ("procrustes_rank", "procrustes_min_dim", "procrustes_q_non_unique")
+
+
 @cost_phase_decorator("transformation")
-def _procrustes_from_cross(cross: Tensor) -> Tensor:
-    """Orthogonal Procrustes map from a cross-covariance matrix via SVD."""
-    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
-    return u @ vh
+def _procrustes_from_cross(cross: Tensor, *, return_rank: bool = False):
+    """Orthogonal Procrustes map from a cross-covariance matrix via SVD.
+
+    With ``return_rank=True`` returns ``(q, numerical_rank)`` from the SAME SVD (``q`` is bit-identical
+    to the default return value).
+    """
+    u, s, vh = torch.linalg.svd(cross, full_matrices=False)
+    q = u @ vh
+    if return_rank:
+        return q, _numerical_rank(s, tuple(cross.shape))
+    return q
 
 
 def _check_rows(h: Tensor, e: Tensor, h_name: str, e_name: str) -> None:

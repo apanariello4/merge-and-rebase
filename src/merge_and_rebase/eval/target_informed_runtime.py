@@ -42,6 +42,7 @@ from ..rebase.methods.ariadne.capture import (  # noqa: F401  (re-exported for e
     _dataset_identity,
     _mha_query_key_value,
     _register_capture_hooks,
+    _stable_dataset_identity,
     _stock_mha_out_proj_input,
     _verify_recomputed_attention_input,
     capture_block_gradients,
@@ -435,7 +436,7 @@ def complete_residuals(
                 f"expected={sorted(expected_positions)}, found={sorted(values)}"
             )
     meta = references["calibration"]
-    if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
+    if _stable_dataset_identity(target_loader.dataset) != meta["dataset_identity"]:
         raise ValueError("Cached reference images do not match this task's validation dataset")
     batches = list(
         DataLoader(
@@ -852,7 +853,7 @@ def complete_residuals_direct(
                 f"expected={sorted(expected_positions)}, found={sorted(values)}"
             )
     meta = references["calibration"]
-    if repr(_dataset_identity(target_loader.dataset)) != meta["dataset_identity"]:
+    if _stable_dataset_identity(target_loader.dataset) != meta["dataset_identity"]:
         raise ValueError("Cached reference images do not match this task's validation dataset")
     batches = list(
         DataLoader(
@@ -987,7 +988,7 @@ def complete_joint_blockwise(
             f"expected={sorted(expected_positions)}, found={sorted(transforms)}"
         )
     metadata = references.get("calibration")
-    if metadata is None or repr(_dataset_identity(target_loader.dataset)) != metadata["dataset_identity"]:
+    if metadata is None or _stable_dataset_identity(target_loader.dataset) != metadata["dataset_identity"]:
         raise ValueError("Joint blockwise references do not match this task's validation dataset")
     batches = list(
         DataLoader(
@@ -1148,9 +1149,9 @@ def complete_direct_p1_shared_correction(
     metadata = references.get("calibration")
     if metadata is None:
         raise ValueError("Direct P1 references are missing calibration metadata")
-    if repr(_dataset_identity(source_loader.dataset)) != metadata["dataset_identity"]:
+    if _stable_dataset_identity(source_loader.dataset) != metadata["dataset_identity"]:
         raise ValueError("Direct P1 source calibration dataset mismatch")
-    if repr(_dataset_identity(target_loader.dataset)) != metadata["dataset_identity"]:
+    if _stable_dataset_identity(target_loader.dataset) != metadata["dataset_identity"]:
         raise ValueError("Direct P1 target calibration dataset mismatch")
 
     def _batches(loader):
@@ -1293,7 +1294,7 @@ def capture_resized_joint_source_inputs(
     substitute after structural insertion and upstream ARIADNE corrections.
     """
     metadata = references.get("calibration")
-    if metadata is None or repr(_dataset_identity(source_loader.dataset)) != metadata["dataset_identity"]:
+    if metadata is None or _stable_dataset_identity(source_loader.dataset) != metadata["dataset_identity"]:
         raise ValueError("Joint source capture does not match the paired calibration dataset")
     entries = sorted(layout.get("inserted_blocks", ()), key=lambda row: row["position"])
     if not entries:
