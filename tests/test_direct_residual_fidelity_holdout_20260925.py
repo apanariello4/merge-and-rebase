@@ -26,8 +26,7 @@ from merge_and_rebase.rebase.methods.ariadne.diagnostics import (
     compute_fidelity_holdout_diagnostics,
     draw_fidelity_holdout_calibration,
 )
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.hashing import _task_vector_sha256
+from merge_and_rebase.rebase.methods.ariadne.fit import _task_vector_sha256, fit_direct_residual
 from merge_and_rebase.rebase.methods.ariadne.streaming import (
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,

@@ -62,7 +62,7 @@ from ..rebase.methods.ariadne import (
     parse_direct_residual_config,
     resolve_direct_residual_preset,
 )
-from ..rebase.methods.ariadne.hashing import _task_vector_sha256
+from ..rebase.methods.ariadne.fit import _task_vector_sha256
 from ..rebase.methods.theseus import InterpolatedBlockActivations
 from ..rebase.registry import canonical_method_name
 from ..rebase.runtime import (

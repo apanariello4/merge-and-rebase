@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -11,7 +12,6 @@ import torch
 from ....utils.cost_accounting import cost_phase_decorator
 from ...discrete_layer_match import DiscreteLayerPairing
 from .layouts import _aligned, _rows
-from .linalg import _procrustes_from_cross, centered_rectangular_procrustes, centered_ridge_alignment
 
 Tensor = torch.Tensor
 
@@ -441,3 +441,77 @@ def compute_alignment_diagnostics(
             "target_dim": int(t0_rows.shape[-1]),
         }
     return alignment_diagnostics
+
+
+@cost_phase_decorator("transformation")
+def centered_rectangular_procrustes(
+    source_rows: Tensor, target_rows: Tensor, *, eps: float = 1e-8
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return the polar factor of the centered source/target cross-covariance.
+
+    ``source_rows`` is ``[N, d_source]`` and ``target_rows`` is
+    ``[N, d_target]``; the returned map is ``[d_source, d_target]``.
+    For same-width maps and source-to-target extensions this also minimizes
+    ``||X Q - Y||_F`` under the corresponding orthogonality constraint. For
+    shrink maps it maximizes cross-covariance alignment, but generally does
+    not minimize that least-squares objective because ``||X Q||`` varies with
+    the selected source subspace.
+    """
+    _check_rows(source_rows, target_rows, "source_rows", "target_rows")
+    if source_rows.shape[0] == 0:
+        raise ValueError("Procrustes requires at least one row")
+    if not torch.isfinite(source_rows).all() or not torch.isfinite(target_rows).all():
+        raise ValueError("Procrustes inputs must be finite")
+    if eps <= 0 or not math.isfinite(float(eps)):
+        raise ValueError("eps must be finite and > 0")
+    source_rows = source_rows.to(torch.float64)
+    target_rows = target_rows.to(torch.float64)
+    src_mean = source_rows.mean(dim=0)
+    tgt_mean = target_rows.mean(dim=0)
+    cross = (source_rows - src_mean).T @ (target_rows - tgt_mean)
+    q = _procrustes_from_cross(cross)
+    return q, src_mean, tgt_mean
+
+
+@cost_phase_decorator("transformation")
+def centered_ridge_alignment(
+    source_rows: Tensor, target_rows: Tensor, *, ridge: float | None = None
+) -> tuple[Tensor, Tensor, Tensor, dict[str, float]]:
+    """Fit a centered, ridge-regularized linear source-to-target map.
+
+    With no explicit ridge, uses ``trace(X.T @ X) / (N - 1)``. Returns the
+    map, row means and compact solver diagnostics. The zero-covariance case
+    maps to zero; one-row inputs are accepted and also map to zero.
+    """
+    _check_rows(source_rows, target_rows, "source_rows", "target_rows")
+    if source_rows.shape[0] == 0:
+        raise ValueError("ridge alignment requires at least one row")
+    if not torch.isfinite(source_rows).all() or not torch.isfinite(target_rows).all():
+        raise ValueError("ridge alignment inputs must be finite")
+    x, y = source_rows.to(torch.float64), target_rows.to(torch.float64)
+    mx, my = x.mean(0), y.mean(0)
+    xc, yc = x - mx, y - my
+    gram, cross = xc.T @ xc, xc.T @ yc
+    tr = float(torch.trace(gram).item())
+    lam = tr / float(x.shape[0] - 1) if ridge is None and x.shape[0] > 1 else (0.0 if ridge is None else float(ridge))
+    if not math.isfinite(lam) or lam < 0:
+        raise ValueError("ridge must be finite and >= 0")
+    if tr == 0.0:
+        mapping = torch.zeros((x.shape[1], y.shape[1]), dtype=x.dtype, device=x.device)
+    else:
+        mapping = torch.linalg.solve(gram + lam * torch.eye(gram.shape[0], dtype=x.dtype, device=x.device), cross)
+    return mapping, mx, my, {"ridge": lam, "source_trace": tr}
+
+
+@cost_phase_decorator("transformation")
+def _procrustes_from_cross(cross: Tensor) -> Tensor:
+    """Orthogonal Procrustes map from a cross-covariance matrix via SVD."""
+    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
+    return u @ vh
+
+
+def _check_rows(h: Tensor, e: Tensor, h_name: str, e_name: str) -> None:
+    if h.ndim != 2 or e.ndim != 2:
+        raise ValueError(f"{h_name} and {e_name} must be rank-2")
+    if h.shape[0] != e.shape[0]:
+        raise ValueError("activation and residual row counts must match")

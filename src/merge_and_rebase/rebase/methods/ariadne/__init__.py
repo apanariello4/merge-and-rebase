@@ -22,7 +22,7 @@ shrink, and same-arch without any structural gate.
 The actual per-position ridge solve is NOT reimplemented here. It is the
 exact same code `target_informed_runtime.complete_residuals_direct` has
 always executed for `cascade_order="independent"` -- shared, via the private
-`merge_and_rebase.rebase.methods.ariadne.independent._fit_all_positions_independent` helper, so this
+`merge_and_rebase.rebase.methods.ariadne.fit._fit_all_positions_independent` helper, so this
 module and ARIADNE's own `target_scope="all"` independent-mode path are
 structurally guaranteed to agree whenever they are handed the same alignment
 and the same captured banks (see `tests/test_direct_residual_extend_anchor.py`).
@@ -45,8 +45,11 @@ approximation.
 
 from __future__ import annotations
 
+from .ablations import apply_tv_scaling
 from .alignment import (
     apply_depth_pairing_override,
+    centered_rectangular_procrustes,
+    centered_ridge_alignment,
     compute_alignment_diagnostics,
     compute_desired_effects,
 )
@@ -58,12 +61,10 @@ from .capture import (
     iter_capture_tokens,
     paired_calibration,
 )
-from .components import (
-    COMPONENT_FORWARD_ORDER,
-    order_components,
-)
 from .config import (
+    COMPONENT_FORWARD_ORDER,
     DirectResidualConfig,
+    order_components,
     parse_direct_residual_config,
     resolve_direct_residual_preset,
 )
@@ -75,18 +76,11 @@ from .diagnostics import (
     measure_direct_residual_realization_streaming,
 )
 from .fit import (
+    ResidualSufficientStatistics,
     fit_direct_residual,
     fit_sequential_source_endpoints,
 )
-from .linalg import (
-    ResidualSufficientStatistics,
-    centered_rectangular_procrustes,
-    centered_ridge_alignment,
-)
 from .method import AriadnePrepared, AriadneRebase
-from .scaling import (
-    apply_tv_scaling,
-)
 from .streaming import (
     compute_alignment_diagnostics_streaming,
     fit_direct_residual_streaming,

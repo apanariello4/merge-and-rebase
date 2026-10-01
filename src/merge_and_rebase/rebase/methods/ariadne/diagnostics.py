@@ -12,9 +12,8 @@ import torch
 
 from ...discrete_layer_match import DiscreteLayerPairing
 from .capture import capture_tokens, iter_capture_tokens, paired_calibration
-from .components import CANONICAL_COMPONENT_ORDER, order_components
-from .config import DirectResidualConfig
-from .hashing import _task_vector_sha256
+from .config import CANONICAL_COMPONENT_ORDER, DirectResidualConfig, order_components
+from .fit import _task_vector_sha256
 from .layouts import (
     _PACKED_QKV_SLICE,
     COMPONENT_INPUT_KIND,

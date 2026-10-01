@@ -25,7 +25,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from ..models.vision_utils import _encode_image  # noqa: F401  (re-exported for existing importers)
-from ..rebase.methods.ariadne.blockwise import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods.ariadne.ablations import (  # noqa: F401  (re-exported for existing importers)
     _apply_bias_correction,
     _backfit_data_fit_sq,
     _backfit_objective,
@@ -50,7 +50,7 @@ from ..rebase.methods.ariadne.capture import (  # noqa: F401  (re-exported for e
     iter_capture_tokens,
     paired_calibration,
 )
-from ..rebase.methods.ariadne.components import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods.ariadne.config import (  # noqa: F401  (re-exported for existing importers)
     CANONICAL_COMPONENT_ORDER,
     COMPONENT_FORWARD_ORDER,
 )
@@ -60,14 +60,12 @@ from ..rebase.methods.ariadne.diagnostics import (  # noqa: F401  (re-exported f
     measure_direct_residual_realization,
     measure_direct_residual_realization_streaming,
 )
-from ..rebase.methods.ariadne.hashing import (  # noqa: F401  (re-exported for existing importers)
-    _task_vector_sha256,
-)
-from ..rebase.methods.ariadne.independent import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods.ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
     _finalize_independent_component,
     _fit_all_positions_independent,
     _realization_diagnostic_fields,
     _realized_pred_sq_from_stats,
+    _task_vector_sha256,
 )
 from ..rebase.methods.ariadne.layouts import (  # noqa: F401  (re-exported for existing importers)
     _ATTN_CAPTURE_KINDS,

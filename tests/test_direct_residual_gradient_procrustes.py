@@ -30,12 +30,11 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.models.grad_recipes import clip_contrastive_recipe
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods.ariadne.alignment import centered_rectangular_procrustes, compute_desired_effects
 from merge_and_rebase.rebase.methods.ariadne.capture import capture_block_gradients, capture_paired_boundary_activations
 from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
 from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
 from merge_and_rebase.rebase.methods.ariadne.layouts import _aligned, _rows
-from merge_and_rebase.rebase.methods.ariadne.linalg import centered_rectangular_procrustes
 
 DEVICES = [
     "cpu",

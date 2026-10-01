@@ -12,14 +12,12 @@ import torch
 
 from ....utils.cost_accounting import cost_phase_decorator
 from ...discrete_layer_match import DiscreteLayerPairing
-from .alignment import _derive_block_seed, _random_isometry_map, _validate_alignment_options
+from .alignment import _derive_block_seed, _procrustes_from_cross, _random_isometry_map, _validate_alignment_options
 from .capture import iter_capture_block_gradients, iter_capture_tokens, paired_calibration
-from .components import order_components
-from .config import DirectResidualConfig
+from .config import DirectResidualConfig, order_components
 from .diagnostics import measure_direct_residual_realization_streaming
-from .independent import _finalize_independent_component
+from .fit import ResidualSufficientStatistics, _finalize_independent_component
 from .layouts import COMPONENT_INPUT_KIND, _aligned, _component_effective_out, _layout_for
-from .linalg import ResidualSufficientStatistics, _procrustes_from_cross
 
 Tensor = torch.Tensor
 

@@ -7,7 +7,39 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .components import COMPONENT_FORWARD_ORDER
+#: Residual-writing projections, in the order a block executes them.
+COMPONENT_FORWARD_ORDER: tuple[str, ...] = ("attn.out_proj", "mlp.c_proj")
+
+
+#: Internal (non-residual-writing) components reachable only in output_* modes.
+INTERNAL_COMPONENTS: tuple[str, ...] = ("attn.q_proj", "attn.k_proj", "attn.v_proj", "mlp.c_fc")
+
+
+#: Canonical block-forward evaluation order across all six component names.
+#: Relative order of attn.out_proj and mlp.c_proj is unchanged from
+#: COMPONENT_FORWARD_ORDER, so any set drawn only from the historical two
+#: names orders identically to before.
+CANONICAL_COMPONENT_ORDER: tuple[str, ...] = (
+    "attn.q_proj",
+    "attn.k_proj",
+    "attn.v_proj",
+    "attn.out_proj",
+    "mlp.c_fc",
+    "mlp.c_proj",
+)
+
+
+def order_components(components) -> tuple[str, ...]:
+    """Return ``components`` in block-forward order.
+
+    The config names a *set* of write surfaces; the fit order is a property of
+    the architecture, not of how the config happened to list them. Any name
+    from ``CANONICAL_COMPONENT_ORDER`` (residual-writing or internal) is
+    accepted; unknown names are silently dropped, matching the historical
+    behaviour of filtering against a fixed order tuple.
+    """
+    selected = set(components)
+    return tuple(name for name in CANONICAL_COMPONENT_ORDER if name in selected)
 
 
 @dataclass(frozen=True)
@@ -61,7 +93,7 @@ class DirectResidualConfig:
     #                current fit is mounted on a local (never the live target
     #                model) copy of the block and replayed on the pristine
     #                captured block input X_j^0. See
-    #                ariadne.blockwise._fit_block_boundary_backfit.
+    #                ariadne.ablations._fit_block_boundary_backfit.
     #   "joint"   -- closed-form joint ridge over the stacked (attn.out_proj,
     #                mlp.c_proj) features, solved in one linear-algebra step
     #                under the first-order approximation that the MLP does
@@ -69,12 +101,12 @@ class DirectResidualConfig:
     #                components subset of {"attn.out_proj", "mlp.c_proj"};
     #                with a single component this reduces to (is literally
     #                the same fit as) block_split="none". See
-    #                ariadne.blockwise._fit_block_boundary_joint.
+    #                ariadne.ablations._fit_block_boundary_joint.
     block_split: str = "none"
     backfit_max_iters: int = 20
     # Stop when the relative decrease of the safeguarded block objective J(Delta)
     # (data-fit term plus each component's own round-1-frozen ridge penalty; see
-    # ariadne.blockwise._fit_block_boundary_backfit) between consecutive
+    # ariadne.ablations._fit_block_boundary_backfit) between consecutive
     # full sweeps drops below this. J is measured, not linearized, on every
     # sweep AND accepted/rejected at every Gauss-Seidel sub-step, so it is
     # non-increasing by construction -- see the same docstring.

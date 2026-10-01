@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods.ariadne.ablations import apply_tv_scaling
 from merge_and_rebase.rebase.methods.ariadne.alignment import (
     compute_alignment_diagnostics,
     compute_desired_effects,
@@ -33,10 +34,11 @@ from merge_and_rebase.rebase.methods.ariadne.capture import (
 )
 from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
 from merge_and_rebase.rebase.methods.ariadne.diagnostics import measure_direct_residual_realization
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.independent import _realized_pred_sq_from_stats
-from merge_and_rebase.rebase.methods.ariadne.linalg import ResidualSufficientStatistics
-from merge_and_rebase.rebase.methods.ariadne.scaling import apply_tv_scaling
+from merge_and_rebase.rebase.methods.ariadne.fit import (
+    ResidualSufficientStatistics,
+    _realized_pred_sq_from_stats,
+    fit_direct_residual,
+)
 from merge_and_rebase.rebase.methods.ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
     fit_direct_residual_streaming,

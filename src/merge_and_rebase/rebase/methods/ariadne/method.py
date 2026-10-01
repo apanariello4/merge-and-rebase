@@ -23,17 +23,16 @@ import torch
 from ....utils.cost_accounting import PhaseCostRecorder, cost_excluded, cost_phase, recording
 from ...discrete_layer_match import DiscreteLayerPairing
 from ...registry import register, register_alias
+from .ablations import apply_tv_scaling
 from .alignment import compute_alignment_diagnostics, compute_desired_effects
 from .capture import capture_paired_boundary_activations
-from .components import order_components
-from .config import DirectResidualConfig
+from .config import DirectResidualConfig, order_components
 from .diagnostics import (
     compute_direct_residual_task_vector_stats,
     compute_fidelity_holdout_diagnostics,
     measure_direct_residual_realization,
 )
 from .fit import fit_direct_residual, fit_sequential_source_endpoints
-from .scaling import apply_tv_scaling
 from .streaming import (
     compute_alignment_diagnostics_streaming,
     fit_direct_residual_streaming,

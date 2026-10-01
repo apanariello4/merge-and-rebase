@@ -48,20 +48,22 @@ from typing import Any
 
 import torch
 
-from ..rebase.methods.ariadne.components import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods.ariadne.alignment import (  # noqa: F401  (re-exported for existing importers)
+    _check_rows,
+    _procrustes_from_cross,
+    centered_rectangular_procrustes,
+    centered_ridge_alignment,
+)
+from ..rebase.methods.ariadne.config import (  # noqa: F401  (re-exported for existing importers)
     CANONICAL_COMPONENT_ORDER,
     COMPONENT_FORWARD_ORDER,
     INTERNAL_COMPONENTS,
     order_components,
 )
-from ..rebase.methods.ariadne.linalg import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods.ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
     _RIDGE_NONE_CONDITION_THRESHOLD,
     ResidualSufficientStatistics,
-    _check_rows,
     _clamped_eigh_inverse,
-    _procrustes_from_cross,
-    centered_rectangular_procrustes,
-    centered_ridge_alignment,
 )
 
 Tensor = torch.Tensor

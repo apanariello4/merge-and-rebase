@@ -24,8 +24,7 @@ from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
 from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
 from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.linalg import ResidualSufficientStatistics
+from merge_and_rebase.rebase.methods.ariadne.fit import ResidualSufficientStatistics, fit_direct_residual
 from merge_and_rebase.rebase.methods.ariadne.streaming import (
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,

@@ -28,8 +28,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
 from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.components import order_components
-from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne.config import (
+    DirectResidualConfig,
+    order_components,
+    parse_direct_residual_config,
+)
 from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
 
 # --------------------------------------------------------------------------
@@ -601,10 +604,10 @@ def test_toy_linear_additive_block_backfit_matches_derived_joint_ridge_solution(
 
 import copy as _copy  # noqa: E402
 
-from merge_and_rebase.rebase.methods.ariadne.blockwise import _mount_component, _replay_block_components  # noqa: E402
+from merge_and_rebase.rebase.methods.ariadne.ablations import _mount_component, _replay_block_components  # noqa: E402
 from merge_and_rebase.rebase.methods.ariadne.capture import capture_tokens  # noqa: E402
+from merge_and_rebase.rebase.methods.ariadne.fit import ResidualSufficientStatistics  # noqa: E402
 from merge_and_rebase.rebase.methods.ariadne.layouts import _component_weight_bias, _layout_for  # noqa: E402
-from merge_and_rebase.rebase.methods.ariadne.linalg import ResidualSufficientStatistics  # noqa: E402
 
 
 def _unsafeguarded_backfit_r_trace(

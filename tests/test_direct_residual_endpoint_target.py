@@ -34,13 +34,13 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.rebase.methods.ariadne.alignment import (
+    centered_rectangular_procrustes,
     compute_alignment_diagnostics,
     compute_desired_effects,
 )
 from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
 from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
 from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.linalg import centered_rectangular_procrustes
 
 # --------------------------------------------------------------------------
 # Golden hashes for the untouched transported_delta path, recorded at HEAD
