@@ -113,7 +113,12 @@ def test_final_summary_carries_alignment_and_correction_fit_timing_keys():
     """
     import inspect
 
-    source = inspect.getsource(vision_rebase.main)
-    assert '"alignment_calibration_timings": alignment_calibration_timings' in source
-    assert '"correction_fit_timings": correction_fit_timings' in source
-    assert '"transport_timings": transport_timings' in source
+    from merge_and_rebase.eval import vision_rebase_summary
+
+    summary_source = inspect.getsource(vision_rebase_summary.assemble_summary)
+    assert '"alignment_calibration_timings": record.alignment_calibration_timings' in summary_source
+    assert '"correction_fit_timings": record.correction_fit_timings' in summary_source
+    assert '"transport_timings": record.transport_timings' in summary_source
+    main_source = inspect.getsource(vision_rebase.main)
+    for name in ("alignment_calibration_timings", "correction_fit_timings", "transport_timings"):
+        assert f"{name}={name}," in main_source

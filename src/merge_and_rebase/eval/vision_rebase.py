@@ -74,7 +74,7 @@ from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from ..utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from .block_extension import (
     BlockExtensionConfig,
-    block_extension_protocol,
+    block_extension_protocol,  # noqa: F401  (kept importable)
     calibration_dataset_spec,
     resolve_block_extension_config,
     run_block_extension,
@@ -142,6 +142,10 @@ from .vision_rebase_merge import (  # noqa: F401  (re-exported for tests)
     _scale_delta,
     _scale_deltas_by,
     _visual_key_fingerprint,
+)
+from .vision_rebase_summary import (  # noqa: F401  (re-exported for tests)
+    RunRecord,
+    assemble_summary,
 )
 
 
@@ -3196,207 +3200,80 @@ def main() -> None:
                 f"before={target_hash_before}, after={target_hash_after}."
             )
 
-        final_summary = {
-            "suite": suite_name,
-            "tasks": tasks,
-            "method": method.name,
-            "method_label": method_label,
-            "merge_mode": merge_mode,
-            "merge_method": merge_method_name if merge_mode != "none" else None,
-            "merge_params": merge_params if merge_mode != "none" else None,
-            "target_hash_before": target_hash_before,
-            "target_hash_after": target_hash_after,
-            "strict_diagnostics": {"missing": 0, "failures": 0, "wrong_shape": 0},
-            "single_transport_calibration": single_transport_calibration_metadata,
-            "brace_calibration": brace_calibration_metadata,
-            "block_extension_protocol": block_extension_protocol(block_extension_cfg),
-            "base_construction": base_construction,
-            "independent_endpoint_baseline": (
-                {
-                    "task_vector_definition": "tau_ind_t = ft_ind_t - base_ind_t",
-                    "base_average_definition": "base_ind_avg = mean_t(base_ind_t)",
-                    "base_average_key_scope": "common floating-point visual tensors",
-                    "n_common_visual_keys": len(independent_base_average) if independent_base_average is not None else None,
-                    "base_dispersion_ind": independent_base_dispersion,
-                    "per_task_distance_to_mean_base": independent_base_distance_by_task,
-                    "source_merge_direction_param_count": independent_source_merge_param_count,
-                    "diagnostics_path": independent_base_diagnostics_path,
-                    "direct_delta_key_count": independent_direct_delta_key_count,
-                    "direct_endpoint_difference_used": base_construction == "independent_endpoint_average",
-                }
-                if base_construction == "independent_endpoint_average"
-                else None
-            ),
-            "native_target_tasks": sorted(native_tasks) if native_tasks else [],
-            "global_alpha_search": global_alpha_search if hierarchical else None,
-            "per_task_premerge_alphas": (
-                {item["task"]: float(per_task_premerge_alphas[i]) for i, item in enumerate(per_task)}
-                if hierarchical and per_task_premerge_alphas is not None
-                else None
-            ),
-            "hierarchical_premerge_alpha_curve": hierarchical_premerge_alpha_curve,
-            "global_alpha_curve": global_alpha_curve,
-            "alpha_selection": alpha_selection,
-            "validation_results": selected_validation_results,
-            "best_alpha": float(best_alpha),
-            "best_baseline_alpha": float(best_baseline_alpha),
-            "baseline_label": baseline_label,
-            "metric_definitions": {
-                "absolute_accuracy": "top-1 accuracy in [0, 1] (rebased/transported at the rebased's own best alpha)",
-                "baseline_accuracy": "untransported baseline top-1 at the baseline's own best alpha",
-                "normalized_accuracy_ratio": (
-                    "absolute_accuracy (at rebased best alpha) / baseline_accuracy (at baseline best alpha); "
-                    "each stream independently optimizes alpha on the alpha-search split"
-                ),
-                "normalized_accuracy_ratio_display": (
-                    "ratio (decimal, not a percentage); values above 1.0 indicate the rebased/transported "
-                    "model exceeds the untransported baseline; report as a decimal ratio, never multiplied by 100"
-                ),
-            },
-            "test_results": {
-                # Explicit names prevent a table exporter from treating a ratio as raw accuracy.
-                "per_task_baseline_accuracy": {
-                    item["task"]: float(baseline_test_accs[i]) for i, item in enumerate(per_task)
-                },
-                "per_task_absolute_accuracy": {
-                    item["task"]: float(rebase_test_accs[i]) for i, item in enumerate(per_task)
-                },
-                "per_task_normalized_accuracy_ratio": {
-                    item["task"]: float(norm_accs[i]) for i, item in enumerate(per_task)
-                },
-                "per_task_baseline": {item["task"]: float(baseline_test_accs[i]) for i, item in enumerate(per_task)},
-                "per_task_rebased": {item["task"]: float(rebase_test_accs[i]) for i, item in enumerate(per_task)},
-                "per_task_norm": {item["task"]: float(norm_accs[i]) for i, item in enumerate(per_task)},
-                "avg_rebased": float(sum(rebase_test_accs) / len(rebase_test_accs)),
-                "avg_norm": float(sum(norm_accs) / len(norm_accs)),
-            },
-            "single_tv_diagnostic": (
-                {
-                    "definition": (
-                        "For each task t, evaluate target_base + alpha_t * transported/native task_vector_t "
-                        "on task t's test set; alpha_t is selected on validation only."
-                    ),
-                    "alpha_protocol": single_tv_alpha_protocol,
-                    "per_task_validation_alpha": {
-                        item["task"]: float(single_tv_val_best_alpha[i])
-                        for i, item in enumerate(per_task)
-                    },
-                    "per_task_validation_accuracy": {
-                        item["task"]: float(single_tv_val_best_acc[i])
-                        for i, item in enumerate(per_task)
-                    },
-                    "per_task_test_accuracy": {
-                        item["task"]: float(single_tv_test_accs[i])
-                        for i, item in enumerate(per_task)
-                    },
-                    "avg_test_accuracy": float(sum(single_tv_test_accs) / len(single_tv_test_accs)),
-                    "merged_avg_test_accuracy": float(sum(rebase_test_accs) / len(rebase_test_accs)),
-                    "merge_gap_single_minus_merged": float(
-                        sum(single_tv_test_accs) / len(single_tv_test_accs)
-                        - sum(rebase_test_accs) / len(rebase_test_accs)
-                    ),
-                }
-                if single_tv_test_accs is not None
-                else None
-            ),
-            "selected_alpha_by_task": {item["task"]: float(selected_alpha_by_task[i]) for i, item in enumerate(per_task)},
-            "selected_baseline_alpha_by_task": {
-                item["task"]: float(selected_baseline_alpha_by_task[i]) for i, item in enumerate(per_task)
-            },
-            "block_extension_target_dataset_eval": block_extension_eval_rows,
-            "source_lmc": source_lmc_rows,
-            "cross_task_source_lmc": cross_task_lmc_rows,
-            "all_task_source_lmc": all_task_lmc_rows,
-            "transported_artifacts": transported_artifacts,
-            "transport_timings": transport_timings,
-            "transport_calibration": transport_calibration_meta,
-            "cost_phase_timings": cost_phase_timings,
-            # Always present (default {}) regardless of method/path, so a
-            # downstream summary-JSON parser can read these keys uniformly
-            # across every method, not only depth_alignment='discrete_index_match'
-            # or method='direct_residual' runs.
-            "alignment_calibration_timings": alignment_calibration_timings,
-            "correction_fit_timings": correction_fit_timings,
-            "direct_residual": (
-                {
-                    "config": asdict(direct_residual_cfg),
-                    # Canonical registry name ("direct_residual" is an alias of "ariadne");
-                    # the top-level "method" keeps whatever spelling the config used.
-                    "canonical_method": canonical_method_name(method_name),
-                    # Present only when the params mapping selected a named preset
-                    # (the preset's fields are already resolved into "config").
-                    **({"preset": direct_residual_preset} if direct_residual_preset is not None else {}),
-                    # Which images every fit calibrated on (see
-                    # DirectResidualConfig.calibration_data): the dataset and,
-                    # for vision8_mix, the balanced plan's fingerprint.
-                    "calibration": direct_residual_calibration_meta,
-                    "diagnostics_by_task": direct_residual_diagnostics,
-                    # Additive, analysis-only: both are None per task unless
-                    # direct_residual_cfg.realization_diagnostics is set (see
-                    # _run_direct_residual_fit / measure_direct_residual_realization
-                    # / compute_direct_residual_task_vector_stats).
-                    "realization_by_task": direct_residual_realization,
-                    "task_vector_stats_by_task": direct_residual_task_vector_stats,
-                    # Analysis-only Procrustes-alignment diagnostics (never
-                    # fed to any fit), always populated regardless of
-                    # config.residual_target or realization_diagnostics; see
-                    # compute_alignment_diagnostics.
-                    "alignment_diagnostics_by_task": direct_residual_alignment_diagnostics,
-                    "calibration_by_task": direct_residual_calibration_by_task,
-                    # Additive, analysis-only: None per task unless
-                    # direct_residual_cfg.tv_scaling != "none" (see
-                    # apply_tv_scaling / _run_direct_residual_fit). tv_scaling
-                    # mode + iters are already carried by "config" above
-                    # (asdict(direct_residual_cfg)); this key carries the
-                    # per-task measurement (r_j traces, s_j / c, tau stats
-                    # before/after).
-                    "tv_scaling_by_task": direct_residual_tv_scaling,
-                    # depth_pairing ablation: the pi(j) tuple actually used
-                    # (post apply_depth_pairing_override), for the ablation
-                    # to compare against DirectResidualConfig.depth_pairing
-                    # in "config" above without recomputing it.
-                    "pairing": direct_residual_pairing_record,
-                    # fidelity_holdout diagnostic (analysis-only, never fed to
-                    # any fit): None per task unless
-                    # direct_residual_cfg.fidelity_holdout is set.
-                    "fidelity_holdout_by_task": direct_residual_fidelity_holdout,
-                    "sequential_endpoints_by_task": direct_residual_sequential_endpoints,
-                    "loaded_vectors_by_task": loaded_direct_residual_tvs,
-                }
-                if direct_residual_like
-                else None
-            ),
-            # Reports whichever depth-alignment mode was active for a Theseus-/
-            # BiCo-like method; always present so a downstream parser can rely
-            # on the key, even though the default "ariadne" path never touches
-            # anything new added by this change.
-            "depth_alignment": depth_alignment_mode,
-            "target_residual_completion": (
-                {
-                    "config": asdict(block_extension_cfg.target_residual_completion),
-                    "diagnostics_by_task": residual_completion_diagnostics,
-                }
-                if block_extension_cfg.target_residual_completion.enabled
-                else None
-            ),
-            "joint_blockwise_correction": (
-                {
-                    "config": asdict(block_extension_cfg.joint_blockwise_correction),
-                    "diagnostics_by_task": joint_blockwise_diagnostics,
-                }
-                if block_extension_cfg.joint_blockwise_correction.enabled
-                else None
-            ),
-            "direct_p1_correction": (
-                {
-                    "config": asdict(block_extension_cfg.direct_p1_correction),
-                    "diagnostics_by_task": direct_p1_diagnostics,
-                }
-                if block_extension_cfg.direct_p1_correction.enabled
-                else None
-            ),
-            "saved_merged_path": saved_merged_path,
-        }
+        final_summary = assemble_summary(
+            RunRecord(
+                suite_name=suite_name,
+                tasks=tasks,
+                method_label=method_label,
+                merge_mode=merge_mode,
+                target_hash_before=target_hash_before,
+                target_hash_after=target_hash_after,
+                single_transport_calibration_metadata=single_transport_calibration_metadata,
+                brace_calibration_metadata=brace_calibration_metadata,
+                base_construction=base_construction,
+                hierarchical_premerge_alpha_curve=hierarchical_premerge_alpha_curve,
+                global_alpha_curve=global_alpha_curve,
+                alpha_selection=alpha_selection,
+                selected_validation_results=selected_validation_results,
+                baseline_label=baseline_label,
+                block_extension_eval_rows=block_extension_eval_rows,
+                source_lmc_rows=source_lmc_rows,
+                cross_task_lmc_rows=cross_task_lmc_rows,
+                all_task_lmc_rows=all_task_lmc_rows,
+                transported_artifacts=transported_artifacts,
+                transport_timings=transport_timings,
+                transport_calibration_meta=transport_calibration_meta,
+                cost_phase_timings=cost_phase_timings,
+                alignment_calibration_timings=alignment_calibration_timings,
+                correction_fit_timings=correction_fit_timings,
+                depth_alignment_mode=depth_alignment_mode,
+                saved_merged_path=saved_merged_path,
+                method=method,
+                merge_method_name=merge_method_name,
+                merge_params=merge_params,
+                block_extension_cfg=block_extension_cfg,
+                native_tasks=native_tasks,
+                hierarchical=hierarchical,
+                global_alpha_search=global_alpha_search,
+                best_alpha=best_alpha,
+                best_baseline_alpha=best_baseline_alpha,
+                direct_residual_like=direct_residual_like,
+                independent_base_dispersion=independent_base_dispersion,
+                independent_base_distance_by_task=independent_base_distance_by_task,
+                independent_source_merge_param_count=independent_source_merge_param_count,
+                independent_base_diagnostics_path=independent_base_diagnostics_path,
+                independent_direct_delta_key_count=independent_direct_delta_key_count,
+                single_tv_test_accs=single_tv_test_accs,
+                single_tv_alpha_protocol=single_tv_alpha_protocol,
+                direct_residual_calibration_meta=direct_residual_calibration_meta,
+                direct_residual_diagnostics=direct_residual_diagnostics,
+                direct_residual_realization=direct_residual_realization,
+                direct_residual_task_vector_stats=direct_residual_task_vector_stats,
+                direct_residual_alignment_diagnostics=direct_residual_alignment_diagnostics,
+                direct_residual_calibration_by_task=direct_residual_calibration_by_task,
+                direct_residual_tv_scaling=direct_residual_tv_scaling,
+                direct_residual_pairing_record=direct_residual_pairing_record,
+                direct_residual_fidelity_holdout=direct_residual_fidelity_holdout,
+                direct_residual_sequential_endpoints=direct_residual_sequential_endpoints,
+                loaded_direct_residual_tvs=loaded_direct_residual_tvs,
+                residual_completion_diagnostics=residual_completion_diagnostics,
+                joint_blockwise_diagnostics=joint_blockwise_diagnostics,
+                direct_p1_diagnostics=direct_p1_diagnostics,
+                per_task_premerge_alphas=per_task_premerge_alphas,
+                selected_alpha_by_task=selected_alpha_by_task,
+                per_task=per_task,
+                selected_baseline_alpha_by_task=selected_baseline_alpha_by_task,
+                direct_residual_cfg=direct_residual_cfg,
+                method_name=method_name,
+                independent_base_average=independent_base_average,
+                baseline_test_accs=baseline_test_accs,
+                rebase_test_accs=rebase_test_accs,
+                norm_accs=norm_accs,
+                direct_residual_preset=direct_residual_preset,
+                single_tv_val_best_alpha=single_tv_val_best_alpha,
+                single_tv_val_best_acc=single_tv_val_best_acc,
+            )
+        )
         run_logger.log_summary(final_summary)
         run_logger.finish("success")
     except Exception as exc:
