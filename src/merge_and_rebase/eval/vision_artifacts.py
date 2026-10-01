@@ -9,13 +9,32 @@ from pathlib import Path
 import torch
 
 from ..rebase.methods.ariadne.fit import _task_vector_sha256
+from ..rebase.registry import canonical_method_name
 
 
 def _load_saved_sequential_tv(directory, task, target_base_sd, config):
     """Load a write-once sequential DR vector and verify its fit provenance."""
     root = Path(directory)
-    path = root / f"{task}_direct_residual_transported_native.pt"
-    meta_path = root / f"{task}_direct_residual_transported_native.json"
+    # The saver names files ``{task}_{method.name}_transported_native.{pt,json}`` where ``method.name`` is the
+    # spelling the run used: the canonical name or the legacy alias. Accept either, never both.
+    candidates = []
+    for method_name in dict.fromkeys((canonical_method_name("direct_residual"), "direct_residual")):
+        candidate_path = root / f"{task}_{method_name}_transported_native.pt"
+        candidate_meta = root / f"{task}_{method_name}_transported_native.json"
+        if candidate_path.exists() or candidate_meta.exists():
+            candidates.append((candidate_path, candidate_meta))
+    if len(candidates) > 1:
+        raise ValueError(
+            f"ambiguous saved DR vectors for task {task!r} in {root}: found both "
+            + " and ".join(str(c[0]) for c in candidates)
+        )
+    if not candidates:
+        names = list(dict.fromkeys((canonical_method_name("direct_residual"), "direct_residual")))
+        raise FileNotFoundError(
+            f"no saved DR vector for task {task!r} in {root}: expected "
+            + " or ".join(f"{task}_{n}_transported_native.json" for n in names)
+        )
+    path, meta_path = candidates[0]
     meta = json.loads(meta_path.read_text())
     expected = {
         "task": task,

@@ -418,3 +418,47 @@ def test_run_direct_residual_fit_realization_diagnostics_populates_extra():
     assert stats["n_modified_parameters"] > 0
     for key, value in before.items():
         assert torch.equal(dict(target_base.state_dict())[key], value)
+
+
+def _write_saved_vector(directory, method_name, base, vector, config, task="DTD"):
+    path = directory / f"{task}_{method_name}_transported_native.pt"
+    torch.save(vector, path)
+    metadata = {
+        "task": task,
+        "endpoint_construction": config.endpoint_construction,
+        "target_base_sha256": vision_rebase._state_dict_sha256(base),
+        "vector_sha256": vision_rebase._state_dict_sha256(vector),
+        "calibration_seed": config.seed,
+        "num_batches": config.num_batches,
+        "direct_residual_config": json.loads(json.dumps(asdict(config))),
+    }
+    path.with_suffix(".json").write_text(json.dumps(metadata))
+    return path
+
+
+def _sequential_fixture():
+    key = "visual.transformer.resblocks.0.mlp.c_proj.weight"
+    config = DirectResidualConfig(
+        endpoint_construction="sequential_source_endpoints", components=("mlp.c_proj",), activation_storage="resident"
+    )
+    return {key: torch.zeros(2, 2)}, {key: torch.ones(2, 2)}, config
+
+
+@pytest.mark.parametrize("method_name", ["ariadne", "direct_residual"])
+def test_saved_sequential_vector_loader_accepts_canonical_and_legacy_file_names(tmp_path, method_name):
+    base, vector, config = _sequential_fixture()
+    path = _write_saved_vector(tmp_path, method_name, base, vector, config)
+    loaded, meta = vision_rebase._load_saved_sequential_tv(tmp_path, "DTD", base, config)
+    key = next(iter(vector))
+    assert torch.equal(loaded[key], vector[key])
+    assert meta["path"] == str(path)
+
+
+def test_saved_sequential_vector_loader_rejects_ambiguous_and_missing_files(tmp_path):
+    base, vector, config = _sequential_fixture()
+    with pytest.raises(FileNotFoundError, match="no saved DR vector"):
+        vision_rebase._load_saved_sequential_tv(tmp_path, "DTD", base, config)
+    _write_saved_vector(tmp_path, "ariadne", base, vector, config)
+    _write_saved_vector(tmp_path, "direct_residual", base, vector, config)
+    with pytest.raises(ValueError, match="ambiguous saved DR vectors"):
+        vision_rebase._load_saved_sequential_tv(tmp_path, "DTD", base, config)

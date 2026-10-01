@@ -267,6 +267,9 @@ the Hasher bullet above is historical).
 
 ## `vision_rebase.main()` characterization (Phase 5.0)
 
+**Declared changes (this section).**
+- 2026-10-01, P5.1b: `_load_saved_sequential_tv` now resolves `{task}_{ariadne|direct_residual}_transported_native.{pt,json}` (canonical name and legacy alias; `ValueError` if both exist, `FileNotFoundError` naming both if neither). Quirk 4 below is fixed: vectors saved under `method='ariadne'` reload. No pinned hash changed (the old failure was an asserted exception in `test_main_sequential_load_misses_vectors_saved_under_the_ariadne_spelling`, now `..._reads_vectors_saved_under_the_ariadne_spelling`); the `direct_residual` spelling is byte-identical.
+
 `test_main_golden.py` (+ `main_golden_structure.json`) drives the REAL `eval/vision_rebase.py::main()`
 end to end on a tiny offline world and pins everything it produces, so each Phase 5 move out of
 `vision_rebase.py` is checked at hash level. Tests only: no source file was touched.
@@ -385,7 +388,7 @@ cases use odd 2->3 extension or a 3->2 shrink, target-informed protocols need th
    target-architecture checkpoint is treated as a source one; `align_to_base_keys` keeps only shape-compatible keys (here just `logit_scale`), the run
    prints "Loaded tuned checkpoint ... (1 keys)", "transported delta computed for 0 params" and completes. The error "matches the target architecture; add it to
    native_target_tasks or set auto_detect_ckpt_base=true" is only reachable when `native_target_tasks` is non-empty (error case `target_architecture_checkpoint_without_auto_detect`).
-4. **Ariadne sequential vectors cannot be reloaded when saved under `method='ariadne'`**: the saver names files `{task}_{method.name}_transported_native.pt`, `_load_saved_sequential_tv` hardcodes `{task}_direct_residual_...` (FileNotFoundError). Works with the `direct_residual` spelling (pinned load leg).
+4. **(Fixed in P5.1b, see Declared changes.)** Ariadne sequential vectors could not be reloaded when saved under `method='ariadne'`: the saver names files `{task}_{method.name}_transported_native.pt`, `_load_saved_sequential_tv` hardcodes `{task}_direct_residual_...` (FileNotFoundError). Works with the `direct_residual` spelling (pinned load leg).
 5. **Dead code / dead outputs**: `cross_task_source_lmc` and `all_task_source_lmc` are always `[]` (the evaluators are never called; `corrected_ft_states`/`corrected_ft_templates` are filled, including a CPU `deepcopy` of a model per task, and never read); `cross_task_lmc_pairs` task names are not validated against the task list; the `independent_base_*` variables are never populated so `independent_endpoint_baseline` carries `None`/`{}` fields.
 6. **`base_construction=independent_endpoint_average` has no numerical effect** under `brace_transport_then_merge`/`rebase_then_merge` (verified: identical `test_results` and `global_alpha_curve` with and without it); `independent_base_by_task` is only consumed by `brace_merge_then_transport`. It only adds validation and a summary stub.
 7. **Summary label with `discrete_index_match`**: `block_extension_protocol.label` still reports `ariadne` although no BRACE step runs.

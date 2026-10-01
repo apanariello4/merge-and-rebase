@@ -1563,9 +1563,9 @@ def test_pins_change_when_one_transported_task_vector_changes(tmp_path, monkeypa
     )
 
 
-def test_main_sequential_load_misses_vectors_saved_under_the_ariadne_spelling(tmp_path, monkeypatch):
-    """Quirk, pinned as-is: the saver names files ``{task}_{method.name}_...`` but the loader hardcodes
-    ``direct_residual``, so vectors saved by ``method='ariadne'`` cannot be reloaded."""
+def test_main_sequential_load_reads_vectors_saved_under_the_ariadne_spelling(tmp_path, monkeypatch):
+    """Declared change (P5.1b): the loader resolves ``{task}_{ariadne|direct_residual}_...``, so vectors saved by
+    ``method='ariadne'`` can be reloaded (previously a FileNotFoundError on the hardcoded ``direct_residual`` name)."""
     case = CASES["direct_residual_sequential_endpoints_save"]
     params = case.cfg["direct_residual_params"]
     ariadne = {"method": "ariadne", "method_params": {}, "ariadne_params": params, "direct_residual_params": None}
@@ -1578,5 +1578,6 @@ def test_main_sequential_load_misses_vectors_saved_under_the_ariadne_spelling(tm
     load_cfg = _base_cfg(
         World(**case.world), tmp_path / "run2", **ariadne, load_direct_residual_tvs_dir=str(tmp_path / "run1" / "tvs")
     )
-    with pytest.raises(FileNotFoundError, match=r"MNIST_direct_residual_transported_native\.json"):
-        run_main(load_cfg, tmp_path / "run2", monkeypatch, world=World(**case.world))
+    loaded = run_main(load_cfg, tmp_path / "run2", monkeypatch, world=World(**case.world))
+    by_task = loaded.summary["direct_residual"]["loaded_vectors_by_task"]
+    assert by_task and all(str(meta["path"]).endswith("_ariadne_transported_native.pt") for meta in by_task.values())
