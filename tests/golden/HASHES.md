@@ -264,3 +264,132 @@ the Hasher bullet above is historical).
 | `dr_orchestration_od_resident_fixed_relative:extend:summary` | `ee55a24e6b76151127d944a674c34e7cd65309a0c44d6bbc9bcd7474eca59159` | `ba8c4447a4f3aba99a2640c8728eb5aaa8c055441ba8dafffcb6ef7efbcb7d6a` |
 | `dr_orchestration_od_resident_fixed_relative:shrink:task_vector` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
 | `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `35fee9670ff99777a7be08a3a8f8ad14c012d2d7de6261f6514a21270a5d8066` | `82656c63449b965c653663f63107e1a47ea0dfc86c8e76179b3dfecafa9be8ee` |
+
+## `vision_rebase.main()` characterization (Phase 5.0)
+
+`test_main_golden.py` (+ `main_golden_structure.json`) drives the REAL `eval/vision_rebase.py::main()`
+end to end on a tiny offline world and pins everything it produces, so each Phase 5 move out of
+`vision_rebase.py` is checked at hash level. Tests only: no source file was touched.
+
+- **Generating commit**: values captured on the code of `8028734` (release/ariadne-main) plus the
+  docstring-only edits that were committed as `e262b7c` (AST-identical, no behaviour change); the file
+  passes unchanged on `e262b7c`. Python 3.14.4, torch 2.11.0+cu128, single thread, deterministic
+  algorithms (same platform caveat as above: bit-level hashes are CPU/BLAS/torch specific).
+- **Run**: `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 pytest tests/golden/test_main_golden.py -q -p no:cacheprovider`
+  (109 tests, about 30 s test time on top of the import time; the whole `tests/golden` directory is 180 tests,
+  about 36 s, peak RSS 0.67 GB).
+- **Regenerating** (only after establishing the change is intended; never to "make it green"):
+  `GOLDEN_CAPTURE=/path/out.txt GOLDEN_CAPTURE_STRUCTURE=tests/golden/main_golden_structure.json pytest tests/golden/test_main_golden.py -q -p no:cacheprovider -k test_main_golden`
+  appends `key hash` lines (paste into `EXPECTED`) and rewrites the per-case structure entries. Capture was run in
+  3 separate processes (plus forward/reverse/shuffled test order) and gave identical output.
+
+**Harness.** `run_main(cfg, root, monkeypatch, world=...)` writes `cfg` to JSON, sets `sys.argv` and calls
+`vision_rebase.main()`. The fakes are installed BY NAME into every module of `PATCH_MODULES`
+(`vision_rebase` now; `vision_rebase_context`, `vision_alpha_search`, `rebase.orchestration` are already listed and
+skipped while they do not exist; use `monkeypatch.setattr(mod, name, fake, raising=False)`, so a name that has moved
+is patched wherever it now lives -- add new module names to the list in the same commit as the move).
+Patched names: `OpenClipClassifier` (a fake class around the real tiny attention ViT-like `_AttnModel`, copied from
+the release golden fixtures; `.build`, constructor, `_compute_zeroshot_text_features`, `build_zeroshot_text_features`,
+`top1`, `top1_with_text_features`, `__call__`, `.preprocess.tag` marks the source/target view), `load_ckpt`,
+`resolve_ckpt_path` (in-memory seeded perturbations of the base state dict; native-target checkpoints are
+perturbations of the target base), `SUITES` (fake 2-task suite `fake2` over the real task names MNIST and DTD, because
+`get_templates` is real), `load_hf_splits`, `extract_classnames`, `build_vision_loaders`,
+`build_vision_calibration_loader` (seeded class-labelled tensor datasets with `sample_ids`; the two views differ by a
+seeded perturbation but share labels and ids), `eval_task_top1` (real, weight-sensitive: 0.999 * top-1 accuracy +
+0.001 * mean true-class probability of a zero-shot head on fixed tensors, so a change that flips no prediction still
+changes the bits), `start_run` (a recorder keeping the metadata `resolved_config`, every `log_event`, the summary and the
+final status). Everything else is real: config/CLI resolution, alpha search, BRACE, THESEUS/BiCo/Ariadne, merge
+registry, task vectors, `torch.save`, `default_summary_path`, `finish_with_error`.
+The model's `state_dict()` returns clones: on a CPU model `to_cpu_fp32(model.state_dict())` aliases the live
+parameters and `main()`'s "target base mutated" guard fires (see quirks); a GPU run copies, which is what is mimicked.
+
+**Pinned per case** (`EXPECTED[case:part]`): `summary` (`hash_json` of the `log_summary` payload; timing / memory / path /
+git / `dataset_identity` keys masked, run-dir prefixes normalised), `resolved_config` (`hash_json` of the dict handed
+to `start_run`), `events` (`hash_json` of all `log_event` calls), `file:<relpath>` (`hash_tensor_dict` of every saved
+`.pt`, `hash_json` of every JSON sidecar). `main_golden_structure.json` pins per case the sorted summary key paths
+(`a.b`, `a[]`; the "keys byte-for-byte" gate, timing keys included), the ordered `log_event` names and the
+saved file names, with an added/removed diff in the failure message. Every case is run twice in one process and the
+two digests must be equal. `test_pins_change_when_*` perturb one tuned checkpoint / one transported task vector and
+assert the summary and the saved vector hashes move (the pins are not vacuous). Extra tests: sequential Ariadne
+vectors save -> load round trip (`..._load`), the write-once `FileExistsError`, and the loader/saver file-name quirk.
+
+**Error surface** (`test_main_error_surface`, 67 invalid configs): for each, the exact exception type and message,
+whether it is raised before `OpenClipClassifier.build` (sentinel build raising `_ReachedModelBuild`; for the
+post-build ones the sentinel must be reached and the real run then fails with the pinned message), and whether the run
+record (`start_run`) was already opened (then it is finished `failed`). 41 fail before the build with no run record,
+1 (`tuned_ckpts_missing`) after `start_run` but before the build, 25 after the build.
+
+### Cases (summary hashes; the other parts are in `EXPECTED`)
+
+| Case key | Source -> target (depth, width) | Config (non-default) | Saved files | summary SHA-256 |
+|---|---|---|---|---|
+| `ariadne_calibration_tiny_imagenet` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"calibration_data":"tiny_imagenet"}}` | 0 | `ffbeccb43e42506f59bd0d522eb412b116b945b4d05822ccf67fe79d45892624` |
+| `ariadne_calibration_vision8_mix` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"calibration_data":"vision8_mix"}}` | 0 | `8ccfca91a9130ef3aa1847969b397966d18ecb441db28f085456260cfd894e54` |
+| `ariadne_merge_in_source_then_fit` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"merge_mode":"merge_in_source_then_fit"}}` | 0 | `4227a4252d1237584e71693fde46657161e0fb4bd88e743149f0394bab3c2cb1` |
+| `ariadne_spelling_ariadne` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":"main"}` | 2 | `bd5218e25356daf94570cc5a9a1284bd70f6034e9dc40433201ceb6ae898f412` |
+| `ariadne_spelling_direct_residual` | (2, 4)->(3, 6) | `{"method":"direct_residual","method_params":{},"direct_residual_params":"main"}` | 0 | `ec6ea6f5017cc599862f11e13a7be842c76d2cc529b99ff86ac2fd8a317b5051` |
+| `bico_extend_depth_alignment_absent` | (2, 4)->(3, 6) | `{"method":"bico"}` | 0 | `c3405baf8c644b06eca4029faa223418017724a05ba9e73b0eab0abd78cdfa74` |
+| `bico_extend_discrete_index_match` | (2, 4)->(3, 6) | `{"method":"bico","depth_alignment":"discrete_index_match"}` | 0 | `28d72a90c89a5a0d98c14a08fb56feae0f6d347c52b2619d5ca0dcf0db0150f9` |
+| `direct_residual_sequential_endpoints_save` | (2, 4)->(3, 6) | `{"method":"direct_residual","method_params":{},"direct_residual_params":{"endpoint_construction":"sequential_source_endpoints"}}` | 4 | `4beecdb3b5e70ff98b500e5f5c090acf76b37ed602d78e662cef7107b176c170` |
+| `gradfix_same_architecture` | (2, 4)->(2, 4) | `{"method":"gradfix","method_params":{},"grad_batch_size":4,"grad_imgs_per_class":2,"grad_num_batches":2}` | 0 | `3f43269679dae616de9395dba3ef72f9e49534be04429a19c9f1426253fbaaeb` |
+| `theseus_alpha_patience_per_task` | (2, 4)->(2, 6) | `{"alpha_selection":"per_task","alpha_patience":1,"alpha_min":0.0,"alpha_max":2.0,"alpha_step":0.25,"alpha_search":true}` | 0 | `1c72d19369564dfa41baf37a79c43ab10a9abd671ff5d98d11a11ab5ac415d21` |
+| `theseus_alpha_patience_shared` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_patience":0,"alpha_min":0.0,"alpha_max":2.0,"alpha_step":0.25,"alpha_search":true}` | 0 | `460a1de68c82e7c1501eb2beacecd0353ffc75921de69cdf8d222ee9d3d1cd91` |
+| `theseus_brace_merge_then_transport` | (2, 4)->(3, 6) | `{"merge_mode":"brace_merge_then_transport","transport_calibration_batches":2,"alpha_search":"0..1 step .5"}` | 0 | `10f3f007a2f73c06e8581ccd0921eeb71feb79a1c4d602ebe24a71ff66c16c48` |
+| `theseus_double_direct_p1_correction` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","extension_strategy":"duplicate_per_weight","calibration_split":"val","direct_p1_correction":{"enabled":true}}}` | 0 | `0b2424214be65e13b01c6ecc8902033ee2a638546e1b89b72492421547e53fbb` |
+| `theseus_double_joint_blockwise_correction` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","extension_strategy":"duplicate_per_weight","calibration_split":"val","joint_blockwise_correction":{"enabled":true}}}` | 0 | `804673c14647641ae0488d6064f294d27bf78615498dee985cb02e35b0c279e1` |
+| `theseus_double_target_residual_completion` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","target_residual_completion":{"enabled":true,"num_batches":2}}}` | 0 | `b54d0bf520fa7a0855cad09ad5efa934c79d26dafde193549c5b36c14cff2986` |
+| `theseus_double_target_residual_completion_direct_target` | (2, 4)->(4, 6) | `{"block_extension_params":{"skip_correction":true,"target_residual_completion":{"enabled":true,"mode":"direct_target","num_batches":2}}}` | 0 | `20ecc7afbe1bc36a8fa61b9bea9ea5c82d09db51c40255cf205554603f117a71` |
+| `theseus_equal_depth_none_fixed_alpha_save_tvs` | (2, 4)->(2, 6) | `{"merge_mode":"none","save_transported_tvs_legacy":true}` | 6 | `5b351126ddadffd1fc25dab1752c5431b5c17034a5cfc6c06121126dd2b1213d` |
+| `theseus_extend_brace_correction_search_shared` | (2, 4)->(3, 6) | `{"alpha_selection":"shared","block_extension_params":{"skip_correction":false},"alpha_search":"0..1 step .5"}` | 0 | `6032fd660bbe0b6e85c6c6ec68bb15933dff5e4c9c5c883232895201c539992d` |
+| `theseus_extend_brace_skip_correction` | (2, 4)->(3, 6) | `{"alpha":1.0,"block_extension_params":{"skip_correction":true}}` | 0 | `2d3a70538cfd30bf3ec58259a5193d9390da433bc115d0940ed9f32ce5d35476` |
+| `theseus_extend_eval_before_and_source_lmc` | (2, 4)->(3, 6) | `{"eval_before_rebase":true,"source_lmc_eval":true,"source_lmc_alpha_step":0.5,"cross_task_lmc_pairs":[["MNIST","DTD"]],"all_task_lmc_tasks":["MNIST","DTD"]}` | 0 | `b95d0578abcc84b284d8cf70fbe7e303901a2c241e9856bca753ca855afefc7f` |
+| `theseus_independent_endpoint_average` | (2, 4)->(3, 6) | `{"merge_mode":"brace_transport_then_merge","base_construction":"independent_endpoint_average","alpha_search":"0..1 step .5"}` | 0 | `1d2505f133562abbaf4818fd5399ebea4b1bbec6f1cfad362b73434fa123a77f` |
+| `theseus_merge_then_brace_then_transport_correction` | (2, 4)->(3, 6) | `{"merge_mode":"merge_then_brace_then_transport","transport_calibration_batches":2,"block_extension_params":{"calibration_dataset":{"path":"zh-plus/tiny-imagenet","split":"valid"}},"alpha_search":"0..1 step .5"}` | 0 | `e976a806fed73d1338952b7b0cdda372360dd55781a3566072574ddb4c0c2bc3` |
+| `theseus_merge_then_brace_then_transport_skip_correction` | (2, 4)->(3, 6) | `{"merge_mode":"merge_then_brace_then_transport","transport_calibration_batches":2,"block_extension_params":{"skip_correction":true},"alpha_search":"0..1 step .5"}` | 0 | `f58063754bd30bec80d15b436117a6e5210dc1d1a07d42431cc10c69991f2ab4` |
+| `theseus_merge_then_rebase` | (2, 4)->(2, 6) | `{"merge_mode":"merge_then_rebase","transport_calibration_batches":2,"alpha_search":"0..1 step .5"}` | 0 | `3c19d3932a11ac5561bf5f1afbb06e51b8fd370ed42f77b9f69b2e7bf12206af` |
+| `theseus_merge_then_rebase_tiny_protocol` | (2, 4)->(2, 6) | `{"merge_mode":"merge_then_rebase","transport_calibration_protocol":"tiny","alpha_search":"0..1 step .5"}` | 0 | `7559c8047e0c37ed5561961a76361e8494e257c268bc0ce6caf1a3bfe8141926` |
+| `theseus_native_target_auto_detected_per_task` | (2, 4)->(3, 6) native=DTD | `{"merge_mode":"brace_transport_then_merge","alpha_selection":"per_task","alpha_search":"0..1 step .5"}` | 0 | `e3cb36f02a0d9d6c9fc72944e0b4b72043efcf5e2016ed55fd9ec3e951434da5` |
+| `theseus_native_target_explicit` | (2, 4)->(3, 6) native=DTD | `{"merge_mode":"rebase_then_merge","native_target_tasks":["DTD"],"alpha_search":"0..1 step .5"}` | 0 | `d768a510ca4ce10baa57c9fdc27a9e8610f588484e20903f48b22c4517c9072f` |
+| `theseus_rebase_then_merge_per_task_hierarchical` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_selection":"per_task","alpha_search":"0..1 step .5"}` | 0 | `5be1f078cba33c4592c75813109c5c4aa5c90060cad1d4f2d5fd6070afbc3476` |
+| `theseus_rebase_then_merge_per_task_no_global_search` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_selection":"per_task","global_alpha_search":false,"alpha_search":"0..1 step .5"}` | 0 | `eeb854b733223aa4a20b0c81b112a12fed6f16164f88046c6dc7ccc985fea379` |
+| `theseus_rebase_then_merge_save_merged` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_search":"0..1 step .5"}` | 1 | `448c76a73395bae503501e939e95162595b0264f3fa3f70c2031765618324561` |
+| `theseus_rebase_then_merge_shared` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_search":"0..1 step .5"}` | 0 | `448c76a73395bae503501e939e95162595b0264f3fa3f70c2031765618324561` |
+| `theseus_same_depth_direct_target` | (2, 4)->(2, 6) | `{"block_extension_params":{"skip_correction":true,"target_residual_completion":{"enabled":true,"mode":"direct_target","target_scope":"all","num_batches":2}}}` | 0 | `c253b413f734a3e979c78b9e0da2badd55a73eff36a131667ddf12805526cc4b` |
+| `theseus_samearch_none_alpha_search_untransported` | (2, 4)->(2, 4) | `{"merge_mode":"none","alpha_search":"0..1 step .5"}` | 0 | `afff8207eb788cb3c7ccfda1329139fb12addde7f35542423f3308c5af24ec33` |
+| `theseus_samedepth_eval_before_rebase` | (2, 4)->(2, 6) | `{"eval_before_rebase":true}` | 0 | `ef2b2bc7728b5fbce957db1d559ac214dfef754bf4a4ff4178676fc4bfcae46a` |
+| `theseus_shrink_brace` | (3, 4)->(2, 6) | `{}` | 0 | `b15318e722066886a35a421c00e322ca6fea5ae8e0638af2e604098fc6a0fae6` |
+| `theseus_transport_calibration_tiny_imagenet` | (2, 4)->(2, 6) | `{"transport_calibration_data":"tiny_imagenet"}` | 0 | `09fe816444760519b2823ce6d2280ddcedbd12c76ecba267c051ca8d63cef451` |
+| `direct_residual_sequential_endpoints_load` | (2, 4)->(3, 6) | `load_direct_residual_tvs_dir` = the vectors of the save case above | 0 | `48321f0c8cdae5bed64c8f728a4f48f5c3605ec507311d4bef5fc82e61e5d742` |
+
+All cases except the load leg also pin `resolved_config`, `events` and every saved file (the "Saved files" column counts
+them). Worlds are `_AttnModel` pairs, e.g. `(2, 4)->(3, 6)` = depth 2 width 4 source, depth 3 width 6 target; BRACE
+cases use odd 2->3 extension or a 3->2 shrink, target-informed protocols need the doubled 2->4 layout.
+
+### Not pinned (and why)
+
+- `method=transfusion`: `_load_or_compute_permutations` raises "requires CUDA" on CPU. Only its native-target guard is in the error table.
+- Attention patching (`attn_patch_cfg`, `patched_attn`), `dtype` other than fp32, every CUDA branch (peak-memory brackets, `torch.cuda.synchronize`).
+- `bico_gradin`, `theseus_reference`, `theseus_gqa`, `orthogonal_shift`, `identity` through `main()`; merge methods other than `task_arithmetic`; non-uniform `weights`.
+- `source_only` (always crashes, see quirks), `transport_calibration_protocol` values `vision8_mix*` (the default `task_local` goes through the same balanced builder), `procrustes_source=gradient` and the gradient-recipe paths through `main()` (need a real open_clip ViT).
+- The real data / checkpoint layer (`load_hf_splits`, `build_vision_loaders`, `load_ckpt` key renaming), real summary-JSON serialisation and the `code_fingerprint`, W&B logging: all faked or bypassed.
+- Numbers come from a chance-level toy head on 8 samples per split: they pin bits, not scientific behaviour.
+
+### Observed quirks of `main()` (pinned as-is; nothing was fixed)
+
+1. **`source_only: true` cannot run** (merge_mode `none`): the per-task `continue` skips transport, then
+   `zip(transported_deltas, merge_weights, strict=True)` raises `ValueError: zip() argument 2 is longer than argument 1`.
+2. **`target_hash_before == target_hash_after` guard fails on CPU models**: `to_cpu_fp32` does `.detach().cpu().to(float32)`, which is a view for a
+   CPU fp32 model, so `load_into_model(clf_target.model, ...)` mutates `target_base_sd` in place and the guard raises
+   `RuntimeError: Native target base was mutated ...`. Invisible on CUDA (the CPU copy is real). `main()` with `device=cpu` and real classifiers would hit it.
+3. **Silent empty task vector**: with `auto_detect_ckpt_base=false` and no `native_target_tasks` the checkpoint classification block is skipped entirely, so a
+   target-architecture checkpoint is treated as a source one; `align_to_base_keys` keeps only shape-compatible keys (here just `logit_scale`), the run
+   prints "Loaded tuned checkpoint ... (1 keys)", "transported delta computed for 0 params" and completes. The error "matches the target architecture; add it to
+   native_target_tasks or set auto_detect_ckpt_base=true" is only reachable when `native_target_tasks` is non-empty (error case `target_architecture_checkpoint_without_auto_detect`).
+4. **Ariadne sequential vectors cannot be reloaded when saved under `method='ariadne'`**: the saver names files `{task}_{method.name}_transported_native.pt`, `_load_saved_sequential_tv` hardcodes `{task}_direct_residual_...` (FileNotFoundError). Works with the `direct_residual` spelling (pinned load leg).
+5. **Dead code / dead outputs**: `cross_task_source_lmc` and `all_task_source_lmc` are always `[]` (the evaluators are never called; `corrected_ft_states`/`corrected_ft_templates` are filled, including a CPU `deepcopy` of a model per task, and never read); `cross_task_lmc_pairs` task names are not validated against the task list; the `independent_base_*` variables are never populated so `independent_endpoint_baseline` carries `None`/`{}` fields.
+6. **`base_construction=independent_endpoint_average` has no numerical effect** under `brace_transport_then_merge`/`rebase_then_merge` (verified: identical `test_results` and `global_alpha_curve` with and without it); `independent_base_by_task` is only consumed by `brace_merge_then_transport`. It only adds validation and a summary stub.
+7. **Summary label with `discrete_index_match`**: `block_extension_protocol.label` still reports `ariadne` although no BRACE step runs.
+8. **Unreachable guard**: `direct_residual merge_in_source_then_fit requires at least one non-native task` cannot fire; with every task native the "Native target checkpoints require a merge mode" check (merge_mode `none`) fires first.
+9. **Weights**: `weights` of the wrong length fails with a bare `zip(strict=True)` message in merge_mode `none` (after all transports were computed) but with "weights length must match tuned checkpoints" in the merge modes; there is no up-front validation.
+10. **Exception types**: an unknown `merge_method` is a `KeyError` (from the registry), not a `ValueError`.
+11. **Global RNG coupling**: `main()` seeds torch/numpy/random from `seed` once and the later stages draw from the global streams (e.g. every `iter(DataLoader)` consumes a base seed even with `shuffle=False`), so reordering loader construction or iteration can change downstream bits; this is what the P5.2 "call order and seeds" risk refers to, and these pins would catch it. No nondeterminism was observed: all cases are bit-identical across runs, processes and test orders.
