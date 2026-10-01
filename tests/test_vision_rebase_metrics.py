@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import merge_and_rebase.eval.source_lmc as source_lmc
 import merge_and_rebase.eval.vision_rebase as vision_rebase
 from merge_and_rebase.eval.print_utils import (
     _latex_percent_cells,
@@ -49,6 +50,7 @@ class _ToyEvalClassifier:
 
 def test_source_lmc_reports_area_below_chord_without_zip_length_error(monkeypatch) -> None:
     monkeypatch.setattr(vision_rebase, "OpenClipClassifier", _ToyEvalClassifier)
+    monkeypatch.setattr(source_lmc, "OpenClipClassifier", _ToyEvalClassifier)
     model = nn.Linear(1, 2)
     endpoint_a = {key: value.detach().clone() for key, value in model.state_dict().items()}
     endpoint_b = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -79,6 +81,7 @@ def test_source_lmc_reports_area_below_chord_without_zip_length_error(monkeypatc
 
 def test_cross_task_source_lmc_evaluates_both_task_contexts(monkeypatch) -> None:
     monkeypatch.setattr(vision_rebase, "OpenClipClassifier", _ToyEvalClassifier)
+    monkeypatch.setattr(source_lmc, "OpenClipClassifier", _ToyEvalClassifier)
     model = nn.Linear(1, 2)
     endpoint_a = {key: value.detach().clone() for key, value in model.state_dict().items()}
     endpoint_b = {key: value.detach().clone() for key, value in model.state_dict().items()}

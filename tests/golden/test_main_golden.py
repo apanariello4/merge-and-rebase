@@ -52,6 +52,7 @@ from ._hashing import deterministic_cpu, hash_json, hash_tensor_dict
 # does not import are simply created on it (``raising=False``), which is harmless.
 PATCH_MODULES: list[str] = [
     "merge_and_rebase.eval.vision_rebase",
+    "merge_and_rebase.eval.source_lmc",
     "merge_and_rebase.eval.vision_rebase_context",
     "merge_and_rebase.eval.vision_alpha_search",
     "merge_and_rebase.rebase.orchestration",
