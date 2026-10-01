@@ -84,14 +84,6 @@ def test_config_rejects_unknown_depth_pairing():
         parse_direct_residual_config({"depth_pairing": "bogus"})
 
 
-@pytest.mark.parametrize("depth_pairing", ["reversed", "shift_plus1", "shift_minus1"])
-def test_config_rejects_non_block_boundary_with_non_relative_pairing(depth_pairing):
-    with pytest.raises(ValueError):
-        parse_direct_residual_config(
-            {"depth_pairing": depth_pairing, "component_target": "output_local", "components": ["mlp.c_fc"]}
-        )
-
-
 @pytest.mark.parametrize("depth_pairing", ["relative", "reversed", "shift_plus1", "shift_minus1"])
 def test_config_accepts_block_boundary_with_any_pairing(depth_pairing):
     cfg = parse_direct_residual_config({"depth_pairing": depth_pairing})

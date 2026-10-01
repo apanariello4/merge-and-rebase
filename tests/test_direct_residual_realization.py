@@ -38,7 +38,6 @@ from merge_and_rebase.eval.target_informed_runtime import (
     compute_direct_residual_task_vector_stats,
     measure_direct_residual_realization,
 )
-from merge_and_rebase.eval.target_residual_completion import order_components
 from merge_and_rebase.eval.vision_rebase import _state_dict_sha256
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 
@@ -131,13 +130,13 @@ def _setup(source_depth, target_depth, width=5, seed=11):
     return source_base, source_ft, target_base, data, pairing, target_base_sd
 
 
-def _fit_and_capture(source_depth, target_depth, config, device="cpu", component_inputs=()):
+def _fit_and_capture(source_depth, target_depth, config, device="cpu"):
     """Run the real pipeline once, returning everything ``measure_direct_
     residual_realization``/``compute_direct_residual_task_vector_stats`` need."""
     source_base, source_ft, target_base, data, pairing, target_base_sd = _setup(source_depth, target_depth)
     captured = capture_paired_boundary_activations(
         source_base, source_ft, target_base, data, data, pairing,
-        num_batches=config.num_batches, seed=config.seed, device=device, component_inputs=component_inputs,
+        num_batches=config.num_batches, seed=config.seed, device=device,
     )
     desired = compute_desired_effects(captured, pairing)
     corrections, diagnostics = fit_direct_residual(
@@ -403,110 +402,6 @@ def test_computing_realization_does_not_change_subsequent_fit_hash(block_split):
     assert _state_dict_sha256(ctx1["corrections"]) == _state_dict_sha256(ctx2["corrections"])
 
 
-def test_output_local_realization_matches_independent_recomputation():
-    """Stock nn.MultiheadAttention fixture (needed for q/k/v/c_fc), reused from
-    test_direct_residual_device_parametrization.py's Fixture B (duplicated,
-    per this suite's no-cross-test-import convention)."""
-
-    class _StockAttentionBlock(torch.nn.Module):
-        def __init__(self, width):
-            super().__init__()
-            self.ln_1 = torch.nn.LayerNorm(width)
-            self.attn = torch.nn.MultiheadAttention(width, 1, batch_first=True)
-            self.ls_1 = torch.nn.Identity()
-            self.ln_2 = torch.nn.LayerNorm(width)
-            self.mlp = torch.nn.Sequential(OrderedDict([
-                ("c_fc", torch.nn.Linear(width, width * 2)), ("gelu", torch.nn.GELU()),
-                ("c_proj", torch.nn.Linear(width * 2, width)),
-            ]))
-            self.ls_2 = torch.nn.Identity()
-
-        def forward(self, x):
-            normed = self.ln_1(x)
-            x = x + self.ls_1(self.attn(normed, normed, normed, need_weights=False)[0])
-            return x + self.ls_2(self.mlp(self.ln_2(x)))
-
-    class _StockVisual(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.input = torch.nn.Linear(4, width)
-            self.transformer = torch.nn.Module()
-            self.transformer.resblocks = torch.nn.ModuleList([_StockAttentionBlock(width) for _ in range(depth)])
-
-        def forward(self, images):
-            x = self.input(images)
-            for block in self.transformer.resblocks:
-                x = block(x)
-            return x.mean(dim=1)
-
-    class _StockModel(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.visual = _StockVisual(width, depth)
-
-        def encode_image(self, x):
-            return self.visual(x)
-
-    torch.manual_seed(41)
-    source_base = _StockModel(4, 2).eval()
-    target_base = _StockModel(4, 4).eval()
-    source_ft = deepcopy(source_base)
-    torch.manual_seed(42)
-    with torch.no_grad():
-        for block in source_ft.visual.transformer.resblocks:
-            block.mlp.c_proj.weight.add_(0.2 * torch.randn_like(block.mlp.c_proj.weight))
-            block.attn.in_proj_weight.add_(0.1 * torch.randn_like(block.attn.in_proj_weight))
-    data = _loader(seed=43)
-    pairing = DiscreteLayerPairing.compute(2, 4)
-    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
-
-    components = ("attn.v_proj", "mlp.c_proj")
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_local", components=components,
-    )
-    captured = capture_paired_boundary_activations(
-        source_base, source_ft, target_base, data, data, pairing,
-        num_batches=cfg.num_batches, seed=cfg.seed, device="cpu", component_inputs=order_components(components),
-    )
-    desired = compute_desired_effects(captured, pairing)
-    corrections, _diag = fit_direct_residual(
-        target_base, target_base_sd, captured, desired, pairing, config=cfg, device="cpu",
-    )
-    positions = list(range(pairing.target_depth))
-    result = measure_direct_residual_realization(
-        target_base, target_base_sd, corrections, positions, captured["target_batches"],
-        captured["target_base_outputs_by_position"], desired, device="cpu", components=components,
-    )
-
-    joint_state = _apply_delta(target_base_sd, corrections)
-    joint_model = deepcopy(target_base)
-    joint_model.load_state_dict(joint_state, strict=True)
-    joint_model.eval()
-    joint_outputs = {pos: [] for pos in positions}
-    handles = [
-        joint_model.visual.transformer.resblocks[pos].register_forward_hook(
-            lambda _m, _i, v, pos=pos: joint_outputs[pos].append(v.detach().float().clone())
-        )
-        for pos in positions
-    ]
-    try:
-        with torch.no_grad():
-            for batch in captured["target_batches"]:
-                joint_model.encode_image(batch[0])
-    finally:
-        for h in handles:
-            h.remove()
-
-    for pos in positions:
-        t0 = captured["target_base_outputs_by_position"][pos]
-        d_batches = desired[pos]
-        d_norm = _norm(d_batches)
-        joint_delta = [v - b for v, b in zip(joint_outputs[pos], t0, strict=True)]
-        e_j = _norm([jd - dd for jd, dd in zip(joint_delta, d_batches, strict=True)]) / (d_norm + 1e-12)
-        assert result[pos]["block_realized_target_error"] == pytest.approx(e_j, rel=1e-4, abs=1e-8)
-        assert set(result[pos]["per_family_delta_norm_over_desired"]) == set(components)
-
-
 # --------------------------------------------------------------------------
 # Task-vector stats.
 # --------------------------------------------------------------------------
@@ -525,79 +420,6 @@ def test_task_vector_stats_sha_matches_vision_rebase_helper():
     # WHOLE base model's norm for tau_norm_over_all_base, so it must be a much
     # smaller ratio than tau_norm_over_touched_base (bigger denominator).
     assert stats["tau_norm_over_all_base"] < stats["tau_norm_over_touched_base"]
-
-
-def test_task_vector_stats_v_only_output_local_not_triple_counted():
-    """v-only output_local run -> n_modified_parameters counts d*d_in + d,
-    not 3x (would happen if the whole packed in_proj tensor were counted)."""
-    torch.manual_seed(51)
-
-    class _StockAttentionBlock(torch.nn.Module):
-        def __init__(self, width):
-            super().__init__()
-            self.ln_1 = torch.nn.LayerNorm(width)
-            self.attn = torch.nn.MultiheadAttention(width, 1, batch_first=True)
-            self.ls_1 = torch.nn.Identity()
-            self.ln_2 = torch.nn.LayerNorm(width)
-            self.mlp = torch.nn.Sequential(OrderedDict([
-                ("c_fc", torch.nn.Linear(width, width * 2)), ("gelu", torch.nn.GELU()),
-                ("c_proj", torch.nn.Linear(width * 2, width)),
-            ]))
-            self.ls_2 = torch.nn.Identity()
-
-        def forward(self, x):
-            normed = self.ln_1(x)
-            x = x + self.ls_1(self.attn(normed, normed, normed, need_weights=False)[0])
-            return x + self.ls_2(self.mlp(self.ln_2(x)))
-
-    class _StockVisual(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.input = torch.nn.Linear(4, width)
-            self.transformer = torch.nn.Module()
-            self.transformer.resblocks = torch.nn.ModuleList([_StockAttentionBlock(width) for _ in range(depth)])
-
-        def forward(self, images):
-            x = self.input(images)
-            for block in self.transformer.resblocks:
-                x = block(x)
-            return x.mean(dim=1)
-
-    class _StockModel(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.visual = _StockVisual(width, depth)
-
-        def encode_image(self, x):
-            return self.visual(x)
-
-    width, depth = 4, 2
-    source_base = _StockModel(width, depth).eval()
-    target_base = _StockModel(width, depth).eval()
-    source_ft = deepcopy(source_base)
-    with torch.no_grad():
-        source_ft.visual.transformer.resblocks[0].attn.in_proj_weight.add_(0.2)
-    data = _loader(seed=52)
-    pairing = DiscreteLayerPairing.compute(depth, depth)
-    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_local", components=("attn.v_proj",),
-    )
-    captured = capture_paired_boundary_activations(
-        source_base, source_ft, target_base, data, data, pairing,
-        num_batches=cfg.num_batches, seed=cfg.seed, device="cpu", component_inputs=("attn.v_proj",),
-    )
-    desired = compute_desired_effects(captured, pairing)
-    corrections, _diag = fit_direct_residual(
-        target_base, target_base_sd, captured, desired, pairing, config=cfg, device="cpu",
-    )
-    positions = list(range(pairing.target_depth))
-    stats = compute_direct_residual_task_vector_stats(
-        corrections, target_base_sd, positions, components=("attn.v_proj",),
-    )
-    d_in = width
-    expected_per_position = width * d_in + width  # weight rows + bias rows for the v-slice only
-    assert stats["n_modified_parameters"] == expected_per_position * len(positions)
 
 
 # --------------------------------------------------------------------------
@@ -620,85 +442,6 @@ def test_measure_realization_restores_target_model_exactly():
 # --------------------------------------------------------------------------
 # Device parametrization.
 # --------------------------------------------------------------------------
-
-
-def test_packed_qkv_presence_is_not_falsely_triggered_by_a_sibling_component():
-    """Regression: q/k/v share ONE physical state-dict key
-    (in_proj_weight/in_proj_bias). Passing the broad CANONICAL_COMPONENT_ORDER
-    default (which includes q and k) to measure_direct_residual_realization
-    for a run that only ever fit v must NOT report q/k as "present" -- caught
-    during initial development of this test file, where the default produced
-    spurious q/k rows for a v-only fit because their shared key existed in
-    target_corrections regardless of which row-third was written."""
-
-    class _StockAttentionBlock(torch.nn.Module):
-        def __init__(self, width):
-            super().__init__()
-            self.ln_1 = torch.nn.LayerNorm(width)
-            self.attn = torch.nn.MultiheadAttention(width, 1, batch_first=True)
-            self.ls_1 = torch.nn.Identity()
-            self.ln_2 = torch.nn.LayerNorm(width)
-            self.mlp = torch.nn.Sequential(OrderedDict([
-                ("c_fc", torch.nn.Linear(width, width * 2)), ("gelu", torch.nn.GELU()),
-                ("c_proj", torch.nn.Linear(width * 2, width)),
-            ]))
-            self.ls_2 = torch.nn.Identity()
-
-        def forward(self, x):
-            normed = self.ln_1(x)
-            x = x + self.ls_1(self.attn(normed, normed, normed, need_weights=False)[0])
-            return x + self.ls_2(self.mlp(self.ln_2(x)))
-
-    class _StockVisual(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.input = torch.nn.Linear(4, width)
-            self.transformer = torch.nn.Module()
-            self.transformer.resblocks = torch.nn.ModuleList([_StockAttentionBlock(width) for _ in range(depth)])
-
-        def forward(self, images):
-            x = self.input(images)
-            for block in self.transformer.resblocks:
-                x = block(x)
-            return x.mean(dim=1)
-
-    class _StockModel(torch.nn.Module):
-        def __init__(self, width, depth):
-            super().__init__()
-            self.visual = _StockVisual(width, depth)
-
-        def encode_image(self, x):
-            return self.visual(x)
-
-    torch.manual_seed(61)
-    source_base = _StockModel(4, 2).eval()
-    target_base = _StockModel(4, 2).eval()
-    source_ft = deepcopy(source_base)
-    with torch.no_grad():
-        source_ft.visual.transformer.resblocks[0].attn.in_proj_weight.add_(0.2)
-    data = _loader(seed=62)
-    pairing = DiscreteLayerPairing.compute(2, 2)
-    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_local", components=("attn.v_proj",),
-    )
-    captured = capture_paired_boundary_activations(
-        source_base, source_ft, target_base, data, data, pairing,
-        num_batches=cfg.num_batches, seed=cfg.seed, device="cpu", component_inputs=("attn.v_proj",),
-    )
-    desired = compute_desired_effects(captured, pairing)
-    corrections, _diag = fit_direct_residual(
-        target_base, target_base_sd, captured, desired, pairing, config=cfg, device="cpu",
-    )
-    positions = list(range(pairing.target_depth))
-    # Passing exactly the fitted family (the safe, required contract).
-    result = measure_direct_residual_realization(
-        target_base, target_base_sd, corrections, positions, captured["target_batches"],
-        captured["target_base_outputs_by_position"], desired, device="cpu", components=("attn.v_proj",),
-    )
-    for row in result.values():
-        assert set(row["per_family_delta_norm_over_desired"]) == {"attn.v_proj"}
-        assert row["component_interaction_error"] is None  # only one family requested
 
 
 def _open_clip_direction_setup(direction, seed=101):

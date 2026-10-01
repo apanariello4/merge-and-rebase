@@ -156,8 +156,10 @@ def test_block_split_defaults_to_none():
     assert cfg.backfit_tol == pytest.approx(1e-4)
 
 
-def test_block_split_backfit_requires_block_boundary():
-    with pytest.raises(ValueError, match="block_boundary"):
+def test_block_split_backfit_with_retired_component_target_is_rejected():
+    # The per-component targets were retired, so block_boundary is the only
+    # component_target left; the retirement error fires before block_split's own check.
+    with pytest.raises(ValueError, match="retired"):
         parse_direct_residual_config(
             {"component_target": "output_local", "components": ["attn.out_proj"], "block_split": "backfit"}
         )

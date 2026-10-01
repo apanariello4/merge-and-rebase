@@ -45,7 +45,6 @@ def test_campaign_variants_parse(fields):
         ({"alignment_map": "ridge", "alignment_row_weighting": "cls_balanced"}, "requires alignment_row_weighting='uniform'"),
         ({"alignment_map": "ridge", "procrustes_source": "gradient"}, "non-default alignment options require"),
         ({"alignment_row_weighting": "cls_balanced", "residual_target": "transported_endpoint"}, "transported_delta"),
-        ({"alignment_row_weighting": "cls_balanced", "component_target": "output_local"}, "block_boundary"),
     ],
 )
 def test_parser_rejects_undefined_combinations(fields, match):

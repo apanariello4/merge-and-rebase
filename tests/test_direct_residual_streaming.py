@@ -273,8 +273,6 @@ def test_streaming_position_chunk_is_bitwise_invariant(source_depth, target_dept
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"component_target": "output_local", "components": ("attn.out_proj",)},
-        {"component_target": "output_total", "components": ("attn.out_proj",)},
         {"block_split": "backfit"},
         {"block_split": "joint"},
     ],

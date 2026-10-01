@@ -1706,9 +1706,6 @@ def _direct_residual_fit_body(
         )
         procrustes_diagnostics.update(prepared["procrustes_diagnostics"])
     else:
-        component_inputs = (
-            order_components(config.components) if config.component_target != "block_boundary" else ()
-        )
         captured = capture_paired_boundary_activations(
             source_base_model,
             source_ft_model,
@@ -1719,11 +1716,9 @@ def _direct_residual_fit_body(
             num_batches=config.num_batches,
             seed=config.seed,
             device=device,
-            component_inputs=component_inputs,
             procrustes_source=config.procrustes_source,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
-            capture_source_ft_component_inputs=config.component_target == "output_total",
         )
         if config.endpoint_construction == "native_delta":
             desired = compute_desired_effects(
@@ -1847,7 +1842,7 @@ def _direct_residual_fit_body(
             # q/k/v share ONE physical state-dict key (attn.in_proj_weight), so a
             # presence check keyed only off "is this key in target_corrections"
             # cannot tell which of q/k/v were actually fit -- e.g. a v-only
-            # output_local run's in_proj_weight key exists in target_corrections
+            # run's in_proj_weight key exists in target_corrections
             # with only its v-rows nonzero, and checking q/k against that same
             # key would falsely report them "present" too. Passing exactly
             # order_components(config.components) sidesteps this: only names the

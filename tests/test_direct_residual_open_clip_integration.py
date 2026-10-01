@@ -9,10 +9,8 @@ actual ``open_clip.transformer.VisionTransformer`` class Direct Residual is
 meant to run against in production, to catch anything the hand-built
 fixtures' simplifications (single head, no patch embedding, no positional
 embedding, no LayerNorm) could hide. ``ls_init_value=None`` gives
-``nn.Identity`` LayerScale on both paths automatically -- the same
-requirement ``_assert_layerscale_identity`` enforces for
-``component_target='output_local'`` -- so no special-casing is needed to
-satisfy it.
+``nn.Identity`` LayerScale on both paths automatically, as the joint fit's
+``_assert_layerscale_identity`` requires.
 
 Source and target are given different ``width``/``layers`` (extend, shrink)
 and different ``image_size``/``patch_size`` (so source and target native
@@ -39,7 +37,6 @@ from merge_and_rebase.eval.direct_residual import (
     compute_desired_effects,
     fit_direct_residual,
 )
-from merge_and_rebase.eval.target_residual_completion import order_components
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 
 DEVICES = [
@@ -140,15 +137,14 @@ def _state_dict_sha256(d) -> str:
     return h.hexdigest()
 
 
-def _fit(direction, config, device, component_inputs=(), capture_source_ft_component_inputs=False):
+def _fit(direction, config, device):
     source_base, source_ft, target_base, source_loader, target_loader, pairing, target_base_sd = _direction_setup(
         direction
     )
     before_hash = _state_dict_sha256(target_base.state_dict())
     captured = capture_paired_boundary_activations(
         source_base, source_ft, target_base, source_loader, target_loader, pairing,
-        num_batches=config.num_batches, seed=config.seed, device=device, component_inputs=component_inputs,
-        capture_source_ft_component_inputs=capture_source_ft_component_inputs,
+        num_batches=config.num_batches, seed=config.seed, device=device,
     )
     desired = compute_desired_effects(captured, pairing)
     corrections, diagnostics = fit_direct_residual(
@@ -221,86 +217,6 @@ def test_block_boundary_backfit_j_trace_is_non_increasing(direction):
         for prev, curr in zip(j_trace, j_trace[1:], strict=False):
             assert curr <= prev + 1e-6, (direction, row["component"], j_trace)
         assert row["backfit_round1_j"] == pytest.approx(j_trace[0])
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
-@pytest.mark.parametrize("device", DEVICES)
-def test_output_local_all_six_end_to_end_finite(direction, device):
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_local", components=_ALL_SIX,
-    )
-    corrections, diagnostics, _model, _sd = _fit(direction, cfg, device, component_inputs=order_components(_ALL_SIX))
-    assert corrections
-    for key, value in corrections.items():
-        assert torch.isfinite(value).all(), key
-    assert {row["component"] for row in diagnostics} == set(_ALL_SIX)
-
-    # Packed in_proj: untouched rows must be exactly zero (each of q/k/v owns
-    # a disjoint 1/3 row slice; here all three are requested, so nothing
-    # should be exactly zero by omission, but the shape/dtype contract is
-    # asserted directly).
-    for key, value in corrections.items():
-        if key.endswith("attn.in_proj_weight"):
-            assert value.shape[0] % 3 == 0
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
-def test_output_local_untouched_qkv_rows_are_exactly_zero(direction):
-    """Requesting only attn.v_proj must leave the q/k row-thirds of the
-    packed in_proj_weight/bias correction exactly zero."""
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_local", components=("attn.v_proj",),
-    )
-    corrections, _diag, _model, _sd = _fit(direction, cfg, "cpu", component_inputs=("attn.v_proj",))
-    for key, value in corrections.items():
-        if key.endswith("attn.in_proj_weight") or key.endswith("attn.in_proj_bias"):
-            d = value.shape[0] // 3
-            q_slice = value[:d]
-            k_slice = value[d : 2 * d]
-            v_slice = value[2 * d :]
-            assert torch.count_nonzero(q_slice) == 0, "q row-third must stay exactly zero"
-            assert torch.count_nonzero(k_slice) == 0, "k row-third must stay exactly zero"
-            assert torch.count_nonzero(v_slice) > 0, "v row-third is the one requested component"
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
-def test_output_local_independence_at_hash_level(direction):
-    """Every component's correction in the ALL run bitwise equals its own
-    single-component run (extends the toy-fixture version of this check in
-    test_direct_residual_component_coverage.py to a real open_clip block)."""
-    joint_corrections, _diag, _model, _sd = _fit(
-        direction,
-        DirectResidualConfig(num_batches=3, ridge_relative=0.05, component_target="output_local", components=_ALL_SIX),
-        "cpu",
-        component_inputs=order_components(_ALL_SIX),
-    )
-    for component in ("attn.out_proj", "mlp.c_fc", "mlp.c_proj"):
-        solo_corrections, _diag2, _model2, _sd2 = _fit(
-            direction,
-            DirectResidualConfig(
-                num_batches=3, ridge_relative=0.05, component_target="output_local", components=(component,)
-            ),
-            "cpu",
-            component_inputs=(component,),
-        )
-        for key, value in solo_corrections.items():
-            torch.testing.assert_close(joint_corrections[key], value, rtol=0, atol=0)
-    for component, idx in (("attn.q_proj", 0), ("attn.k_proj", 1), ("attn.v_proj", 2)):
-        solo_corrections, _diag2, _model2, _sd2 = _fit(
-            direction,
-            DirectResidualConfig(
-                num_batches=3, ridge_relative=0.05, component_target="output_local", components=(component,)
-            ),
-            "cpu",
-            component_inputs=(component,),
-        )
-        for key, value in solo_corrections.items():
-            is_bias = key.endswith("in_proj_bias")
-            d = value.shape[0] // 3
-            rows = slice(idx * d, (idx + 1) * d)
-            solo_slice = value[rows] if is_bias else value[rows, :]
-            joint_slice = joint_corrections[key][rows] if is_bias else joint_corrections[key][rows, :]
-            torch.testing.assert_close(joint_slice, solo_slice, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
@@ -379,50 +295,3 @@ def test_c_fc_recomputation_matches_forward_hook_on_real_block():
     with torch.no_grad():
         recomputed = F.linear(captured_input["x"], block.mlp.c_fc.weight, block.mlp.c_fc.bias)
     torch.testing.assert_close(recomputed, captured_output["y"], rtol=0, atol=1e-6)
-
-
-# --------------------------------------------------------------------------
-# 3. component_target='output_total' end-to-end, against the real open_clip
-#    VisionTransformer -- (d)/(e)/(f) from the implementation plan.
-# --------------------------------------------------------------------------
-
-_OD = ("attn.out_proj", "mlp.c_proj")
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
-@pytest.mark.parametrize("device", DEVICES)
-def test_output_total_od_end_to_end_finite(direction, device):
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_total", components=_OD,
-    )
-    corrections, diagnostics, _model, _sd = _fit(
-        direction, cfg, device, component_inputs=order_components(_OD), capture_source_ft_component_inputs=True,
-    )
-    assert corrections
-    for key, value in corrections.items():
-        assert torch.isfinite(value).all(), key
-    assert {row["component"] for row in diagnostics} == set(_OD)
-    for row in diagnostics:
-        assert row["component_target"] == "output_total"
-        # output_total's paired-only depth rule: exactly one contribution,
-        # at weight 1.0, matching the paired source coordinate (block_boundary's
-        # own depth rule) -- see position_paired_only_contributions.
-        assert row["source_contributions"] == [(int(row["source_position"]), 1.0)]
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink", "same_arch"])
-def test_output_total_realization_diagnostics_finite_real_model(direction):
-    cfg = DirectResidualConfig(
-        num_batches=3, ridge_relative=0.05, component_target="output_total", components=_OD,
-        realization_diagnostics=True,
-    )
-    _corrections, diagnostics, _model, _sd = _fit(
-        direction, cfg, "cpu", component_inputs=order_components(_OD), capture_source_ft_component_inputs=True,
-    )
-    expected = {
-        "fit_relative_residual", "target_norm", "update_norm", "relative_update_norm", "realized_target_norm_ratio",
-    }
-    for row in diagnostics:
-        assert expected <= set(row)
-        for key in expected:
-            assert torch.isfinite(torch.tensor(float(row[key])))

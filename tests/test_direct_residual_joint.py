@@ -180,8 +180,10 @@ def test_block_split_joint_parses():
     assert cfg.block_split == "joint"
 
 
-def test_block_split_joint_requires_block_boundary():
-    with pytest.raises(ValueError, match="block_boundary"):
+def test_block_split_joint_with_retired_component_target_is_rejected():
+    # The per-component targets were retired, so block_boundary is the only
+    # component_target left; the retirement error fires before block_split's own check.
+    with pytest.raises(ValueError, match="retired"):
         parse_direct_residual_config(
             {"component_target": "output_local", "components": ["attn.out_proj"], "block_split": "joint"}
         )
@@ -203,7 +205,7 @@ def test_block_split_invalid_value_rejected():
 
 # --------------------------------------------------------------------------
 # (a) Golden hash for block_split='none' is unaffected by adding 'joint'
-# (independent of the full regression suites for none/output_local/backfit,
+# (independent of the full regression suites for none/backfit,
 # which were run separately and are unchanged -- see the task report).
 # --------------------------------------------------------------------------
 

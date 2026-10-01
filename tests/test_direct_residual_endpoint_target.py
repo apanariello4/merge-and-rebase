@@ -341,17 +341,6 @@ def test_rectangular_split_pythagorean_and_out_of_range_formula(n, d_s, d_t):
 # --------------------------------------------------------------------------
 
 
-def test_transported_endpoint_requires_block_boundary():
-    with pytest.raises(ValueError, match="transported_endpoint"):
-        parse_direct_residual_config(
-            {
-                "residual_target": "transported_endpoint",
-                "component_target": "output_local",
-                "components": ["attn.out_proj"],
-            }
-        )
-
-
 def test_transported_endpoint_with_block_boundary_is_valid():
     cfg = parse_direct_residual_config(
         {"residual_target": "transported_endpoint", "component_target": "block_boundary"}

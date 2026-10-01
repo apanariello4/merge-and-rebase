@@ -406,8 +406,7 @@ def test_fit_direct_residual_gradient_mode_end_to_end_finite(direction, device):
 
 
 # --------------------------------------------------------------------------
-# (g) Parser: default is "activation"; invalid values rejected; incompatible
-#     with component_target="output_local".
+# (g) Parser: default is "activation"; invalid values rejected.
 # --------------------------------------------------------------------------
 
 
@@ -426,13 +425,6 @@ def test_parser_accepts_gradient():
 def test_parser_rejects_invalid_procrustes_source():
     with pytest.raises(ValueError):
         parse_direct_residual_config({"procrustes_source": "bogus"})
-
-
-def test_parser_rejects_gradient_with_output_local():
-    with pytest.raises(ValueError):
-        parse_direct_residual_config(
-            {"procrustes_source": "gradient", "component_target": "output_local", "components": ["mlp.c_proj"]}
-        )
 
 
 def test_parser_allows_gradient_with_backfit_and_joint():

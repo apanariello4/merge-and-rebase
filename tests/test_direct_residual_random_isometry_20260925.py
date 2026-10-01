@@ -51,13 +51,6 @@ def test_config_random_isometry_rejected_with_gradient_procrustes():
         parse_direct_residual_config({"alignment_map": "random_isometry", "procrustes_source": "gradient"})
 
 
-def test_config_random_isometry_rejected_with_non_block_boundary_target():
-    with pytest.raises(ValueError):
-        parse_direct_residual_config(
-            {"alignment_map": "random_isometry", "component_target": "output_local", "components": ["mlp.c_fc"]}
-        )
-
-
 def test_config_random_isometry_rejected_with_endpoint_target():
     with pytest.raises(ValueError):
         parse_direct_residual_config({"alignment_map": "random_isometry", "residual_target": "transported_endpoint"})

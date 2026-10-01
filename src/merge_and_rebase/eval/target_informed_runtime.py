@@ -326,13 +326,12 @@ def _component_weight_bias(shim, block, component):
 
 
 def _assert_layerscale_identity(
-    shim, block, *, context, requirement="component_target='output_local'/'output_total'"
+    shim, block, *, context, requirement="block_split='joint'"
 ):
-    """Refuse a nontrivial LayerScale under output-target modes (and, via
-    ``requirement``, under ``block_split='joint'``, which shares the same
-    ``t_out=I`` assumption -- see ``_fit_block_boundary_joint``).
+    """Refuse a nontrivial LayerScale under ``block_split='joint'`` (see
+    ``_fit_block_boundary_joint``).
 
-    Output-target fits solve with ``t_out = I``: any nonidentity ``ls_1``/
+    The joint fit solves with ``t_out = I``: any nonidentity ``ls_1``/
     ``ls_2`` would silently drop a scale the block actually applies, so the
     target write surface would no longer be unambiguous.
     """
@@ -823,87 +822,6 @@ def _capture_residual_references(
             }
         )
     return result
-
-
-def capture_source_component_references(
-    source_base,
-    source_ft,
-    source_batches,
-    source_indices,
-    components,
-    device,
-    *,
-    family_adapter=None,
-    capture_ft_inputs=False,
-):
-    """Capture source-base component input banks and both endpoints' weight
-    slices, for the ``component_target='output_local'``/``'output_total'`` fit.
-
-    Shared by any caller that needs component-specific (rather than block-
-    boundary) targets -- currently Direct Residual
-    (``direct_residual.capture_paired_boundary_activations``) -- so it lives
-    here alongside the capture-kind machinery it depends on
-    (``COMPONENT_INPUT_KIND``, ``_component_weight_bias``) rather than being
-    duplicated at each call site. ARIADNE's own ``_capture_residual_references``
-    does not call this: Proposal 1 only ever fits ``component_target=
-    'block_boundary'``.
-
-    The source **base** model's own inputs are always captured: the
-    ``output_local`` target is ``A(X^s0, W) - A(X^s0, W0)``, which never
-    evaluates either model on a fine-tuned input, and ``output_local``'s
-    Procrustes alignment (``A^{s0}`` vs the target's own ``A^{t0}``) is shared
-    unchanged by ``output_total``. ``source_batches`` must already be the
-    paired calibration source batches (e.g. from ``paired_calibration``);
-    this function runs no calibration pairing of its own.
-
-    ``capture_ft_inputs=True`` (``component_target='output_total'`` only)
-    additionally captures the source **fine-tuned** model's own component
-    inputs ``X^{s1}`` on the same ``source_batches`` -- needed because
-    ``output_total``'s target is ``A(X^{s1}, W^{ft}) - A(X^{s0}, W^{base})``,
-    which evaluates the fine-tuned endpoint on the fine-tuned model's own
-    (possibly upstream-drifted) input rather than reusing ``X^{s0}``. When
-    ``False`` (the default, ``output_local``'s case), no extra forward pass
-    runs and the third return value is ``{}``.
-
-    Returns ``(source_component_inputs, source_component_weights,
-    source_component_inputs_ft)``, all keyed by the entries of
-    ``source_indices``; ``source_component_inputs_ft`` is empty unless
-    ``capture_ft_inputs`` is set.
-    """
-    if family_adapter is not None:
-        raise NotImplementedError("component_target='output_local'/'output_total' is vision-only")
-    layout_shim = _layout_for(family_adapter)
-    needed_kinds = sorted({COMPONENT_INPUT_KIND[c] for c in components})
-    component_req = {f"{i}.{kind}": (i, kind) for i in source_indices for kind in needed_kinds}
-    component_base = capture_tokens(source_base, source_batches, component_req, device, family_adapter=family_adapter)
-    component_ft = None
-    if capture_ft_inputs:
-        component_ft = capture_tokens(source_ft, source_batches, component_req, device, family_adapter=family_adapter)
-    source_component_inputs, source_component_weights, source_component_inputs_ft = {}, {}, {}
-    for i in source_indices:
-        source_component_inputs[i] = {
-            kind: [t.clone() for t in component_base[f"{i}.{kind}"]] for kind in needed_kinds
-        }
-        if capture_ft_inputs:
-            source_component_inputs_ft[i] = {
-                kind: [t.clone() for t in component_ft[f"{i}.{kind}"]] for kind in needed_kinds
-            }
-        base_block = layout_shim.blocks(source_base)[i]
-        ft_block = layout_shim.blocks(source_ft)[i]
-        _assert_layerscale_identity(layout_shim, base_block, context=f"source base block {i}")
-        _assert_layerscale_identity(layout_shim, ft_block, context=f"source FT block {i}")
-        weights = {}
-        for component in components:
-            base_w, base_b, _slice = _component_weight_bias(layout_shim, base_block, component)
-            ft_w, ft_b, _slice2 = _component_weight_bias(layout_shim, ft_block, component)
-            weights[component] = {
-                "base_weight": base_w.detach().float().cpu().clone(),
-                "base_bias": None if base_b is None else base_b.detach().float().cpu().clone(),
-                "ft_weight": ft_w.detach().float().cpu().clone(),
-                "ft_bias": None if ft_b is None else ft_b.detach().float().cpu().clone(),
-            }
-        source_component_weights[i] = weights
-    return source_component_inputs, source_component_weights, source_component_inputs_ft
 
 
 def projection_transforms(prepared, layout, *, target_scope="inserted", family_adapter=None):
@@ -1415,9 +1333,8 @@ def _realization_diagnostic_fields(
     """Analysis-only per-component fit fields, gated on ``realization_
     diagnostics`` (never read by any fit -- see the callers). Shared by every
     block_boundary fit path (``_fit_all_positions_independent``,
-    ``_fit_block_boundary_backfit``) so the schema matches
-    ``_fit_component_outputs_from_contributions``'s own (output_local) fields
-    exactly: ``fit_relative_residual``, ``target_norm``, ``update_norm``,
+    ``_fit_block_boundary_backfit``) with the fields
+    ``fit_relative_residual``, ``target_norm``, ``update_norm``,
     ``relative_update_norm`` (denominator = the pre-correction weight slice),
     ``realized_target_norm_ratio``.
 
@@ -2615,302 +2532,6 @@ def _apply_bias_correction(config, current_state, bias_key, bias_correction, pos
     return False
 
 
-@torch.no_grad()
-def _fit_component_outputs_from_contributions(
-    target_model,
-    current_state: dict[str, torch.Tensor],
-    positions: list[int],
-    position_contributions: dict[int, list[tuple[int, float]]],
-    paired_source_index: dict[int, int],
-    source_component_inputs: dict[int, dict[str, list[torch.Tensor]]],
-    source_component_weights: dict[int, dict[str, dict[str, torch.Tensor | None]]],
-    batches: list,
-    components: tuple,
-    config,
-    device,
-    family_adapter=None,
-    source_component_inputs_ft: dict[int, dict[str, list[torch.Tensor]]] | None = None,
-) -> dict[int, tuple[dict, list]]:
-    """Fit every position's requested components against a per-component
-    target built from one or more weighted source contributions
-    (``config.component_target in {'output_local', 'output_total'}``).
-
-    Unlike ``_fit_all_positions_independent`` -- where every requested
-    component (``attn.out_proj`` and ``mlp.c_proj`` alike) is regressed onto
-    the SAME shared block-boundary target ``D_j`` -- each component ``c``
-    here gets its own target. For a residual-writing component (``attn.
-    out_proj``/``mlp.c_proj``), position ``j`` may draw on several source
-    blocks at once (``position_contributions[j] = [(i, w_i), ...]``, e.g. the
-    span-aware shrink rule); for an internal component (q/k/v/c_fc) it always
-    draws on exactly the paired source block ``paired_source_index[j]``, at
-    the same weight that block carries in ``position_contributions[j]``
-    (``1/m_i`` on extend/same_arch, ``1.0`` on shrink -- see the caller, e.g.
-    ``direct_residual.position_source_contributions``, for how these weights
-    are derived per direction). The
-    per-contribution term, for ``component_target='output_local'``, is
-
-        Delta_A_{i,c} = X^{s0}_i (W_c^{s1,i} - W_c^{s0,i})^T + (b_c^{s1,i} - b_c^{s0,i})
-                      = A_c(X^{s0}_i, W_c^{s1,i}) - A_c(X^{s0}_i, W_c^{s0,i}),
-
-    i.e. only source block ``i``'s own weight change ("output_local": no
-    upstream-induced input drift), evaluated on that block's own base input
-    ``X^{s0}_i`` for both endpoints.
-
-    For ``component_target='output_total'`` (``source_component_inputs_ft``
-    not ``None``), the fine-tuned endpoint is instead evaluated on the source
-    FT model's OWN captured input ``X^{s1}_i`` (which may differ from
-    ``X^{s0}_i`` once any upstream block's weights have changed), so the term
-    becomes
-
-        Delta_A_{i,c} = A_c(X^{s1}_i, W_c^{s1,i}) - A_c(X^{s0}_i, W_c^{s0,i}),
-
-    i.e. component ``c``'s full realized output change, upstream drift
-    included. The alignment map ``Q_{j,i,c}`` (below) is unchanged between
-    the two modes: it is always fit from the BASE-input raw output
-    ``A_c^{s0}_i = X^{s0}_i (W_c^{s0,i})^T + b_c^{s0,i}``, never the FT one.
-    ``Q_{j,i,c}`` is that term's own centered
-    rectangular Procrustes map, fitted from source block ``i``'s raw
-    component output ``A_c^{s0}_i = X^{s0}_i (W_c^{s0,i})^T + b_c^{s0,i}`` onto
-    the target's own pristine raw component output ``A_c^{t0}_j = H (W_c^{t,0,j})^T
-    + b_c^{t,0,j}``, where ``H`` is the target's own captured component input
-    at position ``j``. The position's target is the weighted sum of every
-    contribution's aligned term:
-
-        D_{j,c} = sum_i w_i * aligned(Delta_A_{i,c}) Q_{j,i,c}.
-
-    The regression then solves ``(H, D_{j,c})`` through the same
-    ``ResidualSufficientStatistics`` machinery as every other direct-target
-    fit, with ``t_in=None`` (no input transport) and ``t_out=I`` (LayerScale
-    is asserted Identity by the caller, via ``_assert_layerscale_identity``,
-    so there is nothing else to fold into the output map).
-
-    This function never mounts a correction: the target model is captured
-    once per position, at the pristine base, and that pristineness is
-    asserted against ``current_state`` rather than assumed. Because nothing
-    is ever mounted, ``q``/``k``/``v`` corrections at the same position are
-    independent regressions that happen to write disjoint row slices of the
-    same packed ``in_proj_weight``/``in_proj_bias`` parameter; each is
-    accumulated into a per-position zero tensor so untouched slices stay
-    exactly zero.
-
-    Returns ``{position: (position_corrections, block_rows)}``, the same
-    contract as ``_fit_all_positions_independent``.
-    """
-    if family_adapter is not None:
-        raise NotImplementedError("component_target='output_local' is vision-only")
-    shim = _layout_for(family_adapter)
-    residual_writers = set(COMPONENT_FORWARD_ORDER)
-    diagnose = bool(getattr(config, "realization_diagnostics", False))
-
-    results: dict[int, tuple[dict, list]] = {}
-    for pos in positions:
-        target_block = shim.blocks(target_model)[pos]
-        _assert_layerscale_identity(shim, target_block, context=f"target block {pos}")
-
-        needed_kinds = sorted({COMPONENT_INPUT_KIND[c] for c in components})
-        captured = capture_tokens(
-            target_model,
-            batches,
-            {kind: (pos, kind) for kind in needed_kinds},
-            device,
-            family_adapter=family_adapter,
-        )
-
-        position_corrections: dict[str, torch.Tensor] = {}
-        block_rows: list[dict[str, Any]] = []
-        for component in components:
-            key = shim.component_key(pos, component, prefixed=True)
-            input_kind = COMPONENT_INPUT_KIND[component]
-            h_batches = captured[input_kind]
-            if component in residual_writers:
-                contributions = position_contributions[pos]
-            else:
-                # Internal components (q/k/v/c_fc) use the paired source block
-                # only, but at the SAME weight that block carries in the
-                # residual-writer contribution list for this position
-                # (1/m_i on extend/same_arch, 1.0 on shrink) -- not a
-                # hardcoded 1.0, which would be wrong under extend, where a
-                # source block realized as m_i > 1 target positions must have
-                # its local effect split across them.
-                paired = paired_source_index[pos]
-                weight = next((w for i, w in position_contributions[pos] if i == paired), None)
-                if weight is None:
-                    raise ValueError(
-                        f"Paired source index {paired} is not among position {pos}'s contributions "
-                        f"({position_contributions[pos]!r}); internal components only ever use the "
-                        "paired block, so it must appear there"
-                    )
-                contributions = [(paired, weight)]
-            if not contributions:
-                raise ValueError(f"No source contributions for position {pos}, component {component!r}")
-
-            target_w, target_b, row_slice = _component_weight_bias(shim, target_block, component)
-            # Live module parameters may be on any device (e.g. CUDA, if the
-            # caller keeps the target model resident there); every captured
-            # bank (h_batches, source component inputs/weights) is forced to
-            # CPU float32 by capture_tokens/capture_source_component_references.
-            # Force these to match before any F.linear/comparison against them.
-            target_w = target_w.detach().cpu().float()
-            target_b = None if target_b is None else target_b.detach().cpu().float()
-            expected = current_state[key]
-            if row_slice is not None:
-                expected = expected[row_slice]
-            if not torch.equal(target_w.detach().cpu().float(), expected.detach().cpu().float()):
-                raise RuntimeError(
-                    f"component_target='output_local' fit started from a target model that is "
-                    f"not the native base at position {pos}, component {component!r}"
-                )
-            a_t0_batches = [F.linear(h, target_w, target_b) for h in h_batches]
-
-            d_batches = [torch.zeros_like(a) for a in a_t0_batches]
-            procrustes_ranks = []
-            for source_idx, weight in contributions:
-                if source_idx not in source_component_inputs or source_idx not in source_component_weights:
-                    raise ValueError(f"Missing captured component references for source block {source_idx}")
-                source_x_batches = source_component_inputs[source_idx][input_kind]
-                weights = source_component_weights[source_idx][component]
-                base_w, base_b = weights["base_weight"], weights["base_bias"]
-                ft_w, ft_b = weights["ft_weight"], weights["ft_bias"]
-                a0_batches = [F.linear(x, base_w, base_b) for x in source_x_batches]
-                if source_component_inputs_ft is not None:
-                    # output_total: evaluate the FT endpoint on the source FT
-                    # model's OWN captured input X^{s1}_i, not X^{s0}_i -- the
-                    # only way this term differs from output_local's.
-                    if source_idx not in source_component_inputs_ft:
-                        raise ValueError(f"Missing captured FT component references for source block {source_idx}")
-                    source_x_ft_batches = source_component_inputs_ft[source_idx][input_kind]
-                    ft_a_batches = [F.linear(x, ft_w, ft_b) for x in source_x_ft_batches]
-                    delta_batches = [
-                        ft_a - F.linear(x, base_w, base_b)
-                        for ft_a, x in zip(ft_a_batches, source_x_batches, strict=True)
-                    ]
-                else:
-                    delta_batches = [
-                        F.linear(x, ft_w, ft_b) - F.linear(x, base_w, base_b) for x in source_x_batches
-                    ]
-                aligned_a0 = _aligned(a0_batches, h_batches)
-                aligned_delta = _aligned(delta_batches, h_batches)
-                q, _mu_s, _mu_t = centered_rectangular_procrustes(
-                    _rows(aligned_a0).double(), _rows(a_t0_batches).double()
-                )
-                q = q.float()
-                procrustes_ranks.append(int(torch.linalg.matrix_rank(q.double()).item()))
-                for idx, delta in enumerate(aligned_delta):
-                    d_batches[idx] = d_batches[idx] + float(weight) * (delta @ q)
-
-            d_out = int(target_w.shape[0])
-            identity_out = torch.eye(d_out, dtype=torch.float32)
-            stats = ResidualSufficientStatistics(device=device)
-            desired_sq = 0.0
-            for h, d in zip(h_batches, d_batches, strict=True):
-                desired_sq += float((d.double() ** 2).sum().item())
-                stats.update(h.reshape(-1, h.shape[-1]), d.reshape(-1, d.shape[-1]), None, identity_out)
-            correction, diag = stats.solve(
-                ridge_relative=config.ridge_relative,
-                ridge_estimator=config.ridge_estimator,
-                exact_form=config.exact_form,
-            )
-            correction = correction.cpu()
-            diag["bias_correction"] = diag["bias_correction"].cpu()
-            if correction.shape != target_w.shape or not torch.isfinite(correction).all():
-                raise RuntimeError("output_local component fit produced an invalid projection")
-
-            if row_slice is not None:
-                if key not in position_corrections:
-                    position_corrections[key] = torch.zeros_like(current_state[key])
-                position_corrections[key][row_slice] = correction
-            else:
-                position_corrections[key] = correction
-
-            # Packed q/k/v share ``attn.in_proj_weight`` / ``attn.in_proj_bias``
-            # (no dot before "weight"/"bias"), unlike a standalone projection's
-            # ``<module>.weight`` / ``<module>.bias``.
-            if key.endswith("in_proj_weight"):
-                bias_key = key[: -len("in_proj_weight")] + "in_proj_bias"
-            else:
-                bias_key = f"{key[: -len('.weight')]}.bias"
-            bias_correction = diag["bias_correction"]
-            skip_bias = False
-            if bias_key not in current_state:
-                if config.missing_bias == "materialize":
-                    raise RuntimeError(
-                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
-                        "before residual completion runs; call "
-                        "materialize_missing_projection_biases() on the target model and its "
-                        "base state dict first"
-                    )
-                elif config.missing_bias == "skip":
-                    if torch.count_nonzero(bias_correction):
-                        raise RuntimeError(
-                            "missing_bias='skip' would discard a nonzero intercept at "
-                            f"{bias_key}; the weight was fitted on centered banks and is "
-                            "not valid without it"
-                        )
-                    skip_bias = True
-                else:
-                    raise RuntimeError(
-                        f"Target model is missing the expected bias parameter {bias_key}. "
-                        "Set target_residual_completion.missing_bias to 'materialize' (exact, "
-                        "adds the parameter) or 'skip' with exact_form=false."
-                    )
-            if not skip_bias:
-                bias_delta = bias_correction.to(current_state[bias_key])
-                if row_slice is not None:
-                    if bias_key not in position_corrections:
-                        position_corrections[bias_key] = torch.zeros_like(current_state[bias_key])
-                    if (
-                        bias_delta.shape != current_state[bias_key][row_slice].shape
-                        or not torch.isfinite(bias_delta).all()
-                    ):
-                        raise RuntimeError("output_local component fit produced an invalid bias")
-                    position_corrections[bias_key][row_slice] = bias_delta
-                else:
-                    if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
-                        raise RuntimeError("output_local component fit produced an invalid bias")
-                    position_corrections[bias_key] = bias_delta
-
-            desired_norm = desired_sq**0.5
-            block_row: dict[str, Any] = {
-                "mode": "direct_target",
-                "component": component,
-                "component_target": config.component_target,
-                "position": pos,
-                "source_coordinate": float(paired_source_index[pos]),
-                "source_contributions": [(int(i), float(w)) for i, w in contributions],
-                "procrustes_ranks": procrustes_ranks,
-                "desired_norm": desired_norm,
-                "effect_before_norm": 0.0,
-                "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
-                "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
-                **diag,
-            }
-            if diagnose:
-                update_norm = float(torch.linalg.norm(correction).item())
-                weight_norm = float(torch.linalg.norm(target_w.detach().cpu().float()).item())
-                # realized_target_norm_ratio compares the fitted prediction's own
-                # norm (not its residual against D) to the target norm: an exact
-                # readout of the accumulated fit, one extra pass over the
-                # already-resident h_batches/bias (no new capture sweep).
-                bias_for_pred = bias_correction if not skip_bias else torch.zeros(d_out)
-                pred_sq = sum(
-                    float(((h.double() @ correction.double().T + bias_for_pred.double()) ** 2).sum().item())
-                    for h in h_batches
-                )
-                block_row.update(
-                    {
-                        "fit_relative_residual": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                        "target_norm": desired_norm,
-                        "update_norm": update_norm,
-                        "relative_update_norm": update_norm / (weight_norm + 1e-12),
-                        "realized_target_norm_ratio": (pred_sq**0.5) / (desired_norm + 1e-12),
-                    }
-                )
-            block_rows.append(block_row)
-        results[pos] = (position_corrections, block_rows)
-    return results
-
-
 def _task_vector_sha256(sd: Mapping[str, torch.Tensor]) -> str:
     """Stable CPU hash of a task-vector-shaped tensor mapping.
 
@@ -2958,7 +2579,7 @@ def compute_direct_residual_task_vector_stats(
     component)`` pair actually present in ``target_corrections`` -- rather
     than per physical tensor -- so a packed ``in_proj_weight``/``in_proj_bias``
     correction that only ever wrote one q/k/v row-third (e.g. a
-    ``component_target='output_local'`` run requesting only ``attn.v_proj``)
+    run requesting only ``attn.v_proj``)
     is counted as ``d * d_in (+ d for bias)``, not ``3x`` that. Two distinct
     components can never double-count the same rows: each packed component
     owns a disjoint row slice by construction (``_PACKED_QKV_SLICE``).
@@ -3094,10 +2715,9 @@ def measure_direct_residual_realization(
     otherwise), this mounts ``target_base_state + tau_variant``, captures the
     block-boundary output at every position in ``positions`` over ``batches``,
     and compares ``delta_j = T_j^variant - T_j^0`` against ``D_j`` (block-
-    boundary desired effect; the same one every ``component_target`` fits
-    against internally via ``compute_desired_effects``, always available
-    regardless of ``component_target='block_boundary'`` vs ``'output_local'``
-    since it only depends on the always-captured boundary banks).
+    boundary desired effect; the same one the fit targets via
+    ``compute_desired_effects``, which only depends on the always-captured
+    boundary banks).
 
     Per position ``j`` this returns:
       * ``block_realized_target_error``: ``||delta_j^joint - D_j||_F /
