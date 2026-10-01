@@ -393,3 +393,51 @@ cases use odd 2->3 extension or a 3->2 shrink, target-informed protocols need th
 9. **Weights**: `weights` of the wrong length fails with a bare `zip(strict=True)` message in merge_mode `none` (after all transports were computed) but with "weights length must match tuned checkpoints" in the merge modes; there is no up-front validation.
 10. **Exception types**: an unknown `merge_method` is a `KeyError` (from the registry), not a `ValueError`.
 11. **Global RNG coupling**: `main()` seeds torch/numpy/random from `seed` once and the later stages draw from the global streams (e.g. every `iter(DataLoader)` consumes a base seed even with `shuffle=False`), so reordering loader construction or iteration can change downstream bits; this is what the P5.2 "call order and seeds" risk refers to, and these pins would catch it. No nondeterminism was observed: all cases are bit-identical across runs, processes and test orders.
+
+## BRACE extra coverage (P6.0)
+
+File: `tests/golden/test_brace_extra_golden.py` (173 tests, ~60 s on one CPU thread). Generating commit: HEAD
+`35f441e` with `eval/block_extension.py` and `eval/block_extension_llm.py` byte-identical to `c221d32` (last touched in
+`af5d144`). Same platform caveat as above (CPU, 1 thread, deterministic algorithms, this torch build). Every hashed case
+runs twice in-process and must agree before the hash is compared; `random` insertion order is seeded with
+`np.random.seed(20261001)` before each run, and the whole file was also verified bit-stable across two separate processes.
+Every option set goes through `resolve_block_extension_config`, so invalid combinations are rejected exactly as in a run.
+
+Parts hashed per case: `base_state`, `ft_state`, `task_vector` (ft - base), `layout` (`hash_json`); diagnostic-collector
+cases add `diag` (hash_json of every `record_map` call incl. W and b tensors). Key formats: `brace_x_vision:<case>:<part>`,
+`brace_x_decoder:<case>:<direction>:<part>` (extend = 2->4 or 4->6, shrink = 4->2 or 6->4). The hashes themselves live in
+`EXPECTED` in the test file (not duplicated here).
+
+| Group | Cases | Baseline (one factor changed) |
+|---|---|---|
+| Vision extend 3->5 | `ext_steer`, `ext_eager`, `ext_dup_eager`, `ext_share_ft_refs`, `ext_dampening`, `ext_dup_dampening`, `ext_skip_correction`, `ext_identity`, `ext_identity_inert`, `ext_scope_interleaved_once`, `ext_scope_iterative_all`, `ext_target_residual`, `ext_cascade_iters2`, `ext_component_ridge`, `ext_ridge_weight`, `ext_skip_final_ln`, `ext_order_{top_bottom,random}`, `ext_density_{spread_mod,clump}`, `ext_target_shared_correction` (shared, target backbone width 10 / depth 5, weight 0.5) | `extend_interpolate_independent` (ridge_identity 1.0) |
+| Vision extend 4->6 | `ext4_{spread,order_top_bottom,order_random,density_spread_mod,density_clump}` | `ext4_spread` |
+| Vision shrink 3->2 | `shr_{steer,eager,share_ft_refs,dampening,dup,skip_correction,cascade_iters2,component_ridge,ridge_weight,skip_final_ln}`; `shr_diag_{independent,steer,shared,shared_ft}` also pin the collector output (`diag`) | `shrink_interpolate_independent` |
+| Vision shrink 6->4 / 4->2 | `shr6_{spread,order_top_bottom,order_random,density_spread_mod,density_clump,clump_top_bottom,clump_random,disjoint,disjoint_top_bottom,disjoint_steer}`, `shr4_disjoint` (`collapse_schedule=disjoint_spans`) | `shr6_spread` |
+| Decoder (tiny Qwen2) extend/shrink | `dup`, `dup_shared`, `steer`, `steer_ridge1`, `shared_ft`, `skip_correction`, `dampening`, `dup_dampening`, `cascade_iters2`, `component_ridge`, `ridge_identity`, `share_ft_refs`, `order_{top_bottom,random}`, `density_{spread_mod,clump}` | pinned `brace_decoder_independent` |
+| Decoder deep (4->6 / 6->4) | `deep_{spread,order_top_bottom,order_random,density_spread_mod,density_clump,clump_top_bottom,clump_random}` | `deep_spread` |
+| Equivalences asserted in-process | decoder ignores `ridge_weight`, `collapse_schedule`, `reference_capture`, `insertion_target_mode`, `skip_final_ln`, `correction_scope`, `inserted_block_mode`, `target_shared_correction` (all hash-identical to baseline); decoder `duplicate` shrink == interpolate shrink; vision eager == lazy (extend and shrink); collector attached/not attached gives equal states | - |
+| Plain-data tables (no hashes) | `TABLES` in the test file: `_build_duplication_schedule`, `_build_collapse_schedule`, realized collapse spans, `_locate_collapse_pos` for BOTH classes; `spread_anchor_schedule`, `balanced_collapse_spans`, `disjoint_collapse_schedule`, `plan_inserted_positions`, `build_extension_layout`, `build_reduction_layout` | - |
+| Validation | `resolve_block_extension_config` rejection messages, vision shrink rejections (`inserted_block_mode`, `correction_scope`, `target_shared_correction`, bad `collapse_schedule`, `random` + `disjoint_spans`), run-time order/density/lmc/strategy errors for both classes, schedule error messages | - |
+
+Observed behaviour pinned as-is (nothing fixed in `src/`):
+
+1. `_build_collapse_schedule(..., "spread_mod")` diverges: vision spreads anchors with `np.linspace` (6 -> 4: `[0, 4]`, top-bottom `[4, 0]`), the decoder reuses `i % (curr - 1)` and ignores `insertion_order` (always `[0, 1]`).
+2. `_locate_collapse_pos` diverges: vision clamps to `len(chain) - 2`, the decoder returns `len(chain) - 1`, so `clump` + `top-bottom` shrink (same anchor repeated) completes in vision and raises `IndexError` in the decoder (`deep_clump_top_bottom:shrink` is pinned as a crash).
+3. Decoder `_shrink_per_weight` ignores `per_weight_mode`: `duplicate_per_weight` shrink is bit-identical to `interpolate_per_weight` shrink (vision honours it).
+4. The decoder silently ignores every vision-only field listed under "Equivalences"; `ridge_weight` is never plumbed (always 1e-6). `steer` is a no-op unless `ridge_identity > 0` in both classes (decoder default 0.0, hence `steer` == `independent` and the extra `steer_ridge1` pin).
+5. Vision `skip_final_ln` is accepted and unused (hash-identical to baseline); the decoder only references it in an unreachable interpolate path.
+6. The diagnostic collector receives nothing on the extension path (`_diagnostic_context` is only set by `_shrink_per_weight`); pinned as "records == []" in every lmc mode.
+7. `spread_mod` duplication with `curr_layers == 1` raises `ZeroDivisionError` in both classes.
+8. Vision eager and lazy reference capture are bit-identical on these fixtures.
+
+Regeneration recipe (only after establishing that a change is intended and documented):
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+rm -f /tmp/brace_x.txt
+GOLDEN_CAPTURE=/tmp/brace_x.txt .venv/bin/python -m pytest tests/golden/test_brace_extra_golden.py -q   # appends "name hash" lines, skips the hash asserts
+.venv/bin/python -m tests.golden.test_brace_extra_golden                                                  # prints the TABLES literal
+# paste both into the EXPECTED / TABLES literals at the bottom of the test file, then
+.venv/bin/ruff check --fix tests/golden/test_brace_extra_golden.py && .venv/bin/ruff format tests/golden/test_brace_extra_golden.py
+```
