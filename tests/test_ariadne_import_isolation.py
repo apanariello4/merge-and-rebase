@@ -9,7 +9,7 @@ import sys
 import pytest
 
 _SUBMODULES = (
-    "method",
+    "biases",
     "config",
     "layouts",
     "capture",
@@ -34,6 +34,6 @@ def test_ariadne_package_imports_nothing_from_eval():
 @pytest.mark.parametrize("submodule", _SUBMODULES)
 def test_ariadne_submodule_imports_first_in_fresh_process(submodule):
     """Import-cycle check: every stage module must be importable as the first import of a process."""
-    code = f"import merge_and_rebase.rebase.methods.ariadne.{submodule}"
+    code = f"import merge_and_rebase.rebase.methods._ariadne.{submodule}"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
