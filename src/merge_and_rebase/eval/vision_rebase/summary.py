@@ -6,10 +6,11 @@ dictionary from it (key order is part of the output contract).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...rebase.block_extension.config import block_extension_protocol
+from ...rebase.methods._ariadne.config import direct_residual_config_dict
 from ...rebase.registry import canonical_method_name
 
 
@@ -312,7 +313,7 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         "correction_fit_timings": record.correction_fit_timings,
         "direct_residual": (
             {
-                "config": asdict(record.direct_residual_cfg),
+                "config": direct_residual_config_dict(record.direct_residual_cfg),
                 # Canonical registry name ("direct_residual" is an alias of "ariadne");
                 # the top-level "method" keeps whatever spelling the config used.
                 "canonical_method": canonical_method_name(record.method_name),

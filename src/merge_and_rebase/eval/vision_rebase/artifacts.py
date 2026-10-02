@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from ...rebase.methods._ariadne.config import direct_residual_config_dict
 from ...rebase.methods._ariadne.fit import _task_vector_sha256
 from ...rebase.registry import canonical_method_name
 from ..utils import to_cpu_fp32
@@ -46,7 +47,7 @@ def _load_saved_sequential_tv(directory, task, target_base_sd, config):
         "target_base_sha256": _state_dict_sha256(target_base_sd),
         "calibration_seed": config.seed,
         "num_batches": config.num_batches,
-        "direct_residual_config": json.loads(json.dumps(asdict(config))),
+        "direct_residual_config": json.loads(json.dumps(direct_residual_config_dict(config))),
     }
     for key, value in expected.items():
         if meta.get(key) != value:
@@ -197,7 +198,7 @@ def save_transported_task_vector(
             "vector_sha256": _state_dict_sha256(delta),
             "calibration_seed": sequential_cfg.seed,
             "num_batches": sequential_cfg.num_batches,
-            "direct_residual_config": asdict(sequential_cfg),
+            "direct_residual_config": direct_residual_config_dict(sequential_cfg),
         }
         Path(meta_path).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     print(f"  {name}: saved {'merged ' if merged else ''}transported TV -> {native_path}")

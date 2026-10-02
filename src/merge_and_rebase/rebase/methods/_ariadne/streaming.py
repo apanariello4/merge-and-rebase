@@ -459,13 +459,18 @@ def fit_direct_residual_streaming(
                         fp_sumsq = float((out64**2).sum().item())
                         exp_sum, exp_sumsq = fingerprints[(k, pos)]
                         scale = math.sqrt(exp_sumsq) if exp_sumsq > 0 else 1.0
-                        sumsq_ok = math.isclose(fp_sumsq, exp_sumsq, rel_tol=1e-9, abs_tol=1e-9)
-                        sum_ok = abs(fp_sum - exp_sum) <= 1e-9 * max(scale, 1.0)
+                        tol = float(config.streaming_fingerprint_tol)
+                        sumsq_ok = math.isclose(fp_sumsq, exp_sumsq, rel_tol=tol, abs_tol=tol)
+                        sum_ok = abs(fp_sum - exp_sum) <= tol * max(scale, 1.0)
                         if not (sumsq_ok and sum_ok):
+                            drift_sumsq = abs(fp_sumsq - exp_sumsq) / max(abs(exp_sumsq), 1e-300)
+                            drift_sum = abs(fp_sum - exp_sum) / max(scale, 1.0)
                             raise RuntimeError(
                                 "Direct completion started from a target model that is not the "
                                 f"native base: target boundary fingerprint mismatch between "
-                                f"pass A and pass B at position {pos} (batch {k})"
+                                f"pass A and pass B at position {pos} (batch {k}); relative drift "
+                                f"sumsq={drift_sumsq:.3e}, sum={drift_sum:.3e} vs "
+                                f"streaming_fingerprint_tol={tol:.3e}"
                             )
                         # Align on CPU, as the resident path does on its CPU banks, so D_j stays bit-comparable.
                         out_cpu = out.cpu()

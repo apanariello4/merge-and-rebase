@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 #: Residual-writing projections, in the order a block executes them.
@@ -115,6 +115,23 @@ class DirectResidualConfig:
     # measuring, per position, how well the unit-strength task vector reproduces D_j on unseen images.
     fidelity_holdout: bool = False
     fidelity_holdout_batches: int = 10
+    # Streaming only: relative tolerance of the pass-A/pass-B target boundary fingerprint check (detects a target
+    # model mutated between passes). 1e-9 = historical; loosen only if non-deterministic kernels trip it.
+    streaming_fingerprint_tol: float = 1e-9
+
+
+# Fields added after results were published: serialized only when non-default, so every historical summary,
+# artifact and golden hash of a default run stays byte-identical.
+_SERIALIZED_WHEN_NON_DEFAULT = {"streaming_fingerprint_tol": 1e-9}
+
+
+def direct_residual_config_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
+    """`asdict(cfg)` minus `_SERIALIZED_WHEN_NON_DEFAULT` fields still at their default."""
+    out = asdict(cfg)
+    for name, default in _SERIALIZED_WHEN_NON_DEFAULT.items():
+        if out.get(name) == default:
+            del out[name]
+    return out
 
 
 # Named bundles of config fields, selected with the optional ``"preset"`` key of the
@@ -184,6 +201,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "alignment_seed",
         "fidelity_holdout",
         "fidelity_holdout_batches",
+        "streaming_fingerprint_tol",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -372,4 +390,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("fidelity_holdout_batches must be a positive integer")
     if cfg.fidelity_holdout_batches <= 0:
         raise ValueError("fidelity_holdout_batches must be a positive integer")
+    tol = cfg.streaming_fingerprint_tol
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
+        raise ValueError("streaming_fingerprint_tol must be a positive finite number")
     return cfg
