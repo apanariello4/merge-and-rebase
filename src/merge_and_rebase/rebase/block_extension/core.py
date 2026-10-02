@@ -18,11 +18,13 @@ import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from functools import partial
+from itertools import islice
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 try:
     from tqdm.auto import tqdm
@@ -40,6 +42,36 @@ def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) 
     if not enabled or tqdm is None:
         return iterable
     return tqdm(iterable, total=total, desc=desc, leave=False)
+
+
+def _deterministic_calibration_loader(loader, n_batches: int):
+    """Freeze a randomized DataLoader for the extender's repeated passes.
+
+    Correction/reference fitting makes several passes over the same calibration examples. A RandomSampler
+    would produce different rows on each pass and pair unrelated activations. Preserve the sampler's first
+    calibration window, then replay it sequentially.
+    """
+
+    if not isinstance(loader, DataLoader) or loader.batch_size is None:
+        return loader
+    if isinstance(loader.sampler, SequentialSampler):
+        return loader
+
+    n_items = max(0, int(n_batches)) * int(loader.batch_size)
+    indices = list(islice(iter(loader.sampler), n_items))
+    frozen_dataset = Subset(loader.dataset, indices)
+    return DataLoader(
+        frozen_dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        collate_fn=loader.collate_fn,
+        pin_memory=loader.pin_memory,
+        drop_last=loader.drop_last,
+        timeout=loader.timeout,
+        worker_init_fn=loader.worker_init_fn,
+        persistent_workers=bool(getattr(loader, "persistent_workers", False) and loader.num_workers > 0),
+    )
 
 
 class EagerProvider:
@@ -208,6 +240,16 @@ class BlockExtenderCore:
             self._record_correction(endpoint, component, W, b)
 
     # ---- per-family block operations (delegated to the adapter) --------------------------------------------------
+
+    @torch.no_grad()
+    def _capture_single_input(self, model: nn.Module, target: int | str, loader: Iterable[Any], n_batches: int):
+        return self.adapter.capture_block_input(model, target, loader, n_batches, self.device)
+
+    @torch.no_grad()
+    def _capture_component_output(
+        self, model: nn.Module, block_idx: int, component: str, loader: Iterable[Any], n_batches: int
+    ):
+        return self.adapter.capture_component_output(model, block_idx, component, loader, n_batches, self.device)
 
     @torch.no_grad()
     def _interpolate_block_weights(self, target_block: nn.Module, source_block: nn.Module, alpha: float = 0.5):

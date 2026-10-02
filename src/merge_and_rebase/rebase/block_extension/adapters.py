@@ -5,11 +5,11 @@ HF decoder families: where the blocks live, which components are corrected and i
 order, how a component's output is captured, how a fitted ``(W, b)`` correction is applied
 to a block, and which collapse-schedule policy the family uses.
 
-Every operation is a verbatim lift of the corresponding ``BlockExtender`` /
+Every operation is a verbatim lift of the original ``BlockExtender`` /
 ``DecoderBlockExtender`` method, including the known vision/decoder divergences (see
-``CollapseSchedulePolicy`` and ``dampen_block_output``). The adapters are not yet used by
-the extenders; ``tests/test_block_extension_adapters.py`` pins them tensor-for-tensor
-against the original methods.
+``CollapseSchedulePolicy`` and ``dampen_block_output``). The extenders delegate to the
+adapter, so there is a single copy of each operation; the pre-refactor behaviour is pinned
+by the golden hashes and ``tests/test_block_extension_adapters.py``.
 """
 
 from __future__ import annotations
@@ -87,6 +87,16 @@ class ComponentAdapter(Protocol):
 
     def inner_block(self, block: nn.Module) -> nn.Module: ...
 
+    def capture_component_output(
+        self,
+        model: nn.Module,
+        block_idx: int,
+        component: str,
+        loader: Iterable[Any],
+        n_batches: int,
+        device: str | torch.device,
+    ) -> torch.Tensor: ...
+
     def capture_component(
         self,
         model: nn.Module,
@@ -117,6 +127,23 @@ class ComponentAdapter(Protocol):
     def collapse_policy(self) -> CollapseSchedulePolicy: ...
 
     def build_layout(self, chain: Sequence[Mapping[str, Any]], *, reduction: bool = False) -> dict[str, Any]: ...
+
+
+def _run_decoder_forward(model: nn.Module, batch: Mapping[str, Any], device: str | torch.device) -> None:
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+    with torch.no_grad():
+        model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=False)
+
+
+def _get_layers(model: nn.Module, family_adapter: Any) -> nn.ModuleList:
+    return family_adapter.transport_scope(model).layers
+
+
+def _get_final_norm(model: nn.Module, family_adapter: Any) -> nn.Module:
+    return family_adapter.transport_scope(model).norm
 
 
 class _InProjCapture:
@@ -215,10 +242,13 @@ class VisionAdapter:
             return torch.empty(0)
         return torch.cat(buffers, dim=0).flatten(0, 1)
 
-    @torch.no_grad()
     def capture_component(self, model, block_idx, spec, loader, n_batches, device):
         # ``out_proj`` is corrected against the attention module's output (ref key ``attn_output``).
         component = "attn" if spec.name == "out_proj" else spec.name
+        return self.capture_component_output(model, block_idx, component, loader, n_batches, device)
+
+    @torch.no_grad()
+    def capture_component_output(self, model, block_idx, component, loader, n_batches, device):
         model.eval()
         buffers: list[torch.Tensor] = []
         block = model.visual.transformer.resblocks[block_idx]
@@ -364,10 +394,10 @@ class DecoderAdapter:
         self.family_adapter = family_adapter
 
     def layers(self, model: nn.Module) -> nn.ModuleList:
-        return self.family_adapter.transport_scope(model).layers
+        return _get_layers(model, self.family_adapter)
 
     def final_norm(self, model: nn.Module) -> nn.Module:
-        return self.family_adapter.transport_scope(model).norm
+        return _get_final_norm(model, self.family_adapter)
 
     def set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
         # Depth/config/KV-cache reindexing stays with ``DecoderBlockExtender`` (_set_depth, _reindex_layers).
@@ -378,13 +408,7 @@ class DecoderAdapter:
         return block
 
     def _forward(self, model: nn.Module, batch: Any, device: str | torch.device) -> None:
-        inputs = self.family_adapter.extract_calibration_batch(batch)
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        with torch.no_grad():
-            model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=False)
+        _run_decoder_forward(model, self.family_adapter.extract_calibration_batch(batch), device)
 
     @torch.no_grad()
     def capture_block_input(self, model, target, loader, n_batches, device):
@@ -413,9 +437,11 @@ class DecoderAdapter:
             return torch.empty(0)
         return torch.cat(buffers, dim=0).flatten(0, 1)
 
-    @torch.no_grad()
     def capture_component(self, model, block_idx, spec, loader, n_batches, device):
-        component = spec.name
+        return self.capture_component_output(model, block_idx, spec.name, loader, n_batches, device)
+
+    @torch.no_grad()
+    def capture_component_output(self, model, block_idx, component, loader, n_batches, device):
         model.eval()
         buffers: list[torch.Tensor] = []
         block = self.layers(model)[block_idx]
