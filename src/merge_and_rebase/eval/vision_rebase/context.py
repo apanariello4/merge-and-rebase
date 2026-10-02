@@ -336,3 +336,157 @@ def _build_task_context(
         build_cfg_task=_build_cfg_for(target_cfg),
         source_build_cfg_task=_build_cfg_for(source_cfg),
     )
+
+
+@dataclass
+class RunCalibration:
+    """Per-task contexts and the task-independent calibration contexts a run builds before any transport."""
+
+    task_context_by_name: dict[str, _TaskContext]
+    #: One dict per task, in task order (loaders, classnames, build configs); consumed by the alpha search.
+    per_task: list[dict[str, Any]]
+    ariadne_calibration_ctx: _TaskContext | None
+    ariadne_calibration_meta: dict[str, Any]
+    transport_calibration_ctx: _TaskContext | None
+    transport_calibration_meta: dict[str, Any]
+    #: The dedicated BRACE loader (replaced by the balanced vision8 mix loader under that protocol).
+    block_extension_calibration_loader: Any
+    brace_calibration_metadata: dict[str, Any] | None
+
+
+def build_run_calibration(
+    resolved: Any,
+    plan: Any,
+    *,
+    cfg: Mapping[str, Any],
+    clf_source: Any,
+    clf_target: Any,
+    source_cfg: Any,
+    target_cfg: Any,
+    native_tasks: set[str],
+    use_humanized_classnames: bool,
+    block_extension_calibration_loader: Any,
+    run_logger: Any,
+) -> RunCalibration:
+    """Build every dataset context of the run once, in the legacy order (the global RNG makes it observable).
+
+    Order: per-task contexts, the task-independent Ariadne calibration, the THESEUS/BiCo transport
+    calibration, then the balanced BRACE calibration mix.
+    """
+    suite = resolved.suite
+    tasks = resolved.tasks
+    theseus_like_method = resolved.theseus_like_method
+    transfusion_mode = resolved.transfusion_mode
+    bico_mode = resolved.bico_mode
+    direct_residual_like = resolved.direct_residual_like
+    direct_residual_cfg = resolved.ariadne_cfg
+    block_extension_cfg = resolved.block_extension_cfg
+    run_block_extension_prestep = plan.run_block_extension_prestep
+    task_context_by_name: dict[str, _TaskContext] = {}
+    per_task: list[dict[str, Any]] = []
+    brace_calibration_metadata: dict[str, Any] | None = None
+
+    for task in tasks:
+        task_ctx = _build_task_context(
+            task,
+            suite=suite,
+            cfg=cfg,
+            clf_target=clf_target,
+            clf_source=clf_source,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+            use_humanized_classnames=use_humanized_classnames,
+            need_source_loaders=bool(
+                (theseus_like_method or transfusion_mode or bico_mode or direct_residual_like)
+                and task not in native_tasks
+            ),
+        )
+        task_context_by_name[task] = task_ctx
+        per_task.append(
+            {
+                "task": task,
+                "loaders": task_ctx.loaders,
+                "classnames": task_ctx.classnames,
+                "build_cfg_task": task_ctx.build_cfg_task,
+                "source_loaders": task_ctx.source_loaders,
+                "source_build_cfg_task": task_ctx.source_build_cfg_task,
+            }
+        )
+
+    # Task-independent Direct Residual calibration (direct_residual_params.
+    # calibration_data != "task_local"): ONE paired context, built here once
+    # and passed to every Direct Residual fit below (per task and
+    # merge_in_source_then_fit alike). Only the fit's calibration images
+    # change; each task's alpha search and evaluation keep its own splits.
+    direct_residual_calibration_ctx: _TaskContext | None = None
+    direct_residual_calibration_meta: dict[str, Any] = {"calibration_data": "task_local"}
+    if direct_residual_like and direct_residual_cfg.calibration_data != "task_local":
+        direct_residual_calibration_ctx, direct_residual_calibration_meta = _build_direct_residual_calibration(
+            direct_residual_cfg.calibration_data,
+            per_task=[item for item in per_task if item["task"] not in native_tasks],
+            suite=suite,
+            cfg=cfg,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+            num_batches=int(direct_residual_cfg.num_batches),
+            calibration_seed=int(direct_residual_cfg.seed),
+        )
+        print(f"Direct Residual calibration: {direct_residual_calibration_meta}")
+
+    # Task-independent THESEUS/BiCo calibration (transport_calibration_data):
+    # one paired context for every task's prepare; alpha search and
+    # evaluation keep each task's own splits.
+    transport_calibration_data = _resolve_transport_calibration_data(
+        cfg, theseus_like_method=theseus_like_method, bico_mode=bico_mode
+    )
+    transport_calibration_ctx: _TaskContext | None = None
+    transport_calibration_meta: dict[str, Any] = {"transport_calibration_data": transport_calibration_data}
+    if transport_calibration_data == "tiny_imagenet":
+        transport_calibration_ctx = _build_direct_paired_calibration_context(
+            DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+            suite=suite,
+            cfg=cfg,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+        )
+        transport_calibration_meta.update(
+            **DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
+            num_samples=len(transport_calibration_ctx.loaders.train.dataset),
+            num_classes=len(transport_calibration_ctx.classnames),
+        )
+        print(f"Transport calibration: {transport_calibration_meta}")
+
+    brace_protocol = str(
+        (cfg.get("block_extension_params", {}) or {}).get("calibration_protocol", "task_local")
+    ).lower()
+    if (
+        run_block_extension_prestep
+        and not block_extension_cfg.skip_correction
+        and brace_protocol.startswith("vision8_mix")
+    ):
+        brace_mix_context, brace_mix_metadata = _build_balanced_calibration_context(
+            per_task,
+            cfg=cfg,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            n_batches=block_extension_cfg.n_batches_act,
+            split=block_extension_cfg.calibration_split,
+        )
+        block_extension_calibration_loader = brace_mix_context.source_loaders.train
+        brace_calibration_metadata = brace_mix_metadata
+        run_logger.log_event("brace_calibration_plan", context=brace_mix_metadata)
+
+    return RunCalibration(
+        task_context_by_name=task_context_by_name,
+        per_task=per_task,
+        ariadne_calibration_ctx=direct_residual_calibration_ctx,
+        ariadne_calibration_meta=direct_residual_calibration_meta,
+        transport_calibration_ctx=transport_calibration_ctx,
+        transport_calibration_meta=transport_calibration_meta,
+        block_extension_calibration_loader=block_extension_calibration_loader,
+        brace_calibration_metadata=brace_calibration_metadata,
+    )
