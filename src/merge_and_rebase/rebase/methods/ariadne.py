@@ -21,20 +21,45 @@ from typing import Any
 
 import torch
 
-from ....utils.cost_accounting import PhaseCostRecorder, cost_excluded, cost_phase, recording
-from ...discrete_layer_match import DiscreteLayerPairing
-from ...registry import register, register_alias
-from .ablations import apply_tv_scaling
-from .alignment import compute_alignment_diagnostics, compute_desired_effects
-from .capture import capture_paired_boundary_activations
-from .config import DirectResidualConfig, order_components
-from .diagnostics import (
+from ...utils.cost_accounting import PhaseCostRecorder, cost_excluded, cost_phase, recording
+from ..discrete_layer_match import DiscreteLayerPairing
+from ..registry import register, register_alias
+from ._ariadne.ablations import apply_tv_scaling
+from ._ariadne.alignment import (
+    apply_depth_pairing_override,
+    centered_rectangular_procrustes,
+    centered_ridge_alignment,
+    compute_alignment_diagnostics,
+    compute_desired_effects,
+)
+from ._ariadne.capture import (
+    capture_block_gradients,
+    capture_paired_boundary_activations,
+    capture_tokens,
+    iter_capture_block_gradients,
+    iter_capture_tokens,
+    paired_calibration,
+)
+from ._ariadne.config import (
+    COMPONENT_FORWARD_ORDER,
+    DirectResidualConfig,
+    order_components,
+    parse_direct_residual_config,
+    resolve_direct_residual_preset,
+)
+from ._ariadne.diagnostics import (
     compute_direct_residual_task_vector_stats,
     compute_fidelity_holdout_diagnostics,
+    draw_fidelity_holdout_calibration,
     measure_direct_residual_realization,
+    measure_direct_residual_realization_streaming,
 )
-from .fit import fit_direct_residual, fit_sequential_source_endpoints
-from .streaming import (
+from ._ariadne.fit import (
+    ResidualSufficientStatistics,
+    fit_direct_residual,
+    fit_sequential_source_endpoints,
+)
+from ._ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
     compute_gradient_delta_disagreement_streaming,
     fit_direct_residual_streaming,
@@ -138,7 +163,7 @@ def _fit_body(
         ]
         if missing:
             raise ValueError(f"procrustes_source='gradient' requires {missing} to be provided")
-        from ....models.grad_recipes import clip_contrastive_recipe
+        from ...models.grad_recipes import clip_contrastive_recipe
 
         source_recipe = clip_contrastive_recipe(
             clf_source,
@@ -539,9 +564,43 @@ class AriadneRebase:
         raise NotImplementedError(
             "Ariadne does not transport a source state-dict delta: it fits the target task vector from paired "
             "source/target activations. Call AriadneRebase().prepare(...) with live models and calibration "
-            "loaders (see merge_and_rebase.rebase.methods.ariadne.method)."
+            "loaders (see merge_and_rebase.rebase.methods.ariadne)."
         )
 
+
+__all__ = [
+    "AriadnePrepared",
+    "AriadneRebase",
+    "COMPONENT_FORWARD_ORDER",
+    "DirectResidualConfig",
+    "ResidualSufficientStatistics",
+    "apply_depth_pairing_override",
+    "apply_tv_scaling",
+    "capture_block_gradients",
+    "capture_paired_boundary_activations",
+    "capture_tokens",
+    "centered_rectangular_procrustes",
+    "centered_ridge_alignment",
+    "compute_alignment_diagnostics",
+    "compute_alignment_diagnostics_streaming",
+    "compute_desired_effects",
+    "compute_direct_residual_task_vector_stats",
+    "compute_fidelity_holdout_diagnostics",
+    "draw_fidelity_holdout_calibration",
+    "fit_direct_residual",
+    "fit_direct_residual_streaming",
+    "fit_sequential_source_endpoints",
+    "iter_capture_block_gradients",
+    "iter_capture_tokens",
+    "measure_direct_residual_realization",
+    "measure_direct_residual_realization_streaming",
+    "measure_streaming_realization_for",
+    "order_components",
+    "paired_calibration",
+    "parse_direct_residual_config",
+    "prepare_direct_residual_streaming",
+    "resolve_direct_residual_preset",
+]
 
 register(AriadneRebase())
 register_alias("direct_residual", "ariadne")

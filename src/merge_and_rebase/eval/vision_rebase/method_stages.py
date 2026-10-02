@@ -247,7 +247,7 @@ def _run_direct_residual_fit(**kwargs: Any):
     the recorder summary splitting this fit's wall time, CUDA peak and host peak
     RSS into activation_collection / transformation / transport (analysis-only
     diagnostics are excluded; see utils.cost_accounting). The pipeline itself
-    lives in `merge_and_rebase.rebase.methods.ariadne.method`.
+    lives in `merge_and_rebase.rebase.methods.ariadne`.
     """
     prepared = AriadneRebase().prepare(**kwargs)
     return prepared.task_vector, prepared.timing, prepared.diagnostics, prepared.extra

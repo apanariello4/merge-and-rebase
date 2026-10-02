@@ -34,14 +34,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import (
+from merge_and_rebase.rebase.methods._ariadne.alignment import (
     apply_depth_pairing_override,
     compute_alignment_diagnostics,
     procrustes_rank_diagnostics,
 )
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.config import parse_direct_residual_config
-from merge_and_rebase.rebase.methods.ariadne.method import AriadneRebase
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import parse_direct_residual_config
+from merge_and_rebase.rebase.methods.ariadne import AriadneRebase
 
 WIDTH, TOKENS, BATCH_SIZE, NUM_BATCHES = 48, 17, 8, 8
 N_CLASSES = 6
@@ -361,7 +361,7 @@ def test_activation_rank_deficiency_flagged_and_warned_once(caplog):
     """Fewer calibration rows than the width => rank(cross) < d in the (default polar) activation fit."""
     kwargs = dict(width=WIDTH, tokens=3, batch_size=2, num_batches=1)
     overrides = dict(num_batches=1)
-    with caplog.at_level(logging.WARNING, logger="merge_and_rebase.rebase.methods.ariadne.method"):
+    with caplog.at_level(logging.WARNING, logger="merge_and_rebase.rebase.methods.ariadne"):
         resident = _prepare(overrides, "extend", "resident", **kwargs)
         resident_records = [r for r in caplog.records if "rank-deficient" in r.getMessage()]
         caplog.clear()
@@ -377,7 +377,7 @@ def test_activation_rank_deficiency_flagged_and_warned_once(caplog):
 
 
 def test_full_rank_activation_fit_is_not_flagged_and_not_warned(caplog):
-    with caplog.at_level(logging.WARNING, logger="merge_and_rebase.rebase.methods.ariadne.method"):
+    with caplog.at_level(logging.WARNING, logger="merge_and_rebase.rebase.methods.ariadne"):
         prepared = _prepare({}, "extend", "streaming")
     assert not [r for r in caplog.records if "rank-deficient" in r.getMessage()]
     assert all(

@@ -20,8 +20,8 @@ from merge_and_rebase.data.balanced_calibration import (
     Vision8TaskContext,
     build_balanced_vision8_calibration_loaders,
 )
-from merge_and_rebase.rebase.methods.ariadne.capture import _dataset_identity, paired_calibration
-from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods._ariadne.capture import _dataset_identity, paired_calibration
+from merge_and_rebase.rebase.methods._ariadne.config import DirectResidualConfig, parse_direct_residual_config
 
 # ---- parser -----------------------------------------------------------------
 

@@ -55,19 +55,19 @@ from ..rebase.block_extension.completion_config import (  # noqa: F401  (re-expo
     parse_residual_completion_config,
     validate_residual_completion_depth_direction,
 )
-from ..rebase.methods.ariadne.alignment import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.alignment import (  # noqa: F401  (re-exported for existing importers)
     _check_rows,
     _procrustes_from_cross,
     centered_rectangular_procrustes,
     centered_ridge_alignment,
 )
-from ..rebase.methods.ariadne.config import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.config import (  # noqa: F401  (re-exported for existing importers)
     CANONICAL_COMPONENT_ORDER,
     COMPONENT_FORWARD_ORDER,
     INTERNAL_COMPONENTS,
     order_components,
 )
-from ..rebase.methods.ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
     _RIDGE_NONE_CONDITION_THRESHOLD,
     ResidualSufficientStatistics,
     _clamped_eigh_inverse,

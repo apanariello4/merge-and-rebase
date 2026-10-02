@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .ariadne.method import AriadneRebase
+from .ariadne import AriadneRebase
 from .bico import BiCoGradInRebase, BiCoRebase
 from .gradfix import GradFixRebase
 from .identity import IdentityTransport

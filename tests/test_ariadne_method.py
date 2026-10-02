@@ -17,12 +17,12 @@ import torch
 from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.rebase import capabilities, run_config
 from merge_and_rebase.rebase.methods.ariadne import (
+    AriadnePrepared,
     AriadneRebase,
     DirectResidualConfig,
     parse_direct_residual_config,
     resolve_direct_residual_preset,
 )
-from merge_and_rebase.rebase.methods.ariadne.method import AriadnePrepared
 from merge_and_rebase.rebase.model_families.base import ModelFamilyMetadata
 from merge_and_rebase.rebase.registry import canonical_method_name, get_method, list_methods
 from merge_and_rebase.rebase.runtime import format_rebase_method_label

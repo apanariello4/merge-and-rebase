@@ -19,15 +19,15 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
-from merge_and_rebase.rebase.methods.ariadne.diagnostics import (
+from merge_and_rebase.rebase.methods._ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods._ariadne.diagnostics import (
     compute_fidelity_holdout_diagnostics,
     draw_fidelity_holdout_calibration,
 )
-from merge_and_rebase.rebase.methods.ariadne.fit import _task_vector_sha256, fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.streaming import (
+from merge_and_rebase.rebase.methods._ariadne.fit import _task_vector_sha256, fit_direct_residual
+from merge_and_rebase.rebase.methods._ariadne.streaming import (
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,
 )

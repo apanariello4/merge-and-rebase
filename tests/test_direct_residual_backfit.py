@@ -26,14 +26,14 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.config import (
+from merge_and_rebase.rebase.methods._ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import (
     DirectResidualConfig,
     order_components,
     parse_direct_residual_config,
 )
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods._ariadne.fit import fit_direct_residual
 
 # --------------------------------------------------------------------------
 # Fixture: plain (non-stock) attention wrapper, IDENTICAL to
@@ -338,7 +338,7 @@ def _penalized_objective(h_rows, d_rows, w_o, b_o, w_d, b_d, lam):
 def test_od_backfit_penalized_objective_is_non_increasing_on_the_toy():
     ridge_relative = 0.1
     source_base, source_ft, target_base, data, pairing, target_base_sd = _toy_setup()
-    from merge_and_rebase.rebase.methods.ariadne.capture import paired_calibration
+    from merge_and_rebase.rebase.methods._ariadne.capture import paired_calibration
 
     _sb, target_batches, _meta = paired_calibration(data, data, num_batches=6, seed=89)
     with torch.no_grad():
@@ -542,7 +542,7 @@ def test_toy_linear_additive_block_backfit_matches_derived_joint_ridge_solution(
     # The block's own INPUT (not its boundary/output): recover it directly by
     # replaying the model's own `input` linear layer on the same calibration
     # images capture_paired_boundary_activations itself replayed.
-    from merge_and_rebase.rebase.methods.ariadne.capture import paired_calibration
+    from merge_and_rebase.rebase.methods._ariadne.capture import paired_calibration
 
     _sb, target_batches, _meta = paired_calibration(data, data, num_batches=cfg.num_batches, seed=cfg.seed)
     with torch.no_grad():
@@ -604,10 +604,10 @@ def test_toy_linear_additive_block_backfit_matches_derived_joint_ridge_solution(
 
 import copy as _copy  # noqa: E402
 
-from merge_and_rebase.rebase.methods.ariadne.ablations import _mount_component, _replay_block_components  # noqa: E402
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_tokens  # noqa: E402
-from merge_and_rebase.rebase.methods.ariadne.fit import ResidualSufficientStatistics  # noqa: E402
-from merge_and_rebase.rebase.methods.ariadne.layouts import _component_weight_bias, _layout_for  # noqa: E402
+from merge_and_rebase.rebase.methods._ariadne.ablations import _mount_component, _replay_block_components  # noqa: E402
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_tokens  # noqa: E402
+from merge_and_rebase.rebase.methods._ariadne.fit import ResidualSufficientStatistics  # noqa: E402
+from merge_and_rebase.rebase.methods._ariadne.layouts import _component_weight_bias, _layout_for  # noqa: E402
 
 
 def _unsafeguarded_backfit_r_trace(

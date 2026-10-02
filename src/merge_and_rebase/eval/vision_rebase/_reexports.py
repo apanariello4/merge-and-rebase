@@ -66,8 +66,8 @@ from ...merge.task_vectors import TaskVector  # noqa: F401  (kept importable)
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model  # noqa: F401
+from ...rebase.methods._ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override  # noqa: F401  (kept importable)
-from ...rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ...rebase.methods.theseus import InterpolatedBlockActivations  # noqa: F401  (kept importable)
 from ...rebase.orchestration import AriadneRunRecord, CompletionRecord, direct_target_p1_requested
 from ...rebase.prestep import StageEnv, TaskInputs

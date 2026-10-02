@@ -38,10 +38,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.eval import target_informed_runtime as runtime
 from merge_and_rebase.eval.target_informed_runtime import _fit_direct_target_position
 from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
-from merge_and_rebase.rebase.methods.ariadne import fit as ariadne_fit
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_tokens
-from merge_and_rebase.rebase.methods.ariadne.config import order_components
-from merge_and_rebase.rebase.methods.ariadne.fit import _fit_all_positions_independent
+from merge_and_rebase.rebase.methods._ariadne import fit as ariadne_fit
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_tokens
+from merge_and_rebase.rebase.methods._ariadne.config import order_components
+from merge_and_rebase.rebase.methods._ariadne.fit import _fit_all_positions_independent
 
 
 class _Attention(torch.nn.Module):

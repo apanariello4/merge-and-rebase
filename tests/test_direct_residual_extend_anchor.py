@@ -26,10 +26,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.eval.target_informed_runtime import capture_residual_references, complete_residuals_direct
 from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import compute_desired_effects
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods._ariadne.alignment import compute_desired_effects
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import DirectResidualConfig
+from merge_and_rebase.rebase.methods._ariadne.fit import fit_direct_residual
 
 
 class _Attention(torch.nn.Module):

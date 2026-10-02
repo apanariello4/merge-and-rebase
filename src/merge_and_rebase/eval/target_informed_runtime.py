@@ -25,8 +25,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from ..models.vision_utils import _encode_image  # noqa: F401  (re-exported for existing importers)
-from ..rebase.methods._shared import _interp_2d_tokens, _to_tokens  # noqa: F401  (re-exported for existing importers)
-from ..rebase.methods.ariadne.ablations import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.ablations import (  # noqa: F401  (re-exported for existing importers)
     _apply_bias_correction,
     _backfit_data_fit_sq,
     _backfit_objective,
@@ -38,7 +37,7 @@ from ..rebase.methods.ariadne.ablations import (  # noqa: F401  (re-exported for
     _mount_component,
     _replay_block_components,
 )
-from ..rebase.methods.ariadne.capture import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.capture import (  # noqa: F401  (re-exported for existing importers)
     _assert_layerscale_identity,
     _dataset_identity,
     _mha_query_key_value,
@@ -52,24 +51,24 @@ from ..rebase.methods.ariadne.capture import (  # noqa: F401  (re-exported for e
     iter_capture_tokens,
     paired_calibration,
 )
-from ..rebase.methods.ariadne.config import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.config import (  # noqa: F401  (re-exported for existing importers)
     CANONICAL_COMPONENT_ORDER,
     COMPONENT_FORWARD_ORDER,
 )
-from ..rebase.methods.ariadne.diagnostics import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.diagnostics import (  # noqa: F401  (re-exported for existing importers)
     _family_delta_state,
     compute_direct_residual_task_vector_stats,
     measure_direct_residual_realization,
     measure_direct_residual_realization_streaming,
 )
-from ..rebase.methods.ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.fit import (  # noqa: F401  (re-exported for existing importers)
     _finalize_independent_component,
     _fit_all_positions_independent,
     _realization_diagnostic_fields,
     _realized_pred_sq_from_stats,
     _task_vector_sha256,
 )
-from ..rebase.methods.ariadne.layouts import (  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._ariadne.layouts import (  # noqa: F401  (re-exported for existing importers)
     _ATTN_CAPTURE_KINDS,
     _ATTN_QUERY_KINDS,
     _CAPTURE_KINDS,
@@ -85,6 +84,7 @@ from ..rebase.methods.ariadne.layouts import (  # noqa: F401  (re-exported for e
     _rows,
     _VisionLayout,
 )
+from ..rebase.methods._shared import _interp_2d_tokens, _to_tokens  # noqa: F401  (re-exported for existing importers)
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,

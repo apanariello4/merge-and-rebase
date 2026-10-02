@@ -23,11 +23,11 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
-from merge_and_rebase.rebase.methods.ariadne.alignment import centered_rectangular_procrustes, compute_desired_effects
-from merge_and_rebase.rebase.methods.ariadne.capture import capture_paired_boundary_activations
-from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig, parse_direct_residual_config
-from merge_and_rebase.rebase.methods.ariadne.fit import fit_direct_residual
-from merge_and_rebase.rebase.methods.ariadne.streaming import (
+from merge_and_rebase.rebase.methods._ariadne.alignment import centered_rectangular_procrustes, compute_desired_effects
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import DirectResidualConfig, parse_direct_residual_config
+from merge_and_rebase.rebase.methods._ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods._ariadne.streaming import (
     _StreamingCrossCovariance,
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,
@@ -189,7 +189,7 @@ def test_streaming_cross_covariance_matches_batched_procrustes():
     cross_ref = (x - src_mean).T @ (y - tgt_mean)
 
     assert torch.allclose(acc.cross(), cross_ref, rtol=1e-12, atol=1e-12)
-    from merge_and_rebase.rebase.methods.ariadne.alignment import _procrustes_from_cross
+    from merge_and_rebase.rebase.methods._ariadne.alignment import _procrustes_from_cross
 
     q_stream = _procrustes_from_cross(acc.cross())
     assert torch.allclose(q_stream, q_ref, rtol=1e-12, atol=1e-12)

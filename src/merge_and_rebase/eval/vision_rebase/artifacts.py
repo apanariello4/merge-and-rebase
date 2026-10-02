@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from ...rebase.methods.ariadne.fit import _task_vector_sha256
+from ...rebase.methods._ariadne.fit import _task_vector_sha256
 from ...rebase.registry import canonical_method_name
 from ..utils import to_cpu_fp32
 

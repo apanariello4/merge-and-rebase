@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..methods.ariadne.config import (
+from ..methods._ariadne.config import (
     COMPONENT_FORWARD_ORDER,
     INTERNAL_COMPONENTS,
     order_components,

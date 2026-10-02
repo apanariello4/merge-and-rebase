@@ -8,7 +8,7 @@ from merge_and_rebase.eval import direct_residual as legacy_dr
 from merge_and_rebase.eval import target_informed_runtime as legacy_runtime
 from merge_and_rebase.eval import target_residual_completion as legacy_completion
 from merge_and_rebase.rebase.methods import ariadne
-from merge_and_rebase.rebase.methods.ariadne import (
+from merge_and_rebase.rebase.methods._ariadne import (
     ablations,
     alignment,
     capture,
