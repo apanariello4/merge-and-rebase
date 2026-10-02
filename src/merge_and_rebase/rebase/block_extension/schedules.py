@@ -1,7 +1,7 @@
 """Pure schedule and layout functions for BRACE block extension and reduction.
 
 No model access: these map depths, insertion orders and ancestry chains to anchor
-schedules and layout dicts. ``eval.block_extension`` re-exports every name.
+schedules and layout dicts.
 """
 
 from __future__ import annotations

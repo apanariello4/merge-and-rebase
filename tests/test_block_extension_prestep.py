@@ -9,13 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.block_extension import (
-    BlockExtender,
+from merge_and_rebase.rebase.block_extension.config import (
     BlockExtensionConfig,
     resolve_block_extension_config,
-    run_block_extension,
     select_loader,
 )
+from merge_and_rebase.rebase.block_extension.vision import BlockExtender, run_block_extension
 
 
 class _TinyAttn(nn.Module):

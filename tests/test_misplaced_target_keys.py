@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from merge_and_rebase.eval.block_extension import resolve_block_extension_config
+from merge_and_rebase.rebase.block_extension.config import resolve_block_extension_config
 
 _MISPLACED_KEYS = (
     "target_shared_correction",

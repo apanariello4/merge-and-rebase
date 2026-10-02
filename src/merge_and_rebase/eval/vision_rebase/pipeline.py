@@ -19,9 +19,9 @@ from ...data.vision_loaders import build_vision_calibration_loader
 from ...io.ckpt import load_ckpt
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.methods._common import axpy_state_dict
+from ...rebase.block_extension.config import calibration_dataset_spec
 from ...rebase.orchestration import AriadneRunRecord, TaskPipeline
 from ...rebase.prestep import StageEnv
-from ..block_extension import calibration_dataset_spec
 from ..print_utils import pretty_print_task_accuracies
 from ..utils import patch_base_for_attn, to_cpu_fp32
 from .alpha_search import AlphaSearchSpec, TargetEvaluator, run_alpha_search

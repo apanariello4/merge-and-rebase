@@ -20,7 +20,7 @@ from merge_and_rebase.io.peft_helpers import (
 from merge_and_rebase.io.utils import atomic_write_json
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
-from ..cli_args import (
+from ...cli_args import (
     add_config_arg,
     add_device_dtype_args,
     add_merge_io_args,
@@ -31,9 +31,9 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.templates import get_templates
-from ..data.vision_loaders import build_vision_loaders, load_hf_splits
-from ..eval.utils import (
+from ...data.templates import get_templates
+from ...data.vision_loaders import build_vision_loaders, load_hf_splits
+from ...eval.utils import (
     TaskAttentionMeta,
     assert_qkv_patched_before_linearizing,
     build_dense_delta_branch,
@@ -48,22 +48,22 @@ from ..eval.utils import (
     maybe_patch_base_for_task_attn,
     to_cpu_fp32,
 )
-from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ..merge.base import PreparedMergeMethod
-from ..merge.methods._common import resolve_merge_weights
-from ..merge.registry import get_method, list_methods
-from ..merge.runtime import build_merged_state_for_alpha
-from ..merge.subspaces.registry import get_subspace, list_subspaces
-from ..models.forward_modes import (
+from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
+from ...merge.base import PreparedMergeMethod
+from ...merge.methods._common import resolve_merge_weights
+from ...merge.registry import get_method, list_methods
+from ...merge.runtime import build_merged_state_for_alpha
+from ...merge.subspaces.registry import get_subspace, list_subspaces
+from ...models.forward_modes import (
     get_forward_mode,
     list_forward_modes,
     normalize_forward_mode_params,
     resolve_auto_forward_mode,
     resolve_shared_forward_mode_params,
 )
-from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..run_logging import print_config_args
-from .datasets.vision8_14_20 import SUITES
+from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...run_logging import print_config_args
+from ..datasets.vision8_14_20 import SUITES
 
 
 @dataclass(frozen=True)

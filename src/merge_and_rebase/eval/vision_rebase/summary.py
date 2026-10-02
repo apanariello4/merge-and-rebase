@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ...rebase.block_extension.config import block_extension_protocol
 from ...rebase.registry import canonical_method_name
-from ..block_extension import block_extension_protocol
 
 
 @dataclass(kw_only=True)

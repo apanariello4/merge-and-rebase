@@ -15,6 +15,7 @@ from ...merge.base import PreparedMergeMethod
 from ...merge.methods._common import axpy_state_dict
 from ...merge.registry import get_method as get_merge_method
 from ...merge.task_vectors import TaskVector
+from ...rebase.block_extension.vision import run_block_extension
 from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
     _SINGLE_TRANSPORT_MODES,
     _TRANSPORT_THEN_MERGE_MODES,
@@ -22,7 +23,6 @@ from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
     _resolve_merge_mode_config,
 )
 from ...rebase.prestep import StageEnv
-from ..block_extension import run_block_extension
 from ..utils import to_cpu_fp32
 from .context import (
     _build_balanced_calibration_context,

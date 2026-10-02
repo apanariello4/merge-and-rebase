@@ -65,6 +65,8 @@ from ...merge.registry import list_methods as list_merge_methods
 from ...merge.task_vectors import TaskVector  # noqa: F401  (kept importable)
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
+from ...rebase.block_extension.config import block_extension_protocol, calibration_dataset_spec, select_loader
+from ...rebase.block_extension.vision import run_block_extension
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model  # noqa: F401
 from ...rebase.methods._ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override  # noqa: F401  (kept importable)
@@ -75,12 +77,6 @@ from ...rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  #
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ...utils.alpha_search import PerTaskAlphaTracker, average_scores  # noqa: F401  (kept importable)
 from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording  # noqa: F401  (kept importable)
-from ..block_extension import (
-    block_extension_protocol,  # noqa: F401  (kept importable)
-    calibration_dataset_spec,
-    run_block_extension,  # noqa: F401  (kept importable)
-    select_loader,  # noqa: F401  (kept importable)
-)
 from ..datasets.vision8_14_20 import SUITES
 from ..print_utils import pretty_print_task_accuracies
 from ..rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)

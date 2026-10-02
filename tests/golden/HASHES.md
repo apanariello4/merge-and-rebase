@@ -29,8 +29,7 @@ a changed hash means a changed number and invalidates published results until ex
   (`485999a6...`, `48a74919...`) when hashed with that file's `_task_vector_sha256`.
 
 Public paths used by the tests (the back-compat shims must keep them importable):
-`merge_and_rebase.eval.direct_residual`, `eval.target_informed_runtime`, `eval.block_extension`,
-`eval.block_extension_llm`, `eval.vision_rebase` (`_run_direct_residual_fit`,
+`merge_and_rebase.rebase.methods.ariadne` (+ `_ariadne.*`), `rebase.block_extension.{config,vision,decoder,core,schedules}` (the `eval.direct_residual` / `eval.block_extension*` shims were removed in P5.16, hashes unchanged), `eval.vision_rebase` (`_run_direct_residual_fit`,
 `_build_rebase_prepared`), `eval.llm_rebase` (`_prepare_resized_task_delta`,
 `_build_text_calibration_loader`), `rebase.registry.get_method`, `rebase.methods`,
 `rebase.model_families.infer_family`, `rebase.discrete_layer_match`, `models.grad_recipes`,

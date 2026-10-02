@@ -26,13 +26,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.block_extension import (
-    BlockExtender,
-    BlockExtensionConfig,
-    build_extension_layout,
-    resolve_block_extension_config,
-    run_block_extension,
-)
+from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig, resolve_block_extension_config
+from merge_and_rebase.rebase.block_extension.schedules import build_extension_layout
+from merge_and_rebase.rebase.block_extension.vision import BlockExtender, run_block_extension
 from merge_and_rebase.rebase.methods.theseus import (
     InterpolatedBlockActivations,
     collect_activations,

@@ -17,6 +17,8 @@ import torch
 
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.task_vectors import TaskVector
+from ...rebase.block_extension.config import select_loader
+from ...rebase.block_extension.vision import run_block_extension
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
 from ...rebase.methods.theseus import InterpolatedBlockActivations
 from ...rebase.prestep import (
@@ -29,7 +31,6 @@ from ...rebase.prestep import (
     TaskModels,
     select_prestep_kind,
 )
-from ..block_extension import run_block_extension, select_loader
 from ..utils import to_cpu_fp32
 from .artifacts import _state_dict_sha256
 from .source_lmc import _evaluate_source_lmc, _evaluate_source_model_top1

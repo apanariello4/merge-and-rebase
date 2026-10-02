@@ -520,7 +520,7 @@ class InterpolatedBlockActivations:
 
     ``entries`` holds ``(inserted_position, left_position, right_position)``
     triples over the extended block list, as produced by
-    ``merge_and_rebase.eval.block_extension.build_extension_layout``.
+    ``merge_and_rebase.rebase.block_extension.schedules.build_extension_layout``.
     """
 
     entries: tuple[tuple[int, int, int], ...]

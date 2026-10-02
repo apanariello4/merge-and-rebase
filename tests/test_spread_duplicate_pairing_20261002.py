@@ -6,7 +6,8 @@ import pytest
 import torch
 from test_ariadne_depth_baselines import _make_loader, _TinyModel
 
-from merge_and_rebase.eval.block_extension import BlockExtensionConfig, run_block_extension
+from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+from merge_and_rebase.rebase.block_extension.vision import run_block_extension
 from merge_and_rebase.rebase.depth_pairing import spread_duplicate_pairing
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.rebase.methods._ariadne.alignment import apply_depth_pairing_override

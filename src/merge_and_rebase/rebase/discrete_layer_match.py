@@ -7,7 +7,7 @@ position ``i(j)`` in ``[0, D_A)`` it is aligned with, where ``D_A`` is
 index-only correspondence: no interpolation, no weight blending, no fit.
 
 This is the one piece of code that both Direct Residual
-(``merge_and_rebase.eval.direct_residual``) and the faithful BiCo/THESEUS
+(``merge_and_rebase.rebase.methods.ariadne``) and the faithful BiCo/THESEUS
 structural-resize control must agree on bit-for-bit, so it is defined exactly
 once, here, and imported by both consumers.
 

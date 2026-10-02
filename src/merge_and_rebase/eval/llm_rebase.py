@@ -52,13 +52,12 @@ from ..merge.runtime import (
 from ..merge.task_vectors import TaskVector, default_key_filter
 from ..models.text_lm import TextBuildConfig, TextLM
 from ..rebase import get_method
-from ..rebase.block_extension.config import warn_decoder_ignored_fields
+from ..rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
+from ..rebase.block_extension.decoder import run_block_extension_llm
 from ..rebase.capabilities import check_pair
 from ..rebase.model_families import infer_family
 from ..rebase.registry import canonical_method_name
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
-from .block_extension import resolve_block_extension_config
-from .block_extension_llm import run_block_extension_llm
 from .llm_common import (
     default_prompt_for_task,
     head_class_ids_for_task,

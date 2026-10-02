@@ -1,7 +1,7 @@
 """BRACE block-extension configuration: dataclasses, protocol, resolver and coercers.
 
 Pure configuration/topology layer. It imports nothing from ``merge_and_rebase.eval``;
-``eval.block_extension`` re-exports every public and private name defined here.
+(The former ``eval.block_extension`` shim was removed; import from here.)
 """
 
 from __future__ import annotations

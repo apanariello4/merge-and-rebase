@@ -4,11 +4,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from merge_and_rebase.eval.block_extension import BlockExtensionConfig
-from merge_and_rebase.eval.block_extension_llm import (
-    DecoderBlockExtender,
-    run_block_extension_llm,
-)
+from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+from merge_and_rebase.rebase.block_extension.decoder import DecoderBlockExtender, run_block_extension_llm
 
 
 class DummyRMSNorm(nn.Module):

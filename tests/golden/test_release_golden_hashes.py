@@ -22,16 +22,15 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.direct_residual import (
-    DirectResidualConfig,
-    apply_depth_pairing_override,
-    capture_paired_boundary_activations,
-    compute_desired_effects,
-    fit_direct_residual,
+from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
+from merge_and_rebase.rebase.methods._ariadne.alignment import apply_depth_pairing_override, compute_desired_effects
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_paired_boundary_activations
+from merge_and_rebase.rebase.methods._ariadne.config import DirectResidualConfig
+from merge_and_rebase.rebase.methods._ariadne.fit import fit_direct_residual
+from merge_and_rebase.rebase.methods._ariadne.streaming import (
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,
 )
-from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 
 from ._hashing import deterministic_cpu, flatten_tensors, hash_json, hash_tensor_dict
 
@@ -724,8 +723,9 @@ def _build_vision_orchestration(method_name, source_depth, target_depth, *, pres
     from types import SimpleNamespace
 
     import merge_and_rebase.rebase.methods  # noqa: F401
-    from merge_and_rebase.eval.block_extension import BlockExtensionConfig, run_block_extension
     from merge_and_rebase.eval.vision_rebase import _build_rebase_prepared
+    from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+    from merge_and_rebase.rebase.block_extension.vision import run_block_extension
     from merge_and_rebase.rebase.registry import get_method
 
     torch.manual_seed(7)
@@ -929,7 +929,8 @@ BRACE_VISION_CASES = {
 
 @pytest.mark.parametrize("case", sorted(BRACE_VISION_CASES))
 def test_brace_block_extender_vision(case):
-    from merge_and_rebase.eval.block_extension import BlockExtensionConfig, run_block_extension
+    from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+    from merge_and_rebase.rebase.block_extension.vision import run_block_extension
 
     strategy, lmc_mode, source_depth, target_depth = BRACE_VISION_CASES[case]
     base, ft = _brace_vision_models(source_depth)
@@ -966,7 +967,7 @@ def test_brace_block_extender_vision(case):
 
 @pytest.mark.parametrize(("direction", "source_depth", "target_depth"), [("extend", 3, 5), ("shrink", 3, 2)])
 def test_brace_block_extender_vision_class_api(direction, source_depth, target_depth):
-    from merge_and_rebase.eval.block_extension import BlockExtender
+    from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 
     base, ft = _brace_vision_models(source_depth)
     loader = _class_loader(n=16, in_dim=6, batch_size=4, seed=3)
@@ -1069,7 +1070,7 @@ def _llm_source_pair(layers):
 
 
 def _brace_llm_config(target_layers_total, *, lmc_mode="independent", skip_correction=False):
-    from merge_and_rebase.eval.block_extension import BlockExtensionConfig
+    from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
 
     return BlockExtensionConfig(
         extension_strategy="interpolate_per_weight",
@@ -1085,7 +1086,7 @@ def _brace_llm_config(target_layers_total, *, lmc_mode="independent", skip_corre
 @pytest.mark.parametrize("direction", ["extend", "shrink"])
 @pytest.mark.parametrize("lmc_mode", ["independent", "shared"])
 def test_brace_decoder_block_extender(lmc_mode, direction):
-    from merge_and_rebase.eval.block_extension_llm import run_block_extension_llm
+    from merge_and_rebase.rebase.block_extension.decoder import run_block_extension_llm
     from merge_and_rebase.rebase.model_families import infer_family
 
     source_depth, target_depth = _LLM_DEPTHS[direction]
@@ -1108,7 +1109,7 @@ def test_brace_decoder_block_extender(lmc_mode, direction):
 
 @pytest.mark.parametrize("direction", ["extend", "shrink"])
 def test_brace_decoder_block_extender_class_api(direction):
-    from merge_and_rebase.eval.block_extension_llm import DecoderBlockExtender
+    from merge_and_rebase.rebase.block_extension.decoder import DecoderBlockExtender
     from merge_and_rebase.rebase.model_families import infer_family
 
     source_depth, target_depth = _LLM_DEPTHS[direction]

@@ -249,7 +249,7 @@ python -m merge_and_rebase.finetune.train_vision
 python -m merge_and_rebase.finetune.train_text
 python -m merge_and_rebase.eval.vision_merge
 python -m merge_and_rebase.eval.vision_rebase
-python -m merge_and_rebase.eval.vision_connectivity
+python -m merge_and_rebase.eval.diagnostics.vision_connectivity
 python -m merge_and_rebase.eval.llm_merge
 ```
 

@@ -18,7 +18,7 @@ from ...data.vision_loaders import (
 )
 from ...eval.utils import humanize
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..block_extension import select_loader
+from ...rebase.block_extension.config import select_loader
 
 
 @dataclass(frozen=True)

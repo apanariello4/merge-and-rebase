@@ -21,13 +21,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.block_extension import (
+from merge_and_rebase.rebase.block_extension.config import (
     BlockExtensionConfig,
     TargetSharedCorrection,
-    plan_inserted_positions,
     resolve_block_extension_config,
-    run_block_extension,
 )
+from merge_and_rebase.rebase.block_extension.schedules import plan_inserted_positions
+from merge_and_rebase.rebase.block_extension.vision import run_block_extension
 
 
 class _TinyAttn(nn.Module):
@@ -227,7 +227,7 @@ def test_shared_maps_are_identical_between_endpoints() -> None:
 
 def test_blend_is_a_convex_combination_in_source_coordinates() -> None:
     """eta weights the backprojected target against the source reference."""
-    from merge_and_rebase.eval.block_extension import BlockExtender
+    from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 
     torch.manual_seed(7)
     n_samples, tokens, d_source, d_target = 4, 5, 8, 12
@@ -246,7 +246,7 @@ def test_blend_is_a_convex_combination_in_source_coordinates() -> None:
 
 
 def test_blend_rejects_mismatched_sample_counts() -> None:
-    from merge_and_rebase.eval.block_extension import BlockExtender
+    from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 
     source_ref = torch.randn(20, 8)
     target_bank = torch.randn(3, 5, 12)

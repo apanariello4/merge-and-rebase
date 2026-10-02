@@ -20,13 +20,13 @@ from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...rebase.block_extension.config import select_loader
 from ...rebase.depth_pairing import spread_duplicate_pairing
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override
 from ...rebase.orchestration import AriadneRunRecord, MethodResult
 from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
 from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
-from ..block_extension import select_loader
 from ..utils import to_cpu_fp32
 from .artifacts import _load_saved_sequential_tv
 from .context import _TaskContext

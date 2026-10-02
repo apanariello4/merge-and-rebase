@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.block_extension import BlockExtensionConfig, run_block_extension
+from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+from merge_and_rebase.rebase.block_extension.vision import run_block_extension
 from merge_and_rebase.rebase.methods import bico as bico_method
 from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
 from merge_and_rebase.rebase.registry import get_method, list_methods

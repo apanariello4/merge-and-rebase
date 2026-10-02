@@ -85,7 +85,7 @@ def _check_table(name: str, actual) -> None:
 
 
 def _resolve(params: dict):
-    from merge_and_rebase.eval.block_extension import resolve_block_extension_config
+    from merge_and_rebase.rebase.block_extension.config import resolve_block_extension_config
 
     full = {"n_batches_act": 2, "verbose": False, "show_progress": False, **params}
     _, config = resolve_block_extension_config({"block_extension_params": full})
@@ -139,7 +139,7 @@ def _target_model(width=10, depth=5, seed=77):
 
 
 def _run_vision(params: dict, source_depth: int, target_depth: int, *, collector=None, with_target=False):
-    from merge_and_rebase.eval.block_extension import run_block_extension
+    from merge_and_rebase.rebase.block_extension.vision import run_block_extension
 
     config = _resolve({**_VISION_BASE, **params})
     base, ft = _brace_vision_models(source_depth)
@@ -296,7 +296,7 @@ _DECODER_BASE = {"extension_strategy": "interpolate_per_weight", "lmc_mode": "in
 
 
 def _run_decoder(params: dict, source_depth: int, target_depth: int):
-    from merge_and_rebase.eval.block_extension_llm import run_block_extension_llm
+    from merge_and_rebase.rebase.block_extension.decoder import run_block_extension_llm
     from merge_and_rebase.rebase.model_families import infer_family
 
     config = _resolve({**_DECODER_BASE, **params})
@@ -550,8 +550,8 @@ def _capture(fn, *args):
 
 
 def _extenders():
-    from merge_and_rebase.eval.block_extension import BlockExtender
-    from merge_and_rebase.eval.block_extension_llm import DecoderBlockExtender
+    from merge_and_rebase.rebase.block_extension.decoder import DecoderBlockExtender
+    from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 
     return {"vision": BlockExtender, "decoder": DecoderBlockExtender}
 
@@ -627,7 +627,7 @@ def _locate_tables():
 
 
 def _pure_function_tables():
-    from merge_and_rebase.eval.block_extension import (
+    from merge_and_rebase.rebase.block_extension.schedules import (
         balanced_collapse_spans,
         build_extension_layout,
         build_reduction_layout,

@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
-from ..cli_args import (
+from ...cli_args import (
     add_config_arg,
     add_device_dtype_args,
     add_logging_args,
@@ -20,23 +20,19 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.templates import get_templates
-from ..data.vision_loaders import (
+from ...data.templates import get_templates
+from ...data.vision_loaders import (
     build_vision_calibration_loader,
     build_vision_loaders,
     load_hf_splits,
 )
-from ..eval.utils import humanize, resolve_eval_split_loader, to_cpu_fp32
-from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..run_logging import default_summary_path, merge_logging_config, start_run
-from .block_extension import (
-    calibration_dataset_spec,
-    resolve_block_extension_config,
-    run_block_extension,
-    select_loader,
-)
-from .datasets.vision8_14_20 import SUITES
+from ...eval.utils import humanize, resolve_eval_split_loader, to_cpu_fp32
+from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
+from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...rebase.block_extension.config import calibration_dataset_spec, resolve_block_extension_config, select_loader
+from ...rebase.block_extension.vision import run_block_extension
+from ...run_logging import default_summary_path, merge_logging_config, start_run
+from ..datasets.vision8_14_20 import SUITES
 
 
 def _evaluate_model_top1(
