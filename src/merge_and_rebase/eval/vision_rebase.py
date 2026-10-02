@@ -94,7 +94,6 @@ from .target_informed_runtime import (
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
-    validate_residual_completion_depth_direction,
 )
 from .vision_alpha_search import (  # noqa: F401  (re-exported for tests)
     _average_defined,
@@ -830,56 +829,9 @@ def main() -> None:
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
-        validate_residual_completion_depth_direction(
-            block_extension_cfg.target_residual_completion,
-            source_depth=source_depth,
-            target_depth=target_depth,
-        )
-        run_block_extension_prestep = bool(
-            blockext_like_method
-            and block_extension_enabled
-            and depth_alignment_mode == "ariadne"
-            and source_depth != target_depth
-        )
-        run_discrete_layer_match_prestep = bool(
-            blockext_like_method and depth_alignment_mode == "discrete_index_match" and source_depth != target_depth
-        )
-        # Direct-target P1 can write into a native target model at equal depth;
-        # in that case it uses an identity layout instead of an ARIADNE resize.
-        run_same_depth_direct_target = bool(
-            blockext_like_method
-            and block_extension_enabled
-            and source_depth == target_depth
-            and block_extension_cfg.target_residual_completion.enabled
-            and block_extension_cfg.target_residual_completion.mode == "direct_target"
-        )
-        if depth_alignment_mode == "discrete_index_match" and (
-            block_extension_cfg.target_residual_completion.enabled
-            or block_extension_cfg.joint_blockwise_correction.enabled
-            or block_extension_cfg.direct_p1_correction.enabled
-        ):
-            raise ValueError(
-                "depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "
-                "joint_blockwise_correction, and direct_p1_correction."
-            )
-        if (
-            block_extension_cfg.joint_blockwise_correction.enabled
-            or block_extension_cfg.direct_p1_correction.enabled
-        ):
-            if not blockext_like_method:
-                raise ValueError("Joint/direct P1 correction requires a Theseus- or BiCo-like transport method")
-            if not run_block_extension_prestep:
-                raise ValueError(
-                    "Joint/direct P1 correction requires a depth-mismatched source/target pair "
-                    "so that ARIADNE realizes inserted blocks"
-                )
-        if merge_mode == "merge_then_rebase" and run_block_extension_prestep:
-            raise NotImplementedError(
-                "merge_then_rebase does not support the block-extension prestep yet: "
-                "per-task extended source bases live on different keyspaces and cannot be "
-                "merged without a consensus-base step (see transport_then_merge). "
-                "Use merge_mode='rebase_then_merge' for depth-mismatch pairs."
-            )
+        plan = resolved.bind(source_depth, target_depth)
+        run_block_extension_prestep = plan.run_block_extension_prestep
+        run_same_depth_direct_target = plan.run_same_depth_direct_target
         if blockext_like_method:
             calibration_dataset = calibration_dataset_spec(block_extension_cfg)
             if run_block_extension_prestep:
@@ -1173,17 +1125,11 @@ def main() -> None:
             brace_calibration_metadata = brace_mix_metadata
             run_logger.log_event("brace_calibration_plan", context=brace_mix_metadata)
         transfusion_prepared: dict[str, Any] | None = None
-        task_block_extension_prestep = bool(
-            run_block_extension_prestep and merge_mode != "merge_then_brace_then_transport"
-        )
-        # Same merge_mode-aware guard as task_block_extension_prestep above:
-        # merge_then_brace_then_transport merges deltas on the native source
-        # base first and only then runs its own once-only structural step
-        # (see the merge_then_brace_then_transport branch further below), so
-        # neither prestep fires per-task under that merge mode.
-        task_discrete_layer_match_prestep = bool(
-            run_discrete_layer_match_prestep and merge_mode != "merge_then_brace_then_transport"
-        )
+        # merge_then_brace_then_transport merges deltas on the native source base first and only
+        # then runs its own once-only structural step, so neither prestep fires per-task under it
+        # (gating resolved in `ResolvedRunConfig.bind`).
+        task_block_extension_prestep = plan.task_block_extension_prestep
+        task_discrete_layer_match_prestep = plan.task_discrete_layer_match_prestep
         # Timing/memory brackets (wandb-visible), parallel to transport_timings:
         # alignment_calibration_timings covers whatever depth/width-alignment
         # step runs before any correction is fitted (build_discrete_indexed_model

@@ -32,6 +32,7 @@ import torch
 from merge_and_rebase.utils.helpers import parse_csv
 
 from ..eval.block_extension import BlockExtensionConfig, resolve_block_extension_config
+from ..eval.target_residual_completion import validate_residual_completion_depth_direction
 from ..eval.vision_rebase_merge import (
     _SINGLE_TRANSPORT_MODES,
     _resolve_merge_mode_config,
@@ -169,6 +170,83 @@ class ResolvedRunConfig:
     @property
     def depth_alignment_mode(self) -> str:
         return self.depth_rule.legacy_depth_alignment
+
+    def bind(self, source_depth: int, target_depth: int) -> RunPlan:
+        """Post-model guards and prestep flags (needs the real source/target depths)."""
+        block_extension_cfg = self.block_extension_cfg
+        blockext_like_method = self.blockext_like_method
+        validate_residual_completion_depth_direction(
+            block_extension_cfg.target_residual_completion,
+            source_depth=source_depth,
+            target_depth=target_depth,
+        )
+        run_block_extension_prestep = bool(
+            blockext_like_method
+            and self.block_extension_enabled
+            and self.depth_rule.kind == "brace"
+            and source_depth != target_depth
+        )
+        run_discrete_layer_match_prestep = bool(
+            blockext_like_method and self.depth_rule.kind == "discrete_index_match" and source_depth != target_depth
+        )
+        # Direct-target P1 can write into a native target model at equal depth;
+        # in that case it uses an identity layout instead of an ARIADNE resize.
+        run_same_depth_direct_target = bool(
+            blockext_like_method
+            and self.block_extension_enabled
+            and source_depth == target_depth
+            and block_extension_cfg.target_residual_completion.enabled
+            and block_extension_cfg.target_residual_completion.mode == "direct_target"
+        )
+        if self.depth_rule.kind == "discrete_index_match" and (
+            block_extension_cfg.target_residual_completion.enabled
+            or block_extension_cfg.joint_blockwise_correction.enabled
+            or block_extension_cfg.direct_p1_correction.enabled
+        ):
+            raise ValueError(
+                "depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "
+                "joint_blockwise_correction, and direct_p1_correction."
+            )
+        if block_extension_cfg.joint_blockwise_correction.enabled or block_extension_cfg.direct_p1_correction.enabled:
+            if not blockext_like_method:
+                raise ValueError("Joint/direct P1 correction requires a Theseus- or BiCo-like transport method")
+            if not run_block_extension_prestep:
+                raise ValueError(
+                    "Joint/direct P1 correction requires a depth-mismatched source/target pair "
+                    "so that ARIADNE realizes inserted blocks"
+                )
+        if self.merge.mode == "merge_then_rebase" and run_block_extension_prestep:
+            raise NotImplementedError(
+                "merge_then_rebase does not support the block-extension prestep yet: "
+                "per-task extended source bases live on different keyspaces and cannot be "
+                "merged without a consensus-base step (see transport_then_merge). "
+                "Use merge_mode='rebase_then_merge' for depth-mismatch pairs."
+            )
+        # merge_then_brace_then_transport merges deltas on the native source base first and only
+        # then runs its own once-only structural step, so neither prestep fires per-task under it.
+        per_task_gate = self.merge.mode != "merge_then_brace_then_transport"
+        return RunPlan(
+            source_depth=int(source_depth),
+            target_depth=int(target_depth),
+            run_block_extension_prestep=run_block_extension_prestep,
+            run_discrete_layer_match_prestep=run_discrete_layer_match_prestep,
+            run_same_depth_direct_target=run_same_depth_direct_target,
+            task_block_extension_prestep=bool(run_block_extension_prestep and per_task_gate),
+            task_discrete_layer_match_prestep=bool(run_discrete_layer_match_prestep and per_task_gate),
+        )
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """Post-model plan: which depth prestep runs, globally and per task."""
+
+    source_depth: int
+    target_depth: int
+    run_block_extension_prestep: bool
+    run_discrete_layer_match_prestep: bool
+    run_same_depth_direct_target: bool
+    task_block_extension_prestep: bool
+    task_discrete_layer_match_prestep: bool
 
 
 def _resolve_depth_rule(cfg: Mapping[str, Any]) -> DepthRule:

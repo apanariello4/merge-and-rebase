@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -87,7 +88,7 @@ def test_discrete_index_match_rejects_ariadne_target_informed_corrections():
     real resblock depths), so it cannot be reached by a real main() call in
     this offline environment; see the module docstring.
     """
-    source = inspect.getsource(vision_rebase.main)
+    source = textwrap.dedent(inspect.getsource(run_config.ResolvedRunConfig.bind))
     tree = ast.parse(source)
     main_fn = tree.body[0]
     assert isinstance(main_fn, ast.FunctionDef)
@@ -113,7 +114,7 @@ def test_discrete_index_match_rejects_ariadne_target_informed_corrections():
 
     assert found_guard, (
         "Expected an `if ... depth_alignment ... discrete_index_match ... target_residual_completion "
-        "... joint_blockwise_correction ...: raise ValueError(...)` guard in main()."
+        "... joint_blockwise_correction ...: raise ValueError(...)` guard in ResolvedRunConfig.bind()."
     )
 
 
