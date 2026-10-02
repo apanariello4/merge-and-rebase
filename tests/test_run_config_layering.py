@@ -7,10 +7,13 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
 
-def test_run_config_import_loads_no_eval_module() -> None:
+
+@pytest.mark.parametrize("module", ["run_config", "prestep"])
+def test_rebase_stage_modules_import_no_eval_module(module: str) -> None:
     code = (
-        "import sys; import merge_and_rebase.rebase.run_config; "
+        f"import sys; import merge_and_rebase.rebase.{module}; "
         "bad=[m for m in sys.modules if m == 'merge_and_rebase.eval' or m.startswith('merge_and_rebase.eval.')]; "
         "assert not bad, bad"
     )

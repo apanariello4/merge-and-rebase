@@ -234,22 +234,34 @@ def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> 
     main_fn = tree.body[0]
     assert isinstance(main_fn, ast.FunctionDef)
     try_block = next(node for node in main_fn.body if isinstance(node, ast.Try))
-    task_loop_index = next(
+    # The last top-level ``for task`` is the transport loop (the first one only builds the task contexts).
+    task_loop_index = max(
         index
         for index, node in enumerate(try_block.body)
         if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "task"
     )
+    before_loop = try_block.body[:task_loop_index]
     initialized = {
-        node.target.id
-        for node in try_block.body[:task_loop_index]
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        node.target.id for node in before_loop if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
     }
+    assert {"cross_task_lmc_rows", "all_task_lmc_rows"} <= initialized
+    # The per-task BRACE collectors moved into the stage objects (P5.8): the source-LMC rows live on the
+    # observer and the corrected/independent endpoint books on StageEnv.endpoints; all of them must exist
+    # before the first task runs.
+    assigned = {
+        target.id
+        for node in before_loop
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert {"stage_env", "prestep", "prestep_observers", "source_lmc_rows"} <= assigned
+    from merge_and_rebase.rebase.prestep import IndependentEndpoints
+
     assert {
-        "source_lmc_rows",
-        "cross_task_lmc_rows",
-        "all_task_lmc_rows",
+        "base_by_task",
+        "ft_by_task",
+        "corrected_source_template",
         "corrected_ft_states",
         "corrected_ft_templates",
-        "independent_base_by_task",
-        "independent_ft_by_task",
-    } <= initialized
+    } <= set(IndependentEndpoints.__dataclass_fields__)

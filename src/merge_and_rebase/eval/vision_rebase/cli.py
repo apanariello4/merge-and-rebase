@@ -54,13 +54,14 @@ from ...merge.registry import list_methods as list_merge_methods
 from ...merge.task_vectors import TaskVector
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
-from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
+from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model  # noqa: F401
 from ...rebase.methods.ariadne import (
     AriadneRebase,
     apply_depth_pairing_override,
 )
 from ...rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
-from ...rebase.methods.theseus import InterpolatedBlockActivations
+from ...rebase.methods.theseus import InterpolatedBlockActivations  # noqa: F401  (kept importable)
+from ...rebase.prestep import StageEnv, TaskInputs
 from ...rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ...utils.alpha_search import PerTaskAlphaTracker, average_scores
@@ -74,7 +75,7 @@ from ..block_extension import (
 from ..datasets.vision8_14_20 import SUITES
 from ..print_utils import pretty_print_task_accuracies
 from ..rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)
-from ..target_informed_runtime import (
+from ..target_informed_runtime import (  # noqa: F401  (kept importable)
     capture_residual_references,
     capture_resized_joint_source_inputs,
     complete_direct_p1_shared_correction,
@@ -98,6 +99,7 @@ from .artifacts import (  # noqa: F401  (re-exported for tests)
     _load_saved_sequential_tv,
     _state_dict_sha256,
 )
+from .completion import _maybe_capture_target_residual_references  # noqa: F401  (re-exported for tests)
 from .context import (  # noqa: F401  (re-exported for tests)
     DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
     TRANSPORT_CALIBRATION_DATA,
@@ -133,6 +135,13 @@ from .source_lmc import (  # noqa: F401  (re-exported for tests)
     _evaluate_source_lmc,
     _evaluate_source_model_top1,
 )
+from .stages import (  # noqa: F401  (re-exported for tests)
+    _resolve_source_activation_plan,
+    _visual_only_filter,
+    build_prestep,
+    build_prestep_observers,
+    build_task_models,
+)
 from .summary import (  # noqa: F401  (re-exported for tests)
     RunRecord,
     assemble_summary,
@@ -163,34 +172,6 @@ def _set_deterministic_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
-    if not v.is_floating_point():
-        return False
-    if ".aligner." in k:
-        return False
-    return k.startswith("visual.")
-
-
-def _resolve_source_activation_plan(
-    block_extension_cfg: Any,
-    extension_layout: Mapping[str, Any] | None,
-) -> InterpolatedBlockActivations | None:
-    """Build the interpolated-activation baseline plan, or ``None`` for ARIADNE.
-
-    The plan is derived from the layout the extender actually realized rather
-    than re-derived from the schedule, so it stays correct for insertion orders
-    that draw source blocks at random.
-    """
-    if str(getattr(block_extension_cfg, "transport_activation_mode", "model")) == "model":
-        return None
-    if not extension_layout:
-        raise RuntimeError(
-            "transport_activation_mode='interpolate_neighbors' requires a recorded block "
-            "extension layout; the extension prestep did not run."
-        )
-    return InterpolatedBlockActivations.from_extension_layout(extension_layout)
 
 
 def _build_rebase_prepared(
@@ -392,41 +373,6 @@ def _build_rebase_prepared(
         return prepared
 
     return transfusion_prepared
-
-
-def _maybe_capture_target_residual_references(
-    *,
-    config: ResidualCompletionConfig,
-    source_base_model: torch.nn.Module,
-    source_ft_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    source_loader: Any,
-    target_loader: Any,
-    seed: int,
-    device: str,
-) -> dict[str, Any] | None:
-    """Capture ARIADNE proposal-1 native reference banks, or no-op when disabled.
-
-    Must be called before ``run_block_extension`` structurally resizes
-    ``source_base_model``/``source_ft_model``: the native references are the
-    un-resized source model's own boundary activations, paired against the
-    pretrained target model at the doubled positions those source blocks will
-    be inserted at. Returns ``None`` when the option is disabled, so callers
-    that thread the result through unconditionally get a byte-identical no-op.
-    """
-    if not config.enabled:
-        return None
-    return capture_residual_references(
-        source_base_model,
-        source_ft_model,
-        target_model,
-        source_loader,
-        target_loader,
-        num_batches=config.num_batches,
-        seed=seed,
-        device=device,
-        target_scope=config.target_scope,
-    )
 
 
 def _maybe_complete_target_residual_task_vector(
@@ -751,15 +697,6 @@ def main() -> None:
         transfusion_mode = resolved.transfusion_mode
         bico_mode = resolved.bico_mode
         depth_alignment_mode = resolved.depth_alignment_mode
-        block_extension_eval_enabled = resolved.lmc.block_extension_eval_enabled
-        block_extension_eval_split = resolved.lmc.block_extension_eval_split
-        block_extension_eval_first_n_batches = resolved.lmc.block_extension_eval_first_n_batches
-        source_lmc_eval = resolved.lmc.eval
-        source_lmc_eval_split = resolved.lmc.eval_split
-        source_lmc_first_n_batches = resolved.lmc.first_n_batches
-        source_lmc_alphas = resolved.lmc.alphas
-        cross_task_lmc_pairs = resolved.lmc.cross_task_pairs
-        all_task_lmc_tasks = resolved.lmc.all_task_tasks
         source_only = resolved.lmc.source_only
         strict_load = resolved.strict_load
         device = resolved.device
@@ -1010,25 +947,17 @@ def main() -> None:
         direct_residual_sequential_endpoints: dict[str, dict[str, Any] | None] = {}
         loaded_direct_residual_tvs: dict[str, dict[str, Any]] = {}
         transported_artifacts: dict[str, list[str]] = {}
-        block_extension_eval_rows: list[dict[str, Any]] = []
-        source_lmc_rows: list[dict[str, Any]] = []
         cross_task_lmc_rows: list[dict[str, Any]] = []
         all_task_lmc_rows: list[dict[str, Any]] = []
-        corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
-        corrected_ft_templates: dict[str, torch.nn.Module] = {}
-        independent_base_by_task: dict[str, dict[str, torch.Tensor]] = {}
         # Last realized per-task extension layout. The insertion schedule
         # depends only on the source/target depths, so every task shares it;
         # the merged-pair transport paths reuse it to address inserted blocks.
-        recorded_extension_layout: dict[str, Any] = {}
-        independent_ft_by_task: dict[str, dict[str, torch.Tensor]] = {}
         independent_base_average: dict[str, torch.Tensor] | None = None
         independent_base_distance_by_task: dict[str, float] = {}
         independent_base_dispersion: float | None = None
         independent_base_diagnostics_path: str | None = None
         independent_source_merge_param_count: int | None = None
         independent_direct_delta_key_count: dict[str, int] = {}
-        corrected_source_template: torch.nn.Module | None = None
         brace_calibration_metadata: dict[str, Any] | None = None
 
         for task in tasks:
@@ -1124,6 +1053,27 @@ def main() -> None:
             block_extension_calibration_loader = brace_mix_context.source_loaders.train
             brace_calibration_metadata = brace_mix_metadata
             run_logger.log_event("brace_calibration_plan", context=brace_mix_metadata)
+        stage_env = StageEnv(
+            resolved=resolved,
+            plan=plan,
+            cfg=cfg,
+            device=device,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            tuned_by_task=tuned_by_task,
+            native_tasks=native_tasks,
+            patch_attn_before_rebase=patch_attn_before_rebase,
+            source_base_sd=source_base_sd,
+            target_base_sd=target_base_sd,
+            target_hash_before=target_hash_before,
+            block_extension_calibration_loader=block_extension_calibration_loader,
+            run_logger=run_logger,
+        )
+        prestep = build_prestep(plan)
+        eval_observer, lmc_observer = build_prestep_observers()
+        prestep_observers = (eval_observer, lmc_observer)
+        block_extension_eval_rows = eval_observer.rows
+        source_lmc_rows = lmc_observer.rows
         transfusion_prepared: dict[str, Any] | None = None
         # merge_then_brace_then_transport merges deltas on the native source base first and only
         # then runs its own once-only structural step, so neither prestep fires per-task under it
@@ -1259,478 +1209,41 @@ def main() -> None:
                 print(f"  {task}: native target checkpoint — skipping transport")
                 continue
 
-            task_source_base_sd = source_base_sd
-            task_residual_references: dict[str, Any] | None = None
-            task_residual_target_loader: Any = None
-            task_joint_references: dict[str, Any] | None = None
-            task_joint_target_loader: Any = None
-            task_direct_p1_references: dict[str, Any] | None = None
-            task_direct_p1_target_loader: Any = None
-            task_source_activation_plan: InterpolatedBlockActivations | None = None
-            task_extension_layout: dict[str, Any] = {}
-
-            source_base_model_task: torch.nn.Module | None = None
-            source_ft_model_task: torch.nn.Module | None = None
-            if blockext_like_method and (
-                task_block_extension_prestep
-                or task_discrete_layer_match_prestep
-                or run_same_depth_direct_target
-                or block_extension_eval_enabled
-            ):
-                source_base_model_task = deepcopy(clf_source.model)
-                source_ft_model_task = deepcopy(clf_source.model)
-                load_into_model(source_base_model_task, source_base_sd, strict=True)
-                load_into_model(source_ft_model_task, source_base_sd, strict=True)
-                load_into_model(source_ft_model_task, load_ckpt(str(tuned_by_task[task])), strict=False)
-
-            if block_extension_eval_enabled and source_loaders is not None:
-                eval_row: dict[str, Any] = {
-                    "task": task,
-                    "split": block_extension_eval_split,
-                    "first_n_batches": (
-                        int(block_extension_eval_first_n_batches)
-                        if block_extension_eval_first_n_batches is not None
-                        else None
-                    ),
-                    "extension_applied": bool(task_block_extension_prestep),
-                }
-                if source_base_model_task is None or source_ft_model_task is None:
-                    raise RuntimeError("Block-extension eval requested but source task models were not initialized.")
-
-                if task_block_extension_prestep:
-                    zero_pre = _evaluate_source_model_top1(
-                        model=source_base_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    ft_pre = _evaluate_source_model_top1(
-                        model=source_ft_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    eval_row["zero_shot_pre"] = float(zero_pre)
-                    eval_row["ft_pre"] = float(ft_pre)
-                else:
-                    zero_curr = _evaluate_source_model_top1(
-                        model=source_base_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    ft_curr = _evaluate_source_model_top1(
-                        model=source_ft_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    eval_row["zero_shot"] = float(zero_curr)
-                    eval_row["ft"] = float(ft_curr)
-
-                block_extension_eval_rows.append(eval_row)
-
-            source_lmc_row: dict[str, Any] | None = None
-            if source_lmc_eval and task_block_extension_prestep:
-                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
-                    raise RuntimeError("Source LMC evaluation requires initialized source models and loaders.")
-                source_lmc_row = {
-                    "task": task,
-                    "lmc_mode": block_extension_cfg.lmc_mode,
-                }
-                source_pre_base_sd = to_cpu_fp32(
-                    {key: value for key, value in source_base_model_task.state_dict().items()}
-                )
-                source_pre_ft_sd = to_cpu_fp32(
-                    {key: value for key, value in source_ft_model_task.state_dict().items()}
-                )
-                print(f"  {task}: evaluating source LMC before block extension")
-                source_lmc_row["before_brace"] = _evaluate_source_lmc(
-                    model=source_base_model_task,
-                    restore_sd=source_pre_base_sd,
-                    endpoint_a_sd=source_pre_base_sd,
-                    endpoint_b_sd=source_pre_ft_sd,
-                    clf_source=clf_source,
-                    loaders_obj=source_loaders,
-                    classnames_task=classnames,
-                    source_build_cfg_task=source_build_cfg_task,
-                    split=source_lmc_eval_split,
-                    first_n_batches=source_lmc_first_n_batches,
-                    alphas=source_lmc_alphas,
-                    device=device,
-                )
-
-            if task_block_extension_prestep:
-                if source_loaders is None:
-                    raise ValueError("Block extension preprocess requires source_loaders for calibration.")
-                if source_base_model_task is None or source_ft_model_task is None:
-                    raise RuntimeError("Block extension preprocess expected initialized source task models.")
-
-                calibration_loader = block_extension_calibration_loader
-                if calibration_loader is None:
-                    calibration_loader = select_loader(
-                        block_extension_cfg.calibration_split,
-                        train_loader=source_loaders.train,
-                        test_loader=source_loaders.test,
-                        val_loader=source_loaders.val,
-                    )
-                if block_extension_cfg.target_residual_completion.enabled:
-                    # ARIADNE proposal 1: capture the native reference banks
-                    # (source base/ft boundary activations, paired against the
-                    # pretrained target model) BEFORE block extension resizes
-                    # source_base_model_task/source_ft_model_task in place.
-                    # These are the un-transported, un-inserted references the
-                    # completion step later regresses each inserted block's
-                    # c_proj projection against.
-                    task_residual_target_loader = select_loader(
-                        block_extension_cfg.calibration_split,
-                        train_loader=loaders.train,
-                        test_loader=loaders.test,
-                        val_loader=loaders.val,
-                    )
-                    task_residual_references = _maybe_capture_target_residual_references(
-                        config=block_extension_cfg.target_residual_completion,
-                        source_base_model=source_base_model_task,
-                        source_ft_model=source_ft_model_task,
-                        target_model=clf_target.model,
-                        source_loader=calibration_loader,
-                        target_loader=task_residual_target_loader,
-                        seed=int(cfg.get("seed", 42)),
-                        device=device,
-                    )
-                if block_extension_cfg.joint_blockwise_correction.enabled:
-                    task_joint_target_loader = select_loader(
-                        block_extension_cfg.calibration_split,
-                        train_loader=loaders.train,
-                        test_loader=loaders.test,
-                        val_loader=loaders.val,
-                    )
-                    task_joint_references = capture_residual_references(
-                        source_base_model_task,
-                        source_ft_model_task,
-                        clf_target.model,
-                        calibration_loader,
-                        task_joint_target_loader,
-                        num_batches=block_extension_cfg.n_batches_act,
-                        seed=int(cfg.get("seed", 42)),
-                        device=device,
-                        capture_joint=True,
-                    )
-                if block_extension_cfg.direct_p1_correction.enabled:
-                    task_direct_p1_target_loader = select_loader(
-                        block_extension_cfg.calibration_split,
-                        train_loader=loaders.train,
-                        test_loader=loaders.test,
-                        val_loader=loaders.val,
-                    )
-                    task_direct_p1_references = capture_residual_references(
-                        source_base_model_task,
-                        source_ft_model_task,
-                        clf_target.model,
-                        calibration_loader,
-                        task_direct_p1_target_loader,
-                        num_batches=block_extension_cfg.n_batches_act,
-                        seed=int(cfg.get("seed", 42)),
-                        device=device,
-                        capture_joint=True,
-                    )
-
-                task_extension_layout = {}
-                final_depth = run_block_extension(
-                    source_base_model=source_base_model_task,
-                    source_ft_model=source_ft_model_task,
-                    calibration_loader=calibration_loader,
-                    target_layers_total=target_depth,
-                    config=block_extension_cfg,
-                    device=device,
-                    layout_out=task_extension_layout,
-                    # Only the target-informed correction option reads this; every
-                    # standard ARIADNE path leaves the target backbone untouched.
-                    target_model=(
-                        clf_target.model
-                        if block_extension_cfg.target_shared_correction is not None
-                        else None
-                    ),
-                )
-                recorded_extension_layout = dict(task_extension_layout)
-                task_source_activation_plan = _resolve_source_activation_plan(
-                    block_extension_cfg, task_extension_layout
-                )
-                if final_depth != target_depth:
-                    raise RuntimeError(
-                        f"Block extension preprocess failed for task '{task}': "
-                        f"final_depth={final_depth}, expected={target_depth}."
-                    )
-                if block_extension_cfg.joint_blockwise_correction.enabled:
-                    task_joint_references = capture_resized_joint_source_inputs(
-                        source_base_model_task,
-                        calibration_loader,
-                        task_joint_references,
-                        task_extension_layout,
-                        device=device,
-                    )
-
-                task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
-                task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
-                task_delta = TaskVector.from_checkpoints(
-                    task_source_base_sd,
-                    task_source_ft_sd,
-                    strict=True,
-                    key_filter=_visual_only_filter,
-                ).delta
-                if merge_mode == "brace_merge_then_transport" or base_construction == "independent_endpoint_average":
-                    independent_base_by_task[task] = task_source_base_sd
-                if base_construction == "independent_endpoint_average":
-                    independent_ft_by_task[task] = task_source_ft_sd
-                if merge_mode == "brace_merge_then_transport" and corrected_source_template is None:
-                    corrected_source_template = deepcopy(source_base_model_task).cpu()
-
-                if cross_task_lmc_pairs or all_task_lmc_tasks:
-                    corrected_ft_states[task] = task_source_ft_sd
-                    corrected_ft_templates[task] = deepcopy(source_ft_model_task).cpu()
-
-                if source_lmc_row is not None:
-                    print(f"  {task}: evaluating source LMC after block extension")
-                    source_lmc_row["after_brace"] = _evaluate_source_lmc(
-                        model=source_base_model_task,
-                        restore_sd=task_source_base_sd,
-                        endpoint_a_sd=task_source_base_sd,
-                        endpoint_b_sd=task_source_ft_sd,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=source_lmc_eval_split,
-                        first_n_batches=source_lmc_first_n_batches,
-                        alphas=source_lmc_alphas,
-                        device=device,
-                    )
-                    source_lmc_rows.append(source_lmc_row)
-                    run_logger.log_event(
-                        "source_lmc",
-                        metrics={
-                            f"source_lmc/{task}/before/max_loss_barrier": source_lmc_row["before_brace"][
-                                "max_loss_barrier"
-                            ],
-                            f"source_lmc/{task}/after/max_loss_barrier": source_lmc_row["after_brace"][
-                                "max_loss_barrier"
-                            ],
-                            f"source_lmc/{task}/before/max_error_barrier": source_lmc_row["before_brace"][
-                                "max_error_barrier"
-                            ],
-                            f"source_lmc/{task}/after/max_error_barrier": source_lmc_row["after_brace"][
-                                "max_error_barrier"
-                            ],
-                        },
-                        context={"task": task, "lmc_mode": block_extension_cfg.lmc_mode},
-                    )
-
-                if block_extension_eval_enabled:
-                    zero_post = _evaluate_source_model_top1(
-                        model=source_base_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    ft_post = _evaluate_source_model_top1(
-                        model=source_ft_model_task,
-                        clf_source=clf_source,
-                        loaders_obj=source_loaders,
-                        classnames_task=classnames,
-                        source_build_cfg_task=source_build_cfg_task,
-                        split=block_extension_eval_split,
-                        first_n_batches=block_extension_eval_first_n_batches,
-                        device=device,
-                    )
-                    last_row = block_extension_eval_rows[-1]
-                    last_row["zero_shot_post"] = float(zero_post)
-                    last_row["ft_post"] = float(ft_post)
-                    print(
-                        f"  {task}: source target-dataset eval "
-                        f"zero_shot {last_row['zero_shot_pre']:.6f}->{zero_post:.6f} "
-                        f"ft {last_row['ft_pre']:.6f}->{ft_post:.6f}"
-                    )
-                    run_logger.log_event(
-                        "block_extension_eval",
-                        metrics={
-                            f"block_extension/eval/{task}/zero_shot_pre": float(last_row["zero_shot_pre"]),
-                            f"block_extension/eval/{task}/zero_shot_post": float(zero_post),
-                            f"block_extension/eval/{task}/ft_pre": float(last_row["ft_pre"]),
-                            f"block_extension/eval/{task}/ft_post": float(ft_post),
-                        },
-                        context=last_row,
-                    )
-                print(
-                    f"  {task}: block extension preprocess completed "
-                    f"(source_depth={source_depth} -> {final_depth}, delta_keys={len(task_delta)})."
-                )
-            elif run_same_depth_direct_target:
-                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
-                    raise RuntimeError("Same-depth direct-target P1 requires source models and calibration loaders.")
-                calibration_loader = select_loader(
-                    block_extension_cfg.calibration_split,
-                    train_loader=source_loaders.train,
-                    test_loader=source_loaders.test,
-                    val_loader=source_loaders.val,
-                )
-                task_residual_target_loader = select_loader(
-                    block_extension_cfg.calibration_split,
-                    train_loader=loaders.train,
-                    test_loader=loaders.test,
-                    val_loader=loaders.val,
-                )
-                task_residual_references = _maybe_capture_target_residual_references(
-                    config=block_extension_cfg.target_residual_completion,
-                    source_base_model=source_base_model_task,
-                    source_ft_model=source_ft_model_task,
-                    target_model=clf_target.model,
-                    source_loader=calibration_loader,
-                    target_loader=task_residual_target_loader,
-                    seed=int(cfg.get("seed", 42)),
-                    device=device,
-                )
-                task_extension_layout = {
-                    "direction": "extend",
-                    "final_blocks": [
-                        {
-                            "position": pos,
-                            "source_orig_idx": pos,
-                            "span_orig_idxs": [pos],
-                            "block_kind": "original",
-                        }
-                        for pos in range(target_depth)
-                    ],
-                    "inserted_blocks": [],
-                }
-                recorded_extension_layout = dict(task_extension_layout)
-            elif task_discrete_layer_match_prestep:
-                if source_base_model_task is None or source_ft_model_task is None:
-                    raise RuntimeError("Discrete layer match expected initialized source task models.")
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.reset_peak_memory_stats()
-                alignment_started = time.perf_counter()
-                pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
-                source_base_model_task = build_discrete_indexed_model(source_base_model_task, pairing)
-                source_ft_model_task = build_discrete_indexed_model(source_ft_model_task, pairing)
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.synchronize()
-                    alignment_peak_memory_bytes = float(torch.cuda.max_memory_allocated())
-                else:
-                    alignment_peak_memory_bytes = 0.0
-                alignment_calibration_timings[task] = {
-                    "alignment_calibration_seconds": time.perf_counter() - alignment_started,
-                    "alignment_calibration_peak_memory_bytes": alignment_peak_memory_bytes,
-                }
-                task_source_base_sd = to_cpu_fp32(source_base_model_task.state_dict())
-                task_source_ft_sd = to_cpu_fp32(source_ft_model_task.state_dict())
-                task_delta = TaskVector.from_checkpoints(
-                    task_source_base_sd, task_source_ft_sd, strict=True, key_filter=_visual_only_filter
-                ).delta
-                print(
-                    f"  {task}: discrete layer match reindex completed "
-                    f"(source_depth={source_depth} -> {target_depth}, delta_keys={len(task_delta)})."
-                )
-            elif block_extension_eval_enabled and block_extension_eval_rows:
-                last_row = block_extension_eval_rows[-1]
-                print(
-                    f"  {task}: source target-dataset eval "
-                    f"zero_shot={last_row['zero_shot']:.6f} ft={last_row['ft']:.6f}"
-                )
-                run_logger.log_event(
-                    "block_extension_eval",
-                    metrics={
-                        f"block_extension/eval/{task}/zero_shot": float(last_row["zero_shot"]),
-                        f"block_extension/eval/{task}/ft": float(last_row["ft"]),
-                    },
-                    context=last_row,
-                )
+            task_in = TaskInputs(task, task_ctx)
+            task_models = build_task_models(stage_env, task)
+            for observer in prestep_observers:
+                observer.before(stage_env, task_in, task_models)
+            pre = prestep.run(stage_env, task_in, task_models)
+            # LMC "after" is logged before the target-dataset eval "post" (legacy event order).
+            for observer in reversed(prestep_observers):
+                observer.after(stage_env, task_in, task_models, pre)
+            if pre.completion_note is not None:
+                print(pre.completion_note)
+            if "alignment_calibration" in pre.timings:
+                alignment_calibration_timings[task] = pre.timings["alignment_calibration"]
 
             if source_only:
                 continue
 
-            if not task_block_extension_prestep and not task_discrete_layer_match_prestep:
-                if transfusion_mode:
-                    if transfusion_prepared is None:
-                        transfusion_prepared = method.prepare(
-                            clf_source=clf_source,
-                            clf_target=clf_target,
-                            source_loaders=source_loaders,
-                            classnames=classnames,
-                            source_build_cfg=source_build_cfg_task,
-                            device=device,
-                            seed=int(cfg.get("seed", 42)),
-                            **method_params,
-                        )
-                        source_base_sd = transfusion_prepared["source_base_sd"]
-                        target_base_sd = transfusion_prepared["target_base_sd"]
-                        target_hash_before = _state_dict_sha256(target_base_sd)
-                        clf_target.model = transfusion_prepared["target_model_patched"]
-                        if transfusion_prepared.get("sanity_check_pre") is not None:
-                            print(
-                                f"  TransFusion perm sanity (once): "
-                                f"{transfusion_prepared['sanity_check_pre']:.6f} -> "
-                                f"{transfusion_prepared['sanity_check_post']:.6f} "
-                                f"(delta={transfusion_prepared['sanity_check_post'] - transfusion_prepared['sanity_check_pre']:+.6f})"
-                            )
-                            run_logger.log_event(
-                                "transfusion_perm_sanity",
-                                metrics={
-                                    f"transfusion/{task}/source_zeroshot": float(transfusion_prepared["sanity_check_pre"]),
-                                    f"transfusion/{task}/permuted_zeroshot": float(transfusion_prepared["sanity_check_post"]),
-                                    f"transfusion/{task}/perm_delta": float(
-                                        transfusion_prepared["sanity_check_post"] - transfusion_prepared["sanity_check_pre"]
-                                    ),
-                                },
-                                context={"task": task},
-                            )
-
-                    tuned_sd = method.load_task_checkpoint(
-                        str(tuned_by_task[task]),
-                        transfusion_prepared["source_model_unpatched"],
-                    )
-                    task_delta = method.compute_task_delta(tuned_sd, source_base_sd)
-                else:
-                    ckpt_path = str(tuned_by_task[task])
-                    sd = load_ckpt(ckpt_path)
-                    aligned = align_to_base_keys(sd, source_base_sd)
-                    if not aligned:
-                        raise ValueError(
-                            f"No tensors from tuned checkpoint aligned to source base keys for task '{task}': {ckpt_path}. "
-                            f"{'The base model was attention-patched before rebase, so the checkpoint must use the same patched keyspace.' if patch_attn_before_rebase else ''}"
-                        )
-                    tuned_sd = to_cpu_fp32(aligned)
-                    task_delta = TaskVector.from_checkpoints(
-                        source_base_sd,
-                        tuned_sd,
-                        strict=False,
-                        key_filter=_visual_only_filter,
-                    ).delta
-                    if base_construction == "independent_endpoint_average":
-                        independent_base_by_task[task] = task_source_base_sd
-                        independent_ft_by_task[task] = tuned_sd
-
-                n_keys = len(tuned_sd)
-                print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
+            pre = prestep.load_delta(stage_env, task_in, pre)
+            # TransFusion's once-only prepare rebinds these run-level objects (see NoPrestep.load_delta).
+            source_base_sd = stage_env.source_base_sd
+            target_base_sd = stage_env.target_base_sd
+            target_hash_before = stage_env.target_hash_before
+            transfusion_prepared = stage_env.transfusion_prepared
+            task_source_base_sd = pre.source_base_sd
+            task_delta = pre.task_delta
+            source_base_model_task = pre.source_base_model
+            source_ft_model_task = pre.source_ft_model
+            task_source_activation_plan = pre.activation_plan
+            task_extension_layout = pre.layout
+            task_residual_references = pre.references.residual
+            task_residual_target_loader = pre.references.residual_target_loader
+            task_joint_references = pre.references.joint
+            task_joint_target_loader = pre.references.joint_target_loader
+            task_direct_p1_references = pre.references.direct_p1
+            task_direct_p1_target_loader = pre.references.direct_p1_target_loader
+            calibration_loader = pre.references.source_calibration_loader
 
             direct_target_p1 = bool(
                 (task_block_extension_prestep or run_same_depth_direct_target)
@@ -2171,10 +1684,10 @@ def main() -> None:
                 prepared_has_brace = False
                 merged_source_activation_plan = None
             elif merge_mode == "brace_merge_then_transport":
-                if corrected_source_template is None or not independent_base_by_task:
+                if stage_env.endpoints.corrected_source_template is None or not stage_env.endpoints.base_by_task:
                     raise RuntimeError("BRACE-then-merge requires corrected source endpoints for every task.")
-                average_visual, average_keys = _average_visual_state_dicts(independent_base_by_task)
-                first_base = independent_base_by_task[sorted(independent_base_by_task)[0]]
+                average_visual, average_keys = _average_visual_state_dicts(stage_env.endpoints.base_by_task)
+                first_base = stage_env.endpoints.base_by_task[sorted(stage_env.endpoints.base_by_task)[0]]
                 merged_source_base = dict(first_base)
                 merged_source_base.update(average_visual)
                 merged_source_direction = _merge_direction(
@@ -2186,7 +1699,7 @@ def main() -> None:
                 )
                 distances = {
                     task: _relative_visual_state_distance(state, average_visual, average_keys)
-                    for task, state in independent_base_by_task.items()
+                    for task, state in stage_env.endpoints.base_by_task.items()
                 }
                 calibration_metadata.update(
                     {
@@ -2196,10 +1709,10 @@ def main() -> None:
                         "source_base_max_relative_distance": max(distances.values()),
                     }
                 )
-                source_template_once = corrected_source_template
+                source_template_once = stage_env.endpoints.corrected_source_template
                 prepared_has_brace = True
                 merged_source_activation_plan = _resolve_source_activation_plan(
-                    block_extension_cfg, recorded_extension_layout
+                    block_extension_cfg, stage_env.recorded_extension_layout
                 )
             elif merge_mode == "merge_then_brace_then_transport":
                 native_merged_direction = _merge_direction(
