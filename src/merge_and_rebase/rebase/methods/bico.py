@@ -606,26 +606,26 @@ class BiCoRebase:
 
                 if family_adapter is not None:
                     tp_keys = family_adapter.transportable_keys(target_base)
-                    visual_key_map = {k: k for k in delta if k in tp_keys}
-                    target_visual_base = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
-                    visual_delta = {k: delta[k] for k in visual_key_map if k in target_visual_base}
+                    key_map = {k: k for k in delta if k in tp_keys}
+                    target_scoped_base = {k: target_base[k] for k in key_map.values() if k in target_base}
+                    scoped_delta = {k: delta[k] for k in key_map if k in target_scoped_base}
                 else:
-                    visual_key_map = _shared._visual_delta_keys(delta)
-                    target_visual_base = _shared._visual_state_dict(target_base)
-                    visual_delta = {
+                    key_map = _shared._visual_delta_keys(delta)
+                    target_scoped_base = _shared._visual_state_dict(target_base)
+                    scoped_delta = {
                         stripped_key: delta[original_key]
-                        for stripped_key, original_key in visual_key_map.items()
-                        if stripped_key in target_visual_base
+                        for stripped_key, original_key in key_map.items()
+                        if stripped_key in target_scoped_base
                     }
 
                 if split_fused_qkv and family_adapter is None:
-                    target_visual_base = _shared._split_fused_qkv_state(target_visual_base)
-                    visual_delta = _shared._split_fused_qkv_state(visual_delta)
+                    target_scoped_base = _shared._split_fused_qkv_state(target_scoped_base)
+                    scoped_delta = _shared._split_fused_qkv_state(scoped_delta)
 
                 transforms_by_key, precompute_diag = _shared._precompute_transforms(
                     target_model=target_model,
-                    target_visual_base=target_visual_base,
-                    visual_delta=visual_delta,
+                    target_visual_base=target_scoped_base,
+                    visual_delta=scoped_delta,
                     activation_registry=activation_registry,
                     center_acts=bool(center_acts),
                     whiten_power=whiten_power,
@@ -717,48 +717,48 @@ class BiCoRebase:
 
         if family_adapter is not None:
             tp_keys = family_adapter.transportable_keys(target_base)
-            visual_key_map = {k: k for k in delta if k in tp_keys}
-            target_visual_base_work = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
-            visual_delta_work = {k: delta[k] for k in visual_key_map if k in target_visual_base_work}
+            key_map = {k: k for k in delta if k in tp_keys}
+            target_scoped_base_work = {k: target_base[k] for k in key_map.values() if k in target_base}
+            scoped_delta_work = {k: delta[k] for k in key_map if k in target_scoped_base_work}
             split_fused_qkv = False
             out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
-            skipped_not_in_target_keys = tuple(k for k in visual_key_map if k not in target_base)
+            skipped_not_in_target_keys = tuple(k for k in key_map if k not in target_base)
         else:
-            visual_key_map = _shared._visual_delta_keys(delta)
-            target_visual_base = _shared._visual_state_dict(target_base)
+            key_map = _shared._visual_delta_keys(delta)
+            target_scoped_base = _shared._visual_state_dict(target_base)
 
-            visual_delta = {
+            scoped_delta = {
                 stripped_key: delta[original_key]
-                for stripped_key, original_key in visual_key_map.items()
+                for stripped_key, original_key in key_map.items()
             }
 
             split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
             if split_fused_qkv:
-                target_visual_base_work = _shared._split_fused_qkv_state(target_visual_base)
-                visual_delta_work = _shared._split_fused_qkv_state(
-                    {key: value for key, value in visual_delta.items() if key in target_visual_base}
+                target_scoped_base_work = _shared._split_fused_qkv_state(target_scoped_base)
+                scoped_delta_work = _shared._split_fused_qkv_state(
+                    {key: value for key, value in scoped_delta.items() if key in target_scoped_base}
                 )
             else:
-                target_visual_base_work = target_visual_base
-                visual_delta_work = {key: value for key, value in visual_delta.items() if key in target_visual_base}
-            has_visual_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
+                target_scoped_base_work = target_scoped_base
+                scoped_delta_work = {key: value for key, value in scoped_delta.items() if key in target_scoped_base}
+            has_prefixed_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
             out_of_scope_keys = tuple(
                 key for key in delta
-                if has_visual_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
+                if has_prefixed_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
             )
             skipped_not_in_target_keys = tuple(
                 original_key
-                for stripped_key, original_key in visual_key_map.items()
-                if stripped_key not in target_visual_base and original_key not in out_of_scope_keys
+                for stripped_key, original_key in key_map.items()
+                if stripped_key not in target_scoped_base and original_key not in out_of_scope_keys
             )
 
-        if strict and not visual_delta_work:
+        if strict and not scoped_delta_work:
             raise ValueError("BiCo did not find any visual delta keys to transport.")
 
         compute_device = prepared.get("compute_device", "cpu")
-        aligned_visual, apply_diag = _shared._apply_transforms_to_visual_delta(
-            target_visual_base=target_visual_base_work,
-            visual_delta=visual_delta_work,
+        aligned_scoped, apply_diag = _shared._apply_transforms_to_visual_delta(
+            target_visual_base=target_scoped_base_work,
+            visual_delta=scoped_delta_work,
             transforms_by_key=transforms_by_key,
             show_progress=bool(show_progress),
             method_name=self.name,
@@ -769,16 +769,16 @@ class BiCoRebase:
         )
 
         if split_fused_qkv:
-            aligned_visual = _shared._merge_split_qkv_state(aligned_visual, reference=target_visual_base)
+            aligned_scoped = _shared._merge_split_qkv_state(aligned_scoped, reference=target_scoped_base)
 
         out: TensorDict = {}
         processed: set[str] = set()
 
-        for stripped_key, original_key in visual_key_map.items():
+        for stripped_key, original_key in key_map.items():
             if original_key not in target_base:
                 continue
-            if stripped_key in aligned_visual:
-                out[original_key] = aligned_visual[stripped_key].to(
+            if stripped_key in aligned_scoped:
+                out[original_key] = aligned_scoped[stripped_key].to(
                     dtype=target_base[original_key].dtype,
                     device=target_base[original_key].device,
                 )
@@ -806,7 +806,7 @@ class BiCoRebase:
                 print(f"{log_prefix} apply: zero_attention_delta zeroed {zeroed} attention keys")
 
         if strict:
-            expected_keys = {key for key in visual_key_map.values() if key in target_base}
+            expected_keys = {key for key in key_map.values() if key in target_base}
             missing = sorted(expected_keys - set(out.keys()))
             if missing:
                 raise KeyError(f"BiCo did not transport all delta keys. Example: {missing[:10]}")
