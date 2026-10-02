@@ -227,6 +227,9 @@ def main() -> None:
         if merge_weights is None:
             merge_weights = [1.0] * len(tasks)
         merge_weights = [float(w) for w in merge_weights]
+        if len(merge_weights) != len(tasks):
+            # B9: validated up front for every merge mode (merge_mode='none' used to fail late on a bare zip()).
+            raise ValueError("weights length must match tuned checkpoints")
 
         source_cfg = OpenClipBuildConfig(
             model_name=cfg.get("source_clip_model", "ViT-B-32"),

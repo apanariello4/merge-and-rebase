@@ -1508,19 +1508,17 @@ ERRORS: dict[str, Err] = {
         run_started=True,
         mutate=("ckpt://MNIST", _prefix_junk),
     ),
-    # Behaviour pinned as-is (see HASHES.md "Observed quirks"): these are NOT designed validations.
+    # B9 (P5.14): validated up front for every merge mode.
     "weights_length_mismatch_merge_mode_none": Err(
         {"weights": [1.0]},
         ValueError,
-        E("zip() argument 2 is shorter than argument 1"),
-        before_build=False,
+        E("weights length must match tuned checkpoints"),
         run_started=True,
     ),
     "weights_length_mismatch_merge": Err(
         {"weights": [1.0], "merge_mode": "rebase_then_merge"},
         ValueError,
         E("weights length must match tuned checkpoints"),
-        before_build=False,
         run_started=True,
     ),
 }
