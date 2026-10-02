@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -30,7 +31,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 from .adapters import ComponentAdapter, ComponentSpec
 from .config import TargetSharedCorrection
-from .schedules import spread_anchor_schedule
+from .schedules import disjoint_collapse_schedule, spread_anchor_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,8 @@ class BlockExtenderCore:
     _LOG_PREFIX = "block_extension"
     _EXPECTED_PREFIX = "Expected one of: "
     _ridge_weight = 1e-6
+    # The decoder shrink always interpolates the merged pair (B13); vision honours ``per_weight_mode``.
+    _SHRINK_HONOURS_PER_WEIGHT_MODE = True
     adapter: ComponentAdapter
 
     def _vprint(self, message: str) -> None:
@@ -398,6 +401,43 @@ class BlockExtenderCore:
         self.adapter.apply_correction(block, spec, W, b)
 
     @torch.no_grad()
+    def _run_cascade(
+        self,
+        model_name: str,
+        model: nn.Module,
+        pos: int,
+        loader: Iterable[Any],
+        n_batches: int,
+        ridge_identity: float,
+        n_iters: int,
+        ref_source: str | None,
+        component_ridge: dict[str, float] | None,
+        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
+        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
+        pair_for: Callable[
+            [ComponentSpec, torch.Tensor, Mapping[str, torch.Tensor]], tuple[torch.Tensor, torch.Tensor]
+        ],
+    ) -> None:
+        """Fit and absorb every component of the block at ``pos`` in cascade order.
+
+        ``pair_for(spec, cur, refs)`` builds the ``(A, T)`` regression pair from the component's current output
+        ``cur`` and the reference bank ``refs``; an empty pair skips the component.
+        """
+        block = self.adapter.layers(model)[pos]
+        refs = self.reference_inputs[ref_source if ref_source is not None else model_name]
+        self._component_ridge = component_ridge
+        for _ in range(n_iters):
+            for spec in self.adapter.components:
+                cur = self._capture_component_output(model, pos, spec.capture_name or spec.name, loader, n_batches)
+                A, T = pair_for(spec, cur, refs)
+                self._fit_and_correct(model_name, block, spec, A, T, ridge_identity, lmc_store, lmc_targets)
+
+    def _direct_pair(self, cur: torch.Tensor, ref: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        if ref is not None and cur.numel() > 0:
+            return self._match_rows(cur, ref)
+        return torch.empty(0), torch.empty(0)
+
+    @torch.no_grad()
     def _correct_block_weights_cascade(
         self,
         model_name: str,
@@ -416,32 +456,63 @@ class BlockExtenderCore:
         target_reference: torch.Tensor | None = None,
         target_weight: float = 0.0,
     ):
-        block = self.adapter.layers(model)[insert_pos]
-        refs = self.reference_inputs[ref_source if ref_source is not None else model_name]
-        self._component_ridge = component_ridge
-        for _ in range(n_iters):
-            for spec in self.adapter.components:
-                cur = self._capture_component_output(
-                    model, insert_pos, spec.capture_name or spec.name, loader, n_batches
-                )
-                ref = refs.get(f"{src_idx}.{spec.ref_key}")
-                if spec.blendable_target and ref is not None and target_reference is not None and target_weight > 0.0:
-                    ref = self._blend_target_reference(
-                        ref, target_reference, self._target_reference_samples, target_weight
-                    )
-                if spec.residual_aware and insertion_target_mode == "residual":
-                    # Pin the post-attention (out_proj) / block-output (c_proj) residual stream to the source
-                    # block's instead of matching the component alone.
-                    adds = [refs.get(f"{src_idx}.input")]
-                    if spec.stream_role == "mlp_out":
-                        adds.append(refs.get(f"{src_idx}.attn_output"))
-                    adds.append(ref)
-                    A, T = self._stream_pair(spec, cur, adds, model, insert_pos, loader, n_batches)
-                elif ref is not None and cur.numel() > 0:
-                    A, T = self._match_rows(cur, ref)
-                else:
-                    A = T = torch.empty(0)
-                self._fit_and_correct(model_name, block, spec, A, T, ridge_identity, lmc_store, lmc_targets)
+        def pair_for(spec: ComponentSpec, cur: torch.Tensor, refs: Mapping[str, torch.Tensor]):
+            ref = refs.get(f"{src_idx}.{spec.ref_key}")
+            if spec.blendable_target and ref is not None and target_reference is not None and target_weight > 0.0:
+                ref = self._blend_target_reference(ref, target_reference, self._target_reference_samples, target_weight)
+            if spec.residual_aware and insertion_target_mode == "residual":
+                # Pin the post-attention (out_proj) / block-output (c_proj) residual stream to the source block's
+                # instead of matching the component alone.
+                adds = [refs.get(f"{src_idx}.input")]
+                if spec.stream_role == "mlp_out":
+                    adds.append(refs.get(f"{src_idx}.attn_output"))
+                adds.append(ref)
+                return self._stream_pair(spec, cur, adds, model, insert_pos, loader, n_batches)
+            return self._direct_pair(cur, ref)
+
+        self._run_cascade(
+            model_name, model, insert_pos, loader, n_batches, ridge_identity, n_iters, ref_source,
+            component_ridge, lmc_store, lmc_targets, pair_for,
+        )  # fmt: skip
+
+    @torch.no_grad()
+    def _correct_collapsed_block_weights_cascade(
+        self,
+        model_name: str,
+        model: nn.Module,
+        block_idx: int,
+        span_start_idx: int,
+        span_end_idx: int,
+        output_ref_key: str,
+        loader: Iterable[Any],
+        n_batches: int,
+        ridge_identity: float = 0.0,
+        n_iters: int = 1,
+        ref_source: str | None = None,
+        component_ridge: dict[str, float] | None = None,
+        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ):
+        """Correct a collapsed block against the span it replaces.
+
+        Norms and q/k/v track the start of the span. The attention output reproduces the last removed block's
+        post-attention residual; the MLP output is fitted against the removed span's final output
+        (``output_ref_key``) minus the stream actually reaching the MLP.
+        """
+
+        def pair_for(spec: ComponentSpec, cur: torch.Tensor, refs: Mapping[str, torch.Tensor]):
+            if spec.stream_role == "attn_out":
+                adds = [refs.get(f"{span_end_idx}.input"), refs.get(f"{span_end_idx}.{spec.ref_key}")]
+                return self._stream_pair(spec, cur, adds, model, block_idx, loader, n_batches)
+            if spec.stream_role == "mlp_out":
+                return self._stream_pair(spec, cur, [refs.get(output_ref_key)], model, block_idx, loader, n_batches)
+            anchor = span_start_idx if spec.span_anchor == "start" else span_end_idx
+            return self._direct_pair(cur, refs.get(f"{anchor}.{spec.ref_key}"))
+
+        self._run_cascade(
+            model_name, model, block_idx, loader, n_batches, ridge_identity, n_iters, ref_source,
+            component_ridge, lmc_store, lmc_targets, pair_for,
+        )  # fmt: skip
 
     @torch.no_grad()
     def _apply_block_corrections(
@@ -600,6 +671,157 @@ class BlockExtenderCore:
         if provider is not None:
             provider.finish()
         self._vprint(f"per-weight extension completed. final_depth={final_depth}")
+        return final_depth
+
+    # ---- shrink skeleton ------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _build_collapse_schedule(curr_layers: int, n_to_remove: int, insertion_order: str, extension_density: str):
+        raise NotImplementedError
+
+    @staticmethod
+    def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
+        raise NotImplementedError
+
+    def _collapse_output_refs(self, span_end: int, orig_depth: int) -> tuple[str, int | str | None]:
+        """Reference key of the span's output boundary and the block-input index capturing it."""
+        raise NotImplementedError
+
+    def _finalize_reduction(self, chain_base: list[dict[str, Any]]) -> None:
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def _shrink_per_weight(
+        self,
+        *,
+        loader: Iterable[Any],
+        n_batches: int,
+        dampening_factor: float,
+        blocks_to_add: int | None,
+        target_layers_total: int | None,
+        insertion_order: str,
+        extension_density: str,
+        collapse_schedule: str = "cascade",
+        ridge_identity: float = 0.0,
+        per_weight_mode: str = "cascade",
+        n_cascade_iters: int = 1,
+        share_ft_refs: bool = False,
+        skip_correction: bool = False,
+        component_ridge: dict[str, float] | None = None,
+        lmc_mode: str = "independent",
+    ) -> int:
+        if per_weight_mode not in {"cascade", "duplicate"}:
+            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
+        self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
+        provider = self._open_references(skip_correction, loader, n_batches)
+
+        curr_layers = len(self.adapter.layers(self.model_base))
+        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
+
+        if n_needed >= 0:
+            logger.info("Block shrink: no shrink needed.")
+            self._vprint("no shrink needed")
+            return curr_layers
+
+        n_to_remove = -n_needed
+        if collapse_schedule == "disjoint_spans":
+            schedule = disjoint_collapse_schedule(curr_layers, n_to_remove, insertion_order)
+        elif collapse_schedule == "cascade":
+            schedule = self._build_collapse_schedule(
+                curr_layers=curr_layers,
+                n_to_remove=n_to_remove,
+                insertion_order=insertion_order,
+                extension_density=extension_density,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported collapse_schedule '{collapse_schedule}'. Expected 'cascade' or 'disjoint_spans'."
+            )
+        logger.info("Block shrink planned collapses: %s", schedule)
+        self._vprint(f"planned collapses: {schedule}")
+
+        orig_base = list(self.adapter.layers(self.model_base))
+        orig_ft = list(self.adapter.layers(self.model_ft))
+        orig_depth = len(orig_base)
+        chain_base = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_base)]
+        chain_ft = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_ft)]
+
+        step_iter = _iter_with_progress(
+            enumerate(schedule, start=1),
+            total=len(schedule),
+            desc=f"{self._LOG_PREFIX}.shrink_per_weight",
+            enabled=self.show_progress,
+        )
+        for step, anchor_orig_idx in step_iter:
+            collapse_pos = self._locate_collapse_pos(chain_base, anchor_orig_idx)
+            left_base = chain_base[collapse_pos]
+            right_base = chain_base[collapse_pos + 1]
+            left_ft = chain_ft[collapse_pos]
+            right_ft = chain_ft[collapse_pos + 1]
+            merged_orig_idxs = tuple(left_base["orig_idxs"] + right_base["orig_idxs"])
+            logger.info(
+                "Block shrink step %d/%d. Merge span %s + %s -> %s",
+                step,
+                len(schedule),
+                left_base["orig_idxs"],
+                right_base["orig_idxs"],
+                merged_orig_idxs,
+            )
+            self._vprint(
+                f"step {step}/{len(schedule)} merge_spans={left_base['orig_idxs']}+{right_base['orig_idxs']}"
+                f" -> {merged_orig_idxs}"
+            )
+
+            merged_base = deepcopy(left_base["mod"])
+            merged_ft = deepcopy(left_ft["mod"])
+            if per_weight_mode == "cascade" or not self._SHRINK_HONOURS_PER_WEIGHT_MODE:
+                self._interpolate_block_weights(merged_base, right_base["mod"], alpha=0.5)
+                self._interpolate_block_weights(merged_ft, right_ft["mod"], alpha=0.5)
+
+            if dampening_factor < 1.0:
+                self._dampen_block_output(merged_base, dampening_factor)
+                self._dampen_block_output(merged_ft, dampening_factor)
+
+            chain_base[collapse_pos : collapse_pos + 2] = [{"mod": merged_base, "orig_idxs": merged_orig_idxs}]
+            chain_ft[collapse_pos : collapse_pos + 2] = [{"mod": merged_ft, "orig_idxs": merged_orig_idxs}]
+            self._commit_chain(self.model_base, chain_base)
+            self._commit_chain(self.model_ft, chain_ft)
+
+            if not skip_correction:
+                span_start_idx = merged_orig_idxs[0]
+                span_end_idx = merged_orig_idxs[-1]
+                output_ref_key, output_input_index = self._collapse_output_refs(span_end_idx, orig_depth)
+                provider.ensure(
+                    endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
+                    block_indices=(span_start_idx, span_end_idx),
+                    input_indices=(span_end_idx, output_input_index),
+                    loader=loader,
+                    n_batches=n_batches,
+                )
+                self._diagnostic_context = {
+                    "structural_step": step,
+                    "final_block": collapse_pos,
+                    "source_block": span_start_idx,
+                }
+                correct = partial(
+                    self._correct_collapsed_block_weights_cascade,
+                    block_idx=collapse_pos,
+                    span_start_idx=span_start_idx,
+                    span_end_idx=span_end_idx,
+                    output_ref_key=output_ref_key,
+                    loader=loader,
+                    n_batches=n_batches,
+                    ridge_identity=ridge_identity,
+                    n_iters=n_cascade_iters,
+                    component_ridge=component_ridge,
+                )
+                self._dispatch_lmc(lmc_mode, share_ft_refs, collapse_pos, correct)
+
+        final_depth = len(self.adapter.layers(self.model_base))
+        self._finalize_reduction(chain_base)
+        if provider is not None:
+            provider.finish()
+        self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
         return final_depth
 
     @classmethod

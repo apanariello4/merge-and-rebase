@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from copy import deepcopy
-from functools import partial
 from itertools import islice
 from typing import Any
 
@@ -487,174 +485,6 @@ class BlockExtender(BlockExtenderCore):
         """
         self.adapter.zero_output_projections(block)
 
-    @torch.no_grad()
-    def _correct_collapsed_block_weights_cascade(
-        self,
-        model_name: str,
-        model: nn.Module,
-        block_idx: int,
-        span_start_idx: int,
-        span_end_idx: int,
-        output_ref_key: str,
-        loader: Iterable[Any],
-        n_batches: int,
-        ridge_identity: float = 0.0,
-        n_iters: int = 1,
-        ref_source: str | None = None,
-        component_ridge: dict[str, float] | None = None,
-        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ):
-        block = model.visual.transformer.resblocks[block_idx]
-        inner = self._inner_block(block)
-        ref_key = ref_source if ref_source is not None else model_name
-        refs = self.reference_inputs[ref_key]
-        dim_qkv = inner.attn.in_proj_weight.shape[0] // 3
-        self._component_ridge = component_ridge
-
-        def _ridge_target(comp: str) -> torch.Tensor | None:
-            if lmc_targets is None or comp not in lmc_targets:
-                return None
-            W_base, _ = lmc_targets[comp]
-            if comp in ("ln_1", "ln_2"):
-                return torch.diag(torch.diag(W_base))
-            return W_base
-
-        for _ in range(n_iters):
-            # Step 1: ln_1 tracks the start of the collapsed span.
-            cur = self._capture_component_output(model, block_idx, "ln_1", loader, n_batches)
-            ref = refs.get(f"{span_start_idx}.ln_1_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_1", ridge_identity), ridge_target=_ridge_target("ln_1"))
-                    if lmc_store is not None:
-                        lmc_store["ln_1"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "ln_1", W, b)
-                    d = torch.diag(W).to(inner.ln_1.weight.device, dtype=inner.ln_1.weight.dtype)
-                    b = b.to(inner.ln_1.bias.device, dtype=inner.ln_1.bias.dtype)
-                    inner.ln_1.weight.mul_(d)
-                    inner.ln_1.bias.copy_(d * inner.ln_1.bias + b)
-
-            # Step 2: q_proj follows the first block input distribution.
-            cur = self._capture_component_output(model, block_idx, "q", loader, n_batches)
-            ref = refs.get(f"{span_start_idx}.q_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("q", ridge_identity), ridge_target=_ridge_target("q"))
-                    if lmc_store is not None:
-                        lmc_store["q"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "q", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[:dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[:dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[:dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[:dim_qkv] = W @ b_slice + b
-
-            # Step 3: k_proj follows the first block input distribution.
-            cur = self._capture_component_output(model, block_idx, "k", loader, n_batches)
-            ref = refs.get(f"{span_start_idx}.k_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("k", ridge_identity), ridge_target=_ridge_target("k"))
-                    if lmc_store is not None:
-                        lmc_store["k"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "k", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv] = W @ b_slice + b
-
-            # Step 4: v_proj follows the first block input distribution.
-            cur = self._capture_component_output(model, block_idx, "v", loader, n_batches)
-            ref = refs.get(f"{span_start_idx}.v_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("v", ridge_identity), ridge_target=_ridge_target("v"))
-                    if lmc_store is not None:
-                        lmc_store["v"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "v", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv] = W @ b_slice + b
-
-            # Step 5: attn output is corrected to reproduce the last removed block's post-attn residual.
-            cur = self._capture_component_output(model, block_idx, "attn", loader, n_batches)
-            cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
-            ref_input = refs.get(f"{span_end_idx}.input")
-            ref_attn = refs.get(f"{span_end_idx}.attn_output")
-            if ref_input is not None and ref_attn is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_attn.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_attn[:n] - cur_input[:n]
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
-                    if lmc_store is not None:
-                        lmc_store["out_proj"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "out_proj", W, b)
-                    W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
-                    b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
-                    inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
-                    inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
-
-            # Step 6: ln_2 tracks the tail block after the attn residual has been matched.
-            cur = self._capture_component_output(model, block_idx, "ln_2", loader, n_batches)
-            ref = refs.get(f"{span_end_idx}.ln_2_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_2", ridge_identity), ridge_target=_ridge_target("ln_2"))
-                    if lmc_store is not None:
-                        lmc_store["ln_2"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "ln_2", W, b)
-                    d = torch.diag(W).to(inner.ln_2.weight.device, dtype=inner.ln_2.weight.dtype)
-                    b = b.to(inner.ln_2.bias.device, dtype=inner.ln_2.bias.dtype)
-                    inner.ln_2.weight.mul_(d)
-                    inner.ln_2.bias.copy_(d * inner.ln_2.bias + b)
-
-            # Step 7: c_fc tracks the tail block MLP hidden state.
-            cur = self._capture_component_output(model, block_idx, "c_fc", loader, n_batches)
-            ref = refs.get(f"{span_end_idx}.c_fc_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_fc", ridge_identity), ridge_target=_ridge_target("c_fc"))
-                    if lmc_store is not None:
-                        lmc_store["c_fc"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "c_fc", W, b)
-                    W = W.to(inner.mlp.c_fc.weight.device, dtype=inner.mlp.c_fc.weight.dtype)
-                    b = b.to(inner.mlp.c_fc.bias.device, dtype=inner.mlp.c_fc.bias.dtype)
-                    inner.mlp.c_fc.weight.copy_(W @ inner.mlp.c_fc.weight)
-                    inner.mlp.c_fc.bias.copy_(W @ inner.mlp.c_fc.bias + b)
-
-            # Step 8: c_proj is corrected against the final target output of the removed span.
-            cur = self._capture_component_output(model, block_idx, "c_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
-            cur_attn = self._capture_component_output(model, block_idx, "attn", loader, n_batches)
-            ref = refs.get(output_ref_key)
-            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], cur_attn.shape[0], ref.shape[0])
-                A = cur[:n]
-                T = ref[:n] - cur_input[:n] - cur_attn[:n]
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
-                    if lmc_store is not None:
-                        lmc_store["c_proj"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "c_proj", W, b)
-                    W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
-                    b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
-                    inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
-                    inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
-
     @staticmethod
     def _build_collapse_schedule(
         curr_layers: int,
@@ -878,156 +708,23 @@ class BlockExtender(BlockExtenderCore):
                 **block_kwargs,
             )
 
+    def _collapse_output_refs(self, span_end: int, orig_depth: int) -> tuple[str, int | str]:
+        # The span's output boundary is the input of the block above it (the final norm for the last block).
+        if span_end + 1 >= orig_depth:
+            return "final.input", "final"
+        return f"{span_end + 1}.input", span_end + 1
+
+    def _finalize_reduction(self, chain_base) -> None:
+        # The extension path publishes its realized layout for downstream target-informed code; the reduction path
+        # must too, or a caller that passes ``layout_out`` silently receives an empty dict.
+        self.extension_layout = build_reduction_layout(chain_base)
+        self.reference_inputs = {"base": {}, "ft": {}}
+
     def _finalize_extension(self, chain_base) -> None:
         self.extension_layout = build_extension_layout(chain_base)
         self._target_reference_banks = {}
         self.reference_inputs = {"base": {}, "ft": {}}
 
-    @torch.no_grad()
-    def _shrink_per_weight(
-        self,
-        *,
-        loader: Iterable[Any],
-        n_batches: int,
-        dampening_factor: float,
-        blocks_to_add: int | None,
-        target_layers_total: int | None,
-        insertion_order: str,
-        extension_density: str,
-        collapse_schedule: str = "cascade",
-        ridge_identity: float = 0.0,
-        per_weight_mode: str = "cascade",
-        n_cascade_iters: int = 1,
-        share_ft_refs: bool = False,
-        skip_correction: bool = False,
-        component_ridge: dict[str, float] | None = None,
-        lmc_mode: str = "independent",
-    ) -> int:
-        if per_weight_mode not in {"cascade", "duplicate"}:
-            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
-        self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
-        provider = self._open_references(skip_correction, loader, n_batches)
-
-        curr_layers = len(self.model_base.visual.transformer.resblocks)
-        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
-
-        if n_needed >= 0:
-            logger.info("Block shrink: no shrink needed.")
-            self._vprint("no shrink needed")
-            return curr_layers
-
-        n_to_remove = -n_needed
-        if collapse_schedule == "disjoint_spans":
-            schedule = disjoint_collapse_schedule(curr_layers, n_to_remove, insertion_order)
-        elif collapse_schedule == "cascade":
-            schedule = self._build_collapse_schedule(
-                curr_layers=curr_layers,
-                n_to_remove=n_to_remove,
-                insertion_order=insertion_order,
-                extension_density=extension_density,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported collapse_schedule '{collapse_schedule}'. "
-                "Expected 'cascade' or 'disjoint_spans'."
-            )
-
-        logger.info("Block shrink planned collapses: %s", schedule)
-        self._vprint(f"planned collapses: {schedule}")
-
-        orig_base = list(self.model_base.visual.transformer.resblocks)
-        orig_ft = list(self.model_ft.visual.transformer.resblocks)
-        orig_depth = len(orig_base)
-
-        chain_base = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_base)]
-        chain_ft = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_ft)]
-
-        step_iter = _iter_with_progress(
-            enumerate(schedule, start=1),
-            total=len(schedule),
-            desc="block_extension.shrink_per_weight",
-            enabled=self.show_progress,
-        )
-        for step, anchor_orig_idx in step_iter:
-            collapse_pos = self._locate_collapse_pos(chain_base, anchor_orig_idx)
-            left_base = chain_base[collapse_pos]
-            right_base = chain_base[collapse_pos + 1]
-            left_ft = chain_ft[collapse_pos]
-            right_ft = chain_ft[collapse_pos + 1]
-            merged_orig_idxs = tuple(left_base["orig_idxs"] + right_base["orig_idxs"])
-            logger.info(
-                "Block shrink step %d/%d. Merge span %s + %s -> %s",
-                step,
-                len(schedule),
-                left_base["orig_idxs"],
-                right_base["orig_idxs"],
-                merged_orig_idxs,
-            )
-            self._vprint(
-                f"step {step}/{len(schedule)} merge_spans={left_base['orig_idxs']}+{right_base['orig_idxs']} -> {merged_orig_idxs}"
-            )
-
-            merged_base = deepcopy(left_base["mod"])
-            merged_ft = deepcopy(left_ft["mod"])
-            if per_weight_mode == "cascade":
-                self._interpolate_block_weights(merged_base, right_base["mod"], alpha=0.5)
-                self._interpolate_block_weights(merged_ft, right_ft["mod"], alpha=0.5)
-
-            if dampening_factor < 1.0:
-                self._dampen_block_output(merged_base, dampening_factor)
-                self._dampen_block_output(merged_ft, dampening_factor)
-
-            chain_base[collapse_pos : collapse_pos + 2] = [{"mod": merged_base, "orig_idxs": merged_orig_idxs}]
-            chain_ft[collapse_pos : collapse_pos + 2] = [{"mod": merged_ft, "orig_idxs": merged_orig_idxs}]
-
-            self.model_base.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_base])
-            self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
-
-            if not skip_correction:
-                span_start_idx = merged_orig_idxs[0]
-                span_end_idx = merged_orig_idxs[-1]
-                output_ref_key = "final.input" if span_end_idx + 1 >= orig_depth else f"{span_end_idx + 1}.input"
-                output_input_index: int | str = (
-                    "final" if span_end_idx + 1 >= orig_depth else span_end_idx + 1
-                )
-                provider.ensure(
-                    endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
-                    block_indices=(span_start_idx, span_end_idx),
-                    input_indices=(span_end_idx, output_input_index),
-                    loader=loader,
-                    n_batches=n_batches,
-                )
-                self._diagnostic_context = {
-                    "structural_step": step,
-                    "final_block": collapse_pos,
-                    "source_block": span_start_idx,
-                }
-                correct = partial(
-                    self._correct_collapsed_block_weights_cascade,
-                    block_idx=collapse_pos,
-                    span_start_idx=span_start_idx,
-                    span_end_idx=span_end_idx,
-                    output_ref_key=output_ref_key,
-                    loader=loader,
-                    n_batches=n_batches,
-                    ridge_identity=ridge_identity,
-                    n_iters=n_cascade_iters,
-                    component_ridge=component_ridge,
-                )
-                self._dispatch_lmc(lmc_mode, share_ft_refs, collapse_pos, correct)
-
-        final_depth = len(self.model_base.visual.transformer.resblocks)
-        # The extension path publishes its realized layout for downstream
-        # target-informed code; the reduction path must too, or a caller that
-        # passes ``layout_out`` silently receives an empty dict.
-        self.extension_layout = build_reduction_layout(chain_base)
-        self.reference_inputs = {"base": {}, "ft": {}}
-        if provider is not None:
-            provider.finish()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
-        return final_depth
 
 
 @torch.no_grad()

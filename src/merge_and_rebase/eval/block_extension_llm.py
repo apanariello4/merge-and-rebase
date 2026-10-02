@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from copy import deepcopy
-from functools import partial
 from typing import Any
 
 import torch
@@ -68,6 +66,7 @@ def _get_final_norm(model: nn.Module, family_adapter: Any) -> nn.Module:
 class DecoderBlockExtender(BlockExtenderCore):
     _LOG_PREFIX = "block_extension_llm"
     _EXPECTED_PREFIX = "Expected: "
+    _SHRINK_HONOURS_PER_WEIGHT_MODE = False
 
     def __init__(
         self,
@@ -94,6 +93,15 @@ class DecoderBlockExtender(BlockExtenderCore):
 
     def _make_reference_provider(self) -> EagerProvider:
         return EagerProvider(self)
+
+    def _collapse_output_refs(self, span_end: int, orig_depth: int) -> tuple[str, None]:
+        # B19: the span's own last block input (not its output boundary, as vision uses) is the target.
+        return f"{span_end}.input", None
+
+    def _finalize_reduction(self, chain_base: list[dict[str, Any]]) -> None:
+        # Publish the realized many-to-one ancestry for consumers such as direct-target P1.  Shrink has no
+        # inserted positions; every target position is addressed by the source span it absorbed.
+        self.realized_layout = build_reduction_layout(chain_base)
 
     def _finalize_extension(self, chain_base: list[dict[str, Any]]) -> None:
         # Describe the realized chain with the same builder vision uses, so a consumer (e.g. residual completion)
@@ -288,250 +296,6 @@ class DecoderBlockExtender(BlockExtenderCore):
         if not buffers:
             return torch.empty(0)
         return torch.cat(buffers, dim=0).flatten(0, 1)
-
-    @torch.no_grad()
-    def _correct_rmsnorm(self, ln: nn.Module, W: torch.Tensor, b: torch.Tensor) -> None:
-        d = torch.diag(W).to(ln.weight.device, dtype=ln.weight.dtype)
-        ln.weight.mul_(d)
-        if hasattr(ln, "bias") and ln.bias is not None:
-            b = b.to(ln.bias.device, dtype=ln.bias.dtype)
-            ln.bias.copy_(d * ln.bias + b)
-
-    @torch.no_grad()
-    def _correct_linear(self, linear: nn.Linear, W: torch.Tensor, b: torch.Tensor) -> None:
-        W = W.to(linear.weight.device, dtype=linear.weight.dtype)
-        linear.weight.copy_(W @ linear.weight)
-        if linear.bias is not None:
-            b = b.to(linear.bias.device, dtype=linear.bias.dtype)
-            linear.bias.copy_(W @ linear.bias + b)
-
-    @torch.no_grad()
-    def _shrink_per_weight(
-        self,
-        *,
-        loader: Iterable[Any],
-        n_batches: int,
-        dampening_factor: float,
-        blocks_to_add: int | None,
-        target_layers_total: int | None,
-        insertion_order: str,
-        extension_density: str,
-        ridge_identity: float = 0.0,
-        per_weight_mode: str = "cascade",
-        n_cascade_iters: int = 1,
-        share_ft_refs: bool = False,
-        skip_correction: bool = False,
-        component_ridge: dict[str, float] | None = None,
-        lmc_mode: str = "independent",
-    ) -> int:
-        if per_weight_mode not in {"cascade", "duplicate"}:
-            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
-        self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
-        self._open_references(skip_correction, loader, n_batches)
-
-        layers_base = _get_layers(self.model_base, self.family_adapter)
-        curr_layers = len(layers_base)
-        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
-
-        if n_needed >= 0:
-            self._vprint("no shrink needed")
-            return curr_layers
-
-        n_to_remove = -n_needed
-        schedule = self._build_collapse_schedule(
-            curr_layers=curr_layers,
-            n_to_remove=n_to_remove,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
-        )
-        self._vprint(f"planned collapses: {schedule}")
-
-        orig_base = list(layers_base)
-        orig_ft = list(_get_layers(self.model_ft, self.family_adapter))
-
-        chain_base: list[dict[str, Any]] = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_base)]
-        chain_ft: list[dict[str, Any]] = [{"mod": b, "orig_idxs": (i,)} for i, b in enumerate(orig_ft)]
-
-        step_iter = _iter_with_progress(
-            enumerate(schedule, start=1),
-            total=len(schedule),
-            desc="block_extension_llm.shrink_per_weight",
-            enabled=self.show_progress,
-        )
-        for _step, anchor_orig_idx in step_iter:
-            collapse_pos = self._locate_collapse_pos(chain_base, anchor_orig_idx)
-            left_base = chain_base[collapse_pos]
-            right_base = chain_base[collapse_pos + 1]
-            left_ft = chain_ft[collapse_pos]
-            right_ft = chain_ft[collapse_pos + 1]
-
-            merged_base = deepcopy(left_base["mod"])
-            merged_ft = deepcopy(left_ft["mod"])
-
-            self._interpolate_block_weights(merged_base, right_base["mod"], alpha=0.5)
-            self._interpolate_block_weights(merged_ft, right_ft["mod"], alpha=0.5)
-
-            if dampening_factor < 1.0:
-                self._dampen_block_output(merged_base, dampening_factor)
-                self._dampen_block_output(merged_ft, dampening_factor)
-
-            merged_origs = tuple(list(left_base["orig_idxs"]) + list(right_base["orig_idxs"]))
-            chain_base[collapse_pos] = {"mod": merged_base, "orig_idxs": merged_origs}
-            chain_ft[collapse_pos] = {"mod": merged_ft, "orig_idxs": merged_origs}
-            del chain_base[collapse_pos + 1]
-            del chain_ft[collapse_pos + 1]
-
-            self._set_layers(self.model_base, [x["mod"] for x in chain_base])
-            self._set_layers(self.model_ft, [x["mod"] for x in chain_ft])
-
-            if not skip_correction:
-                span_start = merged_origs[0]
-                span_end = merged_origs[-1]
-                output_ref_key = f"{span_end}.input"
-
-                correct = partial(
-                    self._correct_collapsed_block_weights_cascade,
-                    block_idx=collapse_pos,
-                    span_start_idx=span_start,
-                    span_end_idx=span_end,
-                    output_ref_key=output_ref_key,
-                    loader=loader,
-                    n_batches=n_batches,
-                    ridge_identity=ridge_identity,
-                    n_iters=n_cascade_iters,
-                    component_ridge=component_ridge,
-                )
-                self._dispatch_lmc(lmc_mode, share_ft_refs, collapse_pos, correct)
-
-        final_depth = len(_get_layers(self.model_base, self.family_adapter))
-        # Publish the realized many-to-one ancestry for consumers such as
-        # direct-target P1.  Shrink has no inserted positions; every target
-        # position is addressed by the source span it absorbed.
-        self.realized_layout = build_reduction_layout(chain_base)
-        self._vprint(f"per-weight shrink completed. final_depth={final_depth}")
-        return final_depth
-
-    @torch.no_grad()
-    def _correct_collapsed_block_weights_cascade(
-        self,
-        model_name: str,
-        model: nn.Module,
-        block_idx: int,
-        span_start_idx: int,
-        span_end_idx: int,
-        output_ref_key: str,
-        loader: Iterable[Any],
-        n_batches: int,
-        ridge_identity: float = 0.0,
-        n_iters: int = 1,
-        ref_source: str | None = None,
-        component_ridge: dict[str, float] | None = None,
-        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ):
-        layers = _get_layers(model, self.family_adapter)
-        block = layers[block_idx]
-        ref_key = ref_source if ref_source is not None else model_name
-        refs = self.reference_inputs[ref_key]
-        self._component_ridge = component_ridge
-
-        def _ridge_target(comp: str) -> torch.Tensor | None:
-            if lmc_targets is None or comp not in lmc_targets:
-                return None
-            W_base, _ = lmc_targets[comp]
-            if comp in ("input_layernorm", "post_attention_layernorm"):
-                return torch.diag(torch.diag(W_base))
-            return W_base
-
-        for _ in range(n_iters):
-            # 1: input_layernorm tracks the start of the collapsed span
-            cur = self._capture_component_output(model, block_idx, "input_layernorm", loader, n_batches)
-            ref = refs.get(f"{span_start_idx}.input_layernorm_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("input_layernorm", ridge_identity), ridge_target=_ridge_target("input_layernorm"))
-                    if lmc_store is not None:
-                        lmc_store["input_layernorm"] = (W.clone(), b.clone())
-                    self._correct_rmsnorm(block.input_layernorm, W, b)
-
-            # 2-4: q/k/v track the start
-            for proj_name in ("q_proj", "k_proj", "v_proj"):
-                cur = self._capture_component_output(model, block_idx, proj_name, loader, n_batches)
-                ref = refs.get(f"{span_start_idx}.{proj_name}_output")
-                if ref is not None and cur.numel() > 0:
-                    A, T = self._match_rows(cur, ref)
-                    if A.numel() > 0 and T.numel() > 0:
-                        W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge(proj_name, ridge_identity), ridge_target=_ridge_target(proj_name))
-                        if lmc_store is not None:
-                            lmc_store[proj_name] = (W.clone(), b.clone())
-                        self._correct_linear(getattr(block.self_attn, proj_name), W, b)
-
-            # 5: o_proj corrected against the end block's residual
-            cur = self._capture_component_output(model, block_idx, "o_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
-            ref_input = refs.get(f"{span_end_idx}.input")
-            ref_attn = refs.get(f"{span_end_idx}.attn_output")
-            if ref_input is not None and ref_attn is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], ref_input.shape[0], ref_attn.shape[0])
-                A = cur[:n]
-                T = ref_input[:n] + ref_attn[:n] - cur_input[:n]
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("o_proj", ridge_identity), ridge_target=_ridge_target("o_proj"))
-                    if lmc_store is not None:
-                        lmc_store["o_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.self_attn.o_proj, W, b)
-
-            # 6: post_attention_layernorm tracks the end
-            cur = self._capture_component_output(model, block_idx, "post_attention_layernorm", loader, n_batches)
-            ref = refs.get(f"{span_end_idx}.post_attn_ln_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("post_attention_layernorm", ridge_identity), ridge_target=_ridge_target("post_attention_layernorm"))
-                    if lmc_store is not None:
-                        lmc_store["post_attention_layernorm"] = (W.clone(), b.clone())
-                    self._correct_rmsnorm(block.post_attention_layernorm, W, b)
-
-            # 7: gate_proj tracks the end
-            cur = self._capture_component_output(model, block_idx, "gate_proj", loader, n_batches)
-            ref = refs.get(f"{span_end_idx}.gate_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("gate_proj", ridge_identity), ridge_target=_ridge_target("gate_proj"))
-                    if lmc_store is not None:
-                        lmc_store["gate_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.gate_proj, W, b)
-
-            # 8: up_proj tracks the end
-            cur = self._capture_component_output(model, block_idx, "up_proj", loader, n_batches)
-            ref = refs.get(f"{span_end_idx}.up_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("up_proj", ridge_identity), ridge_target=_ridge_target("up_proj"))
-                    if lmc_store is not None:
-                        lmc_store["up_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.up_proj, W, b)
-
-            # 9: down_proj corrected against the final target output of the
-            # removed span. The pre-MLP residual stream is the block input plus
-            # the already-corrected attention output, so both are subtracted
-            # (the vision cascade subtracts the same two terms).
-            cur = self._capture_component_output(model, block_idx, "down_proj", loader, n_batches)
-            cur_input = self._capture_single_input(model, block_idx, loader, n_batches)
-            cur_attn = self._capture_component_output(model, block_idx, "attn", loader, n_batches)
-            ref = refs.get(output_ref_key)
-            if ref is not None and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0:
-                n = min(cur.shape[0], cur_input.shape[0], cur_attn.shape[0], ref.shape[0])
-                A = cur[:n]
-                T = ref[:n] - cur_input[:n] - cur_attn[:n]
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
-                    if lmc_store is not None:
-                        lmc_store["down_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.down_proj, W, b)
 
     def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
         scope = self.family_adapter.transport_scope(model)

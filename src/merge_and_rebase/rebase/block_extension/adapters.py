@@ -46,6 +46,9 @@ class ComponentSpec:
     # Position in the residual stream: ``attn_out`` / ``mlp_out`` components can be fitted against a
     # residual-stream target (inputs and already-corrected attention output subtracted).
     stream_role: Literal["attn_out", "mlp_out"] | None = None
+    # Which end of a collapsed span the component's reference is read from (``start``: the first block of the
+    # span, ``end``: the last one).
+    span_anchor: Literal["start", "end"] = "end"
 
 
 @dataclass(frozen=True)
@@ -136,10 +139,10 @@ class _InProjCapture:
 
 
 VISION_COMPONENTS: tuple[ComponentSpec, ...] = (
-    ComponentSpec("ln_1", "ln_1_output", "norm_diag"),
-    ComponentSpec("q", "q_output", "fused_slice", slice_index=0),
-    ComponentSpec("k", "k_output", "fused_slice", slice_index=1),
-    ComponentSpec("v", "v_output", "fused_slice", slice_index=2),
+    ComponentSpec("ln_1", "ln_1_output", "norm_diag", span_anchor="start"),
+    ComponentSpec("q", "q_output", "fused_slice", slice_index=0, span_anchor="start"),
+    ComponentSpec("k", "k_output", "fused_slice", slice_index=1, span_anchor="start"),
+    ComponentSpec("v", "v_output", "fused_slice", slice_index=2, span_anchor="start"),
     ComponentSpec(
         "out_proj", "attn_output", "linear", residual_aware=True, capture_name="attn", stream_role="attn_out"
     ),
@@ -151,10 +154,10 @@ VISION_COMPONENTS: tuple[ComponentSpec, ...] = (
 )
 
 DECODER_COMPONENTS: tuple[ComponentSpec, ...] = (
-    ComponentSpec("input_layernorm", "input_layernorm_output", "norm_diag"),
-    ComponentSpec("q_proj", "q_proj_output", "linear"),
-    ComponentSpec("k_proj", "k_proj_output", "linear"),
-    ComponentSpec("v_proj", "v_proj_output", "linear"),
+    ComponentSpec("input_layernorm", "input_layernorm_output", "norm_diag", span_anchor="start"),
+    ComponentSpec("q_proj", "q_proj_output", "linear", span_anchor="start"),
+    ComponentSpec("k_proj", "k_proj_output", "linear", span_anchor="start"),
+    ComponentSpec("v_proj", "v_proj_output", "linear", span_anchor="start"),
     ComponentSpec("o_proj", "attn_output", "linear", stream_role="attn_out"),
     ComponentSpec("post_attention_layernorm", "post_attn_ln_output", "norm_diag"),
     ComponentSpec("gate_proj", "gate_proj_output", "linear"),
