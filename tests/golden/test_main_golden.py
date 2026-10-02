@@ -1052,6 +1052,15 @@ def test_main_golden_sequential_load(tmp_path, monkeypatch):
     assert digest == {k[len(case) + 1 :]: v for k, v in EXPECTED.items() if k.startswith(case + ":")}
 
 
+def test_main_source_only_completes_without_transport(tmp_path, monkeypatch):
+    """B2 (fixed): source_only used to crash on a zip length mismatch; it now finishes with the source-side rows."""
+    world = World(**_EQ)
+    result = run_main(_base_cfg(world, tmp_path, source_only=True), tmp_path, monkeypatch, world=world)
+    assert result.summary["source_only"] is True
+    assert result.summary["target_hash_before"] == result.summary["target_hash_after"]
+    assert result.pt_files == {}
+
+
 def test_main_sequential_dr_refuses_overwrite(tmp_path, monkeypatch):
     """Sequential Ariadne vectors are write-once: a second save into the same directory must fail loudly."""
     _run_case("direct_residual_sequential_endpoints_save", tmp_path / "run1", monkeypatch)
@@ -1502,13 +1511,6 @@ ERRORS: dict[str, Err] = {
         {"weights": [1.0], "merge_mode": "rebase_then_merge"},
         ValueError,
         E("weights length must match tuned checkpoints"),
-        before_build=False,
-        run_started=True,
-    ),
-    "source_only_always_crashes_in_merge_mode_none": Err(
-        {"source_only": True},
-        ValueError,
-        E("zip() argument 2 is longer than argument 1"),
         before_build=False,
         run_started=True,
     ),

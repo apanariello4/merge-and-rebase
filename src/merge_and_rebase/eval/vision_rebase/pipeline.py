@@ -297,6 +297,29 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     )
     loop_outputs = pipeline.run(env, tasks, calibration.task_context_by_name)
 
+    if resolved.lmc.source_only:
+        # source_only skips transport, merge and target evaluation (B2: this used to crash on a zip length
+        # mismatch); only the source-side observers' rows exist.
+        source_only_hash_after = _state_dict_sha256(env.target_base_sd)
+        if source_only_hash_after != env.target_hash_before:
+            raise RuntimeError(
+                "Native target base was mutated during source-only preparation: "
+                f"before={env.target_hash_before}, after={source_only_hash_after}."
+            )
+        return {
+            "suite": resolved.suite_name,
+            "tasks": resolved.tasks,
+            "method": method.name,
+            "method_label": method_label,
+            "source_only": True,
+            "target_hash_before": env.target_hash_before,
+            "target_hash_after": source_only_hash_after,
+            "block_extension_target_dataset_eval": eval_observer.rows,
+            "source_lmc": lmc_observer.rows,
+            "depth_alignment": resolved.depth_alignment_mode,
+            "depth_rule_resolved": resolved.depth_rule_resolved,
+        }
+
     merge_plan = compose_rebased_deltas(
         env,
         per_task=per_task,
