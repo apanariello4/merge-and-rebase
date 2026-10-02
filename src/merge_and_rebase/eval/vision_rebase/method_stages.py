@@ -20,7 +20,7 @@ from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ...rebase.depth_pairing import BRACE_ANCESTRY_DEFAULTS, brace_ancestry_pairing
+from ...rebase.depth_pairing import spread_duplicate_pairing
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override
 from ...rebase.orchestration import AriadneRunRecord, MethodResult
@@ -394,12 +394,8 @@ class AriadneStage:
         """The depth pairing, computed once per run (both legacy call sites yielded the identical value)."""
         if self._pairing_cache is None:
             ancestry = None
-            if self.cfg.depth_pairing == "brace_ancestry":
-                ancestry = brace_ancestry_pairing(
-                    env.source_depth,
-                    env.target_depth,
-                    **{**BRACE_ANCESTRY_DEFAULTS, **dict(self.cfg.depth_pairing_brace or {})},
-                )
+            if self.cfg.depth_pairing == "spread_duplicate":
+                ancestry = spread_duplicate_pairing(env.source_depth, env.target_depth)
             self._pairing_cache = apply_depth_pairing_override(
                 DiscreteLayerPairing.compute(env.source_depth, env.target_depth),
                 self.cfg.depth_pairing,

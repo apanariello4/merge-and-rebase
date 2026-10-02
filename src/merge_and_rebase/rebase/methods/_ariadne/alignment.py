@@ -30,16 +30,18 @@ def apply_depth_pairing_override(
     ``"relative"`` returns ``pairing`` unchanged (bit-for-bit; the default, golden-hash-pinned
     path). The other modes derive from the ORIGINAL relative pairing, not from each other:
     ``"reversed"``: ``source_depth - 1 - pi(j)``; ``"shift_plus1"``: ``min(source_depth - 1, pi(j) + 1)``;
-    ``"shift_minus1"``: ``max(0, pi(j) - 1)``; ``"brace_ancestry"``: the BRACE ancestor of ``j`` (``ancestry``).
+    ``"shift_minus1"``: ``max(0, pi(j) - 1)``; ``"spread_duplicate"``: the BRACE ancestor of ``j`` (``ancestry``).
     Only valid for ``component_target="block_boundary"``
     (validated by ``parse_direct_residual_config``, not here).
     """
     if depth_pairing == "relative":
         return pairing
     if depth_pairing == "brace_ancestry":
-        # pi(j) = the BRACE ancestor of target position j (rebase.depth_pairing.brace_ancestry_pairing).
+        raise ValueError("depth_pairing 'brace_ancestry' was renamed to 'spread_duplicate'")
+    if depth_pairing == "spread_duplicate":
+        # pi(j) = the BRACE ancestor of target position j (rebase.depth_pairing.spread_duplicate_pairing).
         if ancestry is None:
-            raise ValueError("depth_pairing='brace_ancestry' needs the ancestry pairing (brace_ancestry_pairing)")
+            raise ValueError("depth_pairing='spread_duplicate' needs the ancestry pairing (spread_duplicate_pairing)")
         if (ancestry.source_depth, ancestry.target_depth) != (pairing.source_depth, pairing.target_depth):
             raise ValueError("ancestry pairing depths do not match the source/target depths")
         return ancestry
@@ -52,7 +54,7 @@ def apply_depth_pairing_override(
         new_pairing = tuple(max(0, i - 1) for i in pairing.pairing)
     else:
         raise ValueError(
-            f"depth_pairing must be 'relative', 'reversed', 'shift_plus1', 'shift_minus1' or 'brace_ancestry', got {depth_pairing!r}"
+            f"depth_pairing must be 'relative', 'reversed', 'shift_plus1', 'shift_minus1' or 'spread_duplicate', got {depth_pairing!r}"
         )
     return DiscreteLayerPairing(
         source_depth=pairing.source_depth, target_depth=pairing.target_depth, pairing=new_pairing

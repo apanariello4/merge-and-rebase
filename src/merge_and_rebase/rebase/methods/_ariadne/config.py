@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 
 #: Residual-writing projections, in the order a block executes them.
@@ -104,12 +104,9 @@ class DirectResidualConfig:
     # apply_depth_pairing_override, applied at pairing-construction time). Needs component_target='block_boundary'.
     # 'relative' (default): pairing as computed, untouched (bit-identical to pre-ablation code). 'reversed': D_s - 1 - pi(j).
     # 'shift_plus1' / 'shift_minus1': pi(j) +/- 1, clipped to [0, D_s - 1].
-    # 'brace_ancestry': pi(j) is the ancestor of target position j in the BRACE schedule (rebase.depth_pairing);
-    # its schedule parameters live in ``depth_pairing_brace`` (insertion_order, extension_density,
-    # collapse_schedule; defaults bottom-top / spread / cascade). Shrink uses the vision collapse logic
-    # (span -> first original index); insertion_order='random' is rejected.
+    # 'spread_duplicate': pi(j) is the ancestor of target position j under BRACE's default schedule
+    # (bottom-top, spread; shrink: the vision collapse, span -> first original index); see rebase.depth_pairing.
     depth_pairing: str = "relative"
-    depth_pairing_brace: Mapping[str, str] | None = None
     # alignment_map='random_isometry': per-position seed base; position j's generator is seeded from
     # (alignment_seed, j) via _derive_block_seed, so positions never share a draw and reruns reproduce.
     alignment_seed: int = 0
@@ -141,32 +138,6 @@ def resolve_direct_residual_preset(value: Mapping[str, Any] | None) -> str | Non
     if not isinstance(name, str) or name not in _PRESETS:
         raise ValueError(f"unknown direct_residual preset {name!r}; valid presets: {sorted(_PRESETS)}")
     return name
-
-
-def config_as_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
-    """``asdict`` for summaries / saved metadata; the additive ``depth_pairing_brace`` is omitted when unset."""
-    out = asdict(cfg)
-    if out.get("depth_pairing_brace") is None:
-        out.pop("depth_pairing_brace", None)
-    return out
-
-
-def _validate_depth_pairing_brace(value: Any) -> None:
-    if not isinstance(value, Mapping):
-        raise ValueError("depth_pairing_brace must be a dict")
-    allowed = {
-        "insertion_order": {"bottom-top", "top-bottom"},
-        "extension_density": {"spread", "spread_mod", "clump"},
-        "collapse_schedule": {"cascade", "disjoint_spans"},
-    }
-    unknown = set(value) - set(allowed)
-    if unknown:
-        raise ValueError(f"unknown depth_pairing_brace fields: {sorted(unknown)}")
-    for key, v in value.items():
-        if v == "random" and key == "insertion_order":
-            raise ValueError("depth_pairing='brace_ancestry' does not support insertion_order='random'")
-        if v not in allowed[key]:
-            raise ValueError(f"depth_pairing_brace.{key} must be one of {sorted(allowed[key])}, got {v!r}")
 
 
 def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResidualConfig:
@@ -210,7 +181,6 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "streaming_position_chunk",
         "calibration_data",
         "depth_pairing",
-        "depth_pairing_brace",
         "alignment_seed",
         "fidelity_holdout",
         "fidelity_holdout_batches",
@@ -385,14 +355,12 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "Procrustes backpropagates the task's own labelled loss, which a task-independent calibration "
             "set does not provide"
         )
-    if cfg.depth_pairing not in {"relative", "reversed", "shift_plus1", "shift_minus1", "brace_ancestry"}:
+    if cfg.depth_pairing == "brace_ancestry":
+        raise ValueError("depth_pairing 'brace_ancestry' was renamed to 'spread_duplicate'")
+    if cfg.depth_pairing not in {"relative", "reversed", "shift_plus1", "shift_minus1", "spread_duplicate"}:
         raise ValueError(
-            "depth_pairing must be 'relative', 'reversed', 'shift_plus1', 'shift_minus1' or 'brace_ancestry'"
+            "depth_pairing must be 'relative', 'reversed', 'shift_plus1', 'shift_minus1' or 'spread_duplicate'"
         )
-    if cfg.depth_pairing_brace is not None:
-        if cfg.depth_pairing != "brace_ancestry":
-            raise ValueError("depth_pairing_brace requires depth_pairing='brace_ancestry'")
-        _validate_depth_pairing_brace(cfg.depth_pairing_brace)
     if cfg.depth_pairing != "relative" and cfg.component_target != "block_boundary":
         raise ValueError(
             f"depth_pairing={cfg.depth_pairing!r} requires component_target='block_boundary': the "
