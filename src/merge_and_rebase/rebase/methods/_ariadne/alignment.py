@@ -285,6 +285,11 @@ def _fit_activation_map(
                 **procrustes_rank_diagnostics(rank, q.shape[0], q.shape[1], polar_derived=False),
             },
         )
+    if len({t.shape[1] for t in xs}) > 1:
+        # Padding-masked decoder banks ([1, N_b, D], N_b varying per batch): one flat row bank.
+        if row_weighting != "uniform":
+            raise ValueError(f"row_weighting={row_weighting!r} needs a fixed token layout per batch")
+        xs, ys = [torch.cat(xs, dim=1)], [torch.cat(ys, dim=1)]
     x = torch.cat(xs, dim=0)
     y = torch.cat(ys, dim=0)
     weights = torch.ones(x.shape[:2], dtype=torch.float64, device=x.device)

@@ -47,9 +47,15 @@ class _StreamingCrossCovariance:
         self.weight = 0.0
 
     @cost_phase_decorator("transformation")
-    def update(self, x: Tensor, y: Tensor, weights: Tensor | None = None) -> None:
+    def update(self, x: Tensor, y: Tensor, weights: Tensor | None = None, row_mask: Tensor | None = None) -> None:
         if x.shape[0] != y.shape[0]:
             raise ValueError("cross-covariance update requires matching row counts")
+        if row_mask is not None:
+            row_mask = row_mask.to(dtype=torch.bool)
+            if row_mask.shape != (x.shape[0],):
+                raise ValueError("row_mask must be a bool vector over the rows of x")
+            x, y = x[row_mask.to(x.device)], y[row_mask.to(y.device)]
+            weights = None if weights is None else weights[row_mask.to(weights.device)]
         n_b = int(x.shape[0])
         if n_b == 0:
             return
@@ -161,7 +167,7 @@ def prepare_direct_residual_streaming(
     if gradient_mode and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
-        source_loader, target_loader, num_batches=num_batches, seed=seed
+        source_loader, target_loader, num_batches=num_batches, seed=seed, family_adapter=family_adapter
     )
     distinct_source_indices = sorted(set(pairing.pairing))
     src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}

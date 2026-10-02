@@ -277,13 +277,23 @@ class ResidualSufficientStatistics:
         self.d_source: int | None = None
 
     @cost_phase_decorator("transformation")
-    def update(self, h: Tensor, e: Tensor, t_in: Tensor | None, t_out: Tensor) -> None:
+    def update(self, h: Tensor, e: Tensor, t_in: Tensor | None, t_out: Tensor, row_mask: Tensor | None = None) -> None:
         """Accumulate one batch.
+
+        ``row_mask`` (bool ``[N]``, optional) keeps only the selected rows, applied before any finiteness check;
+        a batch with no selected row is a no-op. ``None`` is the unchanged (vision) behaviour.
 
         ``t_in=None`` means an identity input map (``direct_target`` mode): the weight lives in the target input
         coordinates of ``h`` and the normal equations reduce to ``A = H``. It is spelled ``None`` so the
         ``d_mlp``-sized identity matmul (4096x4096 per batch on ViT-L/14) is never materialized.
         """
+        if row_mask is not None:
+            row_mask = row_mask.to(device=h.device, dtype=torch.bool)
+            if h.ndim != 2 or e.ndim != 2 or row_mask.shape != (h.shape[0],) or e.shape[0] != h.shape[0]:
+                raise ValueError("row_mask must be a bool vector matching the rows of h and e")
+            h, e = h[row_mask], e[row_mask.to(e.device)]
+            if h.shape[0] == 0:
+                return
         _check_rows(h, e, "h", "e")
         if h.ndim != 2 or e.ndim != 2 or t_out.ndim != 2 or (t_in is not None and t_in.ndim != 2):
             raise ValueError("activations and transport maps must be matrices")

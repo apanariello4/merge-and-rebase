@@ -375,6 +375,7 @@ def draw_fidelity_holdout_calibration(
     num_batches: int,
     holdout_batches: int,
     seed: int | None,
+    family_adapter=None,
 ) -> tuple[list, list, dict[str, Any]]:
     """Draw a held-out batch set disjoint from the ``num_batches`` calibration set tau was fit on.
 
@@ -388,7 +389,7 @@ def draw_fidelity_holdout_calibration(
         raise ValueError("fidelity_holdout requires a deterministic (non-None) calibration seed")
     total_batches = int(num_batches) + int(holdout_batches)
     all_source, all_target, metadata = paired_calibration(
-        source_loader, target_loader, num_batches=total_batches, seed=seed
+        source_loader, target_loader, num_batches=total_batches, seed=seed, family_adapter=family_adapter
     )
     if len(all_source) < total_batches:
         raise ValueError(
@@ -462,9 +463,10 @@ def compute_fidelity_holdout_diagnostics(
         num_batches=config.num_batches,
         holdout_batches=config.fidelity_holdout_batches,
         seed=config.seed,
+        family_adapter=family_adapter,
     )
     calibration_source, calibration_target, _calib_meta = paired_calibration(
-        source_loader, target_loader, num_batches=config.num_batches, seed=config.seed
+        source_loader, target_loader, num_batches=config.num_batches, seed=config.seed, family_adapter=family_adapter
     )
 
     entry_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}

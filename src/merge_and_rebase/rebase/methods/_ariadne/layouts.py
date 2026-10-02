@@ -120,8 +120,8 @@ class _DecoderLayout:
         return block
 
     def forward(self, model, batch, device):
-        inputs = self.family_adapter.extract_calibration_batch(batch)
-        model(**{k: v.to(device) for k, v in inputs.items() if hasattr(v, "to")})
+        # Backbone-only, no labels / LM head, use_cache=False (hooks sit on the layers inside the backbone).
+        self.family_adapter.calibration_forward(model, batch, device)
 
     def batch_size(self, batch):
         inputs = self.family_adapter.extract_calibration_batch(batch)

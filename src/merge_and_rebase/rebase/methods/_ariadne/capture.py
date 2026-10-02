@@ -54,8 +54,45 @@ def _stable_dataset_identity(dataset) -> str:
     return f"{cls.__module__}.{cls.__qualname__};n={len(dataset)}"
 
 
-def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
-    """Replay identical dataset indices under the two model preprocessors."""
+#: Batch-dict key carrying the combined (source & target) content-row mask of a decoder calibration batch.
+#: ``extract_calibration_batch`` ignores it, so model forwards never see it; capture reads it to drop padding rows.
+ROW_MASK_KEY = "_ariadne_row_mask"
+
+
+def _batch_row_mask(batch):
+    if isinstance(batch, Mapping):
+        mask = batch.get(ROW_MASK_KEY)
+        if isinstance(mask, torch.Tensor):
+            return mask
+    return None
+
+
+def _attach_row_masks(source_batch, target_batch, family_adapter):
+    """Combine each model's own ``content_mask`` (``ms & mt``) once and attach it to BOTH batches."""
+    ms = family_adapter.content_mask(source_batch)
+    mt = family_adapter.content_mask(target_batch)
+    if ms.shape != mt.shape:
+        raise ValueError(
+            f"Source/target calibration content masks have different shapes {tuple(ms.shape)} vs {tuple(mt.shape)}: "
+            "rows cannot be paired after padding removal (tokenizer or max_length mismatch)"
+        )
+    mask = ms & mt
+    if not bool(mask.any()):
+        raise ValueError("Calibration batch has no content rows after padding removal")
+    out = []
+    for batch in (source_batch, target_batch):
+        wrapped = dict(family_adapter.extract_calibration_batch(batch))
+        wrapped[ROW_MASK_KEY] = mask
+        out.append(wrapped)
+    return out[0], out[1], int(mask.numel()), int(mask.sum())
+
+
+def paired_calibration(source_loader, target_loader, *, num_batches, seed=None, family_adapter=None):
+    """Replay identical dataset indices under the two model preprocessors.
+
+    ``family_adapter`` (HF decoders only) attaches the combined padding mask to every batch pair; the vision path
+    (``None``) returns its batches untouched.
+    """
     if not isinstance(source_loader, DataLoader) or not isinstance(target_loader, DataLoader):
         raise ValueError("Paired calibration requires indexed DataLoaders")
     if _dataset_identity(source_loader.dataset) != _dataset_identity(target_loader.dataset):
@@ -75,6 +112,7 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
     source = DataLoader(Subset(source_loader.dataset, order), collate_fn=source_loader.collate_fn, **kwargs)
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
     source_batches, target_batches = [], []
+    n_rows_total = n_rows_content = 0
     for a, b in zip(source, target, strict=True):
         # Vision batches are (images, labels); labels are model-agnostic and must match example for example.
         # Text batches are tokenizer-specific mappings (ids differ by construction), so nothing is comparable;
@@ -82,6 +120,10 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
         if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)) and len(a) > 1 and len(b) > 1:
             if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
                 raise ValueError("Calibration labels disagree for supposedly identical images")
+        if family_adapter is not None:
+            a, b, total, content = _attach_row_masks(a, b, family_adapter)
+            n_rows_total += total
+            n_rows_content += content
         source_batches.append(a)
         target_batches.append(b)
     metadata = {
@@ -93,6 +135,10 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None):
         "sampling_seed": seed,
         "split": "val",
     }
+    if family_adapter is not None:
+        metadata["n_rows_total"] = n_rows_total
+        metadata["n_rows_content"] = n_rows_content
+        metadata["pad_row_fraction"] = 1.0 - n_rows_content / max(n_rows_total, 1)
     return source_batches, target_batches, metadata
 
 
@@ -278,10 +324,19 @@ def iter_capture_tokens(
             batch_size = layout.batch_size(batch)
             values: dict[str, list[torch.Tensor]] = {key: [] for key in requests}
 
-            def store(name, tensor, *, _batch_size=batch_size, _values=values):
+            _row_mask = _batch_row_mask(batch)
+
+            def store(name, tensor, *, _batch_size=batch_size, _values=values, _row_mask=_row_mask):
                 if isinstance(tensor, tuple):
                     tensor = tensor[0]
                 tokens = _to_tokens(tensor.detach(), batch_size=_batch_size)
+                if _row_mask is not None:
+                    if tuple(tokens.shape[:2]) != tuple(_row_mask.shape):
+                        raise ValueError(
+                            f"captured tokens {tuple(tokens.shape[:2])} do not match row mask {tuple(_row_mask.shape)}"
+                        )
+                    # Content rows only, kept as a [1, N, D] bank so every downstream `_rows`/`_aligned` is unchanged.
+                    tokens = tokens[_row_mask.to(tokens.device)].unsqueeze(0)
                 if store_device == "cpu":
                     tokens = tokens.float().cpu().clone()
                 else:
@@ -502,7 +557,7 @@ def capture_paired_boundary_activations(
     if procrustes_source == "gradient" and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires both source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
-        source_loader, target_loader, num_batches=num_batches, seed=seed
+        source_loader, target_loader, num_batches=num_batches, seed=seed, family_adapter=family_adapter
     )
     # Deduplicate: under extend many target positions share one source index; capturing it twice would waste
     # compute and risk a second, non-identical bank for the same index if anything upstream were nondeterministic.
