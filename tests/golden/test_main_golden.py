@@ -153,9 +153,6 @@ EXPECTED: dict[str, str] = {
     "theseus_extend_eval_before_and_source_lmc:events": "78e670a4a3c3c01ff789067d482f2ce62ac4fa44927f02f5548589aa4582c5db",
     "theseus_extend_eval_before_and_source_lmc:resolved_config": "11cbfbfb16b0e070f832dd985939c2ebd87945fac802abb3cc234fcf9d0e9d3c",
     "theseus_extend_eval_before_and_source_lmc:summary": "0dacee762c854d324794899a6fd177df67b19222ccaa6dd1045576148ccb1bd4",
-    "theseus_independent_endpoint_average:events": "a7e42d55fdcc06a546c261a49198eb289a5f6021ec72eb4a6eaa2e05ee2519a4",
-    "theseus_independent_endpoint_average:resolved_config": "ae31cf15dd14ec899f2f2dcba3fee516f411d266a1ec07312074ed9ec292653f",
-    "theseus_independent_endpoint_average:summary": "445bb0c91dd6c97cf3c758088276c0ef47a617cd69846e66a084260779d43abd",
     "theseus_merge_then_brace_then_transport_correction:events": "781544f517b2ba512ea1697c9d58115dfadac20b1b7a0204403f6e8a0307428d",
     "theseus_merge_then_brace_then_transport_correction:resolved_config": "4ca7dce6ff0a9b5262edb18688b55b9ec71e8fde885ff9c99c05203bf168d0b7",
     "theseus_merge_then_brace_then_transport_correction:summary": "27a848588619005a12f7047366ec8f1a262493f1c4f1d4af85a2f081e2407fc3",
@@ -810,10 +807,6 @@ CASES: dict[str, Case] = {
         _EQ, {"merge_mode": "rebase_then_merge", **_SEARCH}, save_merged=True
     ),
     # 14: independent endpoint average base construction
-    "theseus_independent_endpoint_average": Case(
-        _EXT,
-        {"merge_mode": "brace_transport_then_merge", "base_construction": "independent_endpoint_average", **_SEARCH},
-    ),
     # eval_before_rebase / source LMC around the BRACE prestep
     "theseus_extend_eval_before_and_source_lmc": Case(
         _EXT,
@@ -896,7 +889,6 @@ _LEGACY_DEPTH_CASES = (
     "theseus_double_joint_blockwise_correction",
     "theseus_double_target_residual_completion",
     "theseus_extend_eval_before_and_source_lmc",
-    "theseus_independent_endpoint_average",
     "theseus_merge_then_brace_then_transport_correction",
     "theseus_native_target_auto_detected_per_task",
     "theseus_native_target_explicit",
@@ -1396,6 +1388,14 @@ ERRORS: dict[str, Err] = {
         before_build=False,
         run_started=True,
         world=dict(_NATIVE_DTD),
+    ),
+    # B6 (P5.14): used to run as a silent no-op identical to base_construction='per_task'.
+    "independent_endpoint_average_has_no_effect": Err(
+        {"merge_mode": "brace_transport_then_merge", "base_construction": "independent_endpoint_average", **_SEARCH},
+        ValueError,
+        P("base_construction='independent_endpoint_average' has no effect with merge_mode='brace_transport_then_merge'"),
+        before_build=False,
+        run_started=True,
     ),
     "strict_load_partial_visual_coverage": Err(
         {"strict_load": True},

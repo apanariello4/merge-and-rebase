@@ -254,6 +254,14 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 "base_construction='independent_endpoint_average' requires every task to be "
                 "an independently transformed source endpoint; native target tasks are not allowed."
             )
+        # B6: in the accepted merge modes the independent base is computed for nobody -- it is consumed only by
+        # brace_merge_then_transport, which this option cannot be combined with -- so the run would silently be
+        # identical to base_construction='per_task'.
+        raise ValueError(
+            f"base_construction='independent_endpoint_average' has no effect with merge_mode='{merge_mode}': the "
+            "independent endpoint base is only consumed by merge_mode='brace_merge_then_transport', which does "
+            "not support it. Use base_construction='per_task' (the identical computation)."
+        )
 
     calibration = build_run_calibration(
         resolved,
