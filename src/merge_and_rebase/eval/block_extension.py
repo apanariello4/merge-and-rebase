@@ -17,7 +17,10 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from ..models.vision_utils import _encode_image
-from ..rebase.block_extension.adapters import _InProjCapture  # noqa: F401  (re-exported for existing importers)
+from ..rebase.block_extension.adapters import (  # noqa: F401  (_InProjCapture re-exported for existing importers)
+    VisionAdapter,
+    _InProjCapture,
+)
 from ..rebase.block_extension.config import (  # noqa: F401  (re-exported for existing importers)
     _ANNOTATION_PARAMS,
     _MISPLACED_TOP_LEVEL_KEYS,
@@ -101,6 +104,7 @@ class BlockExtender(BlockExtenderCore):
     ):
         self.model_base = model_base
         self.model_ft = model_ft
+        self.adapter = VisionAdapter()
         # Pretrained target backbone, used only by the target-informed
         # correction option; ``None`` for every standard ARIADNE path.
         self.target_model = target_model
@@ -136,10 +140,6 @@ class BlockExtender(BlockExtenderCore):
             W=W,
             b=b,
         )
-
-    def _record_corrections(self, endpoint: str, corrections: Mapping[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
-        for component, (W, b) in corrections.items():
-            self._record_correction(endpoint, component, W, b)
 
     @staticmethod
     def _inner_block(block: nn.Module) -> nn.Module:
@@ -526,213 +526,6 @@ class BlockExtender(BlockExtenderCore):
         return ("base", "ft")
 
     @torch.no_grad()
-    def _correct_block_weights_cascade(
-        self,
-        model_name: str,
-        model: nn.Module,
-        insert_pos: int,
-        src_idx: int,
-        loader: Iterable[Any],
-        n_batches: int,
-        ridge_identity: float = 0.0,
-        n_iters: int = 1,
-        ref_source: str | None = None,
-        component_ridge: dict[str, float] | None = None,
-        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        insertion_target_mode: str = "direct",
-        target_reference: torch.Tensor | None = None,
-        target_weight: float = 0.0,
-    ):
-        block = model.visual.transformer.resblocks[insert_pos]
-        inner = self._inner_block(block)
-        ref_key = ref_source if ref_source is not None else model_name
-        refs = self.reference_inputs[ref_key]
-        dim_qkv = inner.attn.in_proj_weight.shape[0] // 3
-        self._component_ridge = component_ridge
-
-        def _ridge_target(comp: str) -> torch.Tensor | None:
-            if lmc_targets is None or comp not in lmc_targets:
-                return None
-            W_base, _ = lmc_targets[comp]
-            if comp in ("ln_1", "ln_2"):
-                return torch.diag(torch.diag(W_base))
-            return W_base
-
-        for _ in range(n_iters):
-            # Step 1: ln_1 — element-wise (diagonal) absorption
-            cur = self._capture_component_output(model, insert_pos, "ln_1", loader, n_batches)
-            ref = refs.get(f"{src_idx}.ln_1_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_1", ridge_identity), ridge_target=_ridge_target("ln_1"))
-                    if lmc_store is not None:
-                        lmc_store["ln_1"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "ln_1", W, b)
-                    d = torch.diag(W).to(inner.ln_1.weight.device, dtype=inner.ln_1.weight.dtype)
-                    b = b.to(inner.ln_1.bias.device, dtype=inner.ln_1.bias.dtype)
-                    inner.ln_1.weight.mul_(d)
-                    inner.ln_1.bias.copy_(d * inner.ln_1.bias + b)
-
-            # Step 2: q_proj — slice 0 of fused in_proj
-            cur = self._capture_component_output(model, insert_pos, "q", loader, n_batches)
-            ref = refs.get(f"{src_idx}.q_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("q", ridge_identity), ridge_target=_ridge_target("q"))
-                    if lmc_store is not None:
-                        lmc_store["q"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "q", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[:dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[:dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[:dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[:dim_qkv] = W @ b_slice + b
-
-            # Step 3: k_proj — slice 1 of fused in_proj
-            cur = self._capture_component_output(model, insert_pos, "k", loader, n_batches)
-            ref = refs.get(f"{src_idx}.k_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("k", ridge_identity), ridge_target=_ridge_target("k"))
-                    if lmc_store is not None:
-                        lmc_store["k"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "k", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv] = W @ b_slice + b
-
-            # Step 4: v_proj — slice 2 of fused in_proj
-            cur = self._capture_component_output(model, insert_pos, "v", loader, n_batches)
-            ref = refs.get(f"{src_idx}.v_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("v", ridge_identity), ridge_target=_ridge_target("v"))
-                    if lmc_store is not None:
-                        lmc_store["v"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "v", W, b)
-                    W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-                    b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-                    w_slice = inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv].clone()
-                    b_slice = inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv].clone()
-                    inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv] = W @ w_slice
-                    inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv] = W @ b_slice + b
-
-            # Step 5: attn output (after out_proj) — full absorption into out_proj
-            cur = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
-            if insertion_target_mode == "residual":
-                # Pin the post-attention residual stream to the source block's
-                # y_s = x_s + a_s instead of matching a_s alone, absorbing the
-                # gap between the inserted block's input and x_s exactly once.
-                ref_input = refs.get(f"{src_idx}.input")
-                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-                if ref is not None and ref_input is not None and cur.numel() > 0 and cur_input.numel() > 0:
-                    n = min(cur.shape[0], cur_input.shape[0], ref.shape[0], ref_input.shape[0])
-                    A = cur[:n]
-                    T = ref_input[:n].to(A.device) + ref[:n].to(A.device) - cur_input[:n].to(A.device)
-                else:
-                    A = T = torch.empty(0)
-            elif ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-            else:
-                A = T = torch.empty(0)
-            if A.numel() > 0 and T.numel() > 0:
-                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("out_proj", ridge_identity), ridge_target=_ridge_target("out_proj"))
-                if lmc_store is not None:
-                    lmc_store["out_proj"] = (W.clone(), b.clone())
-                self._record_correction(model_name, "out_proj", W, b)
-                W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
-                b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
-                inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
-                inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
-
-            # Step 6: ln_2 — element-wise (diagonal) absorption
-            cur = self._capture_component_output(model, insert_pos, "ln_2", loader, n_batches)
-            ref = refs.get(f"{src_idx}.ln_2_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("ln_2", ridge_identity), ridge_target=_ridge_target("ln_2"))
-                    if lmc_store is not None:
-                        lmc_store["ln_2"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "ln_2", W, b)
-                    d = torch.diag(W).to(inner.ln_2.weight.device, dtype=inner.ln_2.weight.dtype)
-                    b = b.to(inner.ln_2.bias.device, dtype=inner.ln_2.bias.dtype)
-                    inner.ln_2.weight.mul_(d)
-                    inner.ln_2.bias.copy_(d * inner.ln_2.bias + b)
-
-            # Step 7: mlp.c_fc (before GELU) — full absorption into c_fc
-            cur = self._capture_component_output(model, insert_pos, "c_fc", loader, n_batches)
-            ref = refs.get(f"{src_idx}.c_fc_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_fc", ridge_identity), ridge_target=_ridge_target("c_fc"))
-                    if lmc_store is not None:
-                        lmc_store["c_fc"] = (W.clone(), b.clone())
-                    self._record_correction(model_name, "c_fc", W, b)
-                    W = W.to(inner.mlp.c_fc.weight.device, dtype=inner.mlp.c_fc.weight.dtype)
-                    b = b.to(inner.mlp.c_fc.bias.device, dtype=inner.mlp.c_fc.bias.dtype)
-                    inner.mlp.c_fc.weight.copy_(W @ inner.mlp.c_fc.weight)
-                    inner.mlp.c_fc.bias.copy_(W @ inner.mlp.c_fc.bias + b)
-
-            # Step 8: mlp.c_proj (after GELU, before ls_2) — full absorption into c_proj
-            cur = self._capture_component_output(model, insert_pos, "c_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.c_proj_output")
-            if ref is not None and target_reference is not None and target_weight > 0.0:
-                ref = self._blend_target_reference(
-                    ref, target_reference, self._target_reference_samples, target_weight
-                )
-            if insertion_target_mode == "residual":
-                # Target the source block's OUTPUT x_{s+1} = x_s + a_s + m_s,
-                # minus the stream actually reaching the MLP, which is the block
-                # input plus the already-corrected attention output. Subtracting
-                # only the block input here would consume the input gap a second
-                # time and invert the block (see the shrink path, which has
-                # always subtracted cur_attn).
-                ref_input = refs.get(f"{src_idx}.input")
-                ref_attn = refs.get(f"{src_idx}.attn_output")
-                cur_input = self._capture_single_input(model, insert_pos, loader, n_batches)
-                cur_attn = self._capture_component_output(model, insert_pos, "attn", loader, n_batches)
-                if (
-                    ref is not None and ref_input is not None and ref_attn is not None
-                    and cur.numel() > 0 and cur_input.numel() > 0 and cur_attn.numel() > 0
-                ):
-                    n = min(
-                        cur.shape[0], cur_input.shape[0], cur_attn.shape[0],
-                        ref.shape[0], ref_input.shape[0], ref_attn.shape[0],
-                    )
-                    A = cur[:n]
-                    T = (
-                        ref_input[:n].to(A.device) + ref_attn[:n].to(A.device) + ref[:n].to(A.device)
-                        - cur_input[:n].to(A.device) - cur_attn[:n].to(A.device)
-                    )
-                else:
-                    A = T = torch.empty(0)
-            elif ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-            else:
-                A = T = torch.empty(0)
-            if A.numel() > 0 and T.numel() > 0:
-                W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("c_proj", ridge_identity), ridge_target=_ridge_target("c_proj"))
-                if lmc_store is not None:
-                    lmc_store["c_proj"] = (W.clone(), b.clone())
-                self._record_correction(model_name, "c_proj", W, b)
-                W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
-                b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
-                inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
-                inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
-
-    @torch.no_grad()
     def _correct_collapsed_block_weights_cascade(
         self,
         model_name: str,
@@ -899,87 +692,6 @@ class BlockExtender(BlockExtenderCore):
                     b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
                     inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
                     inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
-
-    @torch.no_grad()
-    def _apply_block_corrections(
-        self,
-        model: nn.Module,
-        insert_pos: int,
-        corrections: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    ):
-        block = model.visual.transformer.resblocks[insert_pos]
-        inner = self._inner_block(block)
-        dim_qkv = inner.attn.in_proj_weight.shape[0] // 3
-
-        # Step 1: ln_1
-        if "ln_1" in corrections:
-            W, b = corrections["ln_1"]
-            d = torch.diag(W).to(inner.ln_1.weight.device, dtype=inner.ln_1.weight.dtype)
-            b = b.to(inner.ln_1.bias.device, dtype=inner.ln_1.bias.dtype)
-            inner.ln_1.weight.mul_(d)
-            inner.ln_1.bias.copy_(d * inner.ln_1.bias + b)
-
-        # Step 2: q_proj
-        if "q" in corrections:
-            W, b = corrections["q"]
-            W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-            b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-            w_slice = inner.attn.in_proj_weight.data[:dim_qkv].clone()
-            b_slice = inner.attn.in_proj_bias.data[:dim_qkv].clone()
-            inner.attn.in_proj_weight.data[:dim_qkv] = W @ w_slice
-            inner.attn.in_proj_bias.data[:dim_qkv] = W @ b_slice + b
-
-        # Step 3: k_proj
-        if "k" in corrections:
-            W, b = corrections["k"]
-            W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-            b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-            w_slice = inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv].clone()
-            b_slice = inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv].clone()
-            inner.attn.in_proj_weight.data[dim_qkv:2*dim_qkv] = W @ w_slice
-            inner.attn.in_proj_bias.data[dim_qkv:2*dim_qkv] = W @ b_slice + b
-
-        # Step 4: v_proj
-        if "v" in corrections:
-            W, b = corrections["v"]
-            W = W.to(inner.attn.in_proj_weight.device, dtype=inner.attn.in_proj_weight.dtype)
-            b = b.to(inner.attn.in_proj_bias.device, dtype=inner.attn.in_proj_bias.dtype)
-            w_slice = inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv].clone()
-            b_slice = inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv].clone()
-            inner.attn.in_proj_weight.data[2*dim_qkv:3*dim_qkv] = W @ w_slice
-            inner.attn.in_proj_bias.data[2*dim_qkv:3*dim_qkv] = W @ b_slice + b
-
-        # Step 5: out_proj
-        if "out_proj" in corrections:
-            W, b = corrections["out_proj"]
-            W = W.to(inner.attn.out_proj.weight.device, dtype=inner.attn.out_proj.weight.dtype)
-            b = b.to(inner.attn.out_proj.bias.device, dtype=inner.attn.out_proj.bias.dtype)
-            inner.attn.out_proj.weight.copy_(W @ inner.attn.out_proj.weight)
-            inner.attn.out_proj.bias.copy_(W @ inner.attn.out_proj.bias + b)
-
-        # Step 6: ln_2
-        if "ln_2" in corrections:
-            W, b = corrections["ln_2"]
-            d = torch.diag(W).to(inner.ln_2.weight.device, dtype=inner.ln_2.weight.dtype)
-            b = b.to(inner.ln_2.bias.device, dtype=inner.ln_2.bias.dtype)
-            inner.ln_2.weight.mul_(d)
-            inner.ln_2.bias.copy_(d * inner.ln_2.bias + b)
-
-        # Step 7: c_fc
-        if "c_fc" in corrections:
-            W, b = corrections["c_fc"]
-            W = W.to(inner.mlp.c_fc.weight.device, dtype=inner.mlp.c_fc.weight.dtype)
-            b = b.to(inner.mlp.c_fc.bias.device, dtype=inner.mlp.c_fc.bias.dtype)
-            inner.mlp.c_fc.weight.copy_(W @ inner.mlp.c_fc.weight)
-            inner.mlp.c_fc.bias.copy_(W @ inner.mlp.c_fc.bias + b)
-
-        # Step 8: c_proj
-        if "c_proj" in corrections:
-            W, b = corrections["c_proj"]
-            W = W.to(inner.mlp.c_proj.weight.device, dtype=inner.mlp.c_proj.weight.dtype)
-            b = b.to(inner.mlp.c_proj.bias.device, dtype=inner.mlp.c_proj.bias.dtype)
-            inner.mlp.c_proj.weight.copy_(W @ inner.mlp.c_proj.weight)
-            inner.mlp.c_proj.bias.copy_(W @ inner.mlp.c_proj.bias + b)
 
     @staticmethod
     def _build_collapse_schedule(

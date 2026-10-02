@@ -41,6 +41,11 @@ class ComponentSpec:
     slice_index: int | None = None
     residual_aware: bool = False
     blendable_target: bool = False
+    # Module name the extender's ``_capture_component_output`` hooks when it differs from ``name``.
+    capture_name: str | None = None
+    # Position in the residual stream: ``attn_out`` / ``mlp_out`` components can be fitted against a
+    # residual-stream target (inputs and already-corrected attention output subtracted).
+    stream_role: Literal["attn_out", "mlp_out"] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,10 +140,14 @@ VISION_COMPONENTS: tuple[ComponentSpec, ...] = (
     ComponentSpec("q", "q_output", "fused_slice", slice_index=0),
     ComponentSpec("k", "k_output", "fused_slice", slice_index=1),
     ComponentSpec("v", "v_output", "fused_slice", slice_index=2),
-    ComponentSpec("out_proj", "attn_output", "linear", residual_aware=True),
+    ComponentSpec(
+        "out_proj", "attn_output", "linear", residual_aware=True, capture_name="attn", stream_role="attn_out"
+    ),
     ComponentSpec("ln_2", "ln_2_output", "norm_diag"),
     ComponentSpec("c_fc", "c_fc_output", "linear"),
-    ComponentSpec("c_proj", "c_proj_output", "linear", residual_aware=True, blendable_target=True),
+    ComponentSpec(
+        "c_proj", "c_proj_output", "linear", residual_aware=True, blendable_target=True, stream_role="mlp_out"
+    ),
 )
 
 DECODER_COMPONENTS: tuple[ComponentSpec, ...] = (
@@ -146,11 +155,11 @@ DECODER_COMPONENTS: tuple[ComponentSpec, ...] = (
     ComponentSpec("q_proj", "q_proj_output", "linear"),
     ComponentSpec("k_proj", "k_proj_output", "linear"),
     ComponentSpec("v_proj", "v_proj_output", "linear"),
-    ComponentSpec("o_proj", "attn_output", "linear"),
+    ComponentSpec("o_proj", "attn_output", "linear", stream_role="attn_out"),
     ComponentSpec("post_attention_layernorm", "post_attn_ln_output", "norm_diag"),
     ComponentSpec("gate_proj", "gate_proj_output", "linear"),
     ComponentSpec("up_proj", "up_proj_output", "linear"),
-    ComponentSpec("down_proj", "down_proj_output", "linear"),
+    ComponentSpec("down_proj", "down_proj_output", "linear", stream_role="mlp_out"),
 )
 
 

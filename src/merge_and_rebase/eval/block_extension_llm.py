@@ -14,6 +14,7 @@ try:
 except Exception:
     tqdm = None
 
+from ..rebase.block_extension.adapters import DecoderAdapter
 from ..rebase.block_extension.core import BlockExtenderCore
 from ..rebase.block_extension.schedules import decoder_collapse_schedule, decoder_locate_collapse_pos
 from .block_extension import (
@@ -80,6 +81,7 @@ class DecoderBlockExtender(BlockExtenderCore):
         self.model_base = model_base
         self.model_ft = model_ft
         self.family_adapter = family_adapter
+        self.adapter = DecoderAdapter(family_adapter)
         self.device = device
         self.reference_inputs: dict[str, dict[str, torch.Tensor]] = {"base": {}, "ft": {}}
         self.verbose = bool(verbose)
@@ -313,181 +315,6 @@ class DecoderBlockExtender(BlockExtenderCore):
         if linear.bias is not None:
             b = b.to(linear.bias.device, dtype=linear.bias.dtype)
             linear.bias.copy_(W @ linear.bias + b)
-
-    @torch.no_grad()
-    def _correct_block_weights_cascade(
-        self,
-        model_name: str,
-        model: nn.Module,
-        insert_pos: int,
-        src_idx: int,
-        loader: Iterable[Any],
-        n_batches: int,
-        ridge_identity: float = 0.0,
-        n_iters: int = 1,
-        ref_source: str | None = None,
-        component_ridge: dict[str, float] | None = None,
-        lmc_store: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-        lmc_targets: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ):
-        layers = _get_layers(model, self.family_adapter)
-        block = layers[insert_pos]
-        ref_key = ref_source if ref_source is not None else model_name
-        refs = self.reference_inputs[ref_key]
-        self._component_ridge = component_ridge
-
-        def _ridge_target(comp: str) -> torch.Tensor | None:
-            if lmc_targets is None or comp not in lmc_targets:
-                return None
-            W_base, _ = lmc_targets[comp]
-            if comp in ("input_layernorm", "post_attention_layernorm"):
-                return torch.diag(torch.diag(W_base))
-            return W_base
-
-        for _ in range(n_iters):
-            # 1: input_layernorm — diagonal absorption
-            cur = self._capture_component_output(model, insert_pos, "input_layernorm", loader, n_batches)
-            ref = refs.get(f"{src_idx}.input_layernorm_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("input_layernorm", ridge_identity), ridge_target=_ridge_target("input_layernorm"))
-                    if lmc_store is not None:
-                        lmc_store["input_layernorm"] = (W.clone(), b.clone())
-                    self._correct_rmsnorm(block.input_layernorm, W, b)
-
-            # 2: q_proj
-            cur = self._capture_component_output(model, insert_pos, "q_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.q_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("q_proj", ridge_identity), ridge_target=_ridge_target("q_proj"))
-                    if lmc_store is not None:
-                        lmc_store["q_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.self_attn.q_proj, W, b)
-
-            # 3: k_proj
-            cur = self._capture_component_output(model, insert_pos, "k_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.k_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("k_proj", ridge_identity), ridge_target=_ridge_target("k_proj"))
-                    if lmc_store is not None:
-                        lmc_store["k_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.self_attn.k_proj, W, b)
-
-            # 4: v_proj
-            cur = self._capture_component_output(model, insert_pos, "v_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.v_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("v_proj", ridge_identity), ridge_target=_ridge_target("v_proj"))
-                    if lmc_store is not None:
-                        lmc_store["v_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.self_attn.v_proj, W, b)
-
-            # 5: attention output — full absorption into o_proj.
-            # An inserted block targets its source block's component activations
-            # directly, matching the vision cascade. A residual-aware target
-            # belongs to the collapse path only, where the span boundary (not a
-            # single source block) defines the reference.
-            cur = self._capture_component_output(model, insert_pos, "o_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.attn_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("o_proj", ridge_identity), ridge_target=_ridge_target("o_proj"))
-                    if lmc_store is not None:
-                        lmc_store["o_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.self_attn.o_proj, W, b)
-
-            # 6: post_attention_layernorm — diagonal absorption
-            cur = self._capture_component_output(model, insert_pos, "post_attention_layernorm", loader, n_batches)
-            ref = refs.get(f"{src_idx}.post_attn_ln_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("post_attention_layernorm", ridge_identity), ridge_target=_ridge_target("post_attention_layernorm"))
-                    if lmc_store is not None:
-                        lmc_store["post_attention_layernorm"] = (W.clone(), b.clone())
-                    self._correct_rmsnorm(block.post_attention_layernorm, W, b)
-
-            # 7: gate_proj
-            cur = self._capture_component_output(model, insert_pos, "gate_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.gate_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("gate_proj", ridge_identity), ridge_target=_ridge_target("gate_proj"))
-                    if lmc_store is not None:
-                        lmc_store["gate_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.gate_proj, W, b)
-
-            # 8: up_proj
-            cur = self._capture_component_output(model, insert_pos, "up_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.up_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("up_proj", ridge_identity), ridge_target=_ridge_target("up_proj"))
-                    if lmc_store is not None:
-                        lmc_store["up_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.up_proj, W, b)
-
-            # 9: mlp output — full absorption into down_proj, direct target as
-            # in step 5. The previous residual-aware target subtracted the block
-            # input a second time (step 5 had already absorbed it), which drove
-            # the inserted block towards inverting its own source block.
-            cur = self._capture_component_output(model, insert_pos, "down_proj", loader, n_batches)
-            ref = refs.get(f"{src_idx}.down_proj_output")
-            if ref is not None and cur.numel() > 0:
-                A, T = self._match_rows(cur, ref)
-                if A.numel() > 0 and T.numel() > 0:
-                    W, b = self._fit_ridge(A, T, ridge_id=self._get_ridge("down_proj", ridge_identity), ridge_target=_ridge_target("down_proj"))
-                    if lmc_store is not None:
-                        lmc_store["down_proj"] = (W.clone(), b.clone())
-                    self._correct_linear(block.mlp.down_proj, W, b)
-
-    @torch.no_grad()
-    def _apply_block_corrections(
-        self,
-        model: nn.Module,
-        insert_pos: int,
-        corrections: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    ):
-        layers = _get_layers(model, self.family_adapter)
-        block = layers[insert_pos]
-
-        if "input_layernorm" in corrections:
-            W, b = corrections["input_layernorm"]
-            self._correct_rmsnorm(block.input_layernorm, W, b)
-        if "q_proj" in corrections:
-            W, b = corrections["q_proj"]
-            self._correct_linear(block.self_attn.q_proj, W, b)
-        if "k_proj" in corrections:
-            W, b = corrections["k_proj"]
-            self._correct_linear(block.self_attn.k_proj, W, b)
-        if "v_proj" in corrections:
-            W, b = corrections["v_proj"]
-            self._correct_linear(block.self_attn.v_proj, W, b)
-        if "o_proj" in corrections:
-            W, b = corrections["o_proj"]
-            self._correct_linear(block.self_attn.o_proj, W, b)
-        if "post_attention_layernorm" in corrections:
-            W, b = corrections["post_attention_layernorm"]
-            self._correct_rmsnorm(block.post_attention_layernorm, W, b)
-        if "gate_proj" in corrections:
-            W, b = corrections["gate_proj"]
-            self._correct_linear(block.mlp.gate_proj, W, b)
-        if "up_proj" in corrections:
-            W, b = corrections["up_proj"]
-            self._correct_linear(block.mlp.up_proj, W, b)
-        if "down_proj" in corrections:
-            W, b = corrections["down_proj"]
-            self._correct_linear(block.mlp.down_proj, W, b)
 
     @torch.no_grad()
     def _extend_interpolate(
