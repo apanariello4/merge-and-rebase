@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 from collections.abc import Iterable, Mapping
@@ -12,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset
 
 from merge_and_rebase.hyperparam_search import (
     SearchEvaluation,
@@ -33,7 +31,12 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.llm_calibration import resolve_calibration_texts
+from ..data.llm_calibration import (
+    TokenizedPromptDataset,
+    build_text_calibration_loader,
+    resolve_calibration_texts,
+    tokenization_stats,
+)
 from ..data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
@@ -72,26 +75,6 @@ from .llm_common import (
     to_unit_acc,
 )
 from .print_utils import pretty_print_task_accuracies
-
-
-class _TokenizedPromptDataset(Dataset):
-    def __init__(self, features: list[dict[str, Any]], sample_ids: list[str] | None = None) -> None:
-        self.features = features
-        # Identity of the underlying examples, not of this tokenization. The
-        # source and target calibration loaders tokenize the SAME texts with
-        # different tokenizers, so they are different objects holding different
-        # token ids; paired calibration has to recognise them as the same
-        # examples replayed under two preprocessors, which is exactly what it
-        # falls back to sample_ids for.
-        self.sample_ids = list(sample_ids) if sample_ids is not None else None
-
-    def __len__(self) -> int:
-        return len(self.features)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        feat = dict(self.features[int(idx)])
-        feat["labels"] = list(feat["input_ids"])
-        return feat
 
 
 @dataclass
@@ -247,48 +230,9 @@ def _summarize_merged_delta(
     }
 
 
-def _build_text_calibration_loader(
-    *,
-    tokenizer: Any,
-    texts: list[str],
-    batch_size: int = 2,
-    max_length: int = 128,
-) -> DataLoader:
-    prompt_list = list(texts)
-    if not prompt_list:
-        raise ValueError("Calibration loader needs at least one text sequence.")
-    enc = tokenizer(
-        prompt_list,
-        truncation=True,
-        max_length=int(max_length),
-        padding="max_length",
-    )
-    features: list[dict[str, Any]] = []
-    for i in range(len(prompt_list)):
-        features.append({k: v[i] for k, v in enc.items()})
-
-    # Stable across processes: str.__hash__ is salted per interpreter, which
-    # would make these ids non-reproducible if they were ever persisted.
-    sample_ids = [f"{i}:{hashlib.sha1(t.encode()).hexdigest()[:12]}" for i, t in enumerate(prompt_list)]
-    dataset = _TokenizedPromptDataset(features, sample_ids=sample_ids)
-
-    def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        feats = [{k: v for k, v in row.items() if k != "labels"} for row in batch]
-        padded = tokenizer.pad(feats, return_tensors="pt", padding="max_length", max_length=int(max_length))
-        padded["labels"] = padded["input_ids"].clone()
-        if "attention_mask" in padded:
-            padded["labels"][padded["attention_mask"] == 0] = -100
-        return padded
-
-    return DataLoader(
-        dataset,
-        batch_size=max(1, int(batch_size)),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=_collate,
-    )
+# Promoted to data/llm_calibration (P7.S5); the old names stay importable (golden tests import them).
+_build_text_calibration_loader = build_text_calibration_loader
+_TokenizedPromptDataset = TokenizedPromptDataset
 
 
 def main() -> None:
@@ -742,13 +686,6 @@ def main() -> None:
         # read from config (method_params.n_batches is rejected above). Resolve it
         # once here so it's counted when sizing the corpus and can beat the
         # _DEFAULT_CALIB_BATCHES default injected at the transport call below.
-        calib_n_batches_cfg = method_params.get("num_batches")
-        calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
-        # These are two separate budgets over one shared text pool, not one
-        # knob: block extension consumes n_batches_act batches for its
-        # activation capture, theseus/bico consume num_batches for theirs, and
-        # neither is derived from the other. The max only sizes the pool, so
-        # whichever consumer asks for more still finds enough text.
         # Vision configs express the calibration budget as
         # method_params.num_batches, and theseus/bico accept either name
         # (preferring n_batches). Resolve it once here so a vision-style config
@@ -765,8 +702,17 @@ def main() -> None:
         n_calib_batches = max(
             int(block_extension_cfg.n_batches_act),
             int(calib_n_batches or 0),
-            int(calib_n_batches or 0),
         )
+        # Opt-in calibration knobs (all default to the historical behaviour):
+        #   calibration_n_sequences      explicit pool size instead of max(batches) * batch_size
+        #   calibration_dataset          explicit HF corpus, decoupled from the evaluated task (no eval hold-out);
+        #                                beats block_extension_params.calibration_dataset
+        #   calibration_include_target   harness source: append the gold target to each rendered prompt
+        calibration_n_sequences_cfg = cfg.get("calibration_n_sequences", None)
+        if calibration_n_sequences_cfg is not None and int(calibration_n_sequences_cfg) <= 0:
+            raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
+        calibration_dataset_cfg = cfg.get("calibration_dataset", None)
+        calibration_include_target = bool(cfg.get("calibration_include_target", False))
         # Resolved on first use: building it from an lm-harness task has to
         # index the task registry, which is far too expensive to pay for on a
         # run that never collects activations at all.
@@ -777,17 +723,40 @@ def main() -> None:
                 resolved = resolve_calibration_texts(
                     prompts=calibration_prompts_cfg,
                     calibration_dataset=(
-                        block_extension_cfg.calibration_dataset
+                        calibration_dataset_cfg
+                        or block_extension_cfg.calibration_dataset
                         or block_extension_cfg.calibration_task
                     ),
                     calibration_split=str(block_extension_cfg.calibration_split),
                     harness_tasks=list(harness_tasks_resolved),
-                    n_sequences=max(1, n_calib_batches) * calib_batch_size,
+                    n_sequences=(
+                        int(calibration_n_sequences_cfg)
+                        if calibration_n_sequences_cfg is not None
+                        else max(1, n_calib_batches) * calib_batch_size
+                    ),
                     seed=int(cfg.get("seed", 0)),
+                    include_target=calibration_include_target,
                 )
+                for note in resolved.notes:
+                    print(f"Calibration note: {note}")
                 print(f"Calibration corpus: {resolved.describe()}")
                 _calibration_cache.append(resolved)
             return _calibration_cache[0]
+
+        def _calibration_provenance() -> dict[str, Any] | None:
+            """Additive summary record (None when no calibration corpus was ever resolved)."""
+            if not _calibration_cache:
+                return None
+            record = _calibration_cache[0].provenance()
+            record["calibration_batch_size"] = calib_batch_size
+            record["calibration_max_length"] = calib_max_length
+            try:
+                record["tokenization"] = tokenization_stats(
+                    source_llm.tokenizer, _calibration_cache[0].texts, calib_max_length
+                )
+            except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
+                record["tokenization"] = {"error": f"{type(exc).__name__}: {exc}"}
+            return record
 
         configured_harness_samples_raw = cfg.get("harness_samples", None)
         configured_harness_samples: dict[str, list[int]] | None = None
@@ -935,6 +904,7 @@ def main() -> None:
             if run_logger is not None:
                 run_logger.log_summary({
                     "ignored_block_extension_fields": ignored_block_extension_fields,
+                    "calibration_provenance": _calibration_provenance(),
                     "method": method_name,
                     "backend": "lm_harness",
                     "stopped_after": "before_rebase_eval",
@@ -1272,6 +1242,7 @@ def main() -> None:
             if run_logger is not None:
                 run_logger.log_summary({
                     "ignored_block_extension_fields": ignored_block_extension_fields,
+                    "calibration_provenance": _calibration_provenance(),
                     "method": method_name,
                     "best_alpha": best_alpha,
                     "backend": "lm_harness",
@@ -1481,6 +1452,7 @@ def main() -> None:
         if run_logger is not None:
             run_logger.log_summary({
                 "ignored_block_extension_fields": ignored_block_extension_fields,
+                "calibration_provenance": _calibration_provenance(),
                 "method": method_name,
                 "best_alpha": best_alpha,
                 "tasks": [td.task for td in task_data],
