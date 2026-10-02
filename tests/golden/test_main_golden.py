@@ -57,6 +57,7 @@ PATCH_MODULES: list[str] = [
     "merge_and_rebase.eval.vision_rebase.alpha_search",
     "merge_and_rebase.eval.vision_rebase.stages",
     "merge_and_rebase.eval.vision_rebase.completion",
+    "merge_and_rebase.eval.vision_rebase.method_stages",
     "merge_and_rebase.rebase.orchestration",
 ]
 

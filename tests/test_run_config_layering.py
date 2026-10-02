@@ -10,7 +10,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("module", ["run_config", "prestep"])
+@pytest.mark.parametrize("module", ["run_config", "prestep", "orchestration"])
 def test_rebase_stage_modules_import_no_eval_module(module: str) -> None:
     code = (
         f"import sys; import merge_and_rebase.rebase.{module}; "
