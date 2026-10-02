@@ -5,8 +5,7 @@ Real calibration code throughout: ``_build_text_calibration_loader`` ->
 family adapter llm_rebase uses. Row masks must come from attention_mask only
 (Qwen pad id == a content token id), and padding must never enter statistics.
 
-Strict xfails document confirmed bugs (see reasons); they must flip to passes
-when the corresponding Phase 7 fix lands.
+The former strict xfails (B20-B23) were flipped to normal tests by the S4a padding hardening.
 """
 
 from __future__ import annotations
@@ -196,7 +195,7 @@ def test_real_qwen_endoftext_as_content_is_kept(method):
     _assert_rows_are_content(reg, _content_tokens(loader))
 
 
-# --------------------------------------------------------------------------- known bugs (strict xfail)
+# --------------------------------------------------------------------------- padding hardening (formerly xfail)
 
 
 def _manual_batches(texts, tok, max_length):
@@ -212,21 +211,12 @@ def test_content_row_mask_normal_case_masks_pads():
     assert theseus_mod._content_row_mask(torch.ones(2, 3, dtype=torch.long), None) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: _content_row_mask returns None for an all-pad batch (`not mask.any()`), so every pad row is kept; "
-    "decision: padding rows never enter statistics.",
-)
 def test_all_pad_batch_has_no_content_rows():
     mask = torch.zeros(2, 4, dtype=torch.long)
     out = theseus_mod._content_row_mask(mask, mask)
     assert out is not None and not bool(out.any())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: an all-pad batch contributes pad rows to THESEUS statistics (n_samples counts pads).",
-)
 def test_all_pad_batch_adds_no_rows_end_to_end():
     tok = local_tokenizer(CALIB_TEXTS, "right")
     src, tgt = _pair("qwen2")
@@ -237,24 +227,19 @@ def test_all_pad_batch_adds_no_rows_end_to_end():
     _assert_rows_are_content(reg, _content_tokens(batches))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: _content_row_mask silently returns None when source/target masks differ in numel (tokenizer "
-    "mismatch), keeping pad rows; decision: error for all methods, never a pad-keeping fallback.",
-)
 def test_mask_numel_mismatch_raises():
     a = torch.ones(2, 5, dtype=torch.long)
     b = torch.ones(2, 7, dtype=torch.long)
     a[:, 3:] = 0
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"\(2, 5\).*\(2, 7\)"):
         theseus_mod._content_row_mask(a, b)
 
 
 def _pooled_content_rows(x: torch.Tensor, mask: torch.Tensor, *, mode: str):
     """The exact per-batch steps collect_activations applies to one (source, target) hook pair."""
-    rows, _ = theseus_mod._align_features(x, x.clone(), mode=mode)
     row_mask = theseus_mod._content_row_mask(mask, mask)
-    return theseus_mod._drop_padding_rows(rows, rows, row_mask)[0]
+    rows, tgt = theseus_mod._align_features(x, x.clone(), mode=mode, content_mask=row_mask)
+    return theseus_mod._drop_padding_rows(rows, tgt, row_mask)[0]
 
 
 def _content_means(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -269,11 +254,6 @@ def test_seq_align_mean_without_padding_is_content_mean():
     torch.testing.assert_close(_pooled_content_rows(x, mask, mode="mean"), _content_means(x, mask))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: seq_align='mean' pools over all positions incl. padding before _drop_padding_rows "
-    "(pooled row count != mask numel, so nothing is dropped); rows differ from the content mean.",
-)
 def test_seq_align_mean_pools_only_content_tokens():
     gen = torch.Generator().manual_seed(0)
     x = torch.randn(3, 5, 4, generator=gen)
@@ -281,12 +261,6 @@ def test_seq_align_mean_pools_only_content_tokens():
     torch.testing.assert_close(_pooled_content_rows(x, mask, mode="mean"), _content_means(x, mask))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=RuntimeError,
-    reason="BUG: collect_activations(seq_align='mean') crashes on any decoder: the embed_tokens hook input is the "
-    "Long input_ids tensor and mean() rejects integer dtype, so mean pooling is unusable for LLMs.",
-)
 def test_seq_align_mean_runs_on_decoder():
     tok = local_tokenizer(CALIB_TEXTS, "right")
     src, tgt = _pair("qwen2")

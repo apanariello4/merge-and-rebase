@@ -64,14 +64,17 @@ from ._shared import (  # noqa: F401
     _LayerTransform,  # noqa: F401
     _matrix_power_psd,  # noqa: F401
     _merge_split_qkv_state,  # noqa: F401
+    _note_padding_rows,  # noqa: F401
     _param_to_module,  # noqa: F401
     _partially_whiten_covariance,  # noqa: F401
+    _poolable,  # noqa: F401
     _precompute_diagnostics_from_transforms,  # noqa: F401
     _precompute_transforms,  # noqa: F401
     _precompute_transforms_data_free,  # noqa: F401
     _PrecomputeDiagnostics,  # noqa: F401
     _report_apply_diagnostics,  # noqa: F401
     _report_precompute_diagnostics,  # noqa: F401
+    _require_content_rows,  # noqa: F401
     _resolve_covariance_mode,  # noqa: F401
     _resolve_device,  # noqa: F401
     _split_fused_qkv_if_needed,  # noqa: F401
@@ -317,8 +320,14 @@ def collect_activations(
     family_adapter: Any = None,
     source_activation_plan: InterpolatedBlockActivations | None = None,
     source_model_ft: torch.nn.Module | None = None,
+    padding_stats: dict[str, int] | None = None,
 ) -> dict[str, ActivationStore]:
     """Stream paired source/target activation statistics.
+
+    Padding rows (``attention_mask == 0``) never enter a statistic: an all-padding batch
+    contributes no rows, and the call fails only when no content row exists at all. When
+    ``padding_stats`` is a dict it is filled with ``{n_rows_total, n_rows_content}`` token-row
+    counts (text calibration only).
 
     When ``source_model_ft`` is given, the fine-tuned source endpoint is run on
     the same batches in the same pass and its statistics are stored under the
@@ -379,6 +388,7 @@ def collect_activations(
                     source_model(**({"input_ids": s_inp, "attention_mask": s_attn} if s_attn is not None else {"input_ids": s_inp}))
                     target_model(**({"input_ids": t_inp, "attention_mask": t_attn} if t_attn is not None else {"input_ids": t_inp}))
                     row_mask = _content_row_mask(s_attn, t_attn)
+                    _note_padding_rows(padding_stats, s_attn if s_attn is not None else t_attn, row_mask)
                 else:
                     source_imgs = _extract_model_inputs(source_batch).to(dev)
                     target_imgs = _extract_model_inputs(target_batch).to(dev)
@@ -406,12 +416,18 @@ def collect_activations(
                 source_activation_plan.apply(source_hook.outputs)
 
             def _accumulate(hook: _ActivationHook, *, prefix: str, row_mask=row_mask) -> None:
+                if row_mask is not None and not bool(row_mask.any()):
+                    return  # all-padding batch: contributes no rows
                 for side, source_side, target_side in (
                     ("in", hook.inputs, target_hook.inputs),
                     ("out", hook.outputs, target_hook.outputs),
                 ):
                     for key in set(source_side.keys()) & set(target_side.keys()):
-                        src_rows, tgt_rows = _align_features(source_side[key], target_side[key], mode=seq_align)
+                        if not _poolable(seq_align, source_side[key], target_side[key]):
+                            continue  # integer hook inputs (embedding input_ids) cannot be pooled
+                        src_rows, tgt_rows = _align_features(
+                            source_side[key], target_side[key], mode=seq_align, content_mask=row_mask
+                        )
                         src_rows, tgt_rows = _drop_padding_rows(src_rows, tgt_rows, row_mask)
                         registry.setdefault(
                             f"{prefix}{key}.{side}",
@@ -430,6 +446,7 @@ def collect_activations(
             target_hook.clear()
             if source_ft_hook is not None:
                 source_ft_hook.clear()
+        _require_content_rows(padding_stats, method="Theseus")
         if n_batches is not None and consumed_batches < int(n_batches):
             raise ValueError(
                 f"Theseus calibration loaders exhausted after {consumed_batches} batches; requested {int(n_batches)}."
@@ -575,6 +592,7 @@ class TheseusRebase:
             print(f"{log_prefix} prepare: patch_qkv disabled")
 
         activation_registry: dict[str, ActivationStore] = {}
+        padding_stats: dict[str, int] = {}
         transforms_by_key: dict[str, _LayerTransform] = {}
         precompute_diag = _PrecomputeDiagnostics(
             slots=0,
@@ -638,6 +656,7 @@ class TheseusRebase:
                         family_adapter=family_adapter,
                         source_activation_plan=source_activation_plan,
                         source_model_ft=source_model_ft,
+                        padding_stats=padding_stats,
                     )
                     if cache_path is not None:
                         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -748,7 +767,9 @@ class TheseusRebase:
         if verbose:
             print(f"{log_prefix} prepare: done")
 
+        prepared_padding = {"padding_stats": dict(padding_stats)} if padding_stats else {}
         return {
+            **prepared_padding,
             "activation_registry": activation_registry,
             "transforms_by_key": transforms_by_key,
             "split_fused_qkv": split_fused_qkv,

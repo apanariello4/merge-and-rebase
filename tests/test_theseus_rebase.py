@@ -511,14 +511,17 @@ def test_content_row_mask_and_padding_drop():
     assert torch.equal(src_kept, src[mask])
     assert torch.equal(tgt_kept, tgt[mask])
 
-    # No mask, an all-real mask, and an all-pad mask all leave rows untouched.
+    # No mask and an all-real mask leave rows untouched; an all-pad batch contributes no rows
+    # (all-False mask, never a pad-keeping None).
     assert _content_row_mask(None, None) is None
     assert _content_row_mask(torch.ones(2, 4, dtype=torch.long), None) is None
-    assert _content_row_mask(torch.zeros(2, 4, dtype=torch.long), None) is None
+    all_pad = _content_row_mask(torch.zeros(2, 4, dtype=torch.long), None)
+    assert all_pad is not None and not bool(all_pad.any())
 
-    # Source and target tokenized to different lengths -> rows no longer
-    # correspond one-to-one, so don't guess.
-    assert _content_row_mask(attn, torch.ones(2, 6, dtype=torch.long)) is None
+    # Source and target tokenized to different lengths -> rows cannot be paired: error, never a
+    # pad-keeping fallback.
+    with pytest.raises(ValueError, match="cannot be paired"):
+        _content_row_mask(attn, torch.ones(2, 6, dtype=torch.long))
 
     # Activations that aren't one row per input token (pooled/head-split) are
     # passed through rather than mis-sliced.

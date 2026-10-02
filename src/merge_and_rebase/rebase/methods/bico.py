@@ -127,6 +127,18 @@ def _calibration_row_mask(
     treatment. Vision batches have no padding, so this returns None and every
     row is kept, leaving the vision path byte-identical.
     """
+    masks = _calibration_attention_masks(source_batch, target_batch, family_adapter)
+    if masks is None:
+        return None
+    return _shared._content_row_mask(masks[0], masks[1])
+
+
+def _calibration_attention_masks(
+    source_batch: Any,
+    target_batch: Any,
+    family_adapter: Any,
+) -> tuple[torch.Tensor | None, torch.Tensor | None] | None:
+    """The source/target ``attention_mask`` tensors of a text calibration pair (None for vision)."""
     if family_adapter is None:
         return None
     masks: list[torch.Tensor | None] = []
@@ -134,7 +146,7 @@ def _calibration_row_mask(
         inputs = family_adapter.extract_calibration_batch(batch)
         mask = inputs.get("attention_mask") if isinstance(inputs, Mapping) else None
         masks.append(mask if torch.is_tensor(mask) else None)
-    return _shared._content_row_mask(masks[0], masks[1])
+    return masks[0], masks[1]
 
 
 @cost_phase_decorator("activation_collection")
@@ -180,9 +192,14 @@ def collect_bilinear_statistics(
     family_adapter: Any = None,
     projection_mode: str = "gradient",
     source_activation_plan: _shared.InterpolatedBlockActivations | None = None,
+    padding_stats: dict[str, int] | None = None,
 ) -> dict[str, _shared.ActivationStore]:
     """
     Collect input activation statistics and output-gradient statistics.
+
+    Padding rows (``attention_mask == 0``) never enter a statistic; an all-padding batch is
+    skipped, and the call fails only when no content row exists. ``padding_stats`` (a dict) is
+    filled with ``{n_rows_total, n_rows_content}`` for text calibration.
 
     Source and target are processed sequentially on GPU to minimise peak memory.
     Only one model is on GPU at a time.
@@ -242,6 +259,12 @@ def collect_bilinear_statistics(
             del source_inputs, target_inputs
 
             row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
+            _attn = _calibration_attention_masks(source_batch, target_batch, family_adapter)
+            if _attn is not None:
+                _shared._note_padding_rows(padding_stats, _attn[0] if _attn[0] is not None else _attn[1], row_mask)
+            if row_mask is not None and not bool(row_mask.any()):
+                consumed_batches += 1
+                continue  # all-padding batch: contributes no rows (and its loss would be undefined)
 
             # Source: forward + backward on GPU
             source_hook.clear()
@@ -281,8 +304,10 @@ def collect_bilinear_statistics(
             # Align and update registries (all tensors are on CPU from hooks)
             common_inputs = set(source_hook.inputs.keys()) & set(target_hook.inputs.keys())
             for key in common_inputs:
+                if not _shared._poolable(seq_align, source_hook.inputs[key], target_hook.inputs[key]):
+                    continue  # integer hook inputs (embedding input_ids) cannot be pooled
                 src_rows, tgt_rows = _shared._align_features(
-                    source_hook.inputs[key], target_hook.inputs[key], mode=seq_align
+                    source_hook.inputs[key], target_hook.inputs[key], mode=seq_align, content_mask=row_mask
                 )
                 src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.in"
@@ -295,7 +320,7 @@ def collect_bilinear_statistics(
             common_grads = set(source_hook.out_grads.keys()) & set(target_hook.out_grads.keys())
             for key in common_grads:
                 src_rows, tgt_rows = _shared._align_features(
-                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align
+                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align, content_mask=row_mask
                 )
                 src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.out"
@@ -307,6 +332,7 @@ def collect_bilinear_statistics(
 
             consumed_batches += 1
 
+        _shared._require_content_rows(padding_stats, method="BiCo")
         if n_batches is not None and consumed_batches < int(n_batches):
             raise ValueError(
                 f"BiCo calibration loaders exhausted after {consumed_batches} batches; requested {int(n_batches)}."
@@ -338,6 +364,7 @@ def collect_gradin_statistics(
     family_adapter: Any = None,
     projection_mode: str = "gradient",
     source_activation_plan: _shared.InterpolatedBlockActivations | None = None,
+    padding_stats: dict[str, int] | None = None,
 ) -> dict[str, _shared.ActivationStore]:
     """
     Like collect_bilinear_statistics, but fills .in using input-side gradients
@@ -392,6 +419,11 @@ def collect_gradin_statistics(
             del source_inputs, target_inputs
 
             row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
+            _attn = _calibration_attention_masks(source_batch, target_batch, family_adapter)
+            if _attn is not None:
+                _shared._note_padding_rows(padding_stats, _attn[0] if _attn[0] is not None else _attn[1], row_mask)
+            if row_mask is not None and not bool(row_mask.any()):
+                continue  # all-padding batch: contributes no rows (and its loss would be undefined)
 
             # Source: forward + backward on GPU with inputs marked grad
             source_hook.clear()
@@ -424,11 +456,13 @@ def collect_gradin_statistics(
             for key in all_keys:
                 if key in source_hook.in_grads and key in target_hook.in_grads:
                     src_rows, tgt_rows = _shared._align_features(
-                        source_hook.in_grads[key], target_hook.in_grads[key], mode=seq_align
+                        source_hook.in_grads[key], target_hook.in_grads[key], mode=seq_align, content_mask=row_mask
                     )
                 elif key in source_hook.inputs and key in target_hook.inputs:
+                    if not _shared._poolable(seq_align, source_hook.inputs[key], target_hook.inputs[key]):
+                        continue  # integer hook inputs (embedding input_ids) cannot be pooled
                     src_rows, tgt_rows = _shared._align_features(
-                        source_hook.inputs[key], target_hook.inputs[key], mode=seq_align
+                        source_hook.inputs[key], target_hook.inputs[key], mode=seq_align, content_mask=row_mask
                     )
                 else:
                     continue
@@ -444,7 +478,7 @@ def collect_gradin_statistics(
             common_grads = set(source_hook.out_grads.keys()) & set(target_hook.out_grads.keys())
             for key in common_grads:
                 src_rows, tgt_rows = _shared._align_features(
-                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align
+                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align, content_mask=row_mask
                 )
                 src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
                 reg_key = f"{key}.out"
@@ -453,6 +487,8 @@ def collect_gradin_statistics(
                     _shared.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
                 )
                 store.update(src_rows, tgt_rows)
+
+        _shared._require_content_rows(padding_stats, method="BiCo")
 
     finally:
         source_hook.remove()
@@ -559,6 +595,7 @@ class BiCoRebase:
             print(f"{log_prefix} prepare: patch_qkv disabled")
 
         activation_registry: dict[str, _shared.ActivationStore] = {}
+        padding_stats: dict[str, int] = {}
         transforms_by_key: dict[str, _shared._LayerTransform] = {}
         precompute_diag = _shared._PrecomputeDiagnostics(
             slots=0,
@@ -596,6 +633,7 @@ class BiCoRebase:
                 projection_mode=projection_input,
                 family_adapter=family_adapter,
                 source_activation_plan=source_activation_plan,
+                padding_stats=padding_stats,
             )
             if verbose:
                 print(f"{log_prefix} prepare: collected activation+gradient entries = {len(activation_registry)}")
@@ -665,7 +703,9 @@ class BiCoRebase:
         if verbose:
             print(f"{log_prefix} prepare: done")
 
+        prepared_padding = {"padding_stats": dict(padding_stats)} if padding_stats else {}
         return {
+            **prepared_padding,
             "activation_registry": activation_registry,
             "transforms_by_key": transforms_by_key,
             "precompute_diagnostics": {

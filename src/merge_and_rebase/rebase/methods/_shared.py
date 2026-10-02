@@ -256,26 +256,73 @@ def _interp_2d_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
     return torch.cat([cls_token, resized], dim=1) if cls_token is not None else resized
 
 
+def _masked_pool(
+    tokens: torch.Tensor,
+    token_mask: torch.Tensor,
+    *,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pool (B, L, D) tokens over content positions only; returns (B, 1, D) and a (B,) keep flag.
+
+    ``mean`` averages the content tokens, ``cls`` takes the first content token (so left padding
+    cannot select a pad position). Sequences with no content token get ``keep=False``.
+    """
+    m = token_mask.to(device=tokens.device).bool()
+    keep = m.any(dim=1)
+    if mode == "mean":
+        w = m.unsqueeze(-1).to(tokens.dtype)
+        pooled = (tokens * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+    else:
+        first = m.to(torch.int64).argmax(dim=1)
+        pooled = tokens[torch.arange(tokens.shape[0], device=tokens.device), first]
+    return pooled.unsqueeze(1), keep
+
+
 def _align_features(
     source_feat: torch.Tensor,
     target_feat: torch.Tensor,
     *,
     mode: str,
+    content_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align source/target features into (rows, features) matrices.
+
+    ``content_mask`` is the flat (batch*tokens,) bool mask from ``_content_row_mask``. It only
+    matters for ``mode in {"mean", "cls"}`` on (B, L, D) token features: the pooled row of each
+    sequence is then computed over its content tokens only, and sequences without any content
+    token yield no row (so the result is already free of padding; ``_drop_padding_rows`` is a
+    no-op on it). Other modes keep one row per token and rely on ``_drop_padding_rows``.
+    """
     if source_feat.shape[0] != target_feat.shape[0]:
         raise ValueError(
             f"Theseus calibration expects aligned batch sizes. Got {source_feat.shape[0]} and {target_feat.shape[0]}."
         )
 
-    source_tokens = _to_tokens(source_feat, batch_size=int(source_feat.shape[0]))
-    target_tokens = _to_tokens(target_feat, batch_size=int(target_feat.shape[0]))
+    batch = int(source_feat.shape[0])
+    source_tokens = _to_tokens(source_feat, batch_size=batch)
+    target_tokens = _to_tokens(target_feat, batch_size=batch)
 
-    if mode == "cls":
-        source_tokens = source_tokens[:, :1, :]
-        target_tokens = target_tokens[:, :1, :]
-    elif mode == "mean":
-        source_tokens = source_tokens.mean(dim=1, keepdim=True)
-        target_tokens = target_tokens.mean(dim=1, keepdim=True)
+    if mode in {"cls", "mean"}:
+        if (
+            content_mask is not None
+            and source_feat.ndim == 3
+            and target_feat.ndim == 3
+            and int(content_mask.numel()) == batch * int(source_tokens.shape[1])
+            and int(content_mask.numel()) == batch * int(target_tokens.shape[1])
+        ):
+            token_mask = content_mask.reshape(batch, -1)
+            source_pooled, keep = _masked_pool(source_tokens, token_mask, mode=mode)
+            target_pooled, _ = _masked_pool(target_tokens, token_mask, mode=mode)
+            return (
+                source_pooled[keep.to(source_pooled.device)].reshape(-1, source_pooled.shape[-1]),
+                target_pooled[keep.to(target_pooled.device)].reshape(-1, target_pooled.shape[-1]),
+            )
+        if mode == "cls":
+            source_tokens = source_tokens[:, :1, :]
+            target_tokens = target_tokens[:, :1, :]
+        else:
+            source_tokens = source_tokens.mean(dim=1, keepdim=True)
+            target_tokens = target_tokens.mean(dim=1, keepdim=True)
     elif mode in {"interpolate2d", "interpolate_2d"}:
         source_tokens = _interp_2d_tokens(source_tokens, int(target_tokens.shape[1]))
     elif mode == "interpolate":
@@ -284,35 +331,69 @@ def _align_features(
     return source_tokens.reshape(-1, source_tokens.shape[-1]), target_tokens.reshape(-1, target_tokens.shape[-1])
 
 
+def _poolable(mode: str, *features: torch.Tensor) -> bool:
+    """False when mean/cls pooling cannot apply (integer features such as the embedding's input_ids).
+
+    The embedding hook receives Long ``input_ids``; it is never transported, so it is excluded from
+    pooled statistics instead of crashing ``mean()``.
+    """
+    if mode not in {"mean", "cls"}:
+        return True
+    return all(torch.is_floating_point(f) for f in features)
+
+
 def _content_row_mask(
     source_attention_mask: torch.Tensor | None,
     target_attention_mask: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Flat (batch*tokens,) bool mask selecting the non-padding activation rows.
 
-    Text calibration batches are padded to a fixed length, so most positions in
-    a short prompt are pad tokens. Their activations carry no signal about how
-    the two models represent content, and folding them into the cross-covariance
-    lets padding dominate the fitted Procrustes maps. Returns None whenever a
-    trustworthy mask can't be built, in which case callers keep every row.
+    Text calibration batches are padded to a fixed length, so most positions in a short prompt
+    are pad tokens. Padding rows never enter any statistic. The mask comes only from the models'
+    own ``attention_mask`` (never from ``input_ids == pad_id``: Qwen's pad token can be content).
+
+    Returns None when there is no mask or nothing to drop (every position is content). An
+    all-padding batch returns an all-False mask (it contributes no rows). Source and target
+    masks that do not have the same shape cannot be paired row by row, so this raises instead of
+    falling back to keeping padding.
     """
-    masks = [
-        m.detach().to(device="cpu").reshape(-1).bool()
-        for m in (source_attention_mask, target_attention_mask)
-        if isinstance(m, torch.Tensor) and m.ndim == 2
-    ]
-    if not masks:
+    present = [m for m in (source_attention_mask, target_attention_mask) if isinstance(m, torch.Tensor) and m.ndim == 2]
+    if not present:
         return None
-    if len({int(m.numel()) for m in masks}) != 1:
-        # Source and target tokenized to different lengths, so rows no longer
-        # correspond one-to-one after sequence alignment; don't guess.
-        return None
+    if len(present) == 2 and tuple(present[0].shape) != tuple(present[1].shape):
+        raise ValueError(
+            "Source and target attention masks cannot be paired row by row (tokenizer/max_length mismatch): "
+            f"source mask shape {tuple(present[0].shape)} vs target mask shape {tuple(present[1].shape)}. "
+            "Padding rows are never allowed into statistics, so there is no fallback."
+        )
+    masks = [m.detach().to(device="cpu").reshape(-1).bool() for m in present]
     mask = masks[0]
     for extra in masks[1:]:
         mask = mask & extra
-    if bool(mask.all()) or not bool(mask.any()):
+    if bool(mask.all()):
         return None
     return mask
+
+
+def _note_padding_rows(
+    stats: dict[str, int] | None,
+    attention_mask: torch.Tensor | None,
+    row_mask: torch.Tensor | None,
+) -> None:
+    """Accumulate ``{n_rows_total, n_rows_content}`` token-row counts for one calibration batch."""
+    if stats is None or not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        return
+    total = int(attention_mask.numel())
+    stats["n_rows_total"] = int(stats.get("n_rows_total", 0)) + total
+    stats["n_rows_content"] = int(stats.get("n_rows_content", 0)) + (total if row_mask is None else int(row_mask.sum()))
+
+
+def _require_content_rows(stats: dict[str, int] | None, *, method: str) -> None:
+    if stats is not None and "n_rows_total" in stats and int(stats.get("n_rows_content", 0)) == 0:
+        raise ValueError(
+            f"{method} calibration has no content rows: all {stats['n_rows_total']} token rows are padding "
+            "according to attention_mask."
+        )
 
 
 def _drop_padding_rows(
@@ -324,7 +405,8 @@ def _drop_padding_rows(
         return source_rows, target_rows
     n = int(mask.numel())
     if int(source_rows.shape[0]) != n or int(target_rows.shape[0]) != n:
-        # Not one row per input token (pooled/head-split features); leave as-is.
+        # Not one row per input token: already-pooled rows (``_align_features`` masks them itself)
+        # or non-token features (4-D head-split norms), which carry no per-token rows.
         return source_rows, target_rows
     return source_rows[mask], target_rows[mask]
 
