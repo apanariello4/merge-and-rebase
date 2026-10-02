@@ -54,6 +54,7 @@ PATCH_MODULES: list[str] = [
     "merge_and_rebase.eval.vision_rebase.cli",
     "merge_and_rebase.eval.vision_rebase.source_lmc",
     "merge_and_rebase.eval.vision_rebase.context",
+    "merge_and_rebase.eval.vision_rebase.merge",
     "merge_and_rebase.eval.vision_rebase.alpha_search",
     "merge_and_rebase.eval.vision_rebase.stages",
     "merge_and_rebase.eval.vision_rebase.completion",

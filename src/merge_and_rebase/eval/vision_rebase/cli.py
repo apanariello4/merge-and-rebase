@@ -4,9 +4,9 @@ import argparse
 import itertools  # noqa: F401  (kept importable)
 import json
 import os
-import time
+import time  # noqa: F401  (kept importable)
 from collections.abc import Mapping, Sequence  # noqa: F401  (kept importable)
-from copy import deepcopy
+from copy import deepcopy  # noqa: F401  (kept importable)
 from dataclasses import asdict, dataclass  # noqa: F401  (kept importable)
 from pathlib import Path
 from typing import Any
@@ -45,13 +45,18 @@ from ...eval.utils import (
     resolve_eval_split_loader,  # noqa: F401  (kept importable)
     to_cpu_fp32,
 )
-from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
+from ...io.ckpt import (  # noqa: F401  (kept importable)
+    align_to_base_keys,
+    load_ckpt,
+    load_into_model,
+    resolve_ckpt_path,
+)
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.base import PreparedMergeMethod  # noqa: F401  (kept importable)
 from ...merge.methods._common import axpy_state_dict
 from ...merge.registry import get_method as get_merge_method  # noqa: F401  (kept importable)
 from ...merge.registry import list_methods as list_merge_methods
-from ...merge.task_vectors import TaskVector
+from ...merge.task_vectors import TaskVector  # noqa: F401  (kept importable)
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model  # noqa: F401
@@ -67,7 +72,7 @@ from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording  #
 from ..block_extension import (
     block_extension_protocol,  # noqa: F401  (kept importable)
     calibration_dataset_spec,
-    run_block_extension,
+    run_block_extension,  # noqa: F401  (kept importable)
     select_loader,  # noqa: F401  (kept importable)
 )
 from ..datasets.vision8_14_20 import SUITES
@@ -128,6 +133,7 @@ from .merge import (  # noqa: F401  (re-exported for tests)
     _scale_delta,
     _scale_deltas_by,
     _visual_key_fingerprint,
+    compose_rebased_deltas,
 )
 from .method_stages import (  # noqa: F401  (re-exported for tests)
     _build_rebase_prepared,
@@ -321,7 +327,7 @@ def main() -> None:
 
         resolved = resolve_run_config(cfg, suites=SUITES)
         method_name = resolved.method_name
-        method_params = resolved.method_params
+        method_params = resolved.method_params  # noqa: F841
         method = resolved.method
         method_label = resolved.method_label
         direct_residual_like = resolved.direct_residual_like
@@ -337,9 +343,9 @@ def main() -> None:
         source_only = resolved.lmc.source_only
         strict_load = resolved.strict_load
         device = resolved.device
-        grad_batch_size = resolved.grad_batch_size
-        grad_imgs_per_class = resolved.grad_imgs_per_class
-        grad_num_batches = resolved.grad_num_batches
+        grad_batch_size = resolved.grad_batch_size  # noqa: F841
+        grad_imgs_per_class = resolved.grad_imgs_per_class  # noqa: F841
+        grad_num_batches = resolved.grad_num_batches  # noqa: F841
         alpha_patience = resolved.alpha.patience
         alpha_search_split = resolved.alpha.search_split
         alphas = resolved.alpha.alphas
@@ -760,7 +766,7 @@ def main() -> None:
             source_base_sd = stage_env.source_base_sd
             target_base_sd = stage_env.target_base_sd
             target_hash_before = stage_env.target_hash_before
-            transfusion_prepared = stage_env.transfusion_prepared
+            transfusion_prepared = stage_env.transfusion_prepared  # noqa: F841
             task_delta = pre.task_delta
 
             direct_target_p1 = direct_target_p1_requested(plan, block_extension_cfg)
@@ -833,300 +839,20 @@ def main() -> None:
                 original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
 
-        can_eval_untransported_by_task: list[bool] = []
-        single_tv_deltas_for_diagnostic: list[dict[str, torch.Tensor]] | None = None
-        single_transport_calibration_metadata: dict[str, Any] | None = None
-        if merge_mode == "none":
-            rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
-            untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
-            print(f"Prepared {len(tasks)} transported deltas (task-independent alpha mode)")
-
-            for task_name, delta_sd in zip(tasks, untransported_deltas, strict=True):
-                enabled, issues = _check_untransported_compatibility(target_base_sd, delta_sd)
-                can_eval_untransported_by_task.append(enabled)
-                if enabled:
-                    print(f"Untransported baseline for '{task_name}': enabled.")
-                else:
-                    print(f"Untransported baseline for '{task_name}': skipped (incompatible with target model).")
-                    for msg in issues[:3]:
-                        print(f"  - {msg}")
-                    if len(issues) > 3:
-                        print(f"  - ... and {len(issues) - 3} more incompatibilities")
-        elif merge_mode in _TRANSPORT_THEN_MERGE_MODES:
-            native_delta_by_task: dict[str, dict[str, torch.Tensor]] = {}
-            for task in sorted(native_tasks):
-                path = str(tuned_by_task[task])
-                sd = load_ckpt(path)
-                aligned = align_to_base_keys(sd, target_base_sd)
-                if not aligned:
-                    raise ValueError(
-                        f"No tensors from native target checkpoint aligned to target base keys "
-                        f"for task '{task}': {path}."
-                    )
-                native_delta_by_task[task] = TaskVector.from_checkpoints(
-                    target_base_sd,
-                    to_cpu_fp32(aligned),
-                    strict=False,
-                    key_filter=_visual_only_filter,
-                ).delta
-                print(
-                    f"  {task}: native target delta computed ({len(native_delta_by_task[task])} params)"
-                )
-                run_logger.log_event(
-                    "native_delta_end",
-                    metrics={f"rebase/{task}/native_param_count": float(len(native_delta_by_task[task]))},
-                    context={"task": task},
-                )
-
-            transported_iter = iter(transported_deltas)
-            merge_input_deltas = []
-            for t in tasks:
-                if t in native_delta_by_task:
-                    merge_input_deltas.append(native_delta_by_task[t])
-                else:
-                    merge_input_deltas.append(next(transported_iter))
-            single_tv_deltas_for_diagnostic = list(merge_input_deltas)
-
-            if alpha_selection == "per_task":
-                # Hierarchical: per-task alphas are searched on the individual
-                # deltas (transported + native) first; composition happens after pass 1.
-                rebased_deltas = list(merge_input_deltas)
-                untransported_deltas = original_deltas
-                print(
-                    f"Hierarchical mode '{merge_mode}' ({merge_method_name}): per-task alpha "
-                    f"search on {len(merge_input_deltas)} deltas before merge"
-                )
-            else:
-                merged_direction = _merge_direction(
-                    base_sd=target_base_sd,
-                    deltas=merge_input_deltas,
-                    merge_method_name=merge_method_name,
-                    weights=merge_weights,
-                    merge_params=merge_params,
-                )
-                print(
-                    f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(merge_input_deltas)} "
-                    f"deltas (transported + native) -> merged direction with {len(merged_direction)} params"
-                )
-                run_logger.log_event(
-                    "merge_composition_end",
-                    metrics={"merge/param_count": float(len(merged_direction))},
-                    context={
-                        "mode": merge_mode,
-                        "merge_method": merge_method_name,
-                        "merge_params": merge_params,
-                        "n_tasks": len(merge_input_deltas),
-                        "n_native": len(native_delta_by_task),
-                    },
-                )
-                # One shared merged model: every task evaluates the same direction at alpha.
-                rebased_deltas = [merged_direction] * len(tasks)
-                untransported_deltas = original_deltas
-        else:
-            first_item = per_task[0]
-            transport_protocol = str(cfg.get("transport_calibration_protocol", "task_local")).lower()
-            calibration_metadata: dict[str, Any] = {"protocol": transport_protocol}
-            single_transport_calibration_metadata = calibration_metadata
-            if transport_protocol.startswith("tiny"):
-                direct_spec = {
-                    "path": "zh-plus/tiny-imagenet",
-                    "split": "valid",
-                    "max_samples": int(cfg.get("transport_calibration_max_samples", 2048)),
-                }
-                transport_ctx = _build_direct_paired_calibration_context(
-                    direct_spec,
-                    suite=suite,
-                    cfg=cfg,
-                    clf_source=clf_source,
-                    clf_target=clf_target,
-                    source_cfg=source_cfg,
-                    target_cfg=target_cfg,
-                )
-            elif transport_protocol in {"vision8_mix", "vision8_mix_10", "task_local", "task_local_10"}:
-                transport_ctx, balanced_meta = _build_balanced_calibration_context(
-                    per_task,
-                    cfg=cfg,
-                    clf_source=clf_source,
-                    clf_target=clf_target,
-                    n_batches=int(cfg.get("transport_calibration_batches", 10)),
-                    split=str(cfg.get("transport_calibration_split", "val")),
-                )
-                calibration_metadata.update(balanced_meta)
-            else:
-                raise ValueError(f"Unsupported transport_calibration_protocol: {transport_protocol!r}")
-
-            if merge_mode == "merge_then_rebase":
-                # Historical same-depth behavior is intentionally unchanged.
-                transport_ctx = _TaskContext(
-                    loaders=first_item["loaders"],
-                    source_loaders=first_item["source_loaders"],
-                    classnames=list(first_item["classnames"]),
-                    build_cfg_task=first_item["build_cfg_task"],
-                    source_build_cfg_task=first_item["source_build_cfg_task"],
-                )
-                merged_source_base = source_base_sd
-                merged_source_direction = _merge_direction(
-                    base_sd=source_base_sd,
-                    deltas=original_deltas,
-                    merge_method_name=merge_method_name,
-                    weights=merge_weights,
-                    merge_params=merge_params,
-                )
-                source_template_once = None
-                prepared_has_brace = False
-                merged_source_activation_plan = None
-            elif merge_mode == "brace_merge_then_transport":
-                if stage_env.endpoints.corrected_source_template is None or not stage_env.endpoints.base_by_task:
-                    raise RuntimeError("BRACE-then-merge requires corrected source endpoints for every task.")
-                average_visual, average_keys = _average_visual_state_dicts(stage_env.endpoints.base_by_task)
-                first_base = stage_env.endpoints.base_by_task[sorted(stage_env.endpoints.base_by_task)[0]]
-                merged_source_base = dict(first_base)
-                merged_source_base.update(average_visual)
-                merged_source_direction = _merge_direction(
-                    base_sd=merged_source_base,
-                    deltas=original_deltas,
-                    merge_method_name=merge_method_name,
-                    weights=merge_weights,
-                    merge_params=merge_params,
-                )
-                distances = {
-                    task: _relative_visual_state_distance(state, average_visual, average_keys)
-                    for task, state in stage_env.endpoints.base_by_task.items()
-                }
-                calibration_metadata.update(
-                    {
-                        "consensus_source_base": "mean_corrected_source_base",
-                        "consensus_visual_key_count": len(average_keys),
-                        "source_base_relative_distance_by_task": distances,
-                        "source_base_max_relative_distance": max(distances.values()),
-                    }
-                )
-                source_template_once = stage_env.endpoints.corrected_source_template
-                prepared_has_brace = True
-                merged_source_activation_plan = _resolve_source_activation_plan(
-                    block_extension_cfg, stage_env.recorded_extension_layout
-                )
-            elif merge_mode == "merge_then_brace_then_transport":
-                native_merged_direction = _merge_direction(
-                    base_sd=source_base_sd,
-                    deltas=original_deltas,
-                    merge_method_name=merge_method_name,
-                    weights=merge_weights,
-                    merge_params=merge_params,
-                )
-                source_base_model_once = deepcopy(clf_source.model)
-                source_ft_model_once = deepcopy(clf_source.model)
-                load_into_model(source_base_model_once, source_base_sd, strict=True)
-                load_into_model(
-                    source_ft_model_once,
-                    axpy_state_dict(source_base_sd, native_merged_direction, alpha=1.0),
-                    strict=True,
-                )
-                # BRACE and transport have distinct calibration contracts and
-                # must not share a bounded loader.  In particular, campaign
-                # rows may request 40 BRACE batches but only 10 transport
-                # batches.  The dedicated BRACE loader was constructed above
-                # from block_extension_cfg; transport_ctx remains exclusively
-                # owned by the subsequent transport preparation.
-                brace_loader = _select_dedicated_brace_loader(
-                    brace_loader=block_extension_calibration_loader,
-                    transport_loader=transport_ctx.source_loaders.train,
-                    correction_enabled=not block_extension_cfg.skip_correction,
-                )
-                merged_extension_layout = {}
-                final_depth = run_block_extension(
-                    source_base_model=source_base_model_once,
-                    source_ft_model=source_ft_model_once,
-                    calibration_loader=brace_loader,
-                    target_layers_total=target_depth,
-                    config=block_extension_cfg,
-                    device=device,
-                    layout_out=merged_extension_layout,
-                )
-                if final_depth != target_depth:
-                    raise RuntimeError(
-                        f"Merged-pair BRACE depth mismatch: final_depth={final_depth}, target_depth={target_depth}."
-                    )
-                merged_source_base = to_cpu_fp32(dict(source_base_model_once.state_dict()))
-                merged_source_ft = to_cpu_fp32(dict(source_ft_model_once.state_dict()))
-                merged_source_direction = TaskVector.from_checkpoints(
-                    merged_source_base,
-                    merged_source_ft,
-                    strict=True,
-                    key_filter=_visual_only_filter,
-                ).delta
-                source_template_once = deepcopy(source_base_model_once).cpu()
-                prepared_has_brace = True
-                merged_source_activation_plan = _resolve_source_activation_plan(
-                    block_extension_cfg, merged_extension_layout
-                )
-            else:  # pragma: no cover - validated by _resolve_merge_mode_config
-                raise AssertionError(f"Unhandled merge mode: {merge_mode}")
-
-            prepared_once = _build_rebase_prepared(
-                method_name=method_name,
-                method=method,
-                method_params=method_params,
-                cfg=cfg,
-                device=device,
-                grad_batch_size=grad_batch_size,
-                grad_imgs_per_class=grad_imgs_per_class,
-                grad_num_batches=grad_num_batches,
-                theseus_like_method=theseus_like_method,
-                bico_mode=bico_mode,
-                run_block_extension_prestep=prepared_has_brace,
-                clf_source=clf_source,
-                clf_target=clf_target,
-                classnames=list(transport_ctx.classnames),
-                loaders=transport_ctx.loaders,
-                source_loaders=transport_ctx.source_loaders,
-                build_cfg_task=transport_ctx.build_cfg_task,
-                source_build_cfg_task=transport_ctx.source_build_cfg_task,
-                task_source_base_sd=merged_source_base,
-                target_base_sd=target_base_sd,
-                task_delta=merged_source_direction,
-                source_base_model_task=source_template_once,
-                transfusion_prepared=transfusion_prepared,
-                source_text_features=transport_ctx.source_text_features,
-                target_text_features=transport_ctx.target_text_features,
-                source_activation_plan=merged_source_activation_plan,
-            )
-            transport_started = time.perf_counter()
-            transported_merged_delta = method.transport(
-                source_base=merged_source_base,
-                target_base=target_base_sd,
-                delta=merged_source_direction,
-                strict=strict_load,
-                prepared=prepared_once,
-                **method_params,
-            )
-            transport_seconds = time.perf_counter() - transport_started
-            print(
-                f"Merge mode '{merge_mode}' ({merge_method_name}): merged on source -> single transport in "
-                f"{transport_seconds:.2f}s ({len(transported_merged_delta)} params)"
-            )
-            run_logger.log_event(
-                "merge_composition_end",
-                metrics={
-                    "merge/param_count": float(len(transported_merged_delta)),
-                    "merge/single_transport_seconds": float(transport_seconds),
-                },
-                context={
-                    "mode": merge_mode,
-                    "merge_method": merge_method_name,
-                    "merge_params": merge_params,
-                    "n_tasks": len(original_deltas),
-                    "calibration": calibration_metadata,
-                },
-            )
-            rebased_deltas = [transported_merged_delta] * len(tasks)
-            untransported_deltas = original_deltas
-
-        if merge_mode != "none":
-            # The per-task "untransported" baseline is meaningless for a single
-            # merged model; fall back to the (alpha-independent, cached) target
-            # zero-shot baseline so normalized ratios remain defined.
-            can_eval_untransported_by_task = [False] * len(tasks)
+        merge_plan = compose_rebased_deltas(
+            stage_env,
+            per_task=per_task,
+            transported_deltas=transported_deltas,
+            original_deltas=original_deltas,
+            merge_weights=merge_weights,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+        )
+        rebased_deltas = merge_plan.rebased_deltas
+        untransported_deltas = merge_plan.untransported_deltas
+        can_eval_untransported_by_task = merge_plan.can_eval_untransported
+        single_tv_deltas_for_diagnostic = merge_plan.single_tv_deltas
+        single_transport_calibration_metadata = merge_plan.calibration_metadata
 
         def _eval_task(item: dict[str, Any], split: str) -> float:
             return float(
@@ -1328,7 +1054,7 @@ def main() -> None:
                 )
 
                 # ---------------- PASS 2: scale by per-task alphas, compose once ----------------
-                scaled_input = _scale_deltas_by(merge_input_deltas, per_task_premerge_alphas)
+                scaled_input = _scale_deltas_by(single_tv_deltas_for_diagnostic, per_task_premerge_alphas)
                 merged_direction = _merge_direction(
                     base_sd=target_base_sd,
                     deltas=scaled_input,
