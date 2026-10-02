@@ -9,13 +9,12 @@ from collections.abc import Mapping, Sequence  # noqa: F401  (kept importable)
 from copy import deepcopy
 from dataclasses import asdict, dataclass  # noqa: F401  (kept importable)
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn.functional as F  # noqa: F401  (kept importable)
 
-from merge_and_rebase.utils.helpers import load_json, parse_csv
+from merge_and_rebase.utils.helpers import load_json
 
 from ..cli_args import (
     add_alpha_args,
@@ -54,29 +53,21 @@ from ..merge.registry import get_method as get_merge_method  # noqa: F401  (kept
 from ..merge.registry import list_methods as list_merge_methods
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..rebase import get_method, list_methods
+from ..rebase import list_methods
 from ..rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
 from ..rebase.methods.ariadne import (
     AriadneRebase,
     apply_depth_pairing_override,
-    parse_direct_residual_config,
-    resolve_direct_residual_preset,
 )
 from ..rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ..rebase.methods.theseus import InterpolatedBlockActivations
-from ..rebase.registry import canonical_method_name
-from ..rebase.runtime import (
-    format_rebase_method_label,
-    resolve_rebase_method_config,
-)
+from ..rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from ..utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from .block_extension import (
-    BlockExtensionConfig,
     block_extension_protocol,  # noqa: F401  (kept importable)
     calibration_dataset_spec,
-    resolve_block_extension_config,
     run_block_extension,
     select_loader,
 )
@@ -181,9 +172,6 @@ def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
     if ".aligner." in k:
         return False
     return k.startswith("visual.")
-
-
-_BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
 
 
 def _resolve_source_activation_plan(
@@ -749,215 +737,48 @@ def main() -> None:
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
 
-        method_name, method_params = resolve_rebase_method_config(cfg)
-        # Ariadne (formerly Direct Residual; "direct_residual" is a registry alias of
-        # "ariadne" and both spellings take exactly this path) is registered, but it
-        # needs whole model objects and dataloaders for paired activation capture,
-        # not a state-dict-delta transport() call, so this entrypoint never calls
-        # `get_method` for it (its `transport` raises NotImplementedError). It also
-        # must never let `resolve_block_extension_config(cfg)` run over `cfg` --
-        # BRACE's config gates have no business accepting or rejecting an Ariadne
-        # config, since Ariadne never reaches a single BRACE code path. See the
-        # module docstring of `direct_residual.py` and
-        # tests/test_vision_rebase_direct_residual_dispatch.py. `method_name` stays
-        # exactly what the config said (it is recorded verbatim in the run summary);
-        # only the dispatch decision goes through the canonical name.
-        direct_residual_like = canonical_method_name(method_name) == "ariadne"
-        if direct_residual_like:
-            method = SimpleNamespace(name=method_name)
-            block_extension_enabled = False
-            block_extension_cfg = BlockExtensionConfig()
-            # Direct Residual's own config schema is narrower than, and
-            # independent of, `method_params` (which historically carries
-            # per-transport-method kwargs consumed by `method.transport()` --
-            # a call Direct Residual never makes). A dedicated top-level key
-            # keeps that separation explicit rather than overloading
-            # `method_params`'s existing per-method dispatch conventions.
-            if cfg.get("direct_residual_params") is not None and cfg.get("ariadne_params") is not None:
-                raise ValueError("config has both 'direct_residual_params' and its alias 'ariadne_params'; use one")
-            direct_residual_raw_params = (
-                cfg["ariadne_params"] if cfg.get("ariadne_params") is not None else cfg.get("direct_residual_params")
-            )
-            direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
-            direct_residual_preset = resolve_direct_residual_preset(direct_residual_raw_params)
-            sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
-            if cfg.get("load_direct_residual_tvs_dir") and direct_residual_cfg.endpoint_construction not in sequential_modes:
-                raise ValueError("load_direct_residual_tvs_dir requires a sequential endpoint construction")
-            if cfg.get("load_direct_residual_tvs_dir") and (
-                cfg.get("save_transported_artifacts") or cfg.get("save_transported_tvs_dir")
-            ):
-                raise ValueError("cannot save transported artifacts while loading sequential DR vectors")
-        else:
-            method = get_method(method_name)
-            block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
-            direct_residual_cfg = None
-            direct_residual_preset = None
-        method_label = format_rebase_method_label(method_name, method_params)
-        theseus_like_method = method_name in {"theseus", "theseus_reference"}
-        blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
-        transfusion_mode = method_name == "transfusion"
-        bico_mode = method_name in ("bico", "bico_gradin")
-        # "ariadne" (default) preserves every existing behavior: the
-        # block-extension prestep resizes the source model's depth via
-        # ARIADNE's insertion/collapse machinery. "discrete_index_match" is
-        # the faithful BiCo/THESEUS structural-resize control: it reindexes
-        # the source model to the target depth via the flat, closed-form
-        # `DiscreteLayerPairing` instead, with no interpolation, no
-        # correction fit, and no ancestry bookkeeping. Resolved here, once,
-        # so an unknown value fails fast rather than surfacing deep in the
-        # per-task loop.
-        depth_alignment_mode = str(cfg.get("depth_alignment", "ariadne")).strip().lower()
-        if depth_alignment_mode not in {"ariadne", "discrete_index_match"}:
-            raise ValueError("depth_alignment must be one of: ariadne, discrete_index_match")
-        if (
-            direct_residual_like
-            and direct_residual_cfg.merge_mode == "merge_in_source_then_fit"
-            and str(cfg.get("alpha_selection", "shared")).strip().lower() != "shared"
-        ):
-            # Mirrors the shared-alpha requirement _resolve_merge_mode_config
-            # already enforces for merge_then_brace_then_transport: once every
-            # task's transported delta collapses to the SAME once-fitted
-            # correction, a per-task alpha search is degenerate (it would just
-            # search the same objective under a different name per task).
-            raise ValueError(
-                "direct_residual merge_mode='merge_in_source_then_fit' requires alpha_selection='shared': "
-                "the fit is performed once, on the merged source pair, and produces one correction shared "
-                "by every task -- a per-task alpha search over an identical delta is not meaningful."
-            )
-        eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
-        block_extension_eval_requested = bool(eval_before_rebase)
-        block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
-        block_extension_eval_split = str(cfg.get("block_extension_eval_split", "test")).strip().lower()
-        if block_extension_eval_split not in {"val", "test"}:
-            raise ValueError("block_extension_eval_split must be one of: val, test")
-        block_extension_eval_first_n_batches = block_extension_cfg.first_n_eval_batches
-        source_lmc_eval = bool(cfg.get("source_lmc_eval", False))
-        source_lmc_eval_split = str(cfg.get("source_lmc_eval_split", "val")).strip().lower()
-        if source_lmc_eval_split not in {"val", "test"}:
-            raise ValueError("source_lmc_eval_split must be one of: val, test")
-        source_lmc_first_n_batches_raw = cfg.get("source_lmc_first_n_batches", None)
-        source_lmc_first_n_batches = (
-            int(source_lmc_first_n_batches_raw) if source_lmc_first_n_batches_raw is not None else None
-        )
-        source_lmc_alpha_min = float(cfg.get("source_lmc_alpha_min", 0.0))
-        source_lmc_alpha_max = float(cfg.get("source_lmc_alpha_max", 1.0))
-        source_lmc_alpha_step = float(cfg.get("source_lmc_alpha_step", 0.05))
-        if source_lmc_alpha_step <= 0:
-            raise ValueError("source_lmc_alpha_step must be > 0")
-        source_lmc_alphas = torch.arange(
-            source_lmc_alpha_min,
-            source_lmc_alpha_max + source_lmc_alpha_step * 0.5,
-            source_lmc_alpha_step,
-        ).tolist()
-        cross_task_lmc_pairs_raw = cfg.get("cross_task_lmc_pairs", [])
-        if cross_task_lmc_pairs_raw is None:
-            cross_task_lmc_pairs_raw = []
-        if not isinstance(cross_task_lmc_pairs_raw, (list, tuple)):
-            raise ValueError("cross_task_lmc_pairs must be a list of two-task lists.")
-        cross_task_lmc_pairs: list[tuple[str, str]] = []
-        for pair in cross_task_lmc_pairs_raw:
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                raise ValueError("Each cross_task_lmc_pairs item must contain exactly two task names.")
-            task_a, task_b = str(pair[0]), str(pair[1])
-            if task_a == task_b:
-                raise ValueError("cross_task_lmc_pairs cannot interpolate a task with itself.")
-            cross_task_lmc_pairs.append((task_a, task_b))
-        cross_task_lmc_split = str(cfg.get("cross_task_lmc_eval_split", source_lmc_eval_split)).strip().lower()
-        if cross_task_lmc_split not in {"val", "test"}:
-            raise ValueError("cross_task_lmc_eval_split must be one of: val, test")
-        all_task_lmc_tasks_raw = cfg.get("all_task_lmc_tasks", [])
-        if all_task_lmc_tasks_raw is None:
-            all_task_lmc_tasks_raw = []
-        if not isinstance(all_task_lmc_tasks_raw, (list, tuple)):
-            raise ValueError("all_task_lmc_tasks must be a list of task names.")
-        all_task_lmc_tasks = [str(task) for task in all_task_lmc_tasks_raw]
-        if all_task_lmc_tasks and (len(all_task_lmc_tasks) < 2 or len(set(all_task_lmc_tasks)) != len(all_task_lmc_tasks)):
-            raise ValueError("all_task_lmc_tasks must contain at least two distinct task names.")
-        all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
-        if all_task_lmc_split not in {"val", "test"}:
-            raise ValueError("all_task_lmc_eval_split must be one of: val, test")
-        source_only = bool(cfg.get("source_only", False))
-        strict_load = bool(cfg.get("strict_load", False))
-        device = str(cfg.get("device", "cuda"))
-
-        if block_extension_eval_requested and not blockext_like_method:
-            print(
-                "Block-extension target-dataset eval: requested but skipped "
-                f"(method='{method_name}' does not support block-extension)."
-            )
-
-        grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
-        grad_imgs_per_class = int(cfg["grad_imgs_per_class"]) if cfg.get("grad_imgs_per_class") is not None else None
-        grad_num_batches = int(cfg["grad_num_batches"]) if cfg.get("grad_num_batches") is not None else None
-
-        alpha_search = bool(cfg.get("alpha_search", False))
-        alpha_patience_raw = cfg.get("alpha_patience", 0)
-        alpha_patience = int(alpha_patience_raw) if alpha_patience_raw is not None else 0
-        if alpha_patience < 0:
-            raise ValueError("alpha_patience must be >= 0")
-
-        alpha_search_split = str(cfg.get("alpha_search_split", "val")).strip().lower()
-        if alpha_search_split not in {"val", "test"}:
-            raise ValueError("alpha_search_split must be one of: val, test")
-
-        if alpha_search:
-            a_min = float(cfg.get("alpha_min", 0.0))
-            a_max = float(cfg.get("alpha_max", 2.0))
-            a_step = float(cfg.get("alpha_step", 0.1))
-            if a_step <= 0.0:
-                raise ValueError("alpha_step must be > 0")
-            if a_max < a_min:
-                raise ValueError("alpha_max must be >= alpha_min")
-            alphas = torch.arange(a_min, a_max + 1e-9, a_step).tolist()
-        else:
-            alphas = [float(cfg.get("alpha", 1.0))]
-
-        alpha_selection = str(cfg.get("alpha_selection", "shared")).strip().lower()
-        if alpha_selection not in {"shared", "per_task"}:
-            raise ValueError("alpha_selection must be one of: shared, per_task")
-
-        merge_mode, merge_method_name, merge_params, global_alpha_search = _resolve_merge_mode_config(cfg, alpha_selection)
-        if direct_residual_like and merge_mode in _SINGLE_TRANSPORT_MODES:
-            # merge_then_rebase / brace_merge_then_transport / merge_then_brace_then_transport
-            # all end by calling method.transport() once on a merged direction
-            # (see the merge-mode dispatch after the per-task loop). Direct
-            # Residual has no such method object to call -- it is not in the
-            # rebase method registry at all (see the method-dispatch comment
-            # above) -- and its own once-only merge path is
-            # `direct_residual_params.merge_mode='merge_in_source_then_fit'`,
-            # which is independent of this top-level `merge_mode` key. Reject
-            # the combination early rather than failing later with an
-            # unhelpful AttributeError.
-            raise ValueError(
-                f"method='direct_residual' does not support merge_mode='{merge_mode}': Direct Residual has no "
-                "transport() call for the merge-mode dispatch to invoke. Use merge_mode='none' (optionally with "
-                "direct_residual_params.merge_mode='merge_in_source_then_fit' for a once-only merged fit) or "
-                "merge_mode='rebase_then_merge'/'brace_transport_then_merge' for per-task fits merged afterward."
-            )
-
-        base_construction = str(cfg.get("base_construction", "per_task")).strip().lower()
-        if base_construction not in _BASE_CONSTRUCTION_MODES:
-            raise ValueError(
-                "base_construction must be one of: " + ", ".join(_BASE_CONSTRUCTION_MODES)
-            )
-
-        positive_alphas = [float(alpha) for alpha in alphas if float(alpha) > 0.0]
-        if alpha_search and not positive_alphas:
-            raise ValueError("alpha_search requires at least one alpha > 0.")
-
-        suite_name = cfg.get("suite", "vision8")
-        if suite_name not in SUITES:
-            raise ValueError(f"Unknown suite '{suite_name}'. Available: {sorted(SUITES)}")
-        suite = SUITES[suite_name]
-
-        tasks_arg = cfg.get("tasks", "all")
-        if tasks_arg == "all":
-            tasks = list(suite.tasks)
-        else:
-            tasks = parse_csv(tasks_arg)
-            bad = [t for t in tasks if t not in suite.tasks]
-            if bad:
-                raise ValueError(f"Unknown tasks: {bad}. Allowed: {sorted(suite.tasks)}")
+        resolved = resolve_run_config(cfg, suites=SUITES)
+        method_name = resolved.method_name
+        method_params = resolved.method_params
+        method = resolved.method
+        method_label = resolved.method_label
+        direct_residual_like = resolved.direct_residual_like
+        block_extension_enabled = resolved.block_extension_enabled
+        block_extension_cfg = resolved.block_extension_cfg
+        direct_residual_cfg = resolved.ariadne_cfg
+        direct_residual_preset = resolved.ariadne_preset
+        theseus_like_method = resolved.theseus_like_method
+        blockext_like_method = resolved.blockext_like_method
+        transfusion_mode = resolved.transfusion_mode
+        bico_mode = resolved.bico_mode
+        depth_alignment_mode = resolved.depth_alignment_mode
+        block_extension_eval_enabled = resolved.lmc.block_extension_eval_enabled
+        block_extension_eval_split = resolved.lmc.block_extension_eval_split
+        block_extension_eval_first_n_batches = resolved.lmc.block_extension_eval_first_n_batches
+        source_lmc_eval = resolved.lmc.eval
+        source_lmc_eval_split = resolved.lmc.eval_split
+        source_lmc_first_n_batches = resolved.lmc.first_n_batches
+        source_lmc_alphas = resolved.lmc.alphas
+        cross_task_lmc_pairs = resolved.lmc.cross_task_pairs
+        all_task_lmc_tasks = resolved.lmc.all_task_tasks
+        source_only = resolved.lmc.source_only
+        strict_load = resolved.strict_load
+        device = resolved.device
+        grad_batch_size = resolved.grad_batch_size
+        grad_imgs_per_class = resolved.grad_imgs_per_class
+        grad_num_batches = resolved.grad_num_batches
+        alpha_patience = resolved.alpha.patience
+        alpha_search_split = resolved.alpha.search_split
+        alphas = resolved.alpha.alphas
+        alpha_selection = resolved.alpha.selection
+        merge_mode = resolved.merge.mode
+        merge_method_name = resolved.merge.method_name
+        merge_params = resolved.merge.params
+        global_alpha_search = resolved.merge.global_alpha_search
+        base_construction = resolved.merge.base_construction
+        suite_name = resolved.suite_name
+        suite = resolved.suite
+        tasks = resolved.tasks
 
         run_summary_path = default_summary_path(
             entrypoint="eval.vision_rebase",

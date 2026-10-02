@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from merge_and_rebase.eval import vision_rebase
-from merge_and_rebase.rebase import capabilities
+from merge_and_rebase.rebase import capabilities, run_config
 from merge_and_rebase.rebase.methods.ariadne import (
     AriadneRebase,
     DirectResidualConfig,
@@ -197,8 +197,8 @@ def test_dispatch_is_identical_for_both_names(monkeypatch, tmp_path, name):
     def _boom(*args, **kwargs):
         raise AssertionError("must not be called for Ariadne")
 
-    monkeypatch.setattr(vision_rebase, "resolve_block_extension_config", _boom)
-    monkeypatch.setattr(vision_rebase, "get_method", _boom)
+    monkeypatch.setattr(run_config, "resolve_block_extension_config", _boom)
+    monkeypatch.setattr(run_config, "get_method", _boom)
     exc = _run_main_with_cfg(
         monkeypatch, tmp_path, {"method": name, "block_extension_params": {"this_field_does_not_exist": 1}}
     )

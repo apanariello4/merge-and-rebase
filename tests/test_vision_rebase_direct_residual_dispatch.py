@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.eval.vision_rebase import _run_direct_residual_fit
+from merge_and_rebase.rebase import run_config
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 from merge_and_rebase.rebase.methods.ariadne.config import DirectResidualConfig
 
@@ -87,8 +88,8 @@ def test_direct_residual_never_calls_ariadne_config_gates(monkeypatch, tmp_path)
     def _boom_get_method(*args, **kwargs):
         raise AssertionError("get_method must not be called for method='direct_residual'")
 
-    monkeypatch.setattr(vision_rebase, "resolve_block_extension_config", _boom)
-    monkeypatch.setattr(vision_rebase, "get_method", _boom_get_method)
+    monkeypatch.setattr(run_config, "resolve_block_extension_config", _boom)
+    monkeypatch.setattr(run_config, "get_method", _boom_get_method)
 
     exc = _run_main_with_cfg(monkeypatch, tmp_path, {"method": "direct_residual"})
 
@@ -109,7 +110,7 @@ def test_invalid_ariadne_only_option_is_inert_for_direct_residual(monkeypatch, t
     def _boom(*args, **kwargs):
         raise AssertionError("resolve_block_extension_config must not be called for method='direct_residual'")
 
-    monkeypatch.setattr(vision_rebase, "resolve_block_extension_config", _boom)
+    monkeypatch.setattr(run_config, "resolve_block_extension_config", _boom)
 
     exc = _run_main_with_cfg(
         monkeypatch,

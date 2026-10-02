@@ -37,6 +37,7 @@ import pytest
 import torch.nn as nn
 
 from merge_and_rebase.eval import vision_rebase
+from merge_and_rebase.rebase import run_config
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
 
 
@@ -117,5 +118,5 @@ def test_discrete_index_match_rejects_ariadne_target_informed_corrections():
 
 
 def test_depth_alignment_default_is_ariadne():
-    source = inspect.getsource(vision_rebase.main)
+    source = inspect.getsource(run_config)
     assert 'cfg.get("depth_alignment", "ariadne")' in source
