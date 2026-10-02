@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ..model_families import accessors as fam
 from .adapters import DECODER_COMPONENTS, DecoderAdapter, _get_final_norm, _get_layers, _run_decoder_forward
 from .config import BlockExtensionConfig
 from .core import BlockExtenderCore, EagerProvider, _deterministic_calibration_loader, _iter_with_progress
@@ -129,35 +130,20 @@ class DecoderBlockExtender(BlockExtenderCore):
             layers = _get_layers(model, self.family_adapter)
             for i in range(len(layers)):
                 block = layers[i]
-                hooks.append(
-                    block.input_layernorm.register_forward_hook(
-                        self._store_output_hook(store, f"{i}.input_layernorm_output")
-                    )
+                comps = fam.block_components(self.family_adapter, block)
+                hooks_spec = (
+                    (comps["input_layernorm"], "input_layernorm_output"),
+                    (fam.attn_module(self.family_adapter, block), "attn_output"),
+                    (comps["q_proj"], "q_proj_output"),
+                    (comps["k_proj"], "k_proj_output"),
+                    (comps["v_proj"], "v_proj_output"),
+                    (comps["post_attention_layernorm"], "post_attn_ln_output"),
+                    (comps["gate_proj"], "gate_proj_output"),
+                    (comps["up_proj"], "up_proj_output"),
+                    (comps["down_proj"], "down_proj_output"),
                 )
-                hooks.append(block.self_attn.register_forward_hook(self._store_output_hook(store, f"{i}.attn_output")))
-                hooks.append(
-                    block.self_attn.q_proj.register_forward_hook(self._store_output_hook(store, f"{i}.q_proj_output"))
-                )
-                hooks.append(
-                    block.self_attn.k_proj.register_forward_hook(self._store_output_hook(store, f"{i}.k_proj_output"))
-                )
-                hooks.append(
-                    block.self_attn.v_proj.register_forward_hook(self._store_output_hook(store, f"{i}.v_proj_output"))
-                )
-                hooks.append(
-                    block.post_attention_layernorm.register_forward_hook(
-                        self._store_output_hook(store, f"{i}.post_attn_ln_output")
-                    )
-                )
-                hooks.append(
-                    block.mlp.gate_proj.register_forward_hook(self._store_output_hook(store, f"{i}.gate_proj_output"))
-                )
-                hooks.append(
-                    block.mlp.up_proj.register_forward_hook(self._store_output_hook(store, f"{i}.up_proj_output"))
-                )
-                hooks.append(
-                    block.mlp.down_proj.register_forward_hook(self._store_output_hook(store, f"{i}.down_proj_output"))
-                )
+                for module, ref_name in hooks_spec:
+                    hooks.append(module.register_forward_hook(self._store_output_hook(store, f"{i}.{ref_name}")))
 
             it = iter(loader)
             for _ in _iter_with_progress(
@@ -180,67 +166,6 @@ class DecoderBlockExtender(BlockExtenderCore):
             for key, tensors in store.items():
                 refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
             self.reference_inputs[name].update(refs)
-
-    def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
-        scope = self.family_adapter.transport_scope(model)
-        scope.layers = nn.ModuleList(new_layers)
-        self._set_depth(model, scope, len(scope.layers))
-        self._reindex_layers(model, scope.layers)
-
-    @staticmethod
-    def _set_depth(model: nn.Module, scope: nn.Module, depth: int) -> None:
-        # HF decoders iterate `self.layers[: self.config.num_hidden_layers]`, so
-        # a longer ModuleList alone does nothing: the appended blocks never run.
-        # Everything downstream still sees them (state_dict reports them, deltas
-        # are computed over them), which makes the truncation invisible -- the
-        # model simply behaves as if it were never extended.
-        for holder in (model, scope):
-            config = getattr(holder, "config", None)
-            if config is None:
-                continue
-            if getattr(config, "num_hidden_layers", None) == depth:
-                continue
-            config.num_hidden_layers = depth
-
-    @staticmethod
-    def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] | None:
-        """Grow `config.layer_types` to the new depth, keeping it authoritative.
-
-        Models with alternating attention patterns key off this list, and the
-        reindex below reads it positionally. Left short, every layer past the
-        original depth keeps whichever `attention_type` it was duplicated with
-        while the config claims a shorter model.
-        """
-        config = getattr(model, "config", None)
-        layer_types = getattr(config, "layer_types", None)
-        if layer_types is None:
-            return None
-        resolved = list(layer_types)
-        if len(resolved) >= len(layers):
-            return resolved[: len(layers)]
-        for idx in range(len(resolved), len(layers)):
-            own = getattr(layers[idx], "attention_type", None)
-            resolved.append(own if own is not None else resolved[-1])
-        config.layer_types = resolved
-        return resolved
-
-    @staticmethod
-    def _reindex_layers(model: nn.Module, layers: nn.ModuleList) -> None:
-        # Each decoder layer's attention module caches its own `layer_idx`
-        # (set at construction) to key into the shared KV cache during a
-        # forward pass. Duplicating/reordering layers without updating it
-        # leaves two layers pointing at the same cache slot: the second one
-        # to run has its `update()` call concatenate onto the first's
-        # leftover keys/values, silently doubling the sequence length the
-        # rest of that layer's attention sees (crashes as a seq-length
-        # mismatch against the attention mask, or worse, doesn't crash).
-        layer_types = DecoderBlockExtender._resolve_layer_types(model, layers)
-        for new_idx, layer in enumerate(layers):
-            for holder in (layer, getattr(layer, "self_attn", None)):
-                if holder is not None and hasattr(holder, "layer_idx"):
-                    holder.layer_idx = new_idx
-            if layer_types is not None and hasattr(layer, "attention_type") and new_idx < len(layer_types):
-                layer.attention_type = layer_types[new_idx]
 
     @torch.no_grad()
     def extend_and_calibrate(

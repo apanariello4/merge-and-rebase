@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from ....models.vision_utils import _encode_image
+from ...model_families import accessors as _fam
 from ..theseus import _interp_2d_tokens
 
 # --- architecture abstraction -------------------------------------------------
@@ -96,16 +97,16 @@ class _DecoderLayout:
         self.family_adapter = family_adapter
 
     def blocks(self, model):
-        return self.family_adapter.transport_scope(model).layers
+        return _fam.layers(self.family_adapter, model)
 
     def block_count(self, model):
         return self.family_adapter.block_count(model)
 
     def proj_module(self, block):
-        return block.mlp.down_proj
+        return _fam.residual_writer(self.family_adapter, block)
 
     def attn_module(self, block):
-        return block.self_attn
+        return _fam.attn_module(self.family_adapter, block)
 
     def attn_proj_module(self, block):
         """``self_attn.o_proj`` is the decoder analogue of CLIP's attn.out_proj.
@@ -113,7 +114,7 @@ class _DecoderLayout:
         Implemented for symmetry with the vision path and **untested on this
         iteration**: no decoder campaign has run the two-component completion.
         """
-        return block.self_attn.o_proj
+        return _fam.attn_output(self.family_adapter, block)
 
     def block_module(self, block):
         return block
@@ -129,10 +130,14 @@ class _DecoderLayout:
     def proj_key(self, pos, *, prefixed):
         # The decoder state dict is already "model.layers.N..."; there is no
         # second prefix the way vision has "visual.".
-        return f"model.layers.{pos}.mlp.down_proj.weight"
+        return _fam.param_key(
+            self.family_adapter, pos, _fam.canonical_components(self.family_adapter)["mlp.c_proj"] + ".weight"
+        )
 
     def attn_proj_key(self, pos, *, prefixed):
-        return f"model.layers.{pos}.self_attn.o_proj.weight"
+        return _fam.param_key(
+            self.family_adapter, pos, _fam.canonical_components(self.family_adapter)["attn.out_proj"] + ".weight"
+        )
 
     def component_key(self, pos, component, *, prefixed):
         if component == "mlp.c_proj":

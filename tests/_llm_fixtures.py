@@ -92,6 +92,32 @@ def tiny_qwen2(
     return _init_seeded(Qwen2ForCausalLM, config, seed)
 
 
+def tiny_llama(
+    *,
+    layers: int = 2,
+    hidden: int = 32,
+    heads: int = 4,
+    kv_heads: int = 2,
+    inter: int = 64,
+    vocab: int = 64,
+    seed: int = 0,
+    tie_word_embeddings: bool = True,
+) -> torch.nn.Module:
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(
+        hidden_size=hidden,
+        num_hidden_layers=layers,
+        num_attention_heads=heads,
+        num_key_value_heads=kv_heads,
+        intermediate_size=inter,
+        vocab_size=vocab,
+        max_position_embeddings=64,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    return _init_seeded(LlamaForCausalLM, config, seed)
+
+
 def tiny_qwen3(
     *,
     layers: int = 2,

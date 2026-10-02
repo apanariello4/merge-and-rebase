@@ -94,6 +94,13 @@ def check_pair(
     if source_meta is None or target_meta is None:
         return
 
+    for role, meta in (("source", source_meta), ("target", target_meta)):
+        if getattr(meta, "is_moe", False):
+            raise ValueError(
+                f"Mixture-of-experts {role} model (family '{meta.family}') is not supported: "
+                "block transport assumes a dense MLP (mlp.gate_proj/up_proj/down_proj)."
+            )
+
     if source_meta.family != target_meta.family:
         pair = frozenset({source_meta.family, target_meta.family})
         if pair not in _COMPATIBLE_CROSS_FAMILY_PAIRS:

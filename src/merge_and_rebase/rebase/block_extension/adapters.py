@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...models.vision_utils import _encode_image
+from ..model_families import accessors as _fam
 from .schedules import (
     build_extension_layout,
     build_reduction_layout,
@@ -139,11 +140,11 @@ def _run_decoder_forward(model: nn.Module, batch: Mapping[str, Any], device: str
 
 
 def _get_layers(model: nn.Module, family_adapter: Any) -> nn.ModuleList:
-    return family_adapter.transport_scope(model).layers
+    return _fam.layers(family_adapter, model)
 
 
 def _get_final_norm(model: nn.Module, family_adapter: Any) -> nn.Module:
-    return family_adapter.transport_scope(model).norm
+    return _fam.final_norm(family_adapter, model)
 
 
 class _InProjCapture:
@@ -400,9 +401,8 @@ class DecoderAdapter:
         return _get_final_norm(model, self.family_adapter)
 
     def set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
-        # Depth/config/KV-cache reindexing stays with ``DecoderBlockExtender`` (_set_depth, _reindex_layers).
-        scope = self.family_adapter.transport_scope(model)
-        scope.layers = nn.ModuleList(new_layers)
+        # The family adapter owns depth / layer_idx / layer_types reindexing.
+        _fam.set_layers(self.family_adapter, model, new_layers)
 
     def inner_block(self, block: nn.Module) -> nn.Module:
         return block
@@ -446,19 +446,11 @@ class DecoderAdapter:
         buffers: list[torch.Tensor] = []
         block = self.layers(model)[block_idx]
 
-        target_map = {
-            "input_layernorm": block.input_layernorm,
-            "attn": block.self_attn,
-            "post_attention_layernorm": block.post_attention_layernorm,
-            "gate_proj": block.mlp.gate_proj,
-            "up_proj": block.mlp.up_proj,
-            "down_proj": block.mlp.down_proj,
-        }
-
-        if component in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            proj = getattr(block.self_attn, component)
-        elif component in target_map:
-            proj = target_map[component]
+        comps = _fam.block_components(self.family_adapter, block)
+        if component == "attn":
+            proj = _fam.attn_module(self.family_adapter, block)
+        elif component in comps:
+            proj = comps[component]
         else:
             raise ValueError(
                 f"Unsupported component '{component}'. Expected one of: {', '.join(s.name for s in self.components)}"
@@ -494,10 +486,7 @@ class DecoderAdapter:
                 b = b.to(ln.bias.device, dtype=ln.bias.dtype)
                 ln.bias.copy_(d * ln.bias + b)
         else:
-            if name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                linear = getattr(block.self_attn, name)
-            else:
-                linear = getattr(block.mlp, name)
+            linear = _fam.block_components(self.family_adapter, block)[name]
             W = W.to(linear.weight.device, dtype=linear.weight.dtype)
             linear.weight.copy_(W @ linear.weight)
             if linear.bias is not None:
@@ -517,14 +506,14 @@ class DecoderAdapter:
     @torch.no_grad()
     def dampen_block_output(self, block, factor):
         # Weights AND biases: unlike the vision extender, the decoder also scales the biases.
-        if hasattr(block, "self_attn") and hasattr(block.self_attn, "o_proj"):
-            block.self_attn.o_proj.weight.mul_(factor)
-            if hasattr(block.self_attn.o_proj, "bias") and block.self_attn.o_proj.bias is not None:
-                block.self_attn.o_proj.bias.mul_(factor)
-        if hasattr(block, "mlp") and hasattr(block.mlp, "down_proj"):
-            block.mlp.down_proj.weight.mul_(factor)
-            if hasattr(block.mlp.down_proj, "bias") and block.mlp.down_proj.bias is not None:
-                block.mlp.down_proj.bias.mul_(factor)
+        for locate in (_fam.attn_output, _fam.residual_writer):
+            try:
+                proj = locate(self.family_adapter, block)
+            except AttributeError:
+                continue
+            proj.weight.mul_(factor)
+            if getattr(proj, "bias", None) is not None:
+                proj.bias.mul_(factor)
 
     def zero_output_projections(self, block):
         raise NotImplementedError("The decoder extender has no residual-identity (zero-projection) baseline.")

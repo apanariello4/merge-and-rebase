@@ -37,6 +37,97 @@ _DECODER_EXCLUDED_ROOTS = frozenset({
 })
 
 
+# Canonical (vision-style) component names mapped to the decoder block's relative module path.
+CANONICAL_COMPONENTS: dict[str, str] = {
+    "mlp.c_proj": "mlp.down_proj",
+    "attn.out_proj": "self_attn.o_proj",
+}
+
+# Correctable block components (name -> module path inside the block); order is the extender's.
+BLOCK_COMPONENT_PATHS: dict[str, str] = {
+    "input_layernorm": "input_layernorm",
+    "q_proj": "self_attn.q_proj",
+    "k_proj": "self_attn.k_proj",
+    "v_proj": "self_attn.v_proj",
+    "o_proj": "self_attn.o_proj",
+    "post_attention_layernorm": "post_attention_layernorm",
+    "gate_proj": "mlp.gate_proj",
+    "up_proj": "mlp.up_proj",
+    "down_proj": "mlp.down_proj",
+}
+
+_MOE_MODEL_TYPES = frozenset({"qwen2_moe", "qwen3_moe"})
+
+
+def _resolve_path(root: nn.Module, path: str) -> nn.Module:
+    obj: Any = root
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def decoder_set_layers(scope: nn.Module, model: nn.Module, blocks: Any) -> None:
+    """Install ``blocks`` on ``scope`` and reindex depth / ``layer_idx`` / ``layer_types``."""
+    scope.layers = nn.ModuleList(blocks)
+    _set_depth(model, scope, len(scope.layers))
+    _reindex_layers(model, scope.layers)
+
+
+def _set_depth(model: nn.Module, scope: nn.Module, depth: int) -> None:
+    # HF decoders iterate `self.layers[: self.config.num_hidden_layers]`, so
+    # a longer ModuleList alone does nothing: the appended blocks never run.
+    # Everything downstream still sees them (state_dict reports them, deltas
+    # are computed over them), which makes the truncation invisible -- the
+    # model simply behaves as if it were never extended.
+    for holder in (model, scope):
+        config = getattr(holder, "config", None)
+        if config is None:
+            continue
+        if getattr(config, "num_hidden_layers", None) == depth:
+            continue
+        config.num_hidden_layers = depth
+
+
+def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] | None:
+    """Grow `config.layer_types` to the new depth, keeping it authoritative.
+
+    Models with alternating attention patterns key off this list, and the
+    reindex below reads it positionally. Left short, every layer past the
+    original depth keeps whichever `attention_type` it was duplicated with
+    while the config claims a shorter model.
+    """
+    config = getattr(model, "config", None)
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return None
+    resolved = list(layer_types)
+    if len(resolved) >= len(layers):
+        return resolved[: len(layers)]
+    for idx in range(len(resolved), len(layers)):
+        own = getattr(layers[idx], "attention_type", None)
+        resolved.append(own if own is not None else resolved[-1])
+    config.layer_types = resolved
+    return resolved
+
+
+def _reindex_layers(model: nn.Module, layers: nn.ModuleList) -> None:
+    # Each decoder layer's attention module caches its own `layer_idx`
+    # (set at construction) to key into the shared KV cache during a
+    # forward pass. Duplicating/reordering layers without updating it
+    # leaves two layers pointing at the same cache slot: the second one
+    # to run has its `update()` call concatenate onto the first's
+    # leftover keys/values, silently doubling the sequence length the
+    # rest of that layer's attention sees (crashes as a seq-length
+    # mismatch against the attention mask, or worse, doesn't crash).
+    layer_types = _resolve_layer_types(model, layers)
+    for new_idx, layer in enumerate(layers):
+        for holder in (layer, getattr(layer, "self_attn", None)):
+            if holder is not None and hasattr(holder, "layer_idx"):
+                holder.layer_idx = new_idx
+        if layer_types is not None and hasattr(layer, "attention_type") and new_idx < len(layer_types):
+            layer.attention_type = layer_types[new_idx]
+
+
 class HfDecoderAdapter:
     """Shared adapter for HF decoder-style models with 'model.layers' layout."""
 
@@ -66,6 +157,7 @@ class HfDecoderAdapter:
             num_attention_heads=num_attention_heads,
             num_key_value_heads=getattr(cfg, "num_key_value_heads", None),
             head_dim=int(head_dim) if head_dim is not None else None,
+            is_moe=str(getattr(cfg, "model_type", "")).strip().lower() in _MOE_MODEL_TYPES,
         )
 
     def transport_scope(self, model: nn.Module) -> nn.Module:
@@ -135,6 +227,55 @@ class HfDecoderAdapter:
 
     def excluded_keys(self) -> set[str]:
         return set(_DECODER_EXCLUDED_ROOTS)
+
+    # ---- decoder layout ------------------------------------------------------------------------------
+
+    CANONICAL_COMPONENTS = CANONICAL_COMPONENTS
+
+    def layers(self, model: nn.Module) -> nn.ModuleList:
+        return self.transport_scope(model).layers
+
+    def set_layers(self, model: nn.Module, blocks: Any) -> None:
+        decoder_set_layers(self.transport_scope(model), model, blocks)
+
+    def final_norm(self, model: nn.Module) -> nn.Module:
+        return self.transport_scope(model).norm
+
+    def block_components(self, block: nn.Module) -> dict[str, nn.Module]:
+        return {name: _resolve_path(block, path) for name, path in BLOCK_COMPONENT_PATHS.items()}
+
+    def attn_module(self, block: nn.Module) -> nn.Module:
+        return block.self_attn
+
+    def residual_writer(self, block: nn.Module) -> nn.Module:
+        return _resolve_path(block, CANONICAL_COMPONENTS["mlp.c_proj"])
+
+    def attn_output(self, block: nn.Module) -> nn.Module:
+        return _resolve_path(block, CANONICAL_COMPONENTS["attn.out_proj"])
+
+    def param_key(self, position: int, suffix: str) -> str:
+        return f"{self.LAYER_PREFIX}.{int(position)}.{suffix}"
+
+    def calibration_forward(self, model: nn.Module, batch: Any, device: Any) -> Any:
+        """Backbone-only forward: no labels, no LM head, ``use_cache=False``.
+
+        Grad mode is the caller's. Not yet used by the capture paths (their compute path is
+        unchanged until the calibration switch-over).
+        """
+        inputs = self.extract_calibration_batch(batch)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        return self.transport_scope(model)(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+
+    def content_mask(self, batch: Any) -> torch.Tensor:
+        """Bool ``[B, T]`` from ``attention_mask`` only; a pad-id token that is attended stays content."""
+        inputs = self.extract_calibration_batch(batch)
+        mask = inputs.get("attention_mask")
+        if mask is None:
+            return torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+        return mask.bool()
 
     @staticmethod
     def _is_layer_param(key: str) -> bool:
