@@ -66,6 +66,7 @@ nav:
       - Rebasin: rebasin.md
   - Reference:
       - Methods Overview: methods.md
+      - Ariadne: methods/ariadne.md
       - Merge Methods API: api/merge-methods.md
       - Rebasin Methods API: api/rebase-methods.md
       - Post-Merge Methods API: api/postmerge-methods.md
