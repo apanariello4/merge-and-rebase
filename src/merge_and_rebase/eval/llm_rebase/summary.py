@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from ...hyperparam_search import summarize_search_results
@@ -76,3 +77,17 @@ def assemble_nli_summary(
         "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
         "saved_merged_path": saved_merged_path,
     }
+
+
+@dataclass
+class RunRecord:
+    """What the evaluation backend produced: ``backend`` ("harness" | "nli") plus the assembler's keyword arguments."""
+
+    backend: str
+    fields: dict[str, Any]
+
+
+def assemble_summary(record: RunRecord) -> dict[str, Any]:
+    if record.backend == "harness":
+        return assemble_harness_summary(**record.fields)
+    return assemble_nli_summary(**record.fields)

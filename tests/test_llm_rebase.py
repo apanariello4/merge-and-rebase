@@ -7,7 +7,7 @@ from merge_and_rebase.eval.llm_rebase import (
     _build_text_calibration_loader,
     _prepare_resized_task_delta,
 )
-from merge_and_rebase.eval.llm_rebase import cli as llm_rebase
+from merge_and_rebase.eval.llm_rebase import stages as llm_rebase
 from merge_and_rebase.eval.llm_rebase.merge import _delta_norm
 
 
