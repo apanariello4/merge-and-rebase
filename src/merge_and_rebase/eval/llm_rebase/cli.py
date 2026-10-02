@@ -20,7 +20,7 @@ from merge_and_rebase.hyperparam_search import (
 )
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
-from ..cli_args import (
+from ...cli_args import (
     add_alpha_args,
     add_config_arg,
     add_device_dtype_args,
@@ -31,37 +31,38 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.llm_calibration import (
+from ...data.llm_calibration import (
     TokenizedPromptDataset,
     build_text_calibration_loader,
     resolve_calibration_texts,
     tokenization_stats,
 )
-from ..data.text_loaders import (
+from ...data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
     NLITokenizedData,
     build_nli_task_data,
     build_nli_tokenized_loader,
 )
-from ..io.ckpt import load_ckpt, load_into_model
-from ..io.text_checkpoints import load_aligned_tuned_from_ref
-from ..merge.methods._common import get_method_params
-from ..merge.runtime import (
+from ...io.ckpt import load_ckpt, load_into_model
+from ...io.text_checkpoints import load_aligned_tuned_from_ref
+from ...merge.methods._common import get_method_params
+from ...merge.runtime import (
     apply_delta,
     compose_weighted_deltas,
     to_cpu_fp32,
 )
-from ..merge.task_vectors import TaskVector, default_key_filter
-from ..models.text_lm import TextBuildConfig, TextLM
-from ..rebase import get_method
-from ..rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
-from ..rebase.block_extension.decoder import run_block_extension_llm
-from ..rebase.capabilities import check_pair
-from ..rebase.model_families import infer_family
-from ..rebase.registry import canonical_method_name
-from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
-from .llm_common import (
+from ...merge.task_vectors import TaskVector, default_key_filter
+from ...models.text_lm import TextBuildConfig, TextLM
+from ...rebase import get_method
+from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
+from ...rebase.block_extension.decoder import run_block_extension_llm
+from ...rebase.capabilities import check_pair
+from ...rebase.model_families import infer_family
+from ...rebase.registry import canonical_method_name
+from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from ..print_utils import pretty_print_task_accuracies
+from .common import (
     default_prompt_for_task,
     head_class_ids_for_task,
     inject_task_head,
@@ -74,7 +75,6 @@ from .llm_common import (
     resolve_tasks,
     to_unit_acc,
 )
-from .print_utils import pretty_print_task_accuracies
 
 
 @dataclass
@@ -588,7 +588,7 @@ def main() -> None:
             return dict(baseline_harness_results_by_task)
 
         def _eval_before_rebase(model: torch.nn.Module, label: str) -> None:
-            from .lm_harness_runner import run as run_harness
+            from .harness import run as run_harness
 
             print(f"\nEvaluating source model ({label}) with lm-harness (before rebase)...")
             results = run_harness(
@@ -1009,7 +1009,7 @@ def main() -> None:
                         **transport_kwargs,
                     )
                 else:
-                    from ..models.grad_recipes import causal_lm_recipe
+                    from ...models.grad_recipes import causal_lm_recipe
 
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     if calib_n_batches is None:
@@ -1112,8 +1112,8 @@ def main() -> None:
 
         # ---- Dispatch evaluation backend ----
         if is_harness_only or harness_tasks_resolved:
-            from .lm_harness_runner import run as run_harness
-            from .lm_harness_runner import score_by_task
+            from .harness import run as run_harness
+            from .harness import score_by_task
 
             best_harness_eval: SearchEvaluation | None = None
             harness_results_by_alpha: dict[float, dict[str, float]] = {}

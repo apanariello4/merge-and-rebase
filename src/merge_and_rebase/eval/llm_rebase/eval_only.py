@@ -3,17 +3,17 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from ..cli_args import (
+from ...cli_args import (
     add_config_arg,
     add_device_dtype_args,
     add_logging_args,
     build_logging_overrides,
     merge_non_none,
 )
-from ..models.text_lm import TextBuildConfig, TextLM
-from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
-from ..utils.helpers import load_json, parse_csv
-from .lm_harness_runner import run as run_harness
+from ...models.text_lm import TextBuildConfig, TextLM
+from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from ...utils.helpers import load_json, parse_csv
+from .harness import run as run_harness
 
 
 def main() -> None:
@@ -96,7 +96,7 @@ def main() -> None:
             # harness_tasks/calibration_split/seed) so this baseline is scored
             # on precisely the docs a merge job with the same
             # n_batches_act/calibration_batch_size never used for calibration.
-            from ..data.llm_calibration import resolve_calibration_texts
+            from ...data.llm_calibration import resolve_calibration_texts
 
             calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 4) or 4))
             calibration = resolve_calibration_texts(

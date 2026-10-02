@@ -12,8 +12,8 @@ import torch
 import torch.nn as nn
 
 from merge_and_rebase.data.text_loaders import NLITaskData
-from merge_and_rebase.eval import llm_common as common
 from merge_and_rebase.eval import llm_merge as merge
+from merge_and_rebase.eval.llm_rebase import common
 
 NAMES = [
     "resolve_tasks",
@@ -33,7 +33,7 @@ NAMES = [
 ALL_TASKS = ["snli", "mnli", "sick", "qnli", "rte", "scitail"]
 
 
-@pytest.fixture(params=["llm_merge", "llm_common"])
+@pytest.fixture(params=["llm_merge", "common"])
 def h(request):
     """Namespace exposing the 13 helpers under their public names, from either module."""
 

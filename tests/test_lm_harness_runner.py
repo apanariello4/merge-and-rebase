@@ -34,7 +34,7 @@ def _install_fake_lm_eval(monkeypatch, simple_evaluate):
 
 
 def test_harness_import_without_lm_eval() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     assert callable(run)
 
@@ -42,7 +42,7 @@ def test_harness_import_without_lm_eval() -> None:
 def test_harness_raises_without_lm_eval(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "lm_eval", None)
 
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     with pytest.raises(ImportError, match="lm-eval"):
         run(tasks=["hellaswag"], model=None, tokenizer=None)
@@ -62,7 +62,7 @@ def test_harness_with_mocked_lm_eval(monkeypatch) -> None:
 
     import torch.nn as nn
 
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     stub_model = nn.Module()
     result = run(tasks=["hellaswag", "piqa"], model=stub_model, tokenizer=None)
@@ -95,7 +95,7 @@ def test_harness_with_math_metrics(monkeypatch) -> None:
 
     import torch.nn as nn
 
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     stub_model = nn.Module()
     result = run(tasks=["hendrycks_math500", "minerva_math500"], model=stub_model, tokenizer=None)
@@ -139,7 +139,7 @@ def test_harness_aggregates_per_task_fewshot(monkeypatch) -> None:
 
     import torch.nn as nn
 
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     stub_model = nn.Module()
     result = run(
@@ -182,7 +182,7 @@ def test_harness_groups_tasks_sharing_fewshot(monkeypatch) -> None:
 
     import torch.nn as nn
 
-    from merge_and_rebase.eval.lm_harness_runner import run
+    from merge_and_rebase.eval.llm_rebase.harness import run
 
     stub_model = nn.Module()
     run(
@@ -198,32 +198,32 @@ def test_harness_groups_tasks_sharing_fewshot(monkeypatch) -> None:
 
 
 def test_resolve_fewshot_by_task_int() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import _resolve_fewshot_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import _resolve_fewshot_by_task
 
     assert _resolve_fewshot_by_task(["a", "b"], 3) == {"a": 3, "b": 3}
 
 
 def test_resolve_fewshot_by_task_list() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import _resolve_fewshot_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import _resolve_fewshot_by_task
 
     assert _resolve_fewshot_by_task(["a", "b"], [0, 5]) == {"a": 0, "b": 5}
 
 
 def test_resolve_fewshot_by_task_dict() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import _resolve_fewshot_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import _resolve_fewshot_by_task
 
     assert _resolve_fewshot_by_task(["a", "b"], {"a": 0, "b": 5}) == {"a": 0, "b": 5}
 
 
 def test_resolve_fewshot_by_task_list_length_mismatch() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import _resolve_fewshot_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import _resolve_fewshot_by_task
 
     with pytest.raises(ValueError, match="parallel"):
         _resolve_fewshot_by_task(["a", "b"], [0])
 
 
 def test_resolve_fewshot_by_task_dict_missing_task() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import _resolve_fewshot_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import _resolve_fewshot_by_task
 
     with pytest.raises(ValueError, match="missing"):
         _resolve_fewshot_by_task(["a", "b"], {"a": 0})
@@ -236,7 +236,7 @@ def test_score_by_task_weights_each_task_equally() -> None:
     the score. score_by_task must average within each task first, then
     average those per-task scores together.
     """
-    from merge_and_rebase.eval.lm_harness_runner import score_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import score_by_task
 
     results = {
         "gsm8k_exact_match": 1.0,
@@ -253,7 +253,7 @@ def test_score_by_task_weights_each_task_equally() -> None:
 
 
 def test_score_by_task_ignores_tasks_with_no_results() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import score_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import score_by_task
 
     results = {"gsm8k_exact_match": 0.8}
     score = score_by_task(results, ["gsm8k", "missing_task"])
@@ -261,6 +261,6 @@ def test_score_by_task_ignores_tasks_with_no_results() -> None:
 
 
 def test_score_by_task_empty_results() -> None:
-    from merge_and_rebase.eval.lm_harness_runner import score_by_task
+    from merge_and_rebase.eval.llm_rebase.harness import score_by_task
 
     assert score_by_task({}, ["gsm8k"]) == 0.0

@@ -12,7 +12,7 @@ from merge_and_rebase.data.llm_calibration import (
     resolve_calibration_texts,
     tokenization_stats,
 )
-from merge_and_rebase.eval import llm_rebase
+from merge_and_rebase.eval.llm_rebase import cli as llm_rebase
 
 
 def test_loader_is_promoted_and_old_names_are_identical():

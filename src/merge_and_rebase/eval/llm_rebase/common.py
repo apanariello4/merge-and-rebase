@@ -6,7 +6,7 @@ import torch
 
 from merge_and_rebase.utils.helpers import parse_csv
 
-from ..data.text_loaders import (
+from ...data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
     default_head_class_ids_for_task,
