@@ -6,14 +6,14 @@ dictionary from it (key order is part of the output contract).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ...rebase.registry import canonical_method_name
 from ..block_extension import block_extension_protocol
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RunRecord:
     suite_name: Any
     tasks: Any
@@ -31,8 +31,8 @@ class RunRecord:
     baseline_label: Any
     block_extension_eval_rows: Any
     source_lmc_rows: Any
-    cross_task_lmc_rows: Any
-    all_task_lmc_rows: Any
+    cross_task_lmc_rows: Any = field(default_factory=list)
+    all_task_lmc_rows: Any = field(default_factory=list)
     transported_artifacts: Any
     transport_timings: Any
     transport_calibration_meta: Any
@@ -51,11 +51,13 @@ class RunRecord:
     best_alpha: Any
     best_baseline_alpha: Any
     direct_residual_like: Any
-    independent_base_dispersion: Any
-    independent_base_distance_by_task: Any
-    independent_source_merge_param_count: Any
-    independent_base_diagnostics_path: Any
-    independent_direct_delta_key_count: Any
+    # The independent-endpoint diagnostics are never populated (dead since the endpoint-average baseline moved
+    # into the BRACE stage); the summary keeps the keys.
+    independent_base_dispersion: Any = None
+    independent_base_distance_by_task: Any = field(default_factory=dict)
+    independent_source_merge_param_count: Any = None
+    independent_base_diagnostics_path: Any = None
+    independent_direct_delta_key_count: Any = field(default_factory=dict)
     single_tv_test_accs: Any
     single_tv_alpha_protocol: Any
     direct_residual_calibration_meta: Any
@@ -78,7 +80,7 @@ class RunRecord:
     selected_baseline_alpha_by_task: Any
     direct_residual_cfg: Any
     method_name: Any
-    independent_base_average: Any
+    independent_base_average: Any = None
     baseline_test_accs: Any
     rebase_test_accs: Any
     norm_accs: Any
@@ -87,6 +89,94 @@ class RunRecord:
     single_tv_val_best_acc: Any
     #: Additive ``save_policy`` entry; ``None`` (key omitted) unless the config named ``save_transported_tvs``.
     save_policy: Any = None
+
+    @classmethod
+    def from_run(
+        cls,
+        resolved: Any,
+        *,
+        native_tasks: Any,
+        per_task: Any,
+        loop_outputs: Any,
+        calibration: Any,
+        merge_plan: Any,
+        alpha: Any,
+        ariadne: Any,
+        completion: Any,
+        block_extension_eval_rows: Any,
+        source_lmc_rows: Any,
+        transported_artifacts: Any,
+        target_hash_before: Any,
+        target_hash_after: Any,
+        saved_merged_path: Any,
+        save_policy: Any = None,
+    ) -> RunRecord:
+        """Collect the run's structured outputs (the summary keys keep their legacy names and order)."""
+        return cls(
+            suite_name=resolved.suite_name,
+            tasks=resolved.tasks,
+            method_label=resolved.method_label,
+            merge_mode=resolved.merge.mode,
+            target_hash_before=target_hash_before,
+            target_hash_after=target_hash_after,
+            single_transport_calibration_metadata=merge_plan.calibration_metadata,
+            brace_calibration_metadata=calibration.brace_calibration_metadata,
+            base_construction=resolved.merge.base_construction,
+            hierarchical_premerge_alpha_curve=alpha.hierarchical_premerge_alpha_curve,
+            global_alpha_curve=alpha.global_alpha_curve,
+            alpha_selection=resolved.alpha.selection,
+            selected_validation_results=alpha.selected_validation_results,
+            baseline_label=alpha.baseline_label,
+            block_extension_eval_rows=block_extension_eval_rows,
+            source_lmc_rows=source_lmc_rows,
+            transported_artifacts=transported_artifacts,
+            transport_timings=loop_outputs.transport_timings,
+            transport_calibration_meta=calibration.transport_calibration_meta,
+            cost_phase_timings=loop_outputs.cost_phase_timings,
+            alignment_calibration_timings=loop_outputs.alignment_calibration_timings,
+            correction_fit_timings=loop_outputs.correction_fit_timings,
+            depth_alignment_mode=resolved.depth_alignment_mode,
+            saved_merged_path=saved_merged_path,
+            method=resolved.method,
+            merge_method_name=resolved.merge.method_name,
+            merge_params=resolved.merge.params,
+            block_extension_cfg=resolved.block_extension_cfg,
+            native_tasks=native_tasks,
+            hierarchical=alpha.hierarchical,
+            global_alpha_search=resolved.merge.global_alpha_search,
+            best_alpha=alpha.best_alpha,
+            best_baseline_alpha=alpha.best_baseline_alpha,
+            direct_residual_like=resolved.direct_residual_like,
+            single_tv_test_accs=alpha.single_tv_test_accs,
+            single_tv_alpha_protocol=alpha.single_tv_alpha_protocol,
+            direct_residual_calibration_meta=ariadne.calibration_meta,
+            direct_residual_diagnostics=ariadne.diagnostics,
+            direct_residual_realization=ariadne.realization,
+            direct_residual_task_vector_stats=ariadne.task_vector_stats,
+            direct_residual_alignment_diagnostics=ariadne.alignment_diagnostics,
+            direct_residual_calibration_by_task=ariadne.calibration_by_task,
+            direct_residual_tv_scaling=ariadne.tv_scaling,
+            direct_residual_pairing_record=ariadne.pairing,
+            direct_residual_fidelity_holdout=ariadne.fidelity_holdout,
+            direct_residual_sequential_endpoints=ariadne.sequential_endpoints,
+            loaded_direct_residual_tvs=ariadne.loaded_vectors,
+            residual_completion_diagnostics=completion.residual,
+            joint_blockwise_diagnostics=completion.joint_blockwise,
+            direct_p1_diagnostics=completion.direct_p1,
+            per_task_premerge_alphas=alpha.per_task_premerge_alphas,
+            selected_alpha_by_task=alpha.selected_alpha_by_task,
+            per_task=per_task,
+            selected_baseline_alpha_by_task=alpha.selected_baseline_alpha_by_task,
+            direct_residual_cfg=resolved.ariadne_cfg,
+            method_name=resolved.method_name,
+            baseline_test_accs=alpha.baseline_test_accs,
+            rebase_test_accs=alpha.rebase_test_accs,
+            norm_accs=alpha.norm_accs,
+            direct_residual_preset=resolved.ariadne_preset,
+            single_tv_val_best_alpha=alpha.single_tv_val_best_alpha,
+            single_tv_val_best_acc=alpha.single_tv_val_best_acc,
+            save_policy=save_policy,
+        )
 
 
 def assemble_summary(record: RunRecord) -> dict[str, Any]:

@@ -119,6 +119,14 @@ def test_final_summary_carries_alignment_and_correction_fit_timing_keys():
     assert '"alignment_calibration_timings": record.alignment_calibration_timings' in summary_source
     assert '"correction_fit_timings": record.correction_fit_timings' in summary_source
     assert '"transport_timings": record.transport_timings' in summary_source
-    main_source = inspect.getsource(vision_rebase.main)
+    # The pipeline hands the per-task loop's timing dicts to the record (RunRecord.from_run, called by run_rebase).
+    record_source = inspect.getsource(vision_rebase_summary.RunRecord.from_run)
     for name in ("alignment_calibration_timings", "correction_fit_timings", "transport_timings"):
-        assert f"{name}={name}," in main_source
+        assert f"{name}=loop_outputs.{name}," in record_source
+    from merge_and_rebase.eval.vision_rebase import pipeline as vision_rebase_pipeline
+
+    assert "RunRecord.from_run(" in inspect.getsource(vision_rebase_pipeline.run_rebase)
+    from merge_and_rebase.rebase.orchestration import TaskLoopOutputs
+
+    for name in ("alignment_calibration_timings", "correction_fit_timings", "transport_timings"):
+        assert TaskLoopOutputs.__dataclass_fields__[name].default_factory is dict

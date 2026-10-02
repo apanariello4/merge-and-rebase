@@ -5,7 +5,7 @@ the sibling modules hold the vision-only helpers. Every name that used to be imp
 merge_and_rebase.eval.vision_rebase is re-exported here.
 """
 
-from .cli import (  # noqa: F401
+from ._reexports import (  # noqa: F401
     _BASE_CONSTRUCTION_MODES,
     _SINGLE_TRANSPORT_MODES,
     _TRANSPORT_THEN_MERGE_MODES,
@@ -66,7 +66,6 @@ from .cli import (  # noqa: F401
     _scale_delta,
     _scale_deltas_by,
     _select_dedicated_brace_loader,
-    _set_deterministic_seed,
     _state_dict_sha256,
     _task_vector_sha256,
     _TaskContext,
@@ -117,7 +116,6 @@ from .cli import (  # noqa: F401
     load_hf_splits,
     load_into_model,
     load_json,
-    main,
     merge_logging_config,
     merge_non_none,
     normalize_attn_patch_cfg,
@@ -139,3 +137,4 @@ from .cli import (  # noqa: F401
     to_cpu_fp32,
     torch,
 )
+from .cli import _set_deterministic_seed, main  # noqa: F401

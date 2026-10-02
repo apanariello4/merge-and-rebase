@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
-from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.eval.vision_rebase import _build_rebase_prepared
 
 
@@ -230,32 +229,39 @@ def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source
 
 
 def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> None:
-    tree = ast.parse(inspect.getsource(vision_rebase.main))
-    main_fn = tree.body[0]
-    assert isinstance(main_fn, ast.FunctionDef)
-    try_block = next(node for node in main_fn.body if isinstance(node, ast.Try))
-    # The last top-level ``for task`` is the transport loop (the first one only builds the task contexts).
-    task_loop_index = max(
+    from merge_and_rebase.eval.vision_rebase import pipeline as vision_rebase_pipeline
+    from merge_and_rebase.eval.vision_rebase.summary import RunRecord
+
+    tree = ast.parse(inspect.getsource(vision_rebase_pipeline.run_rebase))
+    run_fn = tree.body[0]
+    assert isinstance(run_fn, ast.FunctionDef)
+    # The transport loop is ``TaskPipeline.run`` (called as ``pipeline.run(...)``); everything it reads must exist
+    # before that statement.
+    loop_index = next(
         index
-        for index, node in enumerate(try_block.body)
-        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "task"
+        for index, node in enumerate(run_fn.body)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "run"
+        and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id == "pipeline"
     )
-    before_loop = try_block.body[:task_loop_index]
-    initialized = {
-        node.target.id for node in before_loop if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-    }
-    assert {"cross_task_lmc_rows", "all_task_lmc_rows"} <= initialized
-    # The per-task BRACE collectors moved into the stage objects (P5.8): the source-LMC rows live on the
-    # observer and the corrected/independent endpoint books on StageEnv.endpoints; all of them must exist
-    # before the first task runs.
+    before_loop = run_fn.body[:loop_index]
+    # The cross-task / all-task LMC rows are never populated: the record owns them as empty-list defaults.
+    for name in ("cross_task_lmc_rows", "all_task_lmc_rows"):
+        assert RunRecord.__dataclass_fields__[name].default_factory is list
+    # The per-task BRACE collectors live in the stage objects (P5.8): the source-LMC rows on the observer and the
+    # corrected/independent endpoint books on StageEnv.endpoints; all of them must exist before the first task runs.
     assigned = {
-        target.id
+        name.id
         for node in before_loop
         if isinstance(node, ast.Assign)
         for target in node.targets
-        if isinstance(target, ast.Name)
+        for name in (target.elts if isinstance(target, ast.Tuple) else [target])
+        if isinstance(name, ast.Name)
     }
-    assert {"stage_env", "prestep", "prestep_observers", "source_lmc_rows"} <= assigned
+    assert {"env", "pipeline", "eval_observer", "lmc_observer", "calibration"} <= assigned
     from merge_and_rebase.rebase.prestep import IndependentEndpoints
 
     assert {
