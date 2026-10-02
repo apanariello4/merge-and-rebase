@@ -95,6 +95,12 @@ class DecoderBlockExtender(BlockExtenderCore):
     def _make_reference_provider(self) -> EagerProvider:
         return EagerProvider(self)
 
+    def _finalize_extension(self, chain_base: list[dict[str, Any]]) -> None:
+        # Describe the realized chain with the same builder vision uses, so a consumer (e.g. residual completion)
+        # addresses inserted positions by recorded ancestry rather than assuming a doubling depth pattern --
+        # this extension is 24->28, not a doubling.
+        self.realized_layout = build_extension_layout(chain_base)
+
     @staticmethod
     def _build_collapse_schedule(
         curr_layers: int,
@@ -107,27 +113,6 @@ class DecoderBlockExtender(BlockExtenderCore):
     @staticmethod
     def _locate_collapse_pos(chain: list[dict[str, Any]], anchor_orig_idx: int) -> int:
         return decoder_locate_collapse_pos(chain, anchor_orig_idx)
-
-    @torch.no_grad()
-    def _interpolate_block_weights(self, target_block: nn.Module, source_block: nn.Module, alpha: float = 0.5):
-        source_params = dict(source_block.named_parameters())
-        for name_t, p_t in target_block.named_parameters():
-            if name_t.startswith("aligner."):
-                continue
-            p_s = source_params.get(name_t)
-            if p_s is not None and p_t.shape == p_s.shape:
-                p_t.copy_((1.0 - alpha) * p_t + alpha * p_s)
-
-    @torch.no_grad()
-    def _dampen_block_output(self, block: nn.Module, factor: float):
-        if hasattr(block, "self_attn") and hasattr(block.self_attn, "o_proj"):
-            block.self_attn.o_proj.weight.mul_(factor)
-            if hasattr(block.self_attn.o_proj, "bias") and block.self_attn.o_proj.bias is not None:
-                block.self_attn.o_proj.bias.mul_(factor)
-        if hasattr(block, "mlp") and hasattr(block.mlp, "down_proj"):
-            block.mlp.down_proj.weight.mul_(factor)
-            if hasattr(block.mlp.down_proj, "bias") and block.mlp.down_proj.bias is not None:
-                block.mlp.down_proj.bias.mul_(factor)
 
     @torch.no_grad()
     def capture_reference_inputs(self, loader: Iterable[Any], n_batches: int):
@@ -319,181 +304,6 @@ class DecoderBlockExtender(BlockExtenderCore):
         if linear.bias is not None:
             b = b.to(linear.bias.device, dtype=linear.bias.dtype)
             linear.bias.copy_(W @ linear.bias + b)
-
-    @torch.no_grad()
-    def _extend_interpolate(
-        self,
-        *,
-        loader: Iterable[Any],
-        n_batches: int,
-        dampening_factor: float,
-        blocks_to_add: int | None,
-        target_layers_total: int | None,
-        insertion_order: str,
-        extension_density: str,
-        skip_final_ln: bool = False,
-    ) -> int:
-        self._vprint("starting interpolate extension")
-        layers_base = _get_layers(self.model_base, self.family_adapter)
-        curr_layers = len(layers_base)
-        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
-
-        if n_needed <= 0:
-            self._vprint("no extension needed")
-            return curr_layers
-
-        schedule = self._build_duplication_schedule(
-            curr_layers=curr_layers,
-            n_needed=n_needed,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
-        )
-        self._vprint(f"planned duplications: {schedule}")
-
-        for model in [self.model_base, self.model_ft]:
-            layers = _get_layers(model, self.family_adapter)
-            orig_blocks = list(layers)
-            chain: list[nn.Module] = list(orig_blocks)
-
-            for src_idx in schedule:
-                dup = deepcopy(orig_blocks[src_idx])
-                src_next = min(src_idx + 1, len(orig_blocks) - 1)
-                self._interpolate_block_weights(dup, orig_blocks[src_next], alpha=0.5)
-
-                if dampening_factor < 1.0:
-                    self._dampen_block_output(dup, dampening_factor)
-
-                insert_pos = -1
-                for i, blk in enumerate(chain):
-                    if blk is orig_blocks[src_idx]:
-                        insert_pos = i
-                insert_pos += 1
-                chain.insert(insert_pos, dup)
-
-            self._set_layers(model, chain)
-
-        if not skip_final_ln:
-            self._vprint("correcting final norm")
-            for model in [self.model_base, self.model_ft]:
-                final_norm = _get_final_norm(model, self.family_adapter)
-                layers = _get_layers(model, self.family_adapter)
-                if hasattr(final_norm, "weight"):
-                    src_weight = self.reference_inputs.get("base", {}).get("final.input")
-                    if src_weight is not None:
-                        pass  # final norm correction is handled by the transport step
-
-        final_depth = len(_get_layers(self.model_base, self.family_adapter))
-        self._vprint(f"interpolate extension completed. final_depth={final_depth}")
-        return final_depth
-
-    @torch.no_grad()
-    def _extend_per_weight(
-        self,
-        *,
-        loader: Iterable[Any],
-        n_batches: int,
-        dampening_factor: float,
-        blocks_to_add: int | None,
-        target_layers_total: int | None,
-        insertion_order: str,
-        extension_density: str,
-        ridge_identity: float = 0.0,
-        per_weight_mode: str = "cascade",
-        n_cascade_iters: int = 1,
-        share_ft_refs: bool = False,
-        skip_correction: bool = False,
-        component_ridge: dict[str, float] | None = None,
-        lmc_mode: str = "independent",
-    ) -> int:
-        if per_weight_mode not in {"cascade", "duplicate"}:
-            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
-        self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
-        provider = self._open_references(skip_correction, loader, n_batches)
-
-        layers_base = _get_layers(self.model_base, self.family_adapter)
-        curr_layers = len(layers_base)
-        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
-
-        if n_needed <= 0:
-            self._vprint("no extension needed")
-            return curr_layers
-
-        schedule = self._build_duplication_schedule(
-            curr_layers=curr_layers,
-            n_needed=n_needed,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
-        )
-        self._vprint(f"planned duplications: {schedule}")
-
-        orig_base = list(layers_base)
-        orig_ft = list(_get_layers(self.model_ft, self.family_adapter))
-
-        chain_base: list[dict[str, Any]] = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_base)]
-        chain_ft: list[dict[str, Any]] = [{"mod": b, "orig_idx": i} for i, b in enumerate(orig_ft)]
-
-        step_iter = _iter_with_progress(
-            enumerate(schedule, start=1),
-            total=len(schedule),
-            desc="block_extension_llm.per_weight",
-            enabled=self.show_progress,
-        )
-        for step, src_idx in step_iter:
-            self._vprint(f"step {step}/{len(schedule)} source_block={src_idx}")
-
-            dup_base = deepcopy(orig_base[src_idx])
-            dup_ft = deepcopy(orig_ft[src_idx])
-
-            # The neighbour an inserted block is initialized from is part of the
-            # realized layout: proposal-1 style completion addresses the pair of
-            # activation banks that bracket an inserted position, so it has to be
-            # recorded here rather than re-derived from a depth pattern later.
-            src_next = min(src_idx + 1, len(orig_base) - 1)
-            if per_weight_mode == "cascade":
-                self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
-                self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
-
-            if dampening_factor < 1.0:
-                self._dampen_block_output(dup_base, dampening_factor)
-                self._dampen_block_output(dup_ft, dampening_factor)
-
-            insert_pos = -1
-            for i, item in enumerate(chain_base):
-                if item["orig_idx"] == src_idx:
-                    insert_pos = i
-            insert_pos += 1
-
-            inserted_meta = {"orig_idx": src_idx, "inserted": True, "neighbour_orig_idx": src_next}
-            chain_base.insert(insert_pos, {"mod": dup_base, **inserted_meta})
-            chain_ft.insert(insert_pos, {"mod": dup_ft, **inserted_meta})
-
-            self._set_layers(self.model_base, [x["mod"] for x in chain_base])
-            self._set_layers(self.model_ft, [x["mod"] for x in chain_ft])
-
-            if not skip_correction:
-                self._correct_one_block(
-                    provider=provider,
-                    position=insert_pos,
-                    ref_block_idx=src_idx,
-                    loader=loader,
-                    n_batches=n_batches,
-                    ridge_identity=ridge_identity,
-                    n_cascade_iters=n_cascade_iters,
-                    share_ft_refs=share_ft_refs,
-                    component_ridge=component_ridge,
-                    lmc_mode=lmc_mode,
-                )
-
-        final_depth = len(_get_layers(self.model_base, self.family_adapter))
-        # Describe the realized chain with the same builder vision uses, so a
-        # consumer (e.g. residual completion) addresses inserted positions by
-        # recorded ancestry rather than assuming a doubling depth pattern --
-        # this extension is 24->28, not a doubling.
-        self.realized_layout = build_extension_layout(
-            [{k: v for k, v in item.items() if k != "mod"} for item in chain_base]
-        )
-        self._vprint(f"per-weight extension completed. final_depth={final_depth}")
-        return final_depth
 
     @torch.no_grad()
     def _shrink_per_weight(

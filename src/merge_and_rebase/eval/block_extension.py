@@ -352,26 +352,6 @@ class BlockExtender(BlockExtenderCore):
         return torch.cat(buffers, dim=0).flatten(0, 1)
 
     @torch.no_grad()
-    def _interpolate_block_weights(self, target_block: nn.Module, source_block: nn.Module, alpha: float = 0.5):
-        target_inner = self._inner_block(target_block)
-        source_inner = self._inner_block(source_block)
-        source_params = dict(source_inner.named_parameters())
-        for name_t, p_t in target_inner.named_parameters():
-            if name_t.startswith("aligner."):
-                continue
-            p_s = source_params.get(name_t)
-            if p_s is not None and p_t.shape == p_s.shape:
-                p_t.copy_((1.0 - alpha) * p_t + alpha * p_s)
-
-    @torch.no_grad()
-    def _dampen_block_output(self, block: nn.Module, factor: float):
-        inner = self._inner_block(block)
-        if hasattr(inner, "attn") and hasattr(inner.attn, "out_proj"):
-            inner.attn.out_proj.weight.mul_(factor)
-        if hasattr(inner, "mlp") and hasattr(inner.mlp, "c_proj"):
-            inner.mlp.c_proj.weight.mul_(factor)
-
-    @torch.no_grad()
     def _capture_target_component_references(
         self,
         *,
@@ -505,21 +485,7 @@ class BlockExtender(BlockExtenderCore):
         the cost of extra depth from the cost of the computation ARIADNE puts
         in the inserted block.
         """
-        inner = self._inner_block(block)
-        projections = []
-        if hasattr(inner, "attn") and hasattr(inner.attn, "out_proj"):
-            projections.append(inner.attn.out_proj)
-        if hasattr(inner, "mlp") and hasattr(inner.mlp, "c_proj"):
-            projections.append(inner.mlp.c_proj)
-        if len(projections) != 2:
-            raise ValueError(
-                "residual_identity requires a block exposing attn.out_proj and mlp.c_proj; "
-                f"found {len(projections)} output projections on {type(inner).__name__}."
-            )
-        for projection in projections:
-            projection.weight.zero_()
-            if getattr(projection, "bias", None) is not None:
-                projection.bias.zero_()
+        self.adapter.zero_output_projections(block)
 
     @torch.no_grad()
     def _correct_collapsed_block_weights_cascade(
@@ -867,180 +833,55 @@ class BlockExtender(BlockExtenderCore):
             "Expected 'inserted', 'interleaved_once', or 'iterative_all'."
         )
 
-    @torch.no_grad()
-    def _extend_per_weight(
-        self,
-        *,
-        loader: Iterable[Any],
-        n_batches: int,
-        dampening_factor: float,
-        blocks_to_add: int | None,
-        target_layers_total: int | None,
-        insertion_order: str,
-        extension_density: str,
-        ridge_identity: float = 0.0,
-        per_weight_mode: str = "cascade",
-        n_cascade_iters: int = 1,
-        share_ft_refs: bool = False,
-        skip_correction: bool = False,
-        component_ridge: dict[str, float] | None = None,
-        lmc_mode: str = "independent",
-        inserted_block_mode: str = "ariadne",
-        correction_scope: str = "inserted",
-        insertion_target_mode: str = "direct",
-        target_shared_correction: TargetSharedCorrection | None = None,
-    ) -> int:
-        if per_weight_mode not in {"cascade", "duplicate"}:
-            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
-        self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
-        provider = self._open_references(skip_correction, loader, n_batches)
-
-        curr_layers = len(self.model_base.visual.transformer.resblocks)
-        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
-
-        if n_needed <= 0:
-            logger.info("Block extension: no extension needed.")
-            self._vprint("no extension needed")
-            return curr_layers
-
-        schedule = self._build_duplication_schedule(
-            curr_layers=curr_layers,
-            n_needed=n_needed,
-            insertion_order=insertion_order,
-            extension_density=extension_density,
-        )
-
-        logger.info("Block extension planned duplications: %s", schedule)
-        self._vprint(f"planned duplications: {schedule}")
-
-        # Final positions are needed before the loop: the correction step only
-        # knows the position in the partially built chain, but a target-side
-        # reference must be addressed by the block's position in the finished
-        # model, which is what the target backbone's own depth indexes.
-        inserted_positions = plan_inserted_positions(curr_layers, schedule)
+    def _before_extension_loop(self, schedule, curr_layers, loader, n_batches, target_shared_correction) -> None:
+        # Final positions are needed before the loop: the correction step only knows the position in the
+        # partially built chain, but a target-side reference must be addressed by the block's position in the
+        # finished model, which is what the target backbone's own depth indexes.
+        self._inserted_positions = plan_inserted_positions(curr_layers, schedule)
         self._target_reference_banks = {}
         self._target_reference_samples = 0
-        target_weight = 0.0
+        self._target_weight = 0.0
         if target_shared_correction is not None and target_shared_correction.active:
-            target_weight = float(target_shared_correction.target_weight)
+            self._target_weight = float(target_shared_correction.target_weight)
             target_batches = target_shared_correction.num_batches or n_batches
             self._target_reference_banks = self._capture_target_component_references(
-                positions=inserted_positions,
+                positions=self._inserted_positions,
                 loader=loader,
                 n_batches=target_batches,
             )
 
-        orig_base = list(self.model_base.visual.transformer.resblocks)
-        orig_ft = list(self.model_ft.visual.transformer.resblocks)
+    def _target_reference_for(self, step: int) -> tuple[torch.Tensor | None, float]:
+        return self._target_reference_banks.get(self._inserted_positions[step - 1]), self._target_weight
 
-        chain_base = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_base)]
-        chain_ft = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_ft)]
+    def _init_inserted_block(self, dup_base: nn.Module, dup_ft: nn.Module, inserted_block_mode: str) -> None:
+        if inserted_block_mode in {"residual_identity", "residual_identity_inert"}:
+            self._zero_block_output_projections(dup_base)
+            self._zero_block_output_projections(dup_ft)
+        if inserted_block_mode == "residual_identity_inert":
+            # Give the FT endpoint the base endpoint's inserted block, so the inserted position's task vector is
+            # zero on every parameter and not only on the output projections. The base endpoint is untouched, so
+            # this arm and 'residual_identity' fit byte-identical transport maps and differ in exactly one
+            # quantity: the delta being transported.
+            dup_ft.load_state_dict(dup_base.state_dict())
 
-        step_iter = _iter_with_progress(
-            enumerate(schedule, start=1),
-            total=len(schedule),
-            desc="block_extension.per_weight",
-            enabled=self.show_progress,
-        )
-        for step, src_idx in step_iter:
-            logger.info("Block extension step %d/%d. Source block: %d", step, len(schedule), src_idx)
-            self._vprint(f"step {step}/{len(schedule)} source_block={src_idx}")
+    def _post_insert_correction(self, chain_base, insert_pos, correction_scope, **block_kwargs) -> None:
+        # Repair the original blocks the insertion just disturbed. The bottom-to-top schedule visits each original
+        # block as an insertion source exactly once, so correcting the block immediately above the new insertion
+        # touches every original block once and always fits against an input that is already final: everything
+        # below it has been edited for the last time, and later edits land above it. A pass that instead corrected
+        # original blocks *below* an already-fitted inserted block would silently invalidate that block's
+        # absorbed correction.
+        for original_idx in self._original_blocks_to_correct(chain_base, insert_pos=insert_pos, scope=correction_scope):
+            self._correct_one_block(
+                position=self._original_block_position(chain_base, original_idx),
+                ref_block_idx=original_idx,
+                **block_kwargs,
+            )
 
-            dup_base = deepcopy(orig_base[src_idx])
-            dup_ft = deepcopy(orig_ft[src_idx])
-
-            # The neighbour is defined for every init mode: ``cascade`` blends
-            # its weights in, and the interpolated-activation baseline reads
-            # its activations. The last block has no successor and is its own
-            # neighbour, matching the clamp used for the weight midpoint.
-            src_next = min(src_idx + 1, len(orig_base) - 1)
-            if per_weight_mode == "cascade":
-                self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
-                self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
-
-            if dampening_factor < 1.0:
-                self._dampen_block_output(dup_base, dampening_factor)
-                self._dampen_block_output(dup_ft, dampening_factor)
-
-            if inserted_block_mode in {"residual_identity", "residual_identity_inert"}:
-                self._zero_block_output_projections(dup_base)
-                self._zero_block_output_projections(dup_ft)
-            if inserted_block_mode == "residual_identity_inert":
-                # Give the FT endpoint the base endpoint's inserted block, so
-                # the inserted position's task vector is zero on every
-                # parameter and not only on the output projections. The base
-                # endpoint is untouched, so this arm and 'residual_identity'
-                # fit byte-identical transport maps and differ in exactly one
-                # quantity: the delta being transported.
-                dup_ft.load_state_dict(dup_base.state_dict())
-
-            insert_pos = -1
-            for i, item in enumerate(chain_base):
-                if item["orig_idx"] == src_idx:
-                    insert_pos = i
-            insert_pos += 1
-
-            inserted_meta = {"orig_idx": src_idx, "inserted": True, "neighbour_orig_idx": src_next}
-            chain_base.insert(insert_pos, {"mod": dup_base, **inserted_meta})
-            chain_ft.insert(insert_pos, {"mod": dup_ft, **inserted_meta})
-
-            self.model_base.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_base])
-            self.model_ft.visual.transformer.resblocks = nn.ModuleList([x["mod"] for x in chain_ft])
-
-            if not skip_correction:
-                # Original-block repairs below keep their ordinary source
-                # targets; only the inserted block's target is blended.
-                self._correct_one_block(
-                    provider=provider,
-                    position=insert_pos,
-                    ref_block_idx=src_idx,
-                    loader=loader,
-                    n_batches=n_batches,
-                    ridge_identity=ridge_identity,
-                    n_cascade_iters=n_cascade_iters,
-                    share_ft_refs=share_ft_refs,
-                    component_ridge=component_ridge,
-                    lmc_mode=lmc_mode,
-                    insertion_target_mode=insertion_target_mode,
-                    target_reference=self._target_reference_banks.get(inserted_positions[step - 1]),
-                    target_weight=target_weight,
-                )
-                # Repair the original blocks the insertion just disturbed. The
-                # bottom-to-top schedule visits each original block as an
-                # insertion source exactly once, so correcting the block
-                # immediately above the new insertion touches every original
-                # block once and always fits against an input that is already
-                # final: everything below it has been edited for the last time,
-                # and later edits land above it. A pass that instead corrected
-                # original blocks *below* an already-fitted inserted block
-                # would silently invalidate that block's absorbed correction.
-                for original_idx in self._original_blocks_to_correct(
-                    chain_base, insert_pos=insert_pos, scope=correction_scope
-                ):
-                    self._correct_one_block(
-                        provider=provider,
-                        position=self._original_block_position(chain_base, original_idx),
-                        ref_block_idx=original_idx,
-                        loader=loader,
-                        n_batches=n_batches,
-                        ridge_identity=ridge_identity,
-                        n_cascade_iters=n_cascade_iters,
-                        share_ft_refs=share_ft_refs,
-                        component_ridge=component_ridge,
-                        lmc_mode=lmc_mode,
-                        insertion_target_mode=insertion_target_mode,
-                    )
-
-        final_depth = len(self.model_base.visual.transformer.resblocks)
+    def _finalize_extension(self, chain_base) -> None:
         self.extension_layout = build_extension_layout(chain_base)
         self._target_reference_banks = {}
         self.reference_inputs = {"base": {}, "ft": {}}
-        if provider is not None:
-            provider.finish()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        self._vprint(f"per-weight extension completed. final_depth={final_depth}")
-        return final_depth
 
     @torch.no_grad()
     def _shrink_per_weight(

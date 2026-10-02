@@ -14,6 +14,7 @@ The two known differences are kept as class attributes rather than unified:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from typing import Any
@@ -22,8 +23,22 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
+
 from .adapters import ComponentAdapter, ComponentSpec
+from .config import TargetSharedCorrection
 from .schedules import spread_anchor_schedule
+
+logger = logging.getLogger(__name__)
+
+
+def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) -> Any:
+    if not enabled or tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
 class EagerProvider:
@@ -87,6 +102,8 @@ class LazyProvider:
 
     def finish(self) -> None:
         self.models.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class BlockExtenderCore:
@@ -186,6 +203,22 @@ class BlockExtenderCore:
     def _record_corrections(self, endpoint: str, corrections: Mapping[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
         for component, (W, b) in corrections.items():
             self._record_correction(endpoint, component, W, b)
+
+    # ---- per-family block operations (delegated to the adapter) --------------------------------------------------
+
+    @torch.no_grad()
+    def _interpolate_block_weights(self, target_block: nn.Module, source_block: nn.Module, alpha: float = 0.5):
+        self.adapter.interpolate_block_weights(target_block, source_block, alpha)
+
+    @torch.no_grad()
+    def _dampen_block_output(self, block: nn.Module, factor: float):
+        self.adapter.dampen_block_output(block, factor)
+
+    def _set_layers(self, model: nn.Module, new_layers: list[nn.Module]) -> None:
+        self.adapter.set_layers(model, new_layers)
+
+    def _commit_chain(self, model: nn.Module, chain: Sequence[Mapping[str, Any]]) -> None:
+        self._set_layers(model, [item["mod"] for item in chain])
 
     # ---- references and lmc dispatch -----------------------------------------------------------------------------
 
@@ -421,6 +454,153 @@ class BlockExtenderCore:
         for spec in self.adapter.components:
             if spec.name in corrections:
                 self.adapter.apply_correction(block, spec, *corrections[spec.name])
+
+    # ---- extension skeleton ---------------------------------------------------------------------------------------
+
+    def _before_extension_loop(
+        self,
+        schedule: list[int],
+        curr_layers: int,
+        loader: Iterable[Any],
+        n_batches: int,
+        target_shared_correction: TargetSharedCorrection | None,
+    ) -> None:
+        """Hook run once the duplication schedule is known (vision: target-side reference banks)."""
+
+    def _init_inserted_block(self, dup_base: nn.Module, dup_ft: nn.Module, inserted_block_mode: str) -> None:
+        """Hook run on the freshly initialised duplicates (vision: residual-identity baselines)."""
+
+    def _target_reference_for(self, step: int) -> tuple[torch.Tensor | None, float]:
+        return None, 0.0
+
+    def _post_insert_correction(
+        self, chain_base: list[dict[str, Any]], insert_pos: int, correction_scope: str, **block_kwargs: Any
+    ) -> None:
+        """Hook run after the inserted block was corrected (vision: repair of the disturbed original blocks)."""
+
+    def _finalize_extension(self, chain_base: list[dict[str, Any]]) -> None:
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def _extend_per_weight(
+        self,
+        *,
+        loader: Iterable[Any],
+        n_batches: int,
+        dampening_factor: float,
+        blocks_to_add: int | None,
+        target_layers_total: int | None,
+        insertion_order: str,
+        extension_density: str,
+        ridge_identity: float = 0.0,
+        per_weight_mode: str = "cascade",
+        n_cascade_iters: int = 1,
+        share_ft_refs: bool = False,
+        skip_correction: bool = False,
+        component_ridge: dict[str, float] | None = None,
+        lmc_mode: str = "independent",
+        inserted_block_mode: str = "ariadne",
+        correction_scope: str = "inserted",
+        insertion_target_mode: str = "direct",
+        target_shared_correction: TargetSharedCorrection | None = None,
+    ) -> int:
+        if per_weight_mode not in {"cascade", "duplicate"}:
+            raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
+        self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
+        provider = self._open_references(skip_correction, loader, n_batches)
+
+        curr_layers = len(self.adapter.layers(self.model_base))
+        n_needed = self._resolve_depth_delta(curr_layers, blocks_to_add, target_layers_total)
+
+        if n_needed <= 0:
+            logger.info("Block extension: no extension needed.")
+            self._vprint("no extension needed")
+            return curr_layers
+
+        schedule = self._build_duplication_schedule(
+            curr_layers=curr_layers,
+            n_needed=n_needed,
+            insertion_order=insertion_order,
+            extension_density=extension_density,
+        )
+        logger.info("Block extension planned duplications: %s", schedule)
+        self._vprint(f"planned duplications: {schedule}")
+        self._before_extension_loop(schedule, curr_layers, loader, n_batches, target_shared_correction)
+
+        orig_base = list(self.adapter.layers(self.model_base))
+        orig_ft = list(self.adapter.layers(self.model_ft))
+        chain_base = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_base)]
+        chain_ft = [{"mod": b, "orig_idx": i, "inserted": False} for i, b in enumerate(orig_ft)]
+
+        step_iter = _iter_with_progress(
+            enumerate(schedule, start=1),
+            total=len(schedule),
+            desc=f"{self._LOG_PREFIX}.per_weight",
+            enabled=self.show_progress,
+        )
+        for step, src_idx in step_iter:
+            logger.info("Block extension step %d/%d. Source block: %d", step, len(schedule), src_idx)
+            self._vprint(f"step {step}/{len(schedule)} source_block={src_idx}")
+
+            dup_base = deepcopy(orig_base[src_idx])
+            dup_ft = deepcopy(orig_ft[src_idx])
+
+            # The neighbour is defined for every init mode: ``cascade`` blends its weights in, and the
+            # interpolated-activation baseline reads its activations. The last block has no successor and is
+            # its own neighbour, matching the clamp used for the weight midpoint.
+            src_next = min(src_idx + 1, len(orig_base) - 1)
+            if per_weight_mode == "cascade":
+                self._interpolate_block_weights(dup_base, orig_base[src_next], alpha=0.5)
+                self._interpolate_block_weights(dup_ft, orig_ft[src_next], alpha=0.5)
+
+            if dampening_factor < 1.0:
+                self._dampen_block_output(dup_base, dampening_factor)
+                self._dampen_block_output(dup_ft, dampening_factor)
+
+            self._init_inserted_block(dup_base, dup_ft, inserted_block_mode)
+
+            insert_pos = -1
+            for i, item in enumerate(chain_base):
+                if item["orig_idx"] == src_idx:
+                    insert_pos = i
+            insert_pos += 1
+
+            inserted_meta = {"orig_idx": src_idx, "inserted": True, "neighbour_orig_idx": src_next}
+            chain_base.insert(insert_pos, {"mod": dup_base, **inserted_meta})
+            chain_ft.insert(insert_pos, {"mod": dup_ft, **inserted_meta})
+            self._commit_chain(self.model_base, chain_base)
+            self._commit_chain(self.model_ft, chain_ft)
+
+            if not skip_correction:
+                block_kwargs = dict(
+                    provider=provider,
+                    loader=loader,
+                    n_batches=n_batches,
+                    ridge_identity=ridge_identity,
+                    n_cascade_iters=n_cascade_iters,
+                    share_ft_refs=share_ft_refs,
+                    component_ridge=component_ridge,
+                    lmc_mode=lmc_mode,
+                    insertion_target_mode=insertion_target_mode,
+                )
+                # Original-block repairs keep their ordinary source targets; only the inserted block's
+                # target is blended.
+                target_reference, target_weight = self._target_reference_for(step)
+                self._correct_one_block(
+                    position=insert_pos,
+                    ref_block_idx=src_idx,
+                    target_reference=target_reference,
+                    target_weight=target_weight,
+                    **block_kwargs,
+                )
+                self._post_insert_correction(chain_base, insert_pos, correction_scope, **block_kwargs)
+
+        final_depth = len(self.adapter.layers(self.model_base))
+        self._finalize_extension(chain_base)
+        if provider is not None:
+            provider.finish()
+        self._vprint(f"per-weight extension completed. final_depth={final_depth}")
+        return final_depth
 
     @classmethod
     def _build_duplication_schedule(
