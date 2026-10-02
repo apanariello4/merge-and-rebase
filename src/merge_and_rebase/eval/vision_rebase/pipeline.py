@@ -19,14 +19,13 @@ from ...data.vision_loaders import build_vision_calibration_loader
 from ...io.ckpt import load_ckpt
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.methods._common import axpy_state_dict
-from ...rebase.orchestration import AriadneRunRecord, CompletionRecord, TaskPipeline
+from ...rebase.orchestration import AriadneRunRecord, TaskPipeline
 from ...rebase.prestep import StageEnv
 from ..block_extension import calibration_dataset_spec
 from ..print_utils import pretty_print_task_accuracies
 from ..utils import patch_base_for_attn, to_cpu_fp32
 from .alpha_search import AlphaSearchSpec, TargetEvaluator, run_alpha_search
 from .artifacts import TransportedTvSaver, TransportedTvSaveSpec, _state_dict_sha256
-from .completion import build_completion_stages
 from .context import build_run_calibration
 from .merge import (
     _SINGLE_TRANSPORT_MODES,
@@ -314,7 +313,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ariadne_calibration_meta=calibration.ariadne_calibration_meta,
     )
     ariadne_record = method_stage.record if resolved.direct_residual_like else AriadneRunRecord()
-    completion_record = CompletionRecord()
     # merge_then_brace_then_transport merges deltas on the native source base first and only then runs its own
     # once-only structural step, so neither prestep fires per-task under it (gating resolved in
     # `ResolvedRunConfig.bind`).
@@ -322,7 +320,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         prestep=build_prestep(plan),
         observers=(eval_observer, lmc_observer),
         method_stage=method_stage,
-        completion_stages=build_completion_stages(plan, block_extension_cfg, completion_record),
         saver=saver,
         build_models=build_task_models,
     )
@@ -438,7 +435,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             merge_plan=merge_plan,
             alpha=alpha,
             ariadne=ariadne_record,
-            completion=completion_record,
             block_extension_eval_rows=eval_observer.rows,
             source_lmc_rows=lmc_observer.rows,
             transported_artifacts=saver.artifacts,

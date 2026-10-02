@@ -268,8 +268,8 @@ def test_alignment_variants_match_resident_streaming(source_depth, target_depth,
 
 
 def test_delta_magnitude_weights_are_per_image_scale_normalized_and_grid_aligned():
-    from merge_and_rebase.eval.target_informed_runtime import _interp_2d_tokens
     from merge_and_rebase.rebase.methods._ariadne.alignment import _fit_activation_map
+    from merge_and_rebase.rebase.methods._shared import _interp_2d_tokens
 
     torch.manual_seed(171)
     # float64 so the invariance is checked exactly, not up to float32 rounding of the rescaled delta.

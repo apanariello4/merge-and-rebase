@@ -28,10 +28,8 @@ already uses for a property deep inside `main()`.
 
 from __future__ import annotations
 
-import ast
 import inspect
 import json
-import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -78,44 +76,6 @@ def test_depth_alignment_invalid_value_fails_fast(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="depth_alignment must be one of"):
         vision_rebase.main()
-
-
-def test_discrete_index_match_rejects_ariadne_target_informed_corrections():
-    """Structural check (ast): main() raises when depth_alignment='discrete_index_match'
-    is combined with target_residual_completion/joint_blockwise_correction/direct_p1_correction.
-
-    This guard sits after clf_source/clf_target are built (it needs their
-    real resblock depths), so it cannot be reached by a real main() call in
-    this offline environment; see the module docstring.
-    """
-    source = textwrap.dedent(inspect.getsource(run_config.ResolvedRunConfig.bind))
-    tree = ast.parse(source)
-    main_fn = tree.body[0]
-    assert isinstance(main_fn, ast.FunctionDef)
-
-    found_guard = False
-    for node in ast.walk(main_fn):
-        if not isinstance(node, ast.If):
-            continue
-        test_src = ast.dump(node.test)
-        if "discrete_index_match" not in test_src:
-            continue
-        if "target_residual_completion" not in test_src or "joint_blockwise_correction" not in test_src:
-            continue
-        raises = any(
-            isinstance(stmt, ast.Raise)
-            and isinstance(stmt.exc, ast.Call)
-            and getattr(stmt.exc.func, "id", None) == "ValueError"
-            for stmt in ast.walk(node)
-        )
-        if raises:
-            found_guard = True
-            break
-
-    assert found_guard, (
-        "Expected an `if ... depth_alignment ... discrete_index_match ... target_residual_completion "
-        "... joint_blockwise_correction ...: raise ValueError(...)` guard in ResolvedRunConfig.bind()."
-    )
 
 
 def test_depth_alignment_default_is_ariadne():

@@ -73,19 +73,6 @@ from .llm_common import (
     to_unit_acc,
 )
 from .print_utils import pretty_print_task_accuracies
-from .target_informed_runtime import (
-    capture_residual_references,
-    complete_residuals,
-    complete_residuals_direct,
-    materialize_missing_projection_biases,
-    projection_transforms,
-    scale_completion,
-)
-from .target_residual_completion import (
-    ResidualCompletionConfig,
-    order_components,
-    validate_residual_completion_depth_direction,
-)
 
 
 class _TokenizedPromptDataset(Dataset):
@@ -126,7 +113,6 @@ class _PreparedTaskDelta:
     # address inserted positions by ancestry instead of a depth pattern.
     extension_layout: dict[str, Any] | None = None
     # Proposal-1 native reference banks, captured before the resize.
-    residual_references: dict[str, Any] | None = None
 
 
 def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
@@ -227,172 +213,6 @@ def _prepare_resized_task_delta(
         extension_layout=extension_layout or None,
     )
 
-
-
-def _maybe_capture_target_residual_references(
-    *,
-    config: ResidualCompletionConfig,
-    source_base_model: torch.nn.Module,
-    source_ft_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    source_loader: Any,
-    target_loader: Any,
-    family_adapter: Any,
-    seed: int,
-    device: str,
-) -> dict[str, Any] | None:
-    """Capture proposal-1 native reference banks, or no-op when disabled.
-
-    Must run before the resize: these are the un-resized source model's own
-    boundary activations, paired against the pretrained target. Returns None
-    when disabled so callers can thread the result through unconditionally and
-    still get a byte-identical no-op.
-    """
-    if not config.enabled:
-        return None
-    return capture_residual_references(
-        source_base_model,
-        source_ft_model,
-        target_model,
-        source_loader,
-        target_loader,
-        num_batches=config.num_batches,
-        seed=seed,
-        device=device,
-        target_scope=config.target_scope,
-        family_adapter=family_adapter,
-    )
-
-
-def _maybe_complete_target_residual_task_vector(
-    *,
-    config: ResidualCompletionConfig,
-    references: dict[str, Any] | None,
-    prepared: Any,
-    layout: Mapping[str, Any] | None,
-    target_model: torch.nn.Module,
-    target_base_sd: Mapping[str, torch.Tensor],
-    transported_delta: dict[str, torch.Tensor],
-    target_loader: Any,
-    family_adapter: Any,
-    device: str,
-    materialized_bias_keys: set[str] | None = None,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
-    """Complete the transported task vector, or return it untouched.
-
-    Runs after transport is fitted and only ever adds to the task vector, never
-    to the target base weights. Disabled, or missing references/layout, returns
-    the same dict object so a caller hashing the delta sees no change.
-    """
-    if not config.enabled or references is None or not layout:
-        return transported_delta, None
-    # A materialized bias is a target parameter that did not exist before this
-    # run and is zero in the base, so the task vector has no entry for it --
-    # transport only produced the body weights. scale_completion requires every
-    # completion key to have a baseline to add to, so seed those zeros here.
-    # Without this the intercept has nowhere to land and the run dies at
-    # strength>0 (strength=0 returns early and never notices).
-    transported_delta = dict(transported_delta)
-    for bias_key in materialized_bias_keys or ():
-        if bias_key not in transported_delta and bias_key in target_base_sd:
-            transported_delta[bias_key] = torch.zeros_like(target_base_sd[bias_key])
-
-    transforms = projection_transforms(
-        prepared, layout, target_scope=config.target_scope, family_adapter=family_adapter
-    )
-    _source_corrections, target_corrections, diagnostics = complete_residuals(
-        target_model,
-        target_base_sd,
-        transported_delta,
-        references,
-        transforms,
-        layout,
-        target_loader,
-        config=config,
-        device=device,
-        family_adapter=family_adapter,
-    )
-    completed = scale_completion(transported_delta, target_corrections, config.strength)
-    return completed, diagnostics
-
-
-def _maybe_complete_target_residual_task_vector_direct(
-    *,
-    config: ResidualCompletionConfig,
-    references: dict[str, Any] | None,
-    layout: Mapping[str, Any] | None,
-    target_model: torch.nn.Module,
-    target_base_sd: Mapping[str, torch.Tensor],
-    transported_delta: Mapping[str, torch.Tensor],
-    passthrough_delta: Mapping[str, torch.Tensor],
-    target_loader: Any,
-    family_adapter: Any,
-    device: str,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None, list[str]]:
-    """Transport-free completion: the fitted correction *is* the task vector.
-
-    The sibling of :func:`_maybe_complete_target_residual_task_vector` for
-    ``mode='direct_target'``. The difference is not a different solver -- it is
-    that there is no ``tau_t`` to complete. The caller must therefore have
-    skipped the transport fit and apply entirely, so ``transported_delta``
-    arrives empty; that is asserted rather than assumed, because a populated
-    delta here would silently turn the arm into a transport run wearing the
-    direct arm's label.
-
-    The correction is scaled against an explicit zero baseline, which keeps
-    ``strength=0`` an exact native-target-base control exactly as on the vision
-    path.
-
-    ``passthrough_delta`` is the decoder-only wrinkle. That path splits the task
-    vector into a transportable body and a remainder (embeddings, per-layer
-    norms, lm_head) folded in verbatim; vision has no such split.
-    ``config.direct_passthrough`` decides, and the choice changes what the arm
-    measures, so it is explicit and recorded rather than implied:
-
-    * ``False`` (default) -- drop it. The arm is exactly
-      ``theta_t^0 + gamma * dtau_direct``.
-    * ``True`` -- carry the shape-compatible remainder, so the arm differs from
-      the transport arm only in how the body was built. Not strictly
-      transport-free, and ``gamma=0`` no longer reproduces the native base.
-
-    Returns ``(delta, diagnostics, skipped_passthrough_keys)``.
-    """
-    if not config.enabled or references is None or not layout:
-        return dict(transported_delta), None, []
-    if config.mode != "direct_target":
-        raise ValueError(
-            f"_maybe_complete_target_residual_task_vector_direct requires mode='direct_target', "
-            f"got {config.mode!r}"
-        )
-    if transported_delta:
-        raise ValueError(
-            "mode='direct_target' requires an empty transported task vector: the caller passed "
-            f"{len(transported_delta)} transported keys, so the transport fit was not skipped and "
-            "the arm would not be transport-free"
-        )
-    target_corrections, diagnostics = complete_residuals_direct(
-        target_model,
-        target_base_sd,
-        references,
-        layout,
-        target_loader,
-        config=config,
-        device=device,
-        family_adapter=family_adapter,
-    )
-    # complete_residuals_direct returns both the weight and the bias key per
-    # fitted component, so the zero baseline is built from its own output; no
-    # materialized-bias seeding is needed the way the transport arm needs it.
-    zero_baseline = {key: torch.zeros_like(value) for key, value in target_corrections.items()}
-    completed = scale_completion(zero_baseline, target_corrections, config.strength)
-    skipped: list[str] = []
-    if config.direct_passthrough:
-        for key, value in passthrough_delta.items():
-            if key in target_base_sd and tuple(value.shape) == tuple(target_base_sd[key].shape):
-                completed[key] = value.to(dtype=target_base_sd[key].dtype, device="cpu")
-            else:
-                skipped.append(key)
-    return completed, diagnostics, skipped
 
 
 def _summarize_merged_delta(
@@ -735,19 +555,9 @@ def main() -> None:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
         ignored_block_extension_fields = warn_decoder_ignored_fields(cfg.get("block_extension_params"))
-        # ARIADNE proposal 1 (target residual completion). Disabled by default,
-        # and resolve_block_extension_config already rejects it alongside
-        # skip_correction=true, so an enabled run always has a correction to
-        # complete.
-        residual_completion_cfg = block_extension_cfg.target_residual_completion
 
         source_depth = source_meta.num_hidden_layers if source_meta else 0
         target_depth = target_meta.num_hidden_layers if target_meta else 0
-        validate_residual_completion_depth_direction(
-            residual_completion_cfg,
-            source_depth=source_depth,
-            target_depth=target_depth,
-        )
         depth_mismatch = source_depth != target_depth
         check_pair(
             method_name,
@@ -1062,28 +872,6 @@ def main() -> None:
                 if family_adapter_for_ext is None:
                     raise ValueError("Block extension requires a family adapter but none was inferred.")
 
-                # Proposal 1: capture the native reference banks BEFORE the
-                # resize below mutates source_base_model_task/source_ft_model_task
-                # in place. These are the un-resized source's own boundary
-                # activations paired against the pretrained target, which is the
-                # information the completion later regresses against.
-                task_residual_references = _maybe_capture_target_residual_references(
-                    config=residual_completion_cfg,
-                    source_base_model=source_base_model_task,
-                    source_ft_model=source_ft_model_task,
-                    target_model=target_llm.model,
-                    source_loader=blockext_calib_loader,
-                    target_loader=_build_text_calibration_loader(
-                        tokenizer=target_llm.tokenizer,
-                        texts=_calibration().texts,
-                        batch_size=calib_batch_size,
-                        max_length=calib_max_length,
-                    ) if residual_completion_cfg.enabled else None,
-                    family_adapter=family_adapter_for_ext,
-                    seed=int(cfg.get("seed", 0)),
-                    device=device,
-                )
-
                 prepared_task = _prepare_resized_task_delta(
                     source_base_model=source_base_model_task,
                     source_ft_model=source_ft_model_task,
@@ -1093,15 +881,6 @@ def main() -> None:
                     family_adapter=family_adapter_for_ext,
                     device=device,
                 )
-                prepared_task.residual_references = task_residual_references
-                if residual_completion_cfg.enabled:
-                    layout_desc = prepared_task.extension_layout or {}
-                    print(
-                        f"  residual completion armed: scope={residual_completion_cfg.target_scope} "
-                        f"strength={residual_completion_cfg.strength} "
-                        f"inserted={len(layout_desc.get('inserted_blocks', ()))} "
-                        f"final_blocks={len(layout_desc.get('final_blocks', ()))}"
-                    )
                 print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
                 # The resized ft model has already been absorbed into the delta;
                 # drop it before the eval below so it is not holding device
@@ -1201,39 +980,11 @@ def main() -> None:
         # and a fixed alpha cannot distinguish scale from direction.
         norm_match = cfg.get("delta_norm_match", None)
         norm_match = str(norm_match).strip().lower() if norm_match is not None else None
-        direct_target_p1 = bool(
-            residual_completion_cfg.enabled and residual_completion_cfg.mode == "direct_target"
-        )
-        if residual_completion_cfg.enabled and residual_completion_cfg.mode not in {
-            "transport_residual", "direct_target"
-        }:
-            # complete_residuals() does not inspect config.mode; only the direct
-            # solver does. An unhandled mode would silently run a different
-            # method and report a plausible number for it.
-            raise ValueError(
-                f"target_residual_completion.mode={residual_completion_cfg.mode!r} is not "
-                "implemented on the LLM path."
-            )
         if norm_match not in {None, "none", "uncorrected"}:
             raise ValueError(
                 f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
             )
-        if direct_target_p1 and norm_match == "uncorrected":
-            # The rescale multiplies the whole delta by
-            # ||reference_delta restricted to transport_keys|| / ||transported||.
-            # In direct mode the delta is the fitted correction, which is not a
-            # transported image of the source task vector and is far smaller, so
-            # the ratio is a large arbitrary number that would silently blow the
-            # correction up. Refused rather than special-cased.
-            raise ValueError(
-                "delta_norm_match='uncorrected' is incompatible with "
-                "target_residual_completion.mode='direct_target': the direct arm's task vector is "
-                "the fitted correction, not a transported source vector, so matching its norm to "
-                "the source delta has no meaning and would rescale it by an arbitrary factor"
-            )
         task_vector_norms: list[dict[str, float]] = []
-        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
-        materialized_bias_keys: set[str] = set()
         for idx, prepared_task in enumerate(prepared_tasks):
             corrected_delta = prepared_task.delta
             reference_delta = prepared_task.uncorrected_delta or corrected_delta
@@ -1249,65 +1000,7 @@ def main() -> None:
             if run_block_extension_prestep:
                 prepared_task.source_model.to(device)
 
-            if direct_target_p1:
-                # Transport-free arm. THESEUS/BiCo are neither prepared nor
-                # applied: the question is whether the desired functional effect
-                # can be written into the native target base with no parameter
-                # transport at all, so fitting the transport and discarding it
-                # would burn the compute and blur the claim. The fitted
-                # correction is the entire task vector.
-                passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
-                target_calib = _build_text_calibration_loader(
-                    tokenizer=target_llm.tokenizer,
-                    texts=_calibration().texts,
-                    batch_size=calib_batch_size,
-                    max_length=calib_max_length,
-                )
-                # Same contract as the transport arm: the decoder's down_proj is
-                # bias-free, so the exact form's intercept needs a zero bias
-                # materialized in the model and the base state together.
-                if residual_completion_cfg.missing_bias == "materialize":
-                    added_bias_keys = materialize_missing_projection_biases(
-                        target_llm.model, target_base_sd, prepared_task.extension_layout or {},
-                        family_adapter=family_adapter,
-                        components=order_components(residual_completion_cfg.components),
-                    )
-                    if added_bias_keys:
-                        materialized_bias_keys.update(added_bias_keys)
-                        print(f"  materialized {len(added_bias_keys)} zero projection bias(es) for the intercept")
-                transported, completion_diagnostics, skipped_passthrough = (
-                    _maybe_complete_target_residual_task_vector_direct(
-                        config=residual_completion_cfg,
-                        references=prepared_task.residual_references,
-                        layout=prepared_task.extension_layout,
-                        target_model=target_llm.model,
-                        target_base_sd=target_base_sd,
-                        transported_delta={},
-                        passthrough_delta=passthrough_delta,
-                        target_loader=target_calib,
-                        family_adapter=family_adapter,
-                        device=device,
-                    )
-                )
-                if completion_diagnostics is not None:
-                    residual_completion_diagnostics[str(label)] = completion_diagnostics
-                    print(f"  direct completion applied to {len(completion_diagnostics)} block(s)")
-                else:
-                    # references or layout missing -> the completion never ran and
-                    # the arm measured nothing. On the transport arm that leaves a
-                    # transported vector behind; here it leaves an empty delta, so
-                    # say so loudly instead of failing later on the zero gate.
-                    raise RuntimeError(
-                        "mode='direct_target' produced no completion: the block-extension pre-step "
-                        "did not capture reference banks or a realized layout (source/target depths "
-                        "may match). The run would measure the untouched target base."
-                    )
-                if skipped_passthrough:
-                    print(
-                        f"  skipped {len(skipped_passthrough)} passthrough keys with incompatible target shape "
-                        f"(sample={skipped_passthrough[:5]})"
-                    )
-            elif method_name in ("theseus", "theseus_gqa", "bico") and transport_keys:
+            if method_name in ("theseus", "theseus_gqa", "bico") and transport_keys:
                 # Hybrid: transport body keys, identity-pass the rest
                 body_delta = {k: v for k, v in delta.items() if k in transport_keys}
                 passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
@@ -1338,21 +1031,11 @@ def main() -> None:
                         family_adapter=family_adapter,
                         device=device,
                     )
-                    # Residual completion needs the fitted transforms, so the
-                    # payload is built explicitly and handed to transport. When
-                    # completion is off, prepared stays None and transport fits
-                    # it internally exactly as before.
-                    fitted_prepared = (
-                        method.prepare(target_base=target_base_sd, delta=body_delta, **shared_kwargs, **transport_kwargs)
-                        if residual_completion_cfg.enabled
-                        else None
-                    )
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
                         delta=body_delta,
                         strict=False,
-                        prepared=fitted_prepared,
                         **shared_kwargs,
                         **transport_kwargs,
                     )
@@ -1372,58 +1055,15 @@ def main() -> None:
                         family_adapter=family_adapter,
                         device=device,
                     )
-                    fitted_prepared = (
-                        method.prepare(target_base=target_base_sd, delta=body_delta, **shared_kwargs, **transport_kwargs)
-                        if residual_completion_cfg.enabled
-                        else None
-                    )
                     transported_body = method.transport(
                         source_base=prepared_task.source_base,
                         target_base=target_base_sd,
                         delta=body_delta,
                         strict=False,
-                        prepared=fitted_prepared,
                         curvature_dataloader=None,
                         **shared_kwargs,
                         **transport_kwargs,
                     )
-                # missing_bias="materialize": give the target's down_proj a zero
-                # bias before completion runs, in the model and the base state
-                # together. A decoder has none, and the exact form needs one for
-                # its intercept; doing it here (not inside the solver) keeps the
-                # merged state, completion's strict restore, and the eval load
-                # all agreeing on the model's shape.
-                if residual_completion_cfg.enabled and residual_completion_cfg.missing_bias == "materialize":
-                    added_bias_keys = materialize_missing_projection_biases(
-                        target_llm.model, target_base_sd, prepared_task.extension_layout or {},
-                        family_adapter=family_adapter,
-                        components=order_components(residual_completion_cfg.components),
-                    )
-                    if added_bias_keys:
-                        materialized_bias_keys.update(added_bias_keys)
-                        print(f"  materialized {len(added_bias_keys)} zero projection bias(es) for the intercept")
-
-                # Proposal 1: complete the transported task vector before the
-                # passthrough keys are folded in. Only ever adds to the task
-                # vector, never to the target base weights; a disabled run gets
-                # the same object back.
-                transported_body, completion_diagnostics = _maybe_complete_target_residual_task_vector(
-                    config=residual_completion_cfg,
-                    references=prepared_task.residual_references,
-                    prepared=fitted_prepared,
-                    layout=prepared_task.extension_layout,
-                    target_model=target_llm.model,
-                    target_base_sd=target_base_sd,
-                    transported_delta=dict(transported_body),
-                    target_loader=target_calib,
-                    family_adapter=family_adapter,
-                    device=device,
-                    materialized_bias_keys=materialized_bias_keys,
-                )
-                if completion_diagnostics is not None:
-                    residual_completion_diagnostics[str(label)] = completion_diagnostics
-                    print(f"  residual completion applied to {len(completion_diagnostics)} block(s)")
-
                 out = dict(transported_body)
                 skipped_passthrough: list[str] = []
                 for k, v in passthrough_delta.items():
@@ -1484,24 +1124,6 @@ def main() -> None:
             "transport_delta_source": delta_source,
             "delta_norm_match": norm_match or "none",
             "per_task": task_vector_norms,
-            "residual_completion": {
-                "enabled": bool(residual_completion_cfg.enabled),
-                # Which arm actually ran. Recorded because the summary otherwise
-                # advertises `method` (theseus/bico) even when direct mode never
-                # fitted or applied it, which would read as a transport run.
-                "mode": residual_completion_cfg.mode,
-                "parameter_transport": "none" if direct_target_p1 else method_name,
-                "direct_passthrough": (
-                    bool(residual_completion_cfg.direct_passthrough) if direct_target_p1 else None
-                ),
-                "components": list(residual_completion_cfg.components),
-                "target_trajectory": residual_completion_cfg.target_trajectory,
-                "target_scope": residual_completion_cfg.target_scope,
-                "strength": float(residual_completion_cfg.strength),
-                "diagnostics": residual_completion_diagnostics,
-                # Parameters this run added that stock Qwen does not have.
-                "materialized_bias_keys": sorted(materialized_bias_keys),
-            },
         }
         print(
             f"\nMerged delta: keys={delta_stats['key_count']} "
@@ -1510,20 +1132,10 @@ def main() -> None:
             f"rel_norm={delta_stats['merged_delta_rel_norm']:.6f}"
         )
         if delta_stats["nonzero_key_count"] == 0:
-            if direct_target_p1 and float(residual_completion_cfg.strength) == 0.0:
-                # gamma=0 in direct mode is the exact native-target-base control:
-                # the fit still runs and reports diagnostics, and an identically
-                # zero delta is the intended result, not the silent-zero-transport
-                # failure this gate exists to catch.
-                print(
-                    "  merged delta is identically zero, as expected for the direct-mode "
-                    "gamma=0 native-target-base control"
-                )
-            else:
-                raise RuntimeError(
-                    "Merged transported delta is identically zero: every alpha would evaluate "
-                    "the untouched target base model. Check the transport diagnostics above."
-                )
+            raise RuntimeError(
+                "Merged transported delta is identically zero: every alpha would evaluate "
+                "the untouched target base model. Check the transport diagnostics above."
+            )
 
         search_planner = build_search_planner(
             cfg=cfg, base_method_params=method_params

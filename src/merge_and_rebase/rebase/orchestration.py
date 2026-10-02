@@ -20,8 +20,7 @@ class MethodResult:
     """One task's transported task vector plus the timing brackets the run summary records."""
 
     transported_delta: dict[str, Any]
-    #: Fitted transport state (``None`` for Ariadne and for the transport-free direct-target arm);
-    #: the completion stages reuse its projection transforms.
+    #: Fitted transport state (``None`` for Ariadne).
     prepared: Any = None
     transport_timing: dict[str, float] | None = None
     cost_phases: dict[str, Any] | None = None
@@ -32,30 +31,6 @@ class MethodResult:
 
 class MethodStage(Protocol):
     def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult: ...
-
-
-class CompletionStage(Protocol):
-    """Target-informed correction applied to a fitted task vector (target residual, joint, direct P1)."""
-
-    def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult, result: MethodResult) -> MethodResult: ...
-
-
-@dataclass
-class CompletionRecord:
-    """Per-task diagnostics of the completion stages (summary keys keep their legacy names)."""
-
-    residual: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    joint_blockwise: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    direct_p1: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-
-
-def direct_target_p1_requested(plan: Any, block_extension_cfg: Any) -> bool:
-    """Transport-free proposal-1 arm: ordinary parameter transport is skipped entirely."""
-    return bool(
-        (plan.task_block_extension_prestep or plan.run_same_depth_direct_target)
-        and block_extension_cfg.target_residual_completion.enabled
-        and block_extension_cfg.target_residual_completion.mode == "direct_target"
-    )
 
 
 @dataclass
@@ -123,7 +98,7 @@ class TaskLoopOutputs:
 
 
 class TaskPipeline:
-    """The per-task loop: prestep (with observers) -> method stage -> completion stages -> saver.
+    """The per-task loop: prestep (with observers) -> method stage -> saver.
 
     Everything model- or dataset-specific is injected (``build_models`` and the stage objects), so this class
     imports nothing from ``eval``. ``saver(task, transported_delta)`` is called once per transported task.
@@ -135,14 +110,12 @@ class TaskPipeline:
         prestep: DepthPrestep,
         observers: Sequence[PrestepObserver],
         method_stage: Any,
-        completion_stages: Sequence[CompletionStage],
         saver: Callable[[str, dict[str, Any]], None],
         build_models: Callable[[StageEnv, str], TaskModels | None],
     ) -> None:
         self.prestep = prestep
         self.observers = tuple(observers)
         self.method_stage = method_stage
-        self.completion_stages = tuple(completion_stages)
         self.saver = saver
         self.build_models = build_models
 
@@ -182,10 +155,7 @@ class TaskPipeline:
             pre = self.prestep.load_delta(env, task_in, pre)
             task_delta = pre.task_delta
 
-            if direct_target_p1_requested(env.plan, resolved.block_extension_cfg):
-                print(f"\n--- Direct-target P1 for '{task}' (parameter transport skipped) ---")
-            else:
-                print(f"\n--- Transporting '{task}' with method '{resolved.method.name}' ---")
+            print(f"\n--- Transporting '{task}' with method '{resolved.method.name}' ---")
             if resolved.merge.mode not in _SINGLE_TRANSPORT_MODES:
                 method_result = self.method_stage.run(env, task_in, pre)
                 out.transport_timings[task] = method_result.transport_timing
@@ -195,8 +165,6 @@ class TaskPipeline:
                 if method_result.correction_fit is not None:
                     out.correction_fit_timings[task] = method_result.correction_fit
 
-                for completion_stage in self.completion_stages:
-                    method_result = completion_stage.run(env, task_in, pre, method_result)
                 transported_delta = method_result.transported_delta
 
                 out.transported_deltas.append(transported_delta)

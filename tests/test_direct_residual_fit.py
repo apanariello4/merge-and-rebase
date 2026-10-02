@@ -304,20 +304,6 @@ def test_relative_residual_before_is_always_one(source_depth, target_depth):
 
 
 @pytest.mark.parametrize("source_depth, target_depth", REGIMES)
-def test_strength_zero_reproduces_native_target_base_exactly(source_depth, target_depth):
-    """scale_completion(gamma=0) is a full state-dict no-op; prove the fitted
-    corrections never touch anything outside their own weight/bias keys by
-    diffing the FULL state dict, not a components whitelist."""
-    corrections, _diagnostics, target_model, target_base_sd = _fit(source_depth, target_depth)
-    from merge_and_rebase.eval.target_informed_runtime import scale_completion
-
-    completed_at_zero = scale_completion(target_base_sd, corrections, 0)
-    assert set(completed_at_zero) == set(target_base_sd)
-    for key, value in target_base_sd.items():
-        assert torch.equal(completed_at_zero[key], value), key
-
-
-@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
 def test_target_corrections_only_touch_configured_components(source_depth, target_depth):
     corrections, _diagnostics, _model, target_base_sd = _fit(source_depth, target_depth)
     for key in corrections:

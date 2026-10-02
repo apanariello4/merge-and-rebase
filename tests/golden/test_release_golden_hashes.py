@@ -31,8 +31,6 @@ from merge_and_rebase.eval.direct_residual import (
     fit_direct_residual_streaming,
     prepare_direct_residual_streaming,
 )
-from merge_and_rebase.eval.target_informed_runtime import capture_residual_references, complete_residuals_direct
-from merge_and_rebase.eval.target_residual_completion import ResidualCompletionConfig
 from merge_and_rebase.rebase.discrete_layer_match import DiscreteLayerPairing
 
 from ._hashing import deterministic_cpu, flatten_tensors, hash_json, hash_tensor_dict
@@ -101,14 +99,6 @@ EXPECTED: dict[str, str] = {
     "brace_vision_shrink_interpolate_shared_ft:ft_state": "31abfad7eea8cc938eb7200fa24ad8fde587f0c2614d235adcd3264ebca255b0",
     "brace_vision_shrink_interpolate_shared_ft:layout": "d5ce7bc70e71528c76d7b144a56b5f1c05bb0c59063b81f62f0cb59bac7c2a59",
     "brace_vision_shrink_interpolate_shared_ft:task_vector": "60ced8b4cb1274fb82a04fff3ca090e38a3ac23444badb371da365f60590968c",
-    "complete_residuals_direct_empirical_bayes:extend:diagnostics": "93e25baa3788787a7bd6186c1e9aaa57238fa6881a5fe1afbadcf9a787661081",
-    "complete_residuals_direct_empirical_bayes:extend:task_vector": "3057b0aabc072225af942ee939ef0136da0fa8655a1e03c6d640566d8f7014db",
-    "complete_residuals_direct_empirical_bayes:shrink:diagnostics": "6c46da515be30573b3e28c67919d3f8fe3dd4c8a71edf40c61c253bd9b2df7ea",
-    "complete_residuals_direct_empirical_bayes:shrink:task_vector": "6475039c4d88975af6fd76696082cb7cdc600e8d7efa56c588befc7fa551bb33",
-    "complete_residuals_direct_fixed_relative:extend:diagnostics": "0b6691566fde49ae484a33b3f55f1aae1e035cb06eea4df7c9dcd041abfa2433",
-    "complete_residuals_direct_fixed_relative:extend:task_vector": "db4cebbaeec743066976d0f363a02f1e6440778ef8c801bc17a712c09c5819b0",
-    "complete_residuals_direct_fixed_relative:shrink:diagnostics": "4b23327f34ac654094cc96fa7cb8145be144963151600bbe45773ec87ba864f5",
-    "complete_residuals_direct_fixed_relative:shrink:task_vector": "f2c3817d4e9de77e5fa72b95469c5b881c5d6932148dadd3516a689635ab388d",
     "dr_alignment_ridge_streaming:extend:alignment": "2c1b900133f2832ad56a510ea0a8bc51c8891f3c1e68131199eab426dcd594d1",
     "dr_alignment_ridge_streaming:extend:task_vector": "0b9d5a3ca8bf2470d00daf3a27954a738e70c7adc2587cde0cdd566e3ffe1762",
     "dr_alignment_ridge_streaming:shrink:alignment": "d68ec69ff895eda8cce861710365359b8d58fecddda0d52931d8b6e669154b23",
@@ -512,60 +502,6 @@ def test_direct_residual_gradient_procrustes(storage, direction):
     name = f"dr_gradient_procrustes_{storage}:{direction}"
     _check(f"{name}:task_vector", hash_tensor_dict(tv))
     _check(f"{name}:alignment", hash_tensor_dict(alignment))
-
-
-# --------------------------------------------------------------------------------------
-# complete_residuals_direct (ARIADNE direct_target, target_scope="all"): shares the
-# _fit_all_positions_independent kernel with Direct Residual. Fixture adapted from
-# tests/test_direct_residual_extend_anchor.py; the layout is forced to the discrete
-# pairing so extend (2 -> 4) and shrink (4 -> 2) both address every target position.
-# --------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("direction", ["extend", "shrink"])
-@pytest.mark.parametrize("ridge_estimator", ["fixed_relative", "empirical_bayes"])
-def test_complete_residuals_direct(ridge_estimator, direction):
-    source_depth, target_depth = DEPTHS[direction]
-    torch.manual_seed(21)
-    source_base = _Model(5, source_depth).eval()
-    target_base = _Model(5, target_depth).eval()
-    source_ft = deepcopy(source_base)
-    torch.manual_seed(22)
-    with torch.no_grad():
-        for block in source_ft.visual.transformer.resblocks:
-            block.mlp.c_proj.weight.add_(0.2 * torch.randn_like(block.mlp.c_proj.weight))
-            block.attn.out_proj.weight.add_(0.2 * torch.randn_like(block.attn.out_proj.weight))
-    generator = torch.Generator().manual_seed(23)
-    images = torch.randn(8, 5, 4, generator=generator)
-    data = DataLoader(TensorDataset(images, torch.arange(8)), batch_size=2, shuffle=False)
-    target_base_sd = {k: v.clone() for k, v in target_base.state_dict().items()}
-    pairing = DiscreteLayerPairing.compute(source_depth, target_depth)
-    layout = {
-        "final_blocks": [
-            {"position": j, "source_orig_idx": pairing.pairing[j], "block_kind": "final"} for j in range(target_depth)
-        ]
-    }
-    config = ResidualCompletionConfig(
-        enabled=True,
-        mode="direct_target",
-        target_scope="all",
-        target_trajectory="step",
-        cascade_order="independent",
-        components=("attn.out_proj", "mlp.c_proj"),
-        ridge_relative=0.05,
-        ridge_estimator=ridge_estimator,
-        num_batches=3,
-    )
-    references = capture_residual_references(
-        source_base, source_ft, target_base, data, data, num_batches=3, seed=17, device="cpu", target_scope="all"
-    )
-    corrections, diagnostics = complete_residuals_direct(
-        target_base, target_base_sd, references, layout, data, config=config, device="cpu"
-    )
-    assert corrections
-    name = f"complete_residuals_direct_{ridge_estimator}:{direction}"
-    _check(f"{name}:task_vector", hash_tensor_dict(corrections))
-    _check(f"{name}:diagnostics", hash_json(diagnostics))
 
 
 # --------------------------------------------------------------------------------------

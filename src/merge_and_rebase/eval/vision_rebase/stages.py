@@ -30,10 +30,8 @@ from ...rebase.prestep import (
     select_prestep_kind,
 )
 from ..block_extension import run_block_extension, select_loader
-from ..target_informed_runtime import capture_residual_references, capture_resized_joint_source_inputs
 from ..utils import to_cpu_fp32
 from .artifacts import _state_dict_sha256
-from .completion import _maybe_capture_target_residual_references
 from .source_lmc import _evaluate_source_lmc, _evaluate_source_model_top1
 
 
@@ -73,7 +71,6 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         and (
             plan.task_block_extension_prestep
             or plan.task_discrete_layer_match_prestep
-            or plan.run_same_depth_direct_target
             or env.resolved.lmc.block_extension_eval_enabled
         )
     ):
@@ -185,10 +182,8 @@ class BracePrestep:
     def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
         resolved = env.resolved
         block_extension_cfg = resolved.block_extension_cfg
-        cfg = env.cfg
         device = env.device
         t = task.task
-        loaders = task.loaders
         source_loaders = task.source_loaders
         target_depth = env.target_depth
         source_base_model_task = None if models is None else models.source_base
@@ -209,67 +204,6 @@ class BracePrestep:
                 val_loader=source_loaders.val,
             )
         references.source_calibration_loader = calibration_loader
-        if block_extension_cfg.target_residual_completion.enabled:
-            # ARIADNE proposal 1: capture the native reference banks
-            # (source base/ft boundary activations, paired against the
-            # pretrained target model) BEFORE block extension resizes
-            # source_base_model_task/source_ft_model_task in place.
-            # These are the un-transported, un-inserted references the
-            # completion step later regresses each inserted block's
-            # c_proj projection against.
-            references.residual_target_loader = select_loader(
-                block_extension_cfg.calibration_split,
-                train_loader=loaders.train,
-                test_loader=loaders.test,
-                val_loader=loaders.val,
-            )
-            references.residual = _maybe_capture_target_residual_references(
-                config=block_extension_cfg.target_residual_completion,
-                source_base_model=source_base_model_task,
-                source_ft_model=source_ft_model_task,
-                target_model=env.clf_target.model,
-                source_loader=calibration_loader,
-                target_loader=references.residual_target_loader,
-                seed=int(cfg.get("seed", 42)),
-                device=device,
-            )
-        if block_extension_cfg.joint_blockwise_correction.enabled:
-            references.joint_target_loader = select_loader(
-                block_extension_cfg.calibration_split,
-                train_loader=loaders.train,
-                test_loader=loaders.test,
-                val_loader=loaders.val,
-            )
-            references.joint = capture_residual_references(
-                source_base_model_task,
-                source_ft_model_task,
-                env.clf_target.model,
-                calibration_loader,
-                references.joint_target_loader,
-                num_batches=block_extension_cfg.n_batches_act,
-                seed=int(cfg.get("seed", 42)),
-                device=device,
-                capture_joint=True,
-            )
-        if block_extension_cfg.direct_p1_correction.enabled:
-            references.direct_p1_target_loader = select_loader(
-                block_extension_cfg.calibration_split,
-                train_loader=loaders.train,
-                test_loader=loaders.test,
-                val_loader=loaders.val,
-            )
-            references.direct_p1 = capture_residual_references(
-                source_base_model_task,
-                source_ft_model_task,
-                env.clf_target.model,
-                calibration_loader,
-                references.direct_p1_target_loader,
-                num_batches=block_extension_cfg.n_batches_act,
-                seed=int(cfg.get("seed", 42)),
-                device=device,
-                capture_joint=True,
-            )
-
         task_extension_layout: dict[str, Any] = {}
         final_depth = run_block_extension(
             source_base_model=source_base_model_task,
@@ -289,15 +223,6 @@ class BracePrestep:
             raise RuntimeError(
                 f"Block extension preprocess failed for task '{t}': final_depth={final_depth}, expected={target_depth}."
             )
-        if block_extension_cfg.joint_blockwise_correction.enabled:
-            references.joint = capture_resized_joint_source_inputs(
-                source_base_model_task,
-                calibration_loader,
-                references.joint,
-                task_extension_layout,
-                device=device,
-            )
-
         task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
         task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
         task_delta = TaskVector.from_checkpoints(
@@ -387,71 +312,11 @@ class DiscreteIndexPrestep:
         return pre
 
 
-class SameDepthDirectTargetPrestep(_NativeDeltaMixin):
-    """Equal-depth direct-target P1: native reference capture plus an identity layout; delta is the native one."""
-
-    kind = PrestepKind.SAME_DEPTH_DIRECT_TARGET
-
-    def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
-        block_extension_cfg = env.resolved.block_extension_cfg
-        source_loaders = task.source_loaders
-        loaders = task.loaders
-        if source_loaders is None or models is None or models.source_base is None or models.source_ft is None:
-            raise RuntimeError("Same-depth direct-target P1 requires source models and calibration loaders.")
-        references = CapturedReferences()
-        calibration_loader = select_loader(
-            block_extension_cfg.calibration_split,
-            train_loader=source_loaders.train,
-            test_loader=source_loaders.test,
-            val_loader=source_loaders.val,
-        )
-        references.residual_target_loader = select_loader(
-            block_extension_cfg.calibration_split,
-            train_loader=loaders.train,
-            test_loader=loaders.test,
-            val_loader=loaders.val,
-        )
-        references.residual = _maybe_capture_target_residual_references(
-            config=block_extension_cfg.target_residual_completion,
-            source_base_model=models.source_base,
-            source_ft_model=models.source_ft,
-            target_model=env.clf_target.model,
-            source_loader=calibration_loader,
-            target_loader=references.residual_target_loader,
-            seed=int(env.cfg.get("seed", 42)),
-            device=env.device,
-        )
-        task_extension_layout = {
-            "direction": "extend",
-            "final_blocks": [
-                {
-                    "position": pos,
-                    "source_orig_idx": pos,
-                    "span_orig_idxs": [pos],
-                    "block_kind": "original",
-                }
-                for pos in range(env.target_depth)
-            ],
-            "inserted_blocks": [],
-        }
-        env.recorded_extension_layout = dict(task_extension_layout)
-        return PrestepResult(
-            kind=self.kind,
-            source_base_sd=env.source_base_sd,
-            source_base_model=models.source_base,
-            source_ft_model=models.source_ft,
-            layout=task_extension_layout,
-            references=references,
-        )
-
-
 def build_prestep(plan: Any) -> DepthPrestep:
     """Select the per-task prestep once from the ``RunPlan``."""
     kind = select_prestep_kind(plan)
     if kind is PrestepKind.BRACE:
         return BracePrestep()
-    if kind is PrestepKind.SAME_DEPTH_DIRECT_TARGET:
-        return SameDepthDirectTargetPrestep()
     if kind is PrestepKind.DISCRETE_INDEX:
         return DiscreteIndexPrestep()
     return NoPrestep()

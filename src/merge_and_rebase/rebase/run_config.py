@@ -36,7 +36,6 @@ import torch
 from merge_and_rebase.utils.helpers import parse_csv
 
 from . import get_method
-from .block_extension.completion_config import validate_residual_completion_depth_direction
 from .block_extension.config import (
     BlockExtensionConfig,
     parse_depth_rule_schema,
@@ -184,13 +183,7 @@ class ResolvedRunConfig:
         """Post-model guards and prestep flags (needs the real source/target depths)."""
         if self.depth_guard is not None and source_depth != target_depth:
             raise ConfigMeaningChangedError(self.depth_guard)
-        block_extension_cfg = self.block_extension_cfg
         blockext_like_method = self.blockext_like_method
-        validate_residual_completion_depth_direction(
-            block_extension_cfg.target_residual_completion,
-            source_depth=source_depth,
-            target_depth=target_depth,
-        )
         run_block_extension_prestep = bool(
             blockext_like_method
             and self.block_extension_enabled
@@ -200,32 +193,6 @@ class ResolvedRunConfig:
         run_discrete_layer_match_prestep = bool(
             blockext_like_method and self.depth_rule.kind == "discrete_index_match" and source_depth != target_depth
         )
-        # Direct-target P1 can write into a native target model at equal depth;
-        # in that case it uses an identity layout instead of an ARIADNE resize.
-        run_same_depth_direct_target = bool(
-            blockext_like_method
-            and self.block_extension_enabled
-            and source_depth == target_depth
-            and block_extension_cfg.target_residual_completion.enabled
-            and block_extension_cfg.target_residual_completion.mode == "direct_target"
-        )
-        if self.depth_rule.kind == "discrete_index_match" and (
-            block_extension_cfg.target_residual_completion.enabled
-            or block_extension_cfg.joint_blockwise_correction.enabled
-            or block_extension_cfg.direct_p1_correction.enabled
-        ):
-            raise ValueError(
-                "depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "
-                "joint_blockwise_correction, and direct_p1_correction."
-            )
-        if block_extension_cfg.joint_blockwise_correction.enabled or block_extension_cfg.direct_p1_correction.enabled:
-            if not blockext_like_method:
-                raise ValueError("Joint/direct P1 correction requires a Theseus- or BiCo-like transport method")
-            if not run_block_extension_prestep:
-                raise ValueError(
-                    "Joint/direct P1 correction requires a depth-mismatched source/target pair "
-                    "so that ARIADNE realizes inserted blocks"
-                )
         if self.merge.mode == "merge_then_rebase" and run_block_extension_prestep:
             raise NotImplementedError(
                 "merge_then_rebase does not support the block-extension prestep yet: "
@@ -241,7 +208,6 @@ class ResolvedRunConfig:
             target_depth=int(target_depth),
             run_block_extension_prestep=run_block_extension_prestep,
             run_discrete_layer_match_prestep=run_discrete_layer_match_prestep,
-            run_same_depth_direct_target=run_same_depth_direct_target,
             task_block_extension_prestep=bool(run_block_extension_prestep and per_task_gate),
             task_discrete_layer_match_prestep=bool(run_discrete_layer_match_prestep and per_task_gate),
         )
@@ -255,7 +221,6 @@ class RunPlan:
     target_depth: int
     run_block_extension_prestep: bool
     run_discrete_layer_match_prestep: bool
-    run_same_depth_direct_target: bool
     task_block_extension_prestep: bool
     task_discrete_layer_match_prestep: bool
 
@@ -333,9 +298,6 @@ def resolve_depth_rule(
                     and block_extension_cfg.target_shared_correction.active,
                 ),
                 ("correction_scope!='inserted'", block_extension_cfg.correction_scope != "inserted"),
-                ("target_residual_completion", block_extension_cfg.target_residual_completion.enabled),
-                ("joint_blockwise_correction", block_extension_cfg.joint_blockwise_correction.enabled),
-                ("direct_p1_correction", block_extension_cfg.direct_p1_correction.enabled),
             )
             if active
         ]

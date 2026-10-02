@@ -8,9 +8,7 @@ This module is deliberately model- and dataset-agnostic: it defines the result r
 ``run_block_extension`` and the vision key filter, live in ``eval/vision_rebase/stages.py`` and are
 selected there from ``select_prestep_kind``.
 
-Invariant owned by the concrete BRACE stage: target-residual / joint / direct-P1 reference capture
-runs BEFORE ``run_block_extension`` resizes the source models in place; the joint references are
-augmented with the resized source inputs only after the resize.
+(The target-informed completion stages and their reference capture were retired on 2026-10-02.)
 """
 
 from __future__ import annotations
@@ -27,15 +25,12 @@ class PrestepKind(enum.Enum):
     NONE = "none"
     BRACE = "brace"
     DISCRETE_INDEX = "discrete_index"
-    SAME_DEPTH_DIRECT_TARGET = "same_depth_direct_target"
 
 
 def select_prestep_kind(plan: RunPlan) -> PrestepKind:
     """Per-task prestep kind. The precedence is the legacy ``if/elif`` order of ``main()``."""
     if plan.task_block_extension_prestep:
         return PrestepKind.BRACE
-    if plan.run_same_depth_direct_target:
-        return PrestepKind.SAME_DEPTH_DIRECT_TARGET
     if plan.task_discrete_layer_match_prestep:
         return PrestepKind.DISCRETE_INDEX
     return PrestepKind.NONE
@@ -91,21 +86,15 @@ class IndependentEndpoints:
 
 @dataclass
 class CapturedReferences:
-    """Native reference banks captured before the structural resize (None when not requested)."""
+    """Run-time references a prestep hands on (None when not requested)."""
 
-    residual: dict[str, Any] | None = None
-    residual_target_loader: Any = None
-    joint: dict[str, Any] | None = None
-    joint_target_loader: Any = None
-    direct_p1: dict[str, Any] | None = None
-    direct_p1_target_loader: Any = None
-    #: Source-side calibration loader the BRACE prestep used (direct-P1 completion re-reads it).
+    #: Source-side calibration loader the BRACE prestep used.
     source_calibration_loader: Any = None
 
 
 @dataclass
 class PrestepResult:
-    """Everything the method / completion stages need from the depth prestep."""
+    """Everything the method stage needs from the depth prestep."""
 
     kind: PrestepKind
     source_base_sd: dict[str, Any]

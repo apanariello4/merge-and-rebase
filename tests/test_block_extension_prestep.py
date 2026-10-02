@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from merge_and_rebase.eval.block_extension import (
     BlockExtender,
     BlockExtensionConfig,
-    block_extension_protocol,
     resolve_block_extension_config,
     run_block_extension,
     select_loader,
@@ -107,105 +106,6 @@ def test_resolve_block_extension_config_defaults() -> None:
     assert cfg.extension_strategy == "interpolate_per_weight"
     assert cfg.insertion_order == "bottom-top"
     assert cfg.ridge_weight == 1e-6
-    assert not cfg.joint_blockwise_correction.enabled
-
-
-def test_direct_target_can_use_layout_only_block_extension() -> None:
-    """Direct P1 needs the realized layout, not source-side ARIADNE fits."""
-    _, cfg = resolve_block_extension_config(
-        {
-            "block_extension_enabled": True,
-            "block_extension_params": {
-                "skip_correction": True,
-                "lmc_mode": "independent",
-                "target_residual_completion": {
-                    "enabled": True,
-                    "mode": "direct_target",
-                    "target_scope": "all",
-                },
-            },
-        }
-    )
-    assert cfg.skip_correction is True
-    assert cfg.lmc_mode == "independent"
-    semantics = block_extension_protocol(cfg)
-    assert semantics["label"] == "direct_target_layout_only"
-    assert semantics["initialization"] == "layout_only"
-
-
-def test_resolve_block_extension_config_accepts_joint_blockwise_option3() -> None:
-    _, cfg = resolve_block_extension_config(
-        {
-            "block_extension_enabled": True,
-            "block_extension_params": {
-                "lmc_mode": "shared",
-                "extension_strategy": "duplicate_per_weight",
-                "calibration_split": "val",
-                "joint_blockwise_correction": {
-                    "enabled": True,
-                    "source_weight": 0.5,
-                    "target_weight": 2.0,
-                    "ridge_relative": 0.02,
-                }
-            },
-        }
-    )
-    assert cfg.joint_blockwise_correction.enabled
-    assert cfg.joint_blockwise_correction.source_weight == 0.5
-    assert cfg.joint_blockwise_correction.target_weight == 2.0
-    with pytest.raises(ValueError, match="requires lmc_mode='shared'"):
-        resolve_block_extension_config(
-            {"block_extension_params": {"joint_blockwise_correction": {"enabled": True}}}
-        )
-    with pytest.raises(ValueError, match="requires calibration_split='val'"):
-        resolve_block_extension_config(
-            {
-                "block_extension_params": {
-                    "lmc_mode": "shared",
-                    "extension_strategy": "duplicate_per_weight",
-                    "joint_blockwise_correction": {"enabled": True},
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        resolve_block_extension_config(
-            {
-                "block_extension_params": {
-                    "target_residual_completion": {"enabled": True},
-                    "joint_blockwise_correction": {"enabled": True},
-                }
-            }
-        )
-
-
-def test_resolve_block_extension_config_accepts_direct_p1_correction() -> None:
-    _, cfg = resolve_block_extension_config(
-        {
-            "block_extension_enabled": True,
-            "block_extension_params": {
-                "lmc_mode": "shared",
-                "extension_strategy": "duplicate_per_weight",
-                "calibration_split": "val",
-                "direct_p1_correction": {
-                    "enabled": True,
-                    "source_weight": 1.0,
-                    "target_weight": 0.1,
-                    "ridge_relative": 0.02,
-                },
-            },
-        }
-    )
-    assert cfg.direct_p1_correction.enabled
-    assert cfg.direct_p1_correction.target_weight == 0.1
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        resolve_block_extension_config(
-            {
-                "block_extension_params": {
-                    "target_residual_completion": {"enabled": True},
-                    "direct_p1_correction": {"enabled": True},
-                }
-            }
-        )
 
 
 def test_resolve_block_extension_config_accepts_two_ridge_coefficients() -> None:

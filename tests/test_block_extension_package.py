@@ -31,16 +31,6 @@ _CONFIG_NAMES = (
     "_as_optional_dict_float",
 )
 
-_COMPLETION_CONFIG_NAMES = (
-    "ResidualCompletionConfig",
-    "JointCorrectionConfig",
-    "parse_residual_completion_config",
-    "parse_joint_correction_config",
-    "validate_residual_completion_depth_direction",
-    "_DEFAULT_COMPONENTS",
-    "_ALL_COMPONENT_NAMES",
-)
-
 _SCHEDULE_NAMES = (
     "spread_anchor_schedule",
     "balanced_collapse_spans",
@@ -50,21 +40,13 @@ _SCHEDULE_NAMES = (
     "build_reduction_layout",
 )
 
-_PACKAGE_MODULES = ("config", "completion_config", "schedules", "adapters", "core", "vision", "decoder")
+_PACKAGE_MODULES = ("config", "schedules", "adapters", "core", "vision", "decoder")
 
 
 @pytest.mark.parametrize("name", _CONFIG_NAMES)
 def test_config_names_are_reexported_by_identity(name):
     from merge_and_rebase.eval import block_extension as old
     from merge_and_rebase.rebase.block_extension import config as new
-
-    assert getattr(old, name) is getattr(new, name)
-
-
-@pytest.mark.parametrize("name", _COMPLETION_CONFIG_NAMES)
-def test_completion_config_names_are_reexported_by_identity(name):
-    from merge_and_rebase.eval import target_residual_completion as old
-    from merge_and_rebase.rebase.block_extension import completion_config as new
 
     assert getattr(old, name) is getattr(new, name)
 

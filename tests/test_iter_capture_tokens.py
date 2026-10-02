@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from merge_and_rebase.eval.target_informed_runtime import capture_tokens, iter_capture_tokens
+from merge_and_rebase.rebase.methods._ariadne.capture import capture_tokens, iter_capture_tokens
 
 
 class _Attention(torch.nn.Module):

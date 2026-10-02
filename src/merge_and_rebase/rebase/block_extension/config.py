@@ -8,15 +8,8 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any
-
-from .completion_config import (
-    JointCorrectionConfig,
-    ResidualCompletionConfig,
-    parse_joint_correction_config,
-    parse_residual_completion_config,
-)
 
 
 @dataclass(frozen=True)
@@ -91,17 +84,6 @@ class BlockExtensionConfig:
     inserted_block_mode: str = "ariadne"
     # Opt-in target-informed correction target for inserted blocks.
     target_shared_correction: TargetSharedCorrection | None = None
-    # Opt-in target-informed residual completion (ARIADNE proposal 1) for
-    # inserted blocks' c_proj projections. ``enabled=False`` (the default) is
-    # the standard ARIADNE path and does not touch any target-informed code.
-    target_residual_completion: ResidualCompletionConfig = field(default_factory=ResidualCompletionConfig)
-    # Opt-in Option 3 frozen-map joint source/target blockwise solve.  The
-    # default is disabled so historical ARIADNE and Proposal-1 runs are
-    # byte-compatible and do not allocate the additional activation banks.
-    joint_blockwise_correction: JointCorrectionConfig = field(default_factory=JointCorrectionConfig)
-    # Two-pass direct hybrid: fit frozen transport first, then refine the
-    # shared ARIADNE c_proj affine map with a P1 residual objective.
-    direct_p1_correction: JointCorrectionConfig = field(default_factory=JointCorrectionConfig)
     # Which blocks receive a component correction. ``inserted`` is the paper's
     # scope and the default. ``interleaved_once`` additionally repairs the
     # original block immediately above each insertion, which over the
@@ -124,74 +106,19 @@ class BlockExtensionConfig:
 
 
 def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
-    """Describe the structural/P1 semantics of a resolved BRACE config.
+    """Describe the structural semantics of a resolved BRACE config.
 
-    ``residual_identity`` is a structural initialization, not a baseline once
-    target residual completion is enabled: Proposal 1 can populate the
-    inserted positions' task-vector projections after transport.  Keep this
-    distinction explicit in run summaries and diagnostics so the exploratory
-    arm cannot be mistaken for the untouched identity control.
+    ``residual_identity`` is a structural initialization (an exact identity on the residual stream), not a
+    competitive baseline to be confused with the canonical ARIADNE correction; keep the distinction explicit in
+    run summaries. (The target-informed completion protocols were retired; their labels are gone with them.)
     """
-    proposal_1 = bool(config.target_residual_completion.enabled)
-    layout_only_direct_target = bool(
-        proposal_1 and config.target_residual_completion.mode == "direct_target" and config.skip_correction
-    )
-    option_3 = bool(config.joint_blockwise_correction.enabled)
-    direct_p1 = bool(config.direct_p1_correction.enabled)
-    if direct_p1:
-        return {
-            "label": "ariadne_direct_p1_shared_correction",
-            "initialization": "ariadne",
-            "proposal": "direct_p1_shared_correction",
-            "is_baseline": False,
-            "interpretation": "second shared c_proj affine pass with frozen transport and P1 residual objective",
-        }
-    if option_3:
-        return {
-            "label": "ariadne_plus_joint_blockwise_option3",
-            "initialization": "ariadne",
-            "proposal": "joint_blockwise_option3",
-            "is_baseline": False,
-            "interpretation": (
-                "frozen-map one-alternation additive source/target c_proj solve; "
-                "transport maps remain fixed and corrections are mounted sequentially"
-            ),
-        }
-    if layout_only_direct_target:
-        return {
-            "label": "direct_target_layout_only",
-            "initialization": "layout_only",
-            "proposal": "target_residual_completion",
-            "is_baseline": False,
-            "interpretation": (
-                "transport-free P1 with structural correction skipped: the realized "
-                "extension/reduction layout addresses native source references, while "
-                "the fitted target-space correction is the entire task vector"
-            ),
-        }
-    if proposal_1 and config.inserted_block_mode == "residual_identity":
-        return {
-            "label": "residual_identity_plus_proposal_1",
-            "initialization": "residual_identity",
-            "proposal": "target_residual_completion",
-            "is_baseline": False,
-            "interpretation": "identity initialization + P1; exploratory ablation, not a baseline",
-        }
     if config.inserted_block_mode == "residual_identity":
         return {
             "label": "residual_identity_baseline",
             "initialization": "residual_identity",
             "proposal": None,
             "is_baseline": True,
-            "interpretation": "zero-output residual-identity initialization without P1",
-        }
-    if proposal_1:
-        return {
-            "label": "ariadne_plus_proposal_1",
-            "initialization": "ariadne",
-            "proposal": "target_residual_completion",
-            "is_baseline": False,
-            "interpretation": "ARIADNE initialization + P1",
+            "interpretation": "zero-output residual-identity initialization",
         }
     return {
         "label": "ariadne",
@@ -405,14 +332,27 @@ def parse_depth_rule_schema(cfg: Mapping[str, Any], *, warn: bool = True) -> Dep
 
 _MISPLACED_TOP_LEVEL_KEYS = (
     "target_shared_correction",
-    "target_residual_completion",
-    "joint_blockwise_correction",
-    "direct_p1_correction",
     "capture_target_residual_reference",
 )
 
+# Target-informed completion protocols retired on 2026-10-02 (archived under .repo-archive/). Their keys, at the top
+# level of a run config or under ``block_extension_params``, are an error rather than a silent no-op.
+RETIRED_COMPLETION_KEYS = ("target_residual_completion", "joint_blockwise_correction", "direct_p1_correction")
+
+
+def reject_retired_completion_keys(*mappings: Mapping[str, Any] | None) -> None:
+    found = sorted({k for m in mappings if isinstance(m, Mapping) for k in RETIRED_COMPLETION_KEYS if k in m})
+    if found:
+        raise ValueError(
+            f"{found} retired: the target-informed completion protocols (target_residual_completion, "
+            "joint_blockwise_correction, direct_p1_correction) were removed from the codebase "
+            "(archived under .repo-archive/2026-10-02-target-informed/). Remove the key(s); BRACE's "
+            "target_shared_correction and the Ariadne method are unaffected."
+        )
+
 
 def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockExtensionConfig]:
+    reject_retired_completion_keys(cfg, cfg.get("block_extension_params") if isinstance(cfg, Mapping) else None)
     misplaced = [key for key in _MISPLACED_TOP_LEVEL_KEYS if key in cfg]
     if misplaced:
         raise ValueError(
@@ -509,90 +449,6 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
                 "for the per-image Procrustes pairing to be formable."
             )
 
-    target_residual_completion = parse_residual_completion_config(params.get("target_residual_completion", None))
-    joint_blockwise_correction = parse_joint_correction_config(params.get("joint_blockwise_correction", None))
-    direct_p1_correction = parse_joint_correction_config(params.get("direct_p1_correction", None))
-    enabled_target_methods = sum(
-        int(flag)
-        for flag in (
-            target_residual_completion.enabled,
-            joint_blockwise_correction.enabled,
-            direct_p1_correction.enabled,
-        )
-    )
-    if enabled_target_methods > 1:
-        raise ValueError(
-            "target_residual_completion, joint_blockwise_correction, and direct_p1_correction are mutually exclusive; "
-            "enable one target-informed correction protocol per run."
-        )
-    for option_name, option_enabled in (
-        ("joint_blockwise_correction", joint_blockwise_correction.enabled),
-        ("direct_p1_correction", direct_p1_correction.enabled),
-    ):
-        if not option_enabled:
-            continue
-        if target_shared_correction is not None and target_shared_correction.active:
-            raise ValueError(
-                f"{option_name} and target_shared_correction are mutually exclusive; "
-                "change one target-informed factor at a time."
-            )
-        if skip_correction:
-            raise ValueError(f"{option_name} requires skip_correction=false.")
-        if str(params.get("lmc_mode", "independent")) != "shared":
-            raise ValueError(f"{option_name} requires lmc_mode='shared'.")
-        if inserted_block_mode != "ariadne":
-            raise ValueError(f"{option_name} requires inserted_block_mode='ariadne'.")
-        if correction_scope != "inserted":
-            raise ValueError(f"{option_name} currently requires correction_scope='inserted'.")
-        if transport_activation_mode != "model":
-            raise ValueError(f"{option_name} requires transport_activation_mode='model'.")
-        if str(params.get("insertion_target_mode", "direct")) != "direct":
-            raise ValueError(f"{option_name} requires insertion_target_mode='direct'.")
-        if str(params.get("insertion_order", "bottom-top")) != "bottom-top":
-            raise ValueError(f"{option_name} requires insertion_order='bottom-top'.")
-        if str(params.get("collapse_schedule", "cascade")) not in {"cascade", "disjoint_spans"}:
-            raise ValueError("collapse_schedule must be 'cascade' or 'disjoint_spans'.")
-        if str(params.get("extension_density", "spread")) not in {"spread", "spread_mod"}:
-            raise ValueError(f"{option_name} requires spread extension density.")
-        if str(params.get("extension_strategy", "interpolate_per_weight")) != "duplicate_per_weight":
-            raise ValueError(f"{option_name} requires extension_strategy='duplicate_per_weight'.")
-        if str(params.get("calibration_split", "test")) != "val":
-            raise ValueError(f"{option_name} requires calibration_split='val'.")
-        if params.get("calibration_dataset") is not None or params.get("calibration_task") is not None:
-            raise ValueError(f"{option_name} requires task-local calibration data.")
-        if bool(params.get("share_ft_refs", False)):
-            raise ValueError(f"{option_name} requires share_ft_refs=false.")
-    if target_residual_completion.enabled:
-        # The ordinary arm completes a corrected ARIADNE insertion.  The one
-        # exploratory exception is explicit residual_identity + P1: the
-        # inserted block starts as an exact identity, and P1 is then allowed to
-        # populate its transported c_proj task-vector components.  The inert
-        # identity mode remains rejected because it intentionally removes the
-        # inserted task vector everywhere, making P1's interpretation
-        # ambiguous rather than a test of activation of empty depth.
-        direct_layout_only = skip_correction and target_residual_completion.mode == "direct_target"
-        identity_p1 = skip_correction and inserted_block_mode == "residual_identity" and not direct_layout_only
-        if skip_correction and not (identity_p1 or direct_layout_only):
-            raise ValueError(
-                "block_extension_params.target_residual_completion with skip_correction=true "
-                "requires mode='direct_target' (layout-only P1) or "
-                "inserted_block_mode='residual_identity' (the identity initialization + P1 ablation)."
-            )
-        if not direct_layout_only and str(params.get("lmc_mode", "independent")) != "shared":
-            raise ValueError("block_extension_params.target_residual_completion requires lmc_mode='shared'.")
-        if not skip_correction and inserted_block_mode != "ariadne":
-            raise ValueError(
-                "block_extension_params.target_residual_completion fits a real inserted block and "
-                f"is undefined for inserted_block_mode='{inserted_block_mode}'."
-            )
-        if identity_p1 and transport_activation_mode != "model":
-            raise ValueError(
-                "residual_identity + Proposal 1 requires transport_activation_mode='model': "
-                "interpolated-neighbor activations would confound the identity initialization ablation."
-            )
-        if identity_p1 and str(params.get("insertion_target_mode", "direct")) != "direct":
-            raise ValueError("residual_identity + Proposal 1 requires insertion_target_mode='direct'.")
-
     return enabled, BlockExtensionConfig(
         blocks_to_add=_as_optional_int(params.get("blocks_to_add", None)),
         target_layers_total=_as_optional_int(params.get("target_layers_total", None)),
@@ -618,9 +474,6 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
         reference_capture=_as_reference_capture(params.get("reference_capture", "lazy")),
         inserted_block_mode=inserted_block_mode,
         target_shared_correction=target_shared_correction,
-        target_residual_completion=target_residual_completion,
-        joint_blockwise_correction=joint_blockwise_correction,
-        direct_p1_correction=direct_p1_correction,
         correction_scope=correction_scope,
         transport_activation_mode=transport_activation_mode,
         insertion_target_mode=str(params.get("insertion_target_mode", "direct")),

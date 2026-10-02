@@ -56,16 +56,8 @@ def test_explicit_skip_correction_is_never_guarded_nor_overridden():
 
 
 def test_theseus_option_requiring_correction_without_skip_value_raises_at_resolve():
-    with pytest.raises(ConfigMeaningChangedError, match="joint_blockwise_correction"):
-        _resolve(
-            block_extension_params={
-                **BE,
-                "lmc_mode": "shared",
-                "extension_strategy": "duplicate_per_weight",
-                "calibration_split": "val",
-                "joint_blockwise_correction": {"enabled": True},
-            }
-        )
+    with pytest.raises(ConfigMeaningChangedError, match="correction_scope"):
+        _resolve(block_extension_params={**BE, "correction_scope": "interleaved_once"})
 
 
 def test_bico_defaults():

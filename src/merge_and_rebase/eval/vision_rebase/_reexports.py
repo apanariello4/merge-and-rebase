@@ -69,7 +69,7 @@ from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_
 from ...rebase.methods._ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override  # noqa: F401  (kept importable)
 from ...rebase.methods.theseus import InterpolatedBlockActivations  # noqa: F401  (kept importable)
-from ...rebase.orchestration import AriadneRunRecord, CompletionRecord, direct_target_p1_requested
+from ...rebase.orchestration import AriadneRunRecord
 from ...rebase.prestep import StageEnv, TaskInputs
 from ...rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
@@ -84,17 +84,6 @@ from ..block_extension import (
 from ..datasets.vision8_14_20 import SUITES
 from ..print_utils import pretty_print_task_accuracies
 from ..rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)
-from ..target_informed_runtime import (  # noqa: F401  (kept importable)
-    capture_residual_references,
-    capture_resized_joint_source_inputs,
-    complete_direct_p1_shared_correction,
-    complete_joint_blockwise,
-    complete_residuals,
-    complete_residuals_direct,
-    projection_transforms,
-    scale_completion,
-)
-from ..target_residual_completion import JointCorrectionConfig, ResidualCompletionConfig  # noqa: F401
 from .alpha_search import (  # noqa: F401  (re-exported for tests)
     AlphaSearchSpec,
     TargetEvaluator,
@@ -109,13 +98,6 @@ from .artifacts import (  # noqa: F401  (re-exported for tests)
     _legacy_visual_key,
     _load_saved_sequential_tv,
     _state_dict_sha256,
-)
-from .completion import (  # noqa: F401  (re-exported for tests)
-    _maybe_capture_target_residual_references,
-    _maybe_complete_direct_p1_task_vector,
-    _maybe_complete_joint_blockwise_task_vector,
-    _maybe_complete_target_residual_task_vector,
-    build_completion_stages,
 )
 from .context import (  # noqa: F401  (re-exported for tests)
     DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,

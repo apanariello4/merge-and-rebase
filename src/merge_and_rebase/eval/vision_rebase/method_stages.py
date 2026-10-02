@@ -23,7 +23,7 @@ from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifie
 from ...rebase.depth_pairing import BRACE_ANCESTRY_DEFAULTS, brace_ancestry_pairing
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override
-from ...rebase.orchestration import AriadneRunRecord, MethodResult, direct_target_p1_requested
+from ...rebase.orchestration import AriadneRunRecord, MethodResult
 from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
 from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from ..block_extension import select_loader
@@ -599,6 +599,6 @@ def build_method_stage(
             calibration_meta=ariadne_calibration_meta,
         )
     return TransportMethodStage(
-        bypass_ordinary_transport=direct_target_p1_requested(env.plan, env.resolved.block_extension_cfg),
+        bypass_ordinary_transport=False,
         transport_calibration_ctx=transport_calibration_ctx,
     )

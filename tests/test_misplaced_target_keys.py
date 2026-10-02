@@ -20,11 +20,10 @@ from merge_and_rebase.eval.block_extension import resolve_block_extension_config
 
 _MISPLACED_KEYS = (
     "target_shared_correction",
-    "target_residual_completion",
-    "joint_blockwise_correction",
-    "direct_p1_correction",
     "capture_target_residual_reference",
 )
+
+_RETIRED_KEYS = ("target_residual_completion", "joint_blockwise_correction", "direct_p1_correction")
 
 
 @pytest.mark.parametrize("key", _MISPLACED_KEYS)
@@ -123,3 +122,15 @@ def test_target_shared_correction_num_batches_unset_resolves() -> None:
     }
     _, resolved = resolve_block_extension_config(cfg)
     assert resolved.target_shared_correction.num_batches is None
+
+
+@pytest.mark.parametrize("key", _RETIRED_KEYS)
+@pytest.mark.parametrize("nested", [False, True])
+def test_retired_completion_keys_raise(key: str, nested: bool) -> None:
+    cfg = {"block_extension_enabled": True, "block_extension_params": {}}
+    if nested:
+        cfg["block_extension_params"] = {key: {"enabled": True}}
+    else:
+        cfg[key] = {"enabled": True}
+    with pytest.raises(ValueError, match=rf"{key}.*retired"):
+        resolve_block_extension_config(cfg)

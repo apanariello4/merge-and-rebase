@@ -58,7 +58,6 @@ PATCH_MODULES: list[str] = [
     "merge_and_rebase.eval.vision_rebase.pipeline",
     "merge_and_rebase.eval.vision_rebase.alpha_search",
     "merge_and_rebase.eval.vision_rebase.stages",
-    "merge_and_rebase.eval.vision_rebase.completion",
     "merge_and_rebase.eval.vision_rebase.method_stages",
     "merge_and_rebase.rebase.orchestration",
 ]
@@ -74,64 +73,52 @@ TASKS = ("MNIST", "DTD")  # real suite task names: main() calls get_templates(ta
 EXPECTED: dict[str, str] = {
     "ariadne_calibration_tiny_imagenet:events": "01db443136878053b9e90896aedd6077dd33f7438bbcf7aa0cb0240016851fef",
     "ariadne_calibration_tiny_imagenet:resolved_config": "1ccc6ac0ce56a103ba8fc2114f6104d4ff6b472fe9e53610a7eda1e4b16a47f0",
-    "ariadne_calibration_tiny_imagenet:summary": "4dc908ea937fd52a40c32b1aae0b4ed98fdeff14654bf33bffd3592bb34f0e6d",
+    "ariadne_calibration_tiny_imagenet:summary": "7a703af3ccbfddef517f574beaf3ca76cfbe2b347c679fe87e84a71681ecc4b5",
     "ariadne_calibration_vision8_mix:events": "5694dcbe0ff533debe2db4226ba8f14b7dca3f1259c81b1b19e2cb0c47ddaa3b",
     "ariadne_calibration_vision8_mix:resolved_config": "89440adafe07e40054b0a54f8275f164db334da6f6b596fd289ce7668168794a",
-    "ariadne_calibration_vision8_mix:summary": "e02f85eca46abb016059a0da7de6c2a21b7f3978cc6903e198ba90e8c2ac0dda",
+    "ariadne_calibration_vision8_mix:summary": "1b29cfa54d7e8de533b9450829126e3bbf6d9df5feec8ab8c3d0f165fc128900",
     "ariadne_merge_in_source_then_fit:events": "bffa806a91355fd50e6a5d73a908ed2c717e2fd009e98f6102908d6641ecb8b0",
     "ariadne_merge_in_source_then_fit:resolved_config": "a13dc4a3d22d1fb4525970f7abfc022f0dc86fdc07512e5321c9695466d13c10",
-    "ariadne_merge_in_source_then_fit:summary": "50d5ebb3b8b1e5ec5bb138d15d93b13d6d8c1a386e3066b6979f7da55ac06334",
+    "ariadne_merge_in_source_then_fit:summary": "b468c3842a188baef5d42276f4af96d30f8d0be1893700b552f9014b19891b0e",
     "ariadne_spelling_ariadne:events": "c690c559481aa8f7fbaf38ac0079ad75bb290d4096f445e32e4f5cd370027c1c",
     "ariadne_spelling_ariadne:file:tvs/DTD_ariadne_transported_native.pt": "1d6fdae2a1278fff1640fe7e14a525e42a1ebfdc7cb33f9b8106de02065d609e",
     "ariadne_spelling_ariadne:file:tvs/MNIST_ariadne_transported_native.pt": "3724cf5d80fb125e723881e9c5bbe5fe48f4e0be35df60dbd65f51ad51f60c60",
     "ariadne_spelling_ariadne:resolved_config": "1f1689e9a2421fabffe7f62929bd966a22872a1553658e28653b1f835c424624",
-    "ariadne_spelling_ariadne:summary": "7be896b51f45cb5b2a34fd2116a174127b012531760e932d48aebfefdaff09c6",
+    "ariadne_spelling_ariadne:summary": "f40b0425fc538278fa46f81d1a784ca7cc9df6fa0f49fafcf99811e5702ba7ab",
     "ariadne_spelling_direct_residual:events": "b37f66e981c3771d4d73650987dbbcfdf789e72aa63ca71ffc017f1764add678",
     "ariadne_spelling_direct_residual:resolved_config": "37492df2cb806d9d46ad224ec71febb60b6e7081c79eeae57d62f3e6b30d6412",
-    "ariadne_spelling_direct_residual:summary": "d801522a1299cc04386b066a5f6ffdb7563537f6d883a9f75ebc25df7a9f4b7b",
+    "ariadne_spelling_direct_residual:summary": "9fc48229f795f590d698e7c0d4540218debba440bce059d100cc419198bdf119",
     "bico_extend_depth_alignment_absent:events": "2951ff3e64243888e29519fe102b43f475b518b670531d8efb71e70c7691266d",
     "bico_extend_depth_alignment_absent:resolved_config": "1cc8de73ef3df725f04a51f15dc29104eccce03f77cab8f8af50eceea9fafa28",
-    "bico_extend_depth_alignment_absent:summary": "4c0318fa57e3a3a55cf97339e50eb8676876304499f7abedffd029836791b6e4",
+    "bico_extend_depth_alignment_absent:summary": "23fd84d1c8f9ea08355e9b62eea09550e483557fff9f9f907d2f54628354418b",
     "bico_extend_depth_defaults_method:events": "76e14d3a2f64cb79c72bada854eb6e4d744788907a8603b1fa09a1892effaf8c",
     "bico_extend_depth_defaults_method:resolved_config": "562634f183fa57a07af0b338b392df616303ea1d42d028efee84421d150dfee2",
-    "bico_extend_depth_defaults_method:summary": "c55b195478290639d14e3d66e6e29eac562cdf282db744a42533f98e2ad1ef97",
+    "bico_extend_depth_defaults_method:summary": "5662456dcc0e3baa451182f7683742c4e7b8c027d8ab04f475fa6d0b68774188",
     "bico_extend_discrete_index_match:events": "76e14d3a2f64cb79c72bada854eb6e4d744788907a8603b1fa09a1892effaf8c",
     "bico_extend_discrete_index_match:resolved_config": "4d6b1f67141042fc05f253362a54d1884a1853194a34e45041a2b5cdad710e32",
-    "bico_extend_discrete_index_match:summary": "a52d7c92a545232eb948d1e3a7a698287a356f7aa52165a2bd52418216ffa9a8",
+    "bico_extend_discrete_index_match:summary": "165a85e5f1b16137137d12da47609cf06ef0f5ab1e4827a2b207a9becd11407e",
     "direct_residual_sequential_endpoints_load:events": "1ef62c7535846934d8045d5edd63b74276939b40ba01658594f6d93dc4363789",
     "direct_residual_sequential_endpoints_load:resolved_config": "4bc7bb4e4aadc1241a58c6471938f47ac8f50ec3ccef2bd1ffd8fbecdb2a9a0a",
-    "direct_residual_sequential_endpoints_load:summary": "d5c70d0c65668395e79a233e1f56b050352e656cc4a6fe67981afe3e512b56ff",
+    "direct_residual_sequential_endpoints_load:summary": "dc764c9c24dc72500303ca712c2c7af4e51e804402a9ab42607b3d9f4f264486",
     "direct_residual_sequential_endpoints_save:events": "1ef62c7535846934d8045d5edd63b74276939b40ba01658594f6d93dc4363789",
     "direct_residual_sequential_endpoints_save:file:tvs/DTD_direct_residual_transported_native.json": "9c8385b01ce5006b4c2cf26f7dd43c35da27cfdfd8d2d597a3e642c0c4a4fad9",
     "direct_residual_sequential_endpoints_save:file:tvs/DTD_direct_residual_transported_native.pt": "3b71fbd5746bbf862be1a5423b90395a1c06364bc9390d887febba44dab885f8",
     "direct_residual_sequential_endpoints_save:file:tvs/MNIST_direct_residual_transported_native.json": "1c4e6dee06f77b8163b146c6909f9583c1c2caf4093e1678250525fd1a71082a",
     "direct_residual_sequential_endpoints_save:file:tvs/MNIST_direct_residual_transported_native.pt": "82292423e9736ec1d41862a788f9c4771386fcea76ab7c83a73e3835cefcf244",
     "direct_residual_sequential_endpoints_save:resolved_config": "4bc7bb4e4aadc1241a58c6471938f47ac8f50ec3ccef2bd1ffd8fbecdb2a9a0a",
-    "direct_residual_sequential_endpoints_save:summary": "21047a411b7d7faccf11123b992eee3194ea4c8e0c23fe8edee15b4b2196a11b",
+    "direct_residual_sequential_endpoints_save:summary": "577e72a9f52b6076d6a2c0f5d1b7ed6f0036bc69264865087f47095535292fb3",
     "gradfix_same_architecture:events": "9488b1ca2ed5df214e447323d9eb4d903743de9cb480a72eb0d36003488fa696",
     "gradfix_same_architecture:resolved_config": "009d49f15cc0c5a9558e093cd81da6345911f241c2621acf7de9111b9724afb4",
-    "gradfix_same_architecture:summary": "3fcac87bf3e96cf8bd7a12a22cb7324d74946f38f505172463c35bb47fee17f5",
+    "gradfix_same_architecture:summary": "34cdae01a60515b7ab796742ecf9dd58ea2ea45e55bc1e9bf1145b2353f32c9e",
     "theseus_alpha_patience_per_task:events": "0dabeb6947b402ee9e99bf244c6bcbcb940a0cd1d4334481bbb47dcf93bbfab8",
     "theseus_alpha_patience_per_task:resolved_config": "39c946ec679dd6001390c83d96c18e7ae47ba5789c8d1a0a7106b544d9fe9160",
-    "theseus_alpha_patience_per_task:summary": "61369c10bdc122ec53c5e6a108e80489e0730a2ea9902ea08ab5086b53076828",
+    "theseus_alpha_patience_per_task:summary": "d53d02bdbfa43c1ff57764e11bfa02d1a653bfedfee9ad6821b92177adb5baea",
     "theseus_alpha_patience_shared:events": "153553151c33d17a5d6319865dce70af827f93a7a38704c1233ddc0018c0caa3",
     "theseus_alpha_patience_shared:resolved_config": "40461ceb706dd5957ed2127c293402d4af84a44c6486f272a4a03a3ac5440497",
-    "theseus_alpha_patience_shared:summary": "cdc5f15a24272fef41e04c34d1c32b1b48617569bfaf3ee3f27d50da4c9f0931",
+    "theseus_alpha_patience_shared:summary": "d76e1a8517f3532a86bef069666b374a16a934e45894b8eb4887788cf7049a63",
     "theseus_brace_merge_then_transport:events": "d7c196e1874ada01e3a8f2d303b63a7b99ccf5f1476120652951bba8d70b0c5c",
     "theseus_brace_merge_then_transport:resolved_config": "9641014779be7127e747c89af3122e646c2c7a00cbdd2ab0d1671ad83f7c8489",
-    "theseus_brace_merge_then_transport:summary": "f91ba010e6afa7aeeaa64ee409147d653bf9639f41d050c625d4ceb3b189ae07",
-    "theseus_double_direct_p1_correction:events": "9125fc408ba8d27d990778e803ecc35aa043088d74baabf43fad70129d566b16",
-    "theseus_double_direct_p1_correction:resolved_config": "90ad0104b8143593654b8bf6cf3fe012bb8c06215308d71cbf9f944d0d9f3b54",
-    "theseus_double_direct_p1_correction:summary": "fc20517084ddcaac51e22babe37c22e8e1f37ac1541d00a81ffe4da0e8b10b03",
-    "theseus_double_joint_blockwise_correction:events": "be17256a05c8956060e4e724c218d59f082baab38c493ffbd2ef70e898d7f068",
-    "theseus_double_joint_blockwise_correction:resolved_config": "d378dcecc69804e3d0f6f6e617697af1aa7780064d3cbbb15d00b20f96685895",
-    "theseus_double_joint_blockwise_correction:summary": "566e31e48d3e927784d0d149f929fdb6642a3c8bd60b7aca5b092a2738ac57fd",
-    "theseus_double_target_residual_completion:events": "f5787332fff23f5a332d742ee95af50ce82efaeaeaaa06854a363e4e71c771a4",
-    "theseus_double_target_residual_completion:resolved_config": "8dd4105595939ffd1b672210dc352735559f742940de7763844f429ff08fb6b4",
-    "theseus_double_target_residual_completion:summary": "1f5baa798a0d7c0893dd903c07136511a928b62ff43a16da28f9504597345865",
-    "theseus_double_target_residual_completion_direct_target:events": "f4b40b8b7479574858cc155c54fc5bced8c10feaedeef92e620664a1a7488e6f",
-    "theseus_double_target_residual_completion_direct_target:resolved_config": "6213075122cea432869c79b8b696ea902041a893d0c7bea0ee23c925246af280",
-    "theseus_double_target_residual_completion_direct_target:summary": "5066935f322770dc6b73fbf90cfac957fe0789ff1bc4978076e2c9f595be0dec",
+    "theseus_brace_merge_then_transport:summary": "4b61b00a74a91598cf6ca05a23e679f3a7c3d38cb7163f137e5d191f711c05eb",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:events": "770993575bb34821bd491cf840365d33698cd7ae31d35478f427023f278f2c34",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:file:tvs/DTD_theseus_transported_legacy_visual.pt": "2b2f8a33258f9b626bc98ad9096c084b30caf5f1d8f1e856c34e8f4070fe9592",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:file:tvs/DTD_theseus_transported_legacy_visual_no_conv1.pt": "2b2f8a33258f9b626bc98ad9096c084b30caf5f1d8f1e856c34e8f4070fe9592",
@@ -140,68 +127,65 @@ EXPECTED: dict[str, str] = {
     "theseus_equal_depth_none_fixed_alpha_save_tvs:file:tvs/MNIST_theseus_transported_legacy_visual_no_conv1.pt": "5b7931eeeee0dc23fc5dd0e573f21edb5af1fa6a7b9a82c40b479de97e733a87",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:file:tvs/MNIST_theseus_transported_native.pt": "5380b94239486f7d90652b2412c72547ef59d4c41aab22d0c68f73a28a50797b",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:resolved_config": "4e48f4f00d41c7c2b18f7f30a0774137e6116b274ba1dbec1acdd267b557fdaa",
-    "theseus_equal_depth_none_fixed_alpha_save_tvs:summary": "bb413791fe0a4769227075222585b2c73ea33e5e64045b947602654dc4d31ce0",
+    "theseus_equal_depth_none_fixed_alpha_save_tvs:summary": "e3fb970e5863b64efb99af40f6f08a71137f5779808c6f2ee68a4e2a3e1da611",
     "theseus_extend_brace_correction_search_shared:events": "33ed39db4f073498b30cf8450f95703fbb34a17b2dd4cffdcaeb574431e0bc4a",
     "theseus_extend_brace_correction_search_shared:resolved_config": "1d801ce725017a23c49aeef6622822c117346f6e7fe8ef4c22f3eae5cd815230",
-    "theseus_extend_brace_correction_search_shared:summary": "7209af874be8b0d3f9c0698f788116a4a6b3247738e6f69ee74320cfc7775dfe",
+    "theseus_extend_brace_correction_search_shared:summary": "03a1156a3c555250d68de755ca45ac566597b72b1a963ce19a23340b3f5ed8a3",
     "theseus_extend_brace_skip_correction:events": "4d941430e9502494ada076b4a87e4110c284be813f4127d263f7ccf848608a8e",
     "theseus_extend_brace_skip_correction:resolved_config": "1439398ce009ea207cbf1265acb38c618f1a3e4c531aaf7b29b2353c452f11e4",
-    "theseus_extend_brace_skip_correction:summary": "5de3ef413ff1866bbdc1dac7d45edbdf90b1d24c2b9d96dab44c5f973c1f6c61",
+    "theseus_extend_brace_skip_correction:summary": "3885958beee6bca1d984a629f272548712464d58fa06e6eb0fa80460bb461849",
     "theseus_extend_depth_defaults_method:events": "4d941430e9502494ada076b4a87e4110c284be813f4127d263f7ccf848608a8e",
     "theseus_extend_depth_defaults_method:resolved_config": "b421f8e9b43121622c0f79d27bf09975c59ea00fa1d07b0e5ddb2c49def2d0cb",
-    "theseus_extend_depth_defaults_method:summary": "5de3ef413ff1866bbdc1dac7d45edbdf90b1d24c2b9d96dab44c5f973c1f6c61",
+    "theseus_extend_depth_defaults_method:summary": "3885958beee6bca1d984a629f272548712464d58fa06e6eb0fa80460bb461849",
     "theseus_extend_eval_before_and_source_lmc:events": "78e670a4a3c3c01ff789067d482f2ce62ac4fa44927f02f5548589aa4582c5db",
     "theseus_extend_eval_before_and_source_lmc:resolved_config": "11cbfbfb16b0e070f832dd985939c2ebd87945fac802abb3cc234fcf9d0e9d3c",
-    "theseus_extend_eval_before_and_source_lmc:summary": "0dacee762c854d324794899a6fd177df67b19222ccaa6dd1045576148ccb1bd4",
+    "theseus_extend_eval_before_and_source_lmc:summary": "a99aa316451d87a4bb810d146abbca4fded5b58cf4307242e8f07dd30ea1bff0",
     "theseus_merge_then_brace_then_transport_correction:events": "781544f517b2ba512ea1697c9d58115dfadac20b1b7a0204403f6e8a0307428d",
     "theseus_merge_then_brace_then_transport_correction:resolved_config": "4ca7dce6ff0a9b5262edb18688b55b9ec71e8fde885ff9c99c05203bf168d0b7",
-    "theseus_merge_then_brace_then_transport_correction:summary": "27a848588619005a12f7047366ec8f1a262493f1c4f1d4af85a2f081e2407fc3",
+    "theseus_merge_then_brace_then_transport_correction:summary": "1fbd291679eced56634cbfe390dc13a8791f491576af6a3802d76609ad0e2f97",
     "theseus_merge_then_brace_then_transport_skip_correction:events": "a1aa7dae60d1ca1568f590a7307f1e0bc2e5c315f499d7de85f651bf2b2c2946",
     "theseus_merge_then_brace_then_transport_skip_correction:resolved_config": "5ab34a672ef40da2114a0a20f3475f4981870025e95427c28a69a19b2f540c70",
-    "theseus_merge_then_brace_then_transport_skip_correction:summary": "91663584a709e6f11f6b2cb1504f12ee3fc289b32845c4b1fcfe37955960b9b8",
+    "theseus_merge_then_brace_then_transport_skip_correction:summary": "c00b8723066497a0de386170689b54bebdee77dbb86c1de6d4640e971ac7f144",
     "theseus_merge_then_rebase:events": "7728a27a5d763b3c62d138f397d975ecbeecf289a4d6abba4631f7ef6d8d78e7",
     "theseus_merge_then_rebase:resolved_config": "5347bf611bb740e75c4b86c6e3a293102ca6a72bfa5630042f0241015ddef240",
-    "theseus_merge_then_rebase:summary": "4f82c86e5e3b860090df80378454fb6ad50e24cf1c11bf22467a47985eef2a0e",
+    "theseus_merge_then_rebase:summary": "6653a2b95acf9e469c87bf7a963b9a48d81969985a5e9f3a78abbb080f39e4b1",
     "theseus_merge_then_rebase_tiny_protocol:events": "b121b28fec53012d78d40af57c2d7ffb11eb946899994ef6be36e56f1888cb3c",
     "theseus_merge_then_rebase_tiny_protocol:resolved_config": "a604f1007cc4d329527a702b72313441afb2f288a4bd3c85274ba6f752e51cde",
-    "theseus_merge_then_rebase_tiny_protocol:summary": "085b8e58641f64593e1c03a5febeccff19100bd7d5ef0d6d93ca0c8a81c26d52",
+    "theseus_merge_then_rebase_tiny_protocol:summary": "6ccaff1883161e54d5cc2104f5769ecfe16b756cdba47afd8f66ff583cdd4f17",
     "theseus_native_target_auto_detected_per_task:events": "a905c680f869e7087bd2aa0fc353928a4bec6d96c8f1f30e0d85d5f41612eecf",
     "theseus_native_target_auto_detected_per_task:resolved_config": "38ea5fa0a04bd9dc5668a9e75c69ef7169ae3e9caf58ade2ecde22b26eb01f46",
-    "theseus_native_target_auto_detected_per_task:summary": "40c9adb678a3b0146f089f33b77a1002ef7e9306e00bff8ba00527fa468e6e03",
+    "theseus_native_target_auto_detected_per_task:summary": "a43aaf6a92d4190cee7b3cff1af15ee57e75c4f9dc9412d138f1fc72ae647b22",
     "theseus_native_target_explicit:events": "07e139c8ba220ebf927705756b5c3315c498f017ea48c53acef0720a4e6764aa",
     "theseus_native_target_explicit:resolved_config": "9a8a82ecbc021c294c82cc76762276d99e8596baa31fa245c5f5ee0bac7b6173",
-    "theseus_native_target_explicit:summary": "7aabe30bf39be00aea4710091163ff15e377a7d7d6ec5eec8bbe2998aa49539f",
+    "theseus_native_target_explicit:summary": "a7bc44aea9601d05e9d65c4de04205231b425db4c008d352c112a712b08c0629",
     "theseus_rebase_then_merge_per_task_hierarchical:events": "03465f70d0ecd7ae22fb9b0a830e0c7f821fbde6bf383c149cfa4d8a6963db6a",
     "theseus_rebase_then_merge_per_task_hierarchical:resolved_config": "1353eeec7eaf5e4e4c815118f2fa527b82e8e8558187296bf180360a68a6c487",
-    "theseus_rebase_then_merge_per_task_hierarchical:summary": "a23bc0596002a599087c3c0496500c2bfd0e6233df3ffd4783da082671bfec38",
+    "theseus_rebase_then_merge_per_task_hierarchical:summary": "36f84c6b78a0be2830ebffa67158007c5c8ca24bde47b3c4552fb6a39d084a27",
     "theseus_rebase_then_merge_per_task_no_global_search:events": "892fcba861cc7d56d5f8fecda5847a8cb161b66eccef2451ea28c4bcaa9e1e39",
     "theseus_rebase_then_merge_per_task_no_global_search:resolved_config": "e15458047adb2ce4e54c3219b4931bc211623ac7ae19fcb9bff4b6ff0c419cde",
-    "theseus_rebase_then_merge_per_task_no_global_search:summary": "8c204d99477751c5660dae497a189afab630d19f8575a4def3880b3bde02b110",
+    "theseus_rebase_then_merge_per_task_no_global_search:summary": "c6419fd5ddd12db5d8d7b9d7a6ae08a2a21006972e22900d50fdb7b60632ae23",
     "theseus_rebase_then_merge_save_merged:events": "6778e5548a1a14aaa449bd686e62f7f8d647aff6531077e6a569da0695ddcd75",
     "theseus_rebase_then_merge_save_merged:file:merged/merged.pt": "44dc512d001dd7c96020b2244ccbaf8845111b6b5fff304c191cfc3968ccb3c6",
     "theseus_rebase_then_merge_save_merged:resolved_config": "60a99991b1828b5c6d88b24c66ea597feaf9166fdd2c0713b8e5732db81a7da6",
-    "theseus_rebase_then_merge_save_merged:summary": "5f16ae0f844e00da4a9b9a7d906819cef00a4f5342f8f92707be2d2806c6afd0",
+    "theseus_rebase_then_merge_save_merged:summary": "e8f37a128adcd0d7d4ab9118cc1d8a49f9d2ff2001f3d48c9fea01f31020f58b",
     "theseus_rebase_then_merge_shared:events": "6778e5548a1a14aaa449bd686e62f7f8d647aff6531077e6a569da0695ddcd75",
     "theseus_rebase_then_merge_shared:resolved_config": "e9900746e468c5f960d7f34f10493c4188f1a7b50c010a45368115a9cc588a00",
-    "theseus_rebase_then_merge_shared:summary": "5f16ae0f844e00da4a9b9a7d906819cef00a4f5342f8f92707be2d2806c6afd0",
-    "theseus_same_depth_direct_target:events": "a90dec52e9f2d9e3dbeb7acf1905fcfbd735233458cde2890d1121eafe3c2e47",
-    "theseus_same_depth_direct_target:resolved_config": "a09a19560b04945b58a68f52889e95eb4edf2daa23b0625a21cbbc8b7fdf245e",
-    "theseus_same_depth_direct_target:summary": "fe5d459a467b0926b559ee22bd8f874e9b4d4a6a3156661c03eab172c5cd9330",
+    "theseus_rebase_then_merge_shared:summary": "e8f37a128adcd0d7d4ab9118cc1d8a49f9d2ff2001f3d48c9fea01f31020f58b",
     "theseus_samearch_none_alpha_search_untransported:events": "033dc0d386b3870ff1b26d7d5eca56c0b5cde001d374f24ef22f16cb26e1d96b",
     "theseus_samearch_none_alpha_search_untransported:resolved_config": "2c425532a53836dd72b074b2fd74d95dcfcfc92b91049f827f403a30b55f98ec",
-    "theseus_samearch_none_alpha_search_untransported:summary": "e5eee073392d69dc0c96500bcd5862b118a7832f2a4dc053589e1822968abc89",
+    "theseus_samearch_none_alpha_search_untransported:summary": "12783bda8a84ea10cba0ffce44be8791e3a7b6e0b07560bbaec8cc4e878eb06c",
     "theseus_samedepth_eval_before_rebase:events": "2f94eff395370b1335e112bc692f82d9d3320f113b8212717aae0ea07259b3d7",
     "theseus_samedepth_eval_before_rebase:resolved_config": "c6c470d2cd9539809f274b146fb6c4a0a839415c7f165a4f87b50075b8ada306",
-    "theseus_samedepth_eval_before_rebase:summary": "fb5708f4702f9fbb6953c9ac00fc6eb3f0b08a4680e08f2560c69798be97d7ce",
+    "theseus_samedepth_eval_before_rebase:summary": "16ff0f9c37337bac67400f28508c7d043756d8c35c1a5b3e727a6d66c68dd245",
     "theseus_shrink_brace:events": "0370b172ea2a3d7c13dec63092774919e047a89f43e3106ef4f275429a8b7b40",
     "theseus_shrink_brace:resolved_config": "60ca4c7c30730404763a1a3f2e04687480ca58d04c1e447907732afb0a488d88",
-    "theseus_shrink_brace:summary": "39afe6a1ddc9ddb9191f2a23d5d1036f1975991db5d46c97a65b45ef0abb0df5",
+    "theseus_shrink_brace:summary": "6b023f7a03e45a763fff63a5383df1a5f2a80faa67ac3cc6106f5cec03f2f05e",
     "theseus_shrink_depth_defaults_method:events": "f5a2c6855e824ccd1767b9bf23dc9e2c02652965546ac3c069d9818929e19b79",
     "theseus_shrink_depth_defaults_method:resolved_config": "b421f8e9b43121622c0f79d27bf09975c59ea00fa1d07b0e5ddb2c49def2d0cb",
-    "theseus_shrink_depth_defaults_method:summary": "6668b1388aeb062c1ba7191db22146403084b0e76d82719e4c8c44c4d86d4b8e",
+    "theseus_shrink_depth_defaults_method:summary": "7d1e70627eb26d02330d0baf9bce82a400e2ba9e91ce12c302ae9f4669275b22",
     "theseus_transport_calibration_tiny_imagenet:events": "026fce97657d7dc893ee946b46f8edb1755b3a66e6522c1bac60f18ab6fff16f",
     "theseus_transport_calibration_tiny_imagenet:resolved_config": "90d671f2c3f5ed16b1d11d9a0eabfe6a4ff2e2a17d28839569793228500d63a3",
-    "theseus_transport_calibration_tiny_imagenet:summary": "9f5938f5e0aa698dc635c412ed726de7587b471e9d87f751808cc3fa2ef0be83",
+    "theseus_transport_calibration_tiny_imagenet:summary": "a35d1208ed31aa5d95dbeae948de11848d98b0034ed8da39c4a7125b3acf2016",
 }
 
 
@@ -650,7 +634,6 @@ _EQ = {"source": (2, 4), "target": (2, 6)}
 _SAME = {"source": (2, 4), "target": (2, 4)}
 _EXT = {"source": (2, 4), "target": (3, 6)}
 _SHR = {"source": (3, 4), "target": (2, 6)}
-_DOUBLE = {"source": (2, 4), "target": (4, 6)}  # target-informed protocols address doubled positions
 
 
 @dataclass(frozen=True)
@@ -764,21 +747,6 @@ CASES: dict[str, Case] = {
         {"merge_mode": "brace_transport_then_merge", "alpha_selection": "per_task", **_SEARCH},
     ),
     # 11: same-depth direct_target completion (transport-free)
-    "theseus_same_depth_direct_target": Case(
-        _EQ,
-        {
-            "block_extension_params": {
-                **_BE,
-                "skip_correction": True,
-                "target_residual_completion": {
-                    "enabled": True,
-                    "mode": "direct_target",
-                    "target_scope": "all",
-                    "num_batches": 2,
-                },
-            }
-        },
-    ),
     # 12: alpha early stopping
     "theseus_alpha_patience_shared": Case(
         _EQ,
@@ -820,50 +788,6 @@ CASES: dict[str, Case] = {
     ),
     "theseus_samedepth_eval_before_rebase": Case(_EQ, {"eval_before_rebase": True}),
     # target-informed BRACE protocols (all need a depth-mismatched pair + lmc_mode=shared)
-    "theseus_double_target_residual_completion": Case(
-        _DOUBLE,
-        {
-            "block_extension_params": {
-                **_BE,
-                "lmc_mode": "shared",
-                "target_residual_completion": {"enabled": True, "num_batches": 2},
-            }
-        },
-    ),
-    "theseus_double_target_residual_completion_direct_target": Case(
-        _DOUBLE,
-        {
-            "block_extension_params": {
-                **_BE,
-                "skip_correction": True,
-                "target_residual_completion": {"enabled": True, "mode": "direct_target", "num_batches": 2},
-            }
-        },
-    ),
-    "theseus_double_joint_blockwise_correction": Case(
-        _DOUBLE,
-        {
-            "block_extension_params": {
-                **_BE,
-                "lmc_mode": "shared",
-                "extension_strategy": "duplicate_per_weight",
-                "calibration_split": "val",
-                "joint_blockwise_correction": {"enabled": True},
-            }
-        },
-    ),
-    "theseus_double_direct_p1_correction": Case(
-        _DOUBLE,
-        {
-            "block_extension_params": {
-                **_BE,
-                "lmc_mode": "shared",
-                "extension_strategy": "duplicate_per_weight",
-                "calibration_split": "val",
-                "direct_p1_correction": {"enabled": True},
-            }
-        },
-    ),
     # task-independent transport calibration
     "theseus_transport_calibration_tiny_imagenet": Case(_EQ, {"transport_calibration_data": "tiny_imagenet"}),
     # 15: other rebase methods
@@ -885,9 +809,6 @@ CASES: dict[str, Case] = {
 _LEGACY_DEPTH_CASES = (
     "bico_extend_depth_alignment_absent",
     "theseus_brace_merge_then_transport",
-    "theseus_double_direct_p1_correction",
-    "theseus_double_joint_blockwise_correction",
-    "theseus_double_target_residual_completion",
     "theseus_extend_eval_before_and_source_lmc",
     "theseus_merge_then_brace_then_transport_correction",
     "theseus_native_target_auto_detected_per_task",
@@ -1104,7 +1025,6 @@ class Err:
 
 
 _BE_SKIP = {**_BE, "skip_correction": True}
-_JOINT = {**_BE, "lmc_mode": "shared", "extension_strategy": "duplicate_per_weight", "calibration_split": "val"}
 _NATIVE_DTD = {**_EQ, "native": ("DTD",)}
 _ARIADNE_ONLY = {"method": "ariadne", "method_params": {}}
 
@@ -1247,9 +1167,25 @@ ERRORS: dict[str, Err] = {
         {"tasks": "MNIST,Bogus"}, ValueError, E("Unknown tasks: ['Bogus']. Allowed: ['DTD', 'MNIST']")
     ),
     "block_extension_misplaced_top_level_key": Err(
+        {"target_shared_correction": {"enabled": True}},
+        ValueError,
+        P("Found ['target_shared_correction'] at the top level of the run config; "),
+    ),
+    # P5 item 5 (2026-10-02): the target-informed completion protocols were retired.
+    "retired_completion_key_top_level": Err(
         {"target_residual_completion": {"enabled": True}},
         ValueError,
-        P("Found ['target_residual_completion'] at the top level of the run config; "),
+        P("['target_residual_completion'] retired: "),
+    ),
+    "retired_completion_key_nested": Err(
+        {"block_extension_params": {"joint_blockwise_correction": {"enabled": True}}},
+        ValueError,
+        P("['joint_blockwise_correction'] retired: "),
+    ),
+    "retired_completion_key_direct_p1_nested": Err(
+        {"block_extension_params": {"direct_p1_correction": {"enabled": True}}},
+        ValueError,
+        P("['direct_p1_correction'] retired: "),
     ),
     "block_extension_params_not_a_mapping": Err(
         {"block_extension_params": [1]}, ValueError, E("config['block_extension_params'] must be a dict when provided.")
@@ -1269,22 +1205,6 @@ ERRORS: dict[str, Err] = {
         ValueError,
         P("block_extension_params.inserted_block_mode='residual_identity' requires skip_correction=true: "),
     ),
-    "block_extension_joint_needs_shared_lmc": Err(
-        {"block_extension_params": {"joint_blockwise_correction": {"enabled": True}}},
-        ValueError,
-        E("joint_blockwise_correction requires lmc_mode='shared'."),
-    ),
-    "block_extension_two_target_informed_protocols": Err(
-        {
-            "block_extension_params": {
-                "lmc_mode": "shared",
-                "target_residual_completion": {"enabled": True},
-                "direct_p1_correction": {"enabled": True},
-            }
-        },
-        ValueError,
-        P("target_residual_completion, joint_blockwise_correction, and direct_p1_correction are mutually exclusive; "),
-    ),
     # ---- after start_run (a run record exists) but still before any model is built ---------------
     "tuned_ckpts_missing": Err(
         {"tuned_ckpts": None},
@@ -1299,53 +1219,6 @@ ERRORS: dict[str, Err] = {
         E("native_target_tasks contains tasks not in the task list: ['Bogus']"),
         before_build=False,
         run_started=True,
-    ),
-    "shrink_direct_target_needs_scope_all": Err(
-        {
-            "block_extension_params": {
-                **_BE_SKIP,
-                "target_residual_completion": {"enabled": True, "mode": "direct_target"},
-            }
-        },
-        ValueError,
-        P("Shrink direct_target completion requires target_scope='all': "),
-        before_build=False,
-        run_started=True,
-        world=dict(_SHR),
-    ),
-    "discrete_index_match_with_target_informed_protocol": Err(
-        {
-            "depth_alignment": "discrete_index_match",
-            "block_extension_params": {
-                **_BE_SKIP,
-                "target_residual_completion": {"enabled": True, "mode": "direct_target", "target_scope": "all"},
-            },
-        },
-        ValueError,
-        P("depth_alignment='discrete_index_match' is incompatible with target_residual_completion, "),
-        before_build=False,
-        run_started=True,
-        world=dict(_DOUBLE),
-    ),
-    "joint_correction_needs_theseus_or_bico": Err(
-        {
-            "method": "gradfix",
-            "method_params": {},
-            "block_extension_params": {**_JOINT, "joint_blockwise_correction": {"enabled": True}},
-        },
-        ValueError,
-        E("Joint/direct P1 correction requires a Theseus- or BiCo-like transport method"),
-        before_build=False,
-        run_started=True,
-        world=dict(_SAME),
-    ),
-    "joint_correction_needs_depth_mismatch": Err(
-        {"block_extension_params": {**_JOINT, "joint_blockwise_correction": {"enabled": True}}},
-        ValueError,
-        P("Joint/direct P1 correction requires a depth-mismatched source/target pair "),
-        before_build=False,
-        run_started=True,
-        world=dict(_SAME),
     ),
     "merge_then_rebase_with_block_extension_prestep": Err(
         {"merge_mode": "merge_then_rebase"},
@@ -1524,7 +1397,7 @@ ERRORS: dict[str, Err] = {
 }
 
 # P5.12: this error predates the per-method depth defaults; pin it on the legacy semantics explicitly.
-for _name in ("merge_then_rebase_with_block_extension_prestep", "joint_correction_needs_depth_mismatch"):
+for _name in ("merge_then_rebase_with_block_extension_prestep",):
     ERRORS[_name] = replace(ERRORS[_name], cfg={**ERRORS[_name].cfg, "depth_defaults": "legacy"})
 
 

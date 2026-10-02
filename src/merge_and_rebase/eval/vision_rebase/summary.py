@@ -6,7 +6,7 @@ dictionary from it (key order is part of the output contract).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...rebase.methods._ariadne.config import config_as_dict
@@ -73,9 +73,6 @@ class RunRecord:
     direct_residual_fidelity_holdout: Any
     direct_residual_sequential_endpoints: Any
     loaded_direct_residual_tvs: Any
-    residual_completion_diagnostics: Any
-    joint_blockwise_diagnostics: Any
-    direct_p1_diagnostics: Any
     per_task_premerge_alphas: Any
     selected_alpha_by_task: Any
     per_task: Any
@@ -104,7 +101,6 @@ class RunRecord:
         merge_plan: Any,
         alpha: Any,
         ariadne: Any,
-        completion: Any,
         block_extension_eval_rows: Any,
         source_lmc_rows: Any,
         transported_artifacts: Any,
@@ -163,9 +159,6 @@ class RunRecord:
             direct_residual_fidelity_holdout=ariadne.fidelity_holdout,
             direct_residual_sequential_endpoints=ariadne.sequential_endpoints,
             loaded_direct_residual_tvs=ariadne.loaded_vectors,
-            residual_completion_diagnostics=completion.residual,
-            joint_blockwise_diagnostics=completion.joint_blockwise,
-            direct_p1_diagnostics=completion.direct_p1,
             per_task_premerge_alphas=alpha.per_task_premerge_alphas,
             selected_alpha_by_task=alpha.selected_alpha_by_task,
             per_task=per_task,
@@ -373,30 +366,6 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         # anything new added by this change.
         "depth_alignment": record.depth_alignment_mode,
         "depth_rule_resolved": record.depth_rule_resolved,
-        "target_residual_completion": (
-            {
-                "config": asdict(record.block_extension_cfg.target_residual_completion),
-                "diagnostics_by_task": record.residual_completion_diagnostics,
-            }
-            if record.block_extension_cfg.target_residual_completion.enabled
-            else None
-        ),
-        "joint_blockwise_correction": (
-            {
-                "config": asdict(record.block_extension_cfg.joint_blockwise_correction),
-                "diagnostics_by_task": record.joint_blockwise_diagnostics,
-            }
-            if record.block_extension_cfg.joint_blockwise_correction.enabled
-            else None
-        ),
-        "direct_p1_correction": (
-            {
-                "config": asdict(record.block_extension_cfg.direct_p1_correction),
-                "diagnostics_by_task": record.direct_p1_diagnostics,
-            }
-            if record.block_extension_cfg.direct_p1_correction.enabled
-            else None
-        ),
         "saved_merged_path": record.saved_merged_path,
     }
     if record.save_policy is not None:
