@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections.abc import Iterable, Mapping
 from copy import copy, deepcopy
 from dataclasses import dataclass, is_dataclass
 from dataclasses import replace as dataclass_replace
@@ -13,10 +12,7 @@ from typing import Any
 import torch
 
 from merge_and_rebase.hyperparam_search import (
-    SearchEvaluation,
     build_search_planner,
-    describe_candidate,
-    summarize_search_results,
 )
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
@@ -34,8 +30,6 @@ from ...cli_args import (
 from ...data.llm_calibration import (
     TokenizedPromptDataset,
     build_text_calibration_loader,
-    resolve_calibration_texts,
-    tokenization_stats,
 )
 from ...data.text_loaders import (
     NLI_TASKS,
@@ -48,7 +42,6 @@ from ...io.ckpt import load_ckpt, load_into_model
 from ...io.text_checkpoints import load_aligned_tuned_from_ref
 from ...merge.methods._common import get_method_params
 from ...merge.runtime import (
-    apply_delta,
     compose_weighted_deltas,
     to_cpu_fp32,
 )
@@ -62,12 +55,11 @@ from ...rebase.model_families import infer_family
 from ...rebase.registry import canonical_method_name
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..print_utils import pretty_print_task_accuracies
+from .alpha_search import harness_alpha_search, nli_alpha_search, score_harness_test_slice
+from .artifacts import save_merged_state
 from .common import (
-    default_prompt_for_task,
     head_class_ids_for_task,
-    inject_task_head,
     load_task_heads,
-    normalized_acc,
     resolve_eval_mode,
     resolve_fine_tuned_acc,
     resolve_suite_name,
@@ -75,6 +67,15 @@ from .common import (
     resolve_tasks,
     to_unit_acc,
 )
+from .context import TextCalibrationCache
+from .merge import (
+    _summarize_merged_delta,
+    norm_match_transported,
+    report_merged_delta,
+    resolve_delta_source,
+    resolve_norm_match,
+)
+from .summary import assemble_harness_summary, assemble_nli_summary
 
 
 @dataclass
@@ -96,15 +97,6 @@ class _PreparedTaskDelta:
     extension_layout: dict[str, Any] | None = None
     # Proposal-1 native reference banks, captured before the resize.
 
-
-def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
-    """Frobenius norm of a task vector, optionally restricted to `keys`."""
-    total = 0.0
-    for key, value in delta.items():
-        if keys is not None and key not in keys:
-            continue
-        total += float(value.float().pow(2).sum())
-    return total ** 0.5
 
 
 # Calibration batches used by theseus/bico when a config names neither
@@ -195,39 +187,6 @@ def _prepare_resized_task_delta(
         extension_layout=extension_layout or None,
     )
 
-
-
-def _summarize_merged_delta(
-    merged_delta: dict[str, torch.Tensor],
-    target_base: dict[str, torch.Tensor],
-) -> dict[str, float]:
-    """Measure how much of the target model the transported delta actually moves.
-
-    A transport that silently zeroes every key still returns a full set of
-    correctly shaped tensors, so the alpha sweep looks healthy while every
-    candidate evaluates the same untouched base model. These numbers go into the
-    run summary so that failure mode is visible in the JSON, not only in stdout.
-    """
-    sq_delta = 0.0
-    sq_base = 0.0
-    nonzero = 0
-    for key, value in merged_delta.items():
-        val = value.float()
-        sq_delta += float(val.pow(2).sum())
-        if float(val.abs().sum()) > 0.0:
-            nonzero += 1
-        base_ref = target_base.get(key)
-        if base_ref is not None:
-            sq_base += float(base_ref.float().pow(2).sum())
-
-    delta_norm = sq_delta ** 0.5
-    base_norm = sq_base ** 0.5
-    return {
-        "key_count": float(len(merged_delta)),
-        "nonzero_key_count": float(nonzero),
-        "merged_delta_norm": delta_norm,
-        "merged_delta_rel_norm": (delta_norm / base_norm) if base_norm > 0.0 else 0.0,
-    }
 
 
 # Promoted to data/llm_calibration (P7.S5); the old names stay importable (golden tests import them).
@@ -713,50 +672,21 @@ def main() -> None:
             raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
         calibration_dataset_cfg = cfg.get("calibration_dataset", None)
         calibration_include_target = bool(cfg.get("calibration_include_target", False))
-        # Resolved on first use: building it from an lm-harness task has to
-        # index the task registry, which is far too expensive to pay for on a
-        # run that never collects activations at all.
-        _calibration_cache: list[Any] = []
-
-        def _calibration() -> Any:
-            if not _calibration_cache:
-                resolved = resolve_calibration_texts(
-                    prompts=calibration_prompts_cfg,
-                    calibration_dataset=(
-                        calibration_dataset_cfg
-                        or block_extension_cfg.calibration_dataset
-                        or block_extension_cfg.calibration_task
-                    ),
-                    calibration_split=str(block_extension_cfg.calibration_split),
-                    harness_tasks=list(harness_tasks_resolved),
-                    n_sequences=(
-                        int(calibration_n_sequences_cfg)
-                        if calibration_n_sequences_cfg is not None
-                        else max(1, n_calib_batches) * calib_batch_size
-                    ),
-                    seed=int(cfg.get("seed", 0)),
-                    include_target=calibration_include_target,
-                )
-                for note in resolved.notes:
-                    print(f"Calibration note: {note}")
-                print(f"Calibration corpus: {resolved.describe()}")
-                _calibration_cache.append(resolved)
-            return _calibration_cache[0]
-
-        def _calibration_provenance() -> dict[str, Any] | None:
-            """Additive summary record (None when no calibration corpus was ever resolved)."""
-            if not _calibration_cache:
-                return None
-            record = _calibration_cache[0].provenance()
-            record["calibration_batch_size"] = calib_batch_size
-            record["calibration_max_length"] = calib_max_length
-            try:
-                record["tokenization"] = tokenization_stats(
-                    source_llm.tokenizer, _calibration_cache[0].texts, calib_max_length
-                )
-            except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
-                record["tokenization"] = {"error": f"{type(exc).__name__}: {exc}"}
-            return record
+        _calibration_cache = TextCalibrationCache(
+            prompts=calibration_prompts_cfg,
+            calibration_dataset_cfg=calibration_dataset_cfg,
+            block_extension_cfg=block_extension_cfg,
+            harness_tasks=harness_tasks_resolved,
+            n_sequences_cfg=calibration_n_sequences_cfg,
+            n_calib_batches=n_calib_batches,
+            calib_batch_size=calib_batch_size,
+            calib_max_length=calib_max_length,
+            seed=int(cfg.get("seed", 0)),
+            include_target=calibration_include_target,
+            tokenizer=source_llm.tokenizer,
+        )
+        _calibration = _calibration_cache.get
+        _calibration_provenance = _calibration_cache.provenance
 
         configured_harness_samples_raw = cfg.get("harness_samples", None)
         configured_harness_samples: dict[str, list[int]] | None = None
@@ -932,27 +862,8 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
 
         family_adapter = target_family or source_family
-        # Which task vector gets transported. "corrected" is the status quo:
-        # activations and delta both come from the corrected resize.
-        # "uncorrected" keeps the corrected model for activation capture -- so
-        # the fitted alignment map is unchanged -- but transports the delta from
-        # the uncorrected resize, isolating whether correction helps the map or
-        # only distorts the vector.
-        delta_source = str(cfg.get("transport_delta_source", "corrected")).strip().lower()
-        if delta_source not in {"corrected", "uncorrected"}:
-            raise ValueError(
-                f"transport_delta_source must be 'corrected' or 'uncorrected'. Got: {delta_source!r}"
-            )
-        # Rescale the transported delta to the uncorrected task vector's norm.
-        # Procrustes transport is orthogonal and norm-preserving, so without
-        # this the correction's effect on scale reaches the target model in full
-        # and a fixed alpha cannot distinguish scale from direction.
-        norm_match = cfg.get("delta_norm_match", None)
-        norm_match = str(norm_match).strip().lower() if norm_match is not None else None
-        if norm_match not in {None, "none", "uncorrected"}:
-            raise ValueError(
-                f"delta_norm_match must be null or 'uncorrected'. Got: {norm_match!r}"
-            )
+        delta_source = resolve_delta_source(cfg)
+        norm_match = resolve_norm_match(cfg)
         task_vector_norms: list[dict[str, float]] = []
         for idx, prepared_task in enumerate(prepared_tasks):
             corrected_delta = prepared_task.delta
@@ -1057,28 +968,14 @@ def main() -> None:
             elapsed = time.time() - t0
             print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
 
-            # Norms are reported for every run, not only when matching is on, so
-            # the scale effect of correction is visible in the summary.
-            n_corrected = _delta_norm(corrected_delta, transport_keys)
-            n_uncorrected = _delta_norm(reference_delta, transport_keys)
-            n_transported = _delta_norm(transported)
-            scale = 1.0
-            if norm_match == "uncorrected" and n_transported > 0.0:
-                scale = n_uncorrected / n_transported
-                transported = {k: v * scale for k, v in transported.items()}
-            norms = {
-                "source_corrected": n_corrected,
-                "source_uncorrected": n_uncorrected,
-                "transported_before_match": n_transported,
-                "norm_match_scale": scale,
-                "transported_after_match": n_transported * scale,
-            }
-            task_vector_norms.append(norms)
-            print(
-                f"  ||tv|| source corrected={n_corrected:.2f} uncorrected={n_uncorrected:.2f}"
-                f" transported={n_transported:.2f}"
-                + (f" -> rescaled x{scale:.3e}" if norm_match == "uncorrected" else "")
+            transported, norms = norm_match_transported(
+                transported,
+                corrected_delta=corrected_delta,
+                reference_delta=reference_delta,
+                transport_keys=transport_keys,
+                norm_match=norm_match,
             )
+            task_vector_norms.append(norms)
             transported_deltas.append(transported)
             if run_block_extension_prestep:
                 # Release each task-local resized model immediately after its
@@ -1094,17 +991,7 @@ def main() -> None:
             "delta_norm_match": norm_match or "none",
             "per_task": task_vector_norms,
         }
-        print(
-            f"\nMerged delta: keys={delta_stats['key_count']} "
-            f"nonzero_keys={delta_stats['nonzero_key_count']} "
-            f"norm={delta_stats['merged_delta_norm']:.4f} "
-            f"rel_norm={delta_stats['merged_delta_rel_norm']:.6f}"
-        )
-        if delta_stats["nonzero_key_count"] == 0:
-            raise RuntimeError(
-                "Merged transported delta is identically zero: every alpha would evaluate "
-                "the untouched target base model. Check the transport diagnostics above."
-            )
+        report_merged_delta(delta_stats)
 
         search_planner = build_search_planner(
             cfg=cfg, base_method_params=method_params
@@ -1112,69 +999,21 @@ def main() -> None:
 
         # ---- Dispatch evaluation backend ----
         if is_harness_only or harness_tasks_resolved:
-            from .harness import run as run_harness
-            from .harness import score_by_task
-
-            best_harness_eval: SearchEvaluation | None = None
-            harness_results_by_alpha: dict[float, dict[str, float]] = {}
-            harness_search_results: list[SearchEvaluation] = []
 
             baseline_harness_results = _baseline_summary()
 
-            while True:
-                batch = search_planner.next_batch()
-                if batch is None:
-                    break
-                batch_results: list[SearchEvaluation] = []
-
-                for candidate in batch:
-                    alpha = float(candidate.alpha)
-                    scaled = {k: v * alpha for k, v in merged_delta.items()}
-                    merged_sd = apply_delta(target_base_sd, scaled)
-                    load_into_model(target_llm.model, merged_sd, strict=False)
-
-                    print(f"\nEvaluating with lm-harness (alpha={alpha:.3f})...")
-                    harness_results = run_harness(
-                        tasks=list(harness_tasks_resolved),
-                        model=target_llm.model,
-                        tokenizer=target_llm.tokenizer,
-                        device=device,
-                        num_fewshot=harness_num_fewshot,
-                        batch_size=harness_batch_size,
-                        limit=harness_limit,
-                        samples=harness_samples,
-                    )
-                    for task_name, acc in harness_results.items():
-                        print(f"  {task_name}: {acc:.4f}")
-
-                    score = score_by_task(harness_results, list(harness_tasks_resolved))
-                    result = SearchEvaluation(
-                        candidate=candidate,
-                        score=float(score),
-                        avg_acc=float(score),
-                        avg_norm_acc=0.0,
-                        per_task_acc=[float(v) for v in harness_results.values()],
-                        per_task_norm_acc=[],
-                    )
-                    batch_results.append(result)
-                    harness_search_results.append(result)
-                    harness_results_by_alpha[alpha] = harness_results
-
-                    if best_harness_eval is None or result.score > best_harness_eval.score:
-                        best_harness_eval = result
-
-                    print(f"  alpha={alpha:.3f}  avg_score={score:.6f}")
-                    del merged_sd
-
-                search_planner.observe(batch_results)
-
-            if best_harness_eval is None:
-                raise RuntimeError("Harness alpha search produced no results.")
-
-            if len(harness_search_results) > 1:
-                print("\n=== Harness alpha search summary ===")
-                for r in harness_search_results:
-                    print(f"{describe_candidate(r.candidate)}  avg_score={r.avg_acc:.6f}")
+            best_harness_eval, harness_results_by_alpha, harness_search_results = harness_alpha_search(
+                search_planner=search_planner,
+                merged_delta=merged_delta,
+                target_base_sd=target_base_sd,
+                target_llm=target_llm,
+                harness_tasks_resolved=harness_tasks_resolved,
+                device=device,
+                harness_num_fewshot=harness_num_fewshot,
+                harness_batch_size=harness_batch_size,
+                harness_limit=harness_limit,
+                harness_samples=harness_samples,
+            )
 
             best_alpha = float(best_harness_eval.candidate.alpha)
             best_harness_results = harness_results_by_alpha[best_alpha]
@@ -1183,91 +1022,44 @@ def main() -> None:
             for task_name, acc in best_harness_results.items():
                 print(f"  {task_name}: {acc:.4f}")
 
-            # Optional held-out test slice. The alpha search above selects on
-            # `harness_samples`; selecting and reporting on the same documents
-            # makes the reported number the maximum over the alpha grid on that
-            # slice, which is biased upward and -- on a small slice -- by more
-            # than the effects being compared. When `harness_test_samples` is
-            # configured, the winning alpha is re-scored once on those disjoint
-            # documents and that is the number to quote. Costs one extra pass,
-            # not one per alpha.
-            harness_test_results: dict[str, float] | None = None
-            test_samples_cfg = cfg.get("harness_test_samples", None)
-            if test_samples_cfg is not None:
-                if not isinstance(test_samples_cfg, dict):
-                    raise ValueError("config['harness_test_samples'] must map task names to index lists.")
-                test_samples = {}
-                for task_name, indices in test_samples_cfg.items():
-                    if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
-                        raise ValueError(
-                            "config['harness_test_samples'] values must be lists of non-negative indices."
-                        )
-                    test_samples[str(task_name)] = list(indices)
-                overlap = {
-                    t: sorted(set(test_samples.get(t, ())) & set((harness_samples or {}).get(t, ())))
-                    for t in test_samples
-                }
-                leaking = {t: v for t, v in overlap.items() if v}
-                if leaking:
-                    raise ValueError(
-                        "harness_test_samples overlaps the alpha-search slice for "
-                        f"{ {t: len(v) for t, v in leaking.items()} }; the reported number would be "
-                        "selected on documents it is scored on."
-                    )
-                scaled = {k: v * best_alpha for k, v in merged_delta.items()}
-                load_into_model(target_llm.model, apply_delta(target_base_sd, scaled), strict=False)
-                print(f"\nScoring held-out test slice at alpha={best_alpha:.3f}...")
-                harness_test_results = run_harness(
-                    tasks=list(harness_tasks_resolved),
-                    model=target_llm.model,
-                    tokenizer=target_llm.tokenizer,
-                    device=device,
-                    num_fewshot=harness_num_fewshot,
-                    batch_size=harness_batch_size,
-                    limit=None,
-                    samples=test_samples,
-                )
-                print("=== Harness results (held-out test slice) ===")
-                for task_name, acc in harness_test_results.items():
-                    print(f"  {task_name}: {acc:.4f}")
+            harness_test_results, test_samples = score_harness_test_slice(
+                cfg=cfg,
+                merged_delta=merged_delta,
+                target_base_sd=target_base_sd,
+                target_llm=target_llm,
+                harness_tasks_resolved=harness_tasks_resolved,
+                device=device,
+                harness_num_fewshot=harness_num_fewshot,
+                harness_batch_size=harness_batch_size,
+                harness_samples=harness_samples,
+                best_alpha=best_alpha,
+            )
 
             if cfg.get("save_merged", None) is not None:
-                scaled = {k: v * best_alpha for k, v in merged_delta.items()}
-                best_sd = apply_delta(target_base_sd, scaled)
-                outp = Path(str(cfg["save_merged"]))
-                outp.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(to_cpu_fp32(best_sd), str(outp))
-                print(f"Saved rebased state to {outp}")
+                save_merged_state(
+                    cfg["save_merged"], merged_delta, best_alpha, target_base_sd, message="Saved rebased state to"
+                )
 
             if run_logger is not None:
-                run_logger.log_summary({
-                    "ignored_block_extension_fields": ignored_block_extension_fields,
-                    "calibration_provenance": _calibration_provenance(),
-                    "method": method_name,
-                    "best_alpha": best_alpha,
-                    "backend": "lm_harness",
-                    "harness_results": best_harness_results,
-                    # Selected on the search slice; quote harness_results_test
-                    # instead whenever it is present.
-                    "harness_results_test": harness_test_results,
-                    "harness_test_sample_counts": (
-                        {t: len(v) for t, v in test_samples.items()} if harness_test_results else None
-                    ),
-                    "harness_results_before_rebase": baseline_harness_results,
-                    "before_rebase_model": (
-                        "extended_source_base" if run_block_extension_prestep else "source_base"
-                    ),
-                    # Named per-alpha metrics: search_results only keeps a flat
-                    # per_task_acc list, which loses which task each number is.
-                    "harness_results_by_alpha": {
-                        f"{a:g}": r for a, r in sorted(harness_results_by_alpha.items())
-                    },
-                    "merged_delta": delta_stats,
-                    "task_vectors": task_vector_report,
-                    "search_strategy": search_planner.search_summary(),
-                    "search_results": summarize_search_results(harness_search_results),
-                    "saved_merged_path": cfg.get("save_merged"),
-                })
+                run_logger.log_summary(
+                    assemble_harness_summary(
+                        ignored_block_extension_fields=ignored_block_extension_fields,
+                        calibration_provenance=_calibration_provenance(),
+                        method_name=method_name,
+                        best_alpha=best_alpha,
+                        best_harness_results=best_harness_results,
+                        harness_test_results=harness_test_results,
+                        test_samples=test_samples,
+                        baseline_harness_results=baseline_harness_results,
+                        run_block_extension_prestep=run_block_extension_prestep,
+                        harness_results_by_alpha=harness_results_by_alpha,
+                        delta_stats=delta_stats,
+                        task_vector_report=task_vector_report,
+                        search_planner=search_planner,
+                        harness_search_results=harness_search_results,
+                        saved_merged_path=cfg.get("save_merged"),
+                    )
+                )
                 run_logger.finish("success")
             return
 
@@ -1325,97 +1117,22 @@ def main() -> None:
                 tokenized_task_data.append(tk)
                 print(f"Tokenized {td.task}: {tk.meta}")
 
-        best_result: SearchEvaluation | None = None
-        search_results: list[SearchEvaluation] = []
-        alpha_to_task_accs: dict[float, list[float]] = {}
-        alpha_to_task_norm_accs: dict[float, list[float]] = {}
-
-        while True:
-            batch = search_planner.next_batch()
-            if batch is None:
-                break
-            batch_results: list[SearchEvaluation] = []
-
-            for candidate in batch:
-                alpha = float(candidate.alpha)
-
-                scaled = {k: v * alpha for k, v in merged_delta.items()}
-                merged_sd = apply_delta(target_base_sd, scaled)
-                load_into_model(target_llm.model, merged_sd, strict=False)
-
-                accs: list[float] = []
-                norm_accs: list[float] = []
-                for i, td in enumerate(task_data):
-                    if eval_mode == "head_logits" and task_heads is not None:
-                        tk = tokenized_task_data[i]
-                        inject_task_head(
-                            model=target_llm.model,
-                            task=td.task,
-                            task_heads=task_heads,
-                            head_key_pattern=head_key_pattern,
-                            head_class_ids=list(tk.meta.get("head_class_ids", [])),
-                        )
-                        acc = target_llm.sequence_classification_accuracy(
-                            tk.loader,
-                            device=device,
-                            mask_class=tk.mask_class,
-                            print_every=print_every,
-                        )
-                    else:
-                        tpl = user_prompt_template if user_prompt_template else default_prompt_for_task(td)
-                        acc = target_llm.nli_accuracy(
-                            examples=td.examples,
-                            label_texts=td.label_texts,
-                            prompt_template=tpl,
-                            device=device,
-                            max_prompt_tokens=max_prompt_tokens,
-                            print_every=print_every,
-                        )
-                    accs.append(acc)
-                    if external_ref_acc is not None and td.task in external_ref_acc:
-                        n = normalized_acc(acc, external_ref_acc[td.task])
-                        norm_accs.append(n)
-                        print(f"  {td.task}: acc={acc:.6f}  norm_acc={n:.3f}")
-                    else:
-                        print(f"  {td.task}: acc={acc:.6f}")
-
-                avg_acc = sum(accs) / max(1, len(accs))
-                avg_norm_acc = sum(norm_accs) / max(1, len(norm_accs)) if norm_accs else 0.0
-                score = avg_norm_acc if norm_accs else avg_acc
-                result = SearchEvaluation(
-                    candidate=candidate,
-                    score=float(score),
-                    avg_acc=float(avg_acc),
-                    avg_norm_acc=float(avg_norm_acc),
-                    per_task_acc=[float(v) for v in accs],
-                    per_task_norm_acc=[float(v) for v in norm_accs],
-                )
-                batch_results.append(result)
-                search_results.append(result)
-                alpha_to_task_accs[alpha] = [float(v) for v in accs]
-                alpha_to_task_norm_accs[alpha] = [float(v) for v in norm_accs]
-
-                if best_result is None or result.score > best_result.score:
-                    best_result = result
-
-                print(f"  alpha={alpha:.2f}  avg_acc={avg_acc:.6f}  avg_norm_acc={avg_norm_acc:.3f}" if norm_accs else f"  alpha={alpha:.2f}  avg_acc={avg_acc:.6f}")
-
-                del merged_sd
-
-            search_planner.observe(batch_results)
-
-        if best_result is None:
-            raise RuntimeError("Alpha search produced no results.")
-
-        print("\n=== Alpha search summary ===")
-        for r in search_results:
-            if r.per_task_norm_acc:
-                print(
-                    f"{describe_candidate(r.candidate)}  "
-                    f"avg_acc={r.avg_acc:.6f}  avg_norm_acc={r.avg_norm_acc:.3f}"
-                )
-            else:
-                print(f"{describe_candidate(r.candidate)}  avg_acc={r.avg_acc:.6f}")
+        best_result, search_results = nli_alpha_search(
+            search_planner=search_planner,
+            merged_delta=merged_delta,
+            target_base_sd=target_base_sd,
+            target_llm=target_llm,
+            task_data=task_data,
+            tokenized_task_data=tokenized_task_data,
+            task_heads=task_heads,
+            eval_mode=eval_mode,
+            head_key_pattern=head_key_pattern,
+            user_prompt_template=user_prompt_template,
+            max_prompt_tokens=max_prompt_tokens,
+            print_every=print_every,
+            external_ref_acc=external_ref_acc,
+            device=device,
+        )
 
         best_alpha = float(best_result.candidate.alpha)
         best_vals = list(best_result.per_task_acc)
@@ -1442,27 +1159,26 @@ def main() -> None:
             )
 
         if cfg.get("save_merged", None) is not None:
-            scaled = {k: v * best_alpha for k, v in merged_delta.items()}
-            best_sd = apply_delta(target_base_sd, scaled)
-            outp = Path(str(cfg["save_merged"]))
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(to_cpu_fp32(best_sd), str(outp))
-            print(f"Saved best-alpha rebased state to {outp}")
+            save_merged_state(
+                cfg["save_merged"], merged_delta, best_alpha, target_base_sd, message="Saved best-alpha rebased state to"
+            )
 
         if run_logger is not None:
-            run_logger.log_summary({
-                "ignored_block_extension_fields": ignored_block_extension_fields,
-                "calibration_provenance": _calibration_provenance(),
-                "method": method_name,
-                "best_alpha": best_alpha,
-                "tasks": [td.task for td in task_data],
-                "merged_delta": delta_stats,
-                "task_vectors": task_vector_report,
-                "search_strategy": search_planner.search_summary(),
-                "search_results": summarize_search_results(search_results),
-                "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
-                "saved_merged_path": cfg.get("save_merged"),
-            })
+            run_logger.log_summary(
+                assemble_nli_summary(
+                    ignored_block_extension_fields=ignored_block_extension_fields,
+                    calibration_provenance=_calibration_provenance(),
+                    method_name=method_name,
+                    best_alpha=best_alpha,
+                    task_data=task_data,
+                    delta_stats=delta_stats,
+                    task_vector_report=task_vector_report,
+                    search_planner=search_planner,
+                    search_results=search_results,
+                    best_vals=best_vals,
+                    saved_merged_path=cfg.get("save_merged"),
+                )
+            )
             run_logger.finish("success")
 
     except Exception as exc:

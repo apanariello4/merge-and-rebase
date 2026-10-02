@@ -8,6 +8,7 @@ from merge_and_rebase.eval.llm_rebase import (
     _prepare_resized_task_delta,
 )
 from merge_and_rebase.eval.llm_rebase import cli as llm_rebase
+from merge_and_rebase.eval.llm_rebase.merge import _delta_norm
 
 
 class _TinyTokenizer:
@@ -150,8 +151,8 @@ def test_resized_task_delta_also_returns_an_uncorrected_reference(monkeypatch) -
 
     assert prepared.uncorrected_delta is not None
     assert prepared.uncorrected_delta is not prepared.delta
-    n_corr = llm_rebase._delta_norm(prepared.delta)
-    n_unco = llm_rebase._delta_norm(prepared.uncorrected_delta)
+    n_corr = _delta_norm(prepared.delta)
+    n_unco = _delta_norm(prepared.uncorrected_delta)
     assert n_corr > n_unco, (n_corr, n_unco)
 
 
