@@ -208,6 +208,7 @@ def block_extension_protocol(config: BlockExtensionConfig) -> dict[str, Any]:
 _ANNOTATION_PARAMS: frozenset[str] = frozenset(
     {
         "calibration_protocol",
+        "depth_rule",
         "inserted_block_mode",
         "reference_capture",
         "ridge_weight",
@@ -234,6 +235,143 @@ def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
             RuntimeWarning,
             stacklevel=3,
         )
+
+
+
+# ---------------------------------------------------------------------------------------------
+# Depth-rule schema (P6.11). Schema only: the per-method defaults are applied by
+# ``rebase.run_config.resolve_depth_rule``; nothing here changes ``BlockExtensionConfig``.
+# ---------------------------------------------------------------------------------------------
+
+DEPTH_RULES: tuple[str, ...] = ("method_default", "brace", "discrete_index_match")
+# top-level legacy ``depth_alignment`` value -> depth rule
+_DEPTH_ALIGNMENT_ALIAS: dict[str, str] = {"ariadne": "brace", "discrete_index_match": "discrete_index_match"}
+
+# Fields that only the BRACE structural step (insertion/collapse + correction) reads. Under
+# ``discrete_index_match`` they are inert; naming them in a warning beats silently ignoring them.
+_BRACE_ONLY_FIELDS: tuple[str, ...] = (
+    "blocks_to_add",
+    "target_layers_total",
+    "insertion_order",
+    "extension_density",
+    "collapse_schedule",
+    "extension_strategy",
+    "dampening_factor",
+    "skip_correction",
+    "skip_final_ln",
+    "ridge_identity",
+    "ridge_weight",
+    "n_cascade_iters",
+    "share_ft_refs",
+    "component_ridge",
+    "lmc_mode",
+    "reference_capture",
+    "inserted_block_mode",
+    "correction_scope",
+    "transport_activation_mode",
+    "insertion_target_mode",
+    "target_shared_correction",
+)
+
+
+@dataclass(frozen=True)
+class DepthRuleSchema:
+    """Parsed depth-rule keys of a run config (nothing method-specific is resolved here).
+
+    ``rule`` is ``"method_default"`` when neither ``block_extension_params.depth_rule`` nor the
+    legacy top-level ``depth_alignment`` names one. ``source`` records where an explicit rule came
+    from (``"config"``, ``"alias:depth_alignment"``) or ``None``. ``extension_strategy`` and
+    ``skip_correction`` are ``None`` when absent (-> per-method default).
+    """
+
+    rule: str = "method_default"
+    extension_strategy: str | None = None
+    skip_correction: bool | None = None
+    source: str | None = None
+    depth_alignment_given: bool = False
+    depth_rule_given: bool = False
+
+
+def _is_default_raw(name: str, value: Any) -> bool:
+    if value is None:
+        return True
+    if name == "target_shared_correction":
+        return isinstance(value, Mapping) and (not value or not bool(value.get("enabled", True)))
+    default = {f.name: f.default for f in fields(BlockExtensionConfig)}.get(name, None)
+    return value == default
+
+
+def brace_only_fields_set(params: Mapping[str, Any]) -> list[str]:
+    """Explicitly given BRACE-only fields in ``params`` whose value differs from the default."""
+    return sorted(k for k in _BRACE_ONLY_FIELDS if k in params and not _is_default_raw(k, params[k]))
+
+
+def warn_brace_only_fields_under_discrete(params: Mapping[str, Any], *, stacklevel: int = 3) -> list[str]:
+    """RuntimeWarning (not an error: such configs were valid and inert before) listing inert fields."""
+    inert = brace_only_fields_set(params)
+    if inert:
+        warnings.warn(
+            f"depth_rule='discrete_index_match' ignores the BRACE-only block_extension_params {inert}; "
+            "they have no effect on this run.",
+            RuntimeWarning,
+            stacklevel=stacklevel,
+        )
+    return inert
+
+
+def parse_depth_rule_schema(cfg: Mapping[str, Any], *, warn: bool = True) -> DepthRuleSchema:
+    """Parse ``block_extension_params.{depth_rule, extension_strategy, skip_correction}`` + the alias.
+
+    The top-level ``depth_alignment`` is a legacy alias (``ariadne`` -> ``brace``,
+    ``discrete_index_match`` -> itself). Giving both with different rules is a ``ValueError``.
+    BRACE-only fields under ``discrete_index_match`` raise a ``RuntimeWarning`` (when ``warn``).
+    """
+    raw_params = cfg.get("block_extension_params") or {}
+    if not isinstance(raw_params, Mapping):
+        raise ValueError("config['block_extension_params'] must be a dict when provided.")
+
+    alias_rule: str | None = None
+    if "depth_alignment" in cfg:
+        mode = str(cfg.get("depth_alignment", "ariadne")).strip().lower()
+        if mode not in _DEPTH_ALIGNMENT_ALIAS:
+            raise ValueError("depth_alignment must be one of: ariadne, discrete_index_match")
+        alias_rule = _DEPTH_ALIGNMENT_ALIAS[mode]
+
+    explicit_rule: str | None = None
+    if "depth_rule" in raw_params:
+        explicit_rule = str(raw_params["depth_rule"]).strip().lower()
+        if explicit_rule not in DEPTH_RULES:
+            raise ValueError(f"block_extension_params.depth_rule must be one of: {', '.join(DEPTH_RULES)}.")
+    if explicit_rule is not None and alias_rule is not None and explicit_rule != "method_default":
+        if explicit_rule != alias_rule:
+            raise ValueError(
+                f"Conflicting depth rules: depth_alignment={cfg.get('depth_alignment')!r} maps to "
+                f"depth_rule={alias_rule!r} but block_extension_params.depth_rule={explicit_rule!r}. "
+                "Give only one (depth_alignment is a legacy alias)."
+            )
+
+    if explicit_rule is not None and explicit_rule != "method_default":
+        rule, source = explicit_rule, "config"
+    elif alias_rule is not None:
+        rule, source = alias_rule, "alias:depth_alignment"
+    else:
+        rule, source = "method_default", None
+
+    strategy: str | None = None
+    if raw_params.get("extension_strategy") is not None:
+        # Value validity stays with the extender (its messages are pinned); only presence matters here.
+        strategy = str(raw_params["extension_strategy"])
+    skip = raw_params.get("skip_correction", None)
+    if warn and rule == "discrete_index_match":
+        warn_brace_only_fields_under_discrete(raw_params, stacklevel=4)
+    return DepthRuleSchema(
+        rule=rule,
+        extension_strategy=strategy,
+        skip_correction=None if skip is None else bool(skip),
+        source=source,
+        depth_alignment_given="depth_alignment" in cfg,
+        depth_rule_given=explicit_rule is not None,
+    )
 
 
 _MISPLACED_TOP_LEVEL_KEYS = (
@@ -263,6 +401,7 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
 
     params = dict(raw_params)
     _warn_unknown_block_extension_params(params)
+    parse_depth_rule_schema(cfg)
     enabled_raw = cfg.get("block_extension_enabled", None)
     enabled = bool(enabled_raw) if enabled_raw is not None else bool(params)
 
