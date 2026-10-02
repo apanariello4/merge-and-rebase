@@ -379,6 +379,24 @@ class VisionAdapter:
         return build_reduction_layout(chain) if reduction else build_extension_layout(chain)
 
 
+def _content_rows(buffers: list[torch.Tensor], masks: list[torch.Tensor], *, what: str) -> torch.Tensor:
+    """Concatenate per-batch ``[B, T, D]`` captures into content-token rows ``[N, D]``.
+
+    Padding rows (``attention_mask == 0``) never enter a reference or a fit: the row mask is the
+    models' own attention mask, not ``input_ids == pad_id`` (a pad-id token can be content).
+    """
+    if not buffers:
+        return torch.empty(0)
+    rows = torch.cat(buffers, dim=0).flatten(0, 1)
+    mask = torch.cat([m.detach().cpu().bool() for m in masks], dim=0).flatten()
+    if int(mask.numel()) != int(rows.shape[0]):
+        raise ValueError(
+            f"Cannot pair {what} rows with the attention mask: {int(rows.shape[0])} rows vs {int(mask.numel())} "
+            "mask positions."
+        )
+    return rows[mask]
+
+
 class DecoderAdapter:
     family = "hf_decoder"
     components = DECODER_COMPONENTS
@@ -414,6 +432,7 @@ class DecoderAdapter:
     def capture_block_input(self, model, target, loader, n_batches, device):
         model.eval()
         buffers: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
 
         def hook(_module: nn.Module, inputs: tuple[Any, ...], _output: Any):
             if inputs and inputs[0] is not None:
@@ -431,11 +450,10 @@ class DecoderAdapter:
             except StopIteration:
                 break
             self._forward(model, batch, device)
+            masks.append(_fam.content_mask(self.family_adapter, batch))
 
         handle.remove()
-        if not buffers:
-            return torch.empty(0)
-        return torch.cat(buffers, dim=0).flatten(0, 1)
+        return _content_rows(buffers, masks, what="block input")
 
     def capture_component(self, model, block_idx, spec, loader, n_batches, device):
         return self.capture_component_output(model, block_idx, spec.name, loader, n_batches, device)
@@ -444,6 +462,7 @@ class DecoderAdapter:
     def capture_component_output(self, model, block_idx, component, loader, n_batches, device):
         model.eval()
         buffers: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
         block = self.layers(model)[block_idx]
 
         comps = _fam.block_components(self.family_adapter, block)
@@ -469,11 +488,10 @@ class DecoderAdapter:
             except StopIteration:
                 break
             self._forward(model, batch, device)
+            masks.append(_fam.content_mask(self.family_adapter, batch))
 
         handle.remove()
-        if not buffers:
-            return torch.empty(0)
-        return torch.cat(buffers, dim=0).flatten(0, 1)
+        return _content_rows(buffers, masks, what=f"component '{component}' output")
 
     @torch.no_grad()
     def apply_correction(self, block, spec, W, b):

@@ -61,6 +61,20 @@ def param_key(family_adapter: Any, position: int, suffix: str) -> str:
     return fn(position, suffix) if fn is not None else f"{LAYER_PREFIX}.{int(position)}.{suffix}"
 
 
+def content_mask(family_adapter: Any, batch: Any):
+    """Bool ``[B, T]`` content mask of a calibration batch, from ``attention_mask`` only."""
+    import torch
+
+    fn = getattr(family_adapter, "content_mask", None)
+    if fn is not None:
+        return fn(batch)
+    inputs = family_adapter.extract_calibration_batch(batch)
+    mask = inputs.get("attention_mask")
+    if mask is None:
+        return torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+    return mask.bool()
+
+
 def canonical_components(family_adapter: Any) -> dict[str, str]:
     mapping = getattr(family_adapter, "CANONICAL_COMPONENTS", None)
     return dict(mapping) if mapping is not None else dict(CANONICAL_COMPONENTS)

@@ -10,7 +10,14 @@ import torch
 import torch.nn as nn
 
 from ..model_families import accessors as fam
-from .adapters import DECODER_COMPONENTS, DecoderAdapter, _get_final_norm, _get_layers, _run_decoder_forward
+from .adapters import (
+    DECODER_COMPONENTS,
+    DecoderAdapter,
+    _content_rows,
+    _get_final_norm,
+    _get_layers,
+    _run_decoder_forward,
+)
 from .config import BlockExtensionConfig
 from .core import BlockExtenderCore, EagerProvider, _deterministic_calibration_loader, _iter_with_progress
 from .schedules import (
@@ -88,6 +95,7 @@ class DecoderBlockExtender(BlockExtenderCore):
             self._vprint(f"capture reference inputs ({name}) with n_batches={n_batches}")
             model.eval()
             store: dict[str, list[torch.Tensor]] = defaultdict(list)
+            masks: list[torch.Tensor] = []
             hooks: list[Any] = []
 
             layers = _get_layers(model, self.family_adapter)
@@ -110,13 +118,15 @@ class DecoderBlockExtender(BlockExtenderCore):
                     break
                 inputs = self.family_adapter.extract_calibration_batch(batch)
                 _run_decoder_forward(model, inputs, self.device)
+                masks.append(fam.content_mask(self.family_adapter, batch))
 
             for h in hooks:
                 h.remove()
 
             refs: dict[str, torch.Tensor] = {}
             for key, tensors in store.items():
-                refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
+                # Padding rows never enter a reference (rows follow attention_mask only).
+                refs[key] = _content_rows(tensors, masks, what=f"reference '{key}'")
             self.reference_inputs[name] = refs
 
     @torch.no_grad()
@@ -125,6 +135,7 @@ class DecoderBlockExtender(BlockExtenderCore):
             self._vprint(f"capture component references ({name}) with n_batches={n_batches}")
             model.eval()
             store: dict[str, list[torch.Tensor]] = defaultdict(list)
+            masks: list[torch.Tensor] = []
             hooks: list[Any] = []
 
             layers = _get_layers(model, self.family_adapter)
@@ -158,13 +169,15 @@ class DecoderBlockExtender(BlockExtenderCore):
                     break
                 inputs = self.family_adapter.extract_calibration_batch(batch)
                 _run_decoder_forward(model, inputs, self.device)
+                masks.append(fam.content_mask(self.family_adapter, batch))
 
             for h in hooks:
                 h.remove()
 
             refs: dict[str, torch.Tensor] = {}
             for key, tensors in store.items():
-                refs[key] = torch.cat(tensors, dim=0).flatten(0, 1)
+                # Padding rows never enter a reference (rows follow attention_mask only).
+                refs[key] = _content_rows(tensors, masks, what=f"reference '{key}'")
             self.reference_inputs[name].update(refs)
 
     @torch.no_grad()
