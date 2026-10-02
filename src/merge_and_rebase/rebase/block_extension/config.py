@@ -306,6 +306,35 @@ def brace_only_fields_set(params: Mapping[str, Any]) -> list[str]:
     return sorted(k for k in _BRACE_ONLY_FIELDS if k in params and not _is_default_raw(k, params[k]))
 
 
+# Vision-only BRACE fields: the decoder extender never reads them (execution log B14, D-P6a).
+_DECODER_IGNORED_FIELDS: tuple[str, ...] = (
+    "ridge_weight",
+    "collapse_schedule",
+    "reference_capture",
+    "insertion_target_mode",
+    "correction_scope",
+    "inserted_block_mode",
+    "target_shared_correction",
+)
+
+
+def warn_decoder_ignored_fields(params: Mapping[str, Any] | None, *, stacklevel: int = 3) -> list[str]:
+    """RuntimeWarning listing explicitly set, non-default vision-only fields the decoder ignores.
+
+    Returns the sorted list (recorded in the decoder run summary as ``ignored_block_extension_fields``).
+    """
+    params = params or {}
+    ignored = sorted(k for k in _DECODER_IGNORED_FIELDS if k in params and not _is_default_raw(k, params[k]))
+    if ignored:
+        warnings.warn(
+            f"The decoder BRACE extender ignores the vision-only block_extension_params {ignored}; "
+            "they have no effect on this run.",
+            RuntimeWarning,
+            stacklevel=stacklevel,
+        )
+    return ignored
+
+
 def warn_brace_only_fields_under_discrete(params: Mapping[str, Any], *, stacklevel: int = 3) -> list[str]:
     """RuntimeWarning (not an error: such configs were valid and inert before) listing inert fields."""
     inert = brace_only_fields_set(params)

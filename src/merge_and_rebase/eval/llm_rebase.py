@@ -52,6 +52,7 @@ from ..merge.runtime import (
 from ..merge.task_vectors import TaskVector, default_key_filter
 from ..models.text_lm import TextBuildConfig, TextLM
 from ..rebase import get_method
+from ..rebase.block_extension.config import warn_decoder_ignored_fields
 from ..rebase.capabilities import check_pair
 from ..rebase.model_families import infer_family
 from ..rebase.registry import canonical_method_name
@@ -733,6 +734,7 @@ def main() -> None:
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
+        ignored_block_extension_fields = warn_decoder_ignored_fields(cfg.get("block_extension_params"))
         # ARIADNE proposal 1 (target residual completion). Disabled by default,
         # and resolve_block_extension_config already rejects it alongside
         # skip_correction=true, so an enabled run always has a correction to
@@ -1154,6 +1156,7 @@ def main() -> None:
             print("\nStopping after the before-rebase eval (eval_before_rebase_only).")
             if run_logger is not None:
                 run_logger.log_summary({
+                    "ignored_block_extension_fields": ignored_block_extension_fields,
                     "method": method_name,
                     "backend": "lm_harness",
                     "stopped_after": "before_rebase_eval",
@@ -1657,6 +1660,7 @@ def main() -> None:
 
             if run_logger is not None:
                 run_logger.log_summary({
+                    "ignored_block_extension_fields": ignored_block_extension_fields,
                     "method": method_name,
                     "best_alpha": best_alpha,
                     "backend": "lm_harness",
@@ -1865,6 +1869,7 @@ def main() -> None:
 
         if run_logger is not None:
             run_logger.log_summary({
+                "ignored_block_extension_fields": ignored_block_extension_fields,
                 "method": method_name,
                 "best_alpha": best_alpha,
                 "tasks": [td.task for td in task_data],
