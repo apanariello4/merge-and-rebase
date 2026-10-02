@@ -65,7 +65,7 @@ def test_transport_is_not_available():
 def test_capabilities_same_for_both_names():
     for name in ("ariadne", "direct_residual"):
         assert capabilities.supports_cross_size(name) is True
-        assert capabilities.is_text_supported(name) is False
+        assert capabilities.is_text_supported(name) is True
     # existing entries are unchanged
     assert capabilities.supports_cross_size("theseus") and capabilities.is_text_supported("theseus")
     assert not capabilities.supports_cross_size("identity")
@@ -85,14 +85,10 @@ def _meta():
     )
 
 
-def test_check_pair_rejects_text_with_ariadne_message():
-    messages = []
+def test_check_pair_accepts_ariadne_text_and_keeps_transfusion_message():
     for name in ("ariadne", "direct_residual"):
-        with pytest.raises(ValueError, match="Ariadne for text/decoder models is not available yet") as exc:
-            capabilities.check_pair(name, _meta(), _meta())
-        messages.append(str(exc.value).replace(f"'{name}'", "'<m>'"))
-    assert messages[0] == messages[1]
-    # transfusion keeps its generic message
+        assert capabilities.is_text_supported(name)
+        capabilities.check_pair(name, _meta(), _meta())
     with pytest.raises(ValueError, match="not available for text/decoder rebasing in v1"):
         capabilities.check_pair("transfusion", _meta(), _meta())
 
@@ -293,3 +289,22 @@ def test_legacy_wrappers_delegate_to_prepare():
             hash_json({"diagnostics": diagnostics, "extra": extra})
             == EXPECTED["dr_orchestration_main_streaming_eb:extend:summary"]
         )
+
+
+def test_resolve_depth_strategy_and_check_pair_depth():
+    s, t = _meta(), _meta()
+    t = ModelFamilyMetadata(**{**s.__dict__, "num_hidden_layers": 3})
+    rds = capabilities.resolve_depth_strategy
+    assert rds("ariadne", {}, s, t).rule == "none"
+    d = rds("theseus", None, s, t)
+    assert (d.rule, d.skip_correction, d.extension_strategy, d.legacy) == ("brace", True, "interpolate_per_weight", False)
+    assert rds("theseus", None, s, s).rule == "none"
+    assert rds("bico", None, s, t).rule == "discrete_index_match"
+    leg = rds("theseus", {"extension_strategy": "per_weight"}, s, t)
+    assert (leg.legacy, leg.skip_correction, leg.extension_strategy) == (True, False, "per_weight")
+    assert rds("bico", {"skip_correction": False}, s, t).rule == "brace"
+    capabilities.check_pair("ariadne", s, t)
+    capabilities.check_pair("bico", s, t)
+    with pytest.raises(ValueError, match="more layers"):
+        capabilities.check_pair("theseus", t, s)
+    capabilities.check_pair("bico", t, s)  # discrete index match handles any depth

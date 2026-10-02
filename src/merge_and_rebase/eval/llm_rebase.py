@@ -409,8 +409,8 @@ def main() -> None:
         method_name = str(cfg.get("method", "theseus"))
         method = get_method(method_name)
         if canonical_method_name(method_name) == "ariadne":
-            # Registered (vision) but not wired for decoders yet: fail before loading any model.
-            check_pair(method_name, None, None)
+            # Capability-supported, but llm_rebase has no Ariadne branch until S10: fail before loading any model.
+            raise ValueError("Ariadne LLM entrypoint lands in S10; llm_rebase does not run Ariadne yet.")
         method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
         if "n_batches" in method_params:
             raise ValueError(
