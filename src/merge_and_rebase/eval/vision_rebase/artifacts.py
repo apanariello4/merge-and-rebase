@@ -8,8 +8,8 @@ from pathlib import Path
 
 import torch
 
-from ..rebase.methods.ariadne.fit import _task_vector_sha256
-from ..rebase.registry import canonical_method_name
+from ...rebase.methods.ariadne.fit import _task_vector_sha256
+from ...rebase.registry import canonical_method_name
 
 
 def _load_saved_sequential_tv(directory, task, target_base_sd, config):

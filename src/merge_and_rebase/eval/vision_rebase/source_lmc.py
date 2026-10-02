@@ -9,9 +9,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ..eval.utils import resolve_eval_split_loader
-from ..io.ckpt import load_into_model
-from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...eval.utils import resolve_eval_split_loader
+from ...io.ckpt import load_into_model
+from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 
 _ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
 

@@ -7,10 +7,16 @@ from typing import Any
 
 import torch
 
-from ..io.ckpt import align_to_base_keys
-from ..merge.base import PreparedMergeMethod
-from ..merge.methods._common import axpy_state_dict
-from ..merge.registry import get_method as get_merge_method
+from ...io.ckpt import align_to_base_keys
+from ...merge.base import PreparedMergeMethod
+from ...merge.methods._common import axpy_state_dict
+from ...merge.registry import get_method as get_merge_method
+from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
+    _SINGLE_TRANSPORT_MODES,
+    _TRANSPORT_THEN_MERGE_MODES,
+    _VALID_MERGE_MODES,
+    _resolve_merge_mode_config,
+)
 
 
 def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
@@ -89,62 +95,6 @@ def _relative_visual_state_distance(
     if denominator == 0.0:
         return 0.0 if float(torch.sqrt(distance_sq)) == 0.0 else float("inf")
     return float(torch.sqrt(distance_sq)) / denominator
-
-
-_VALID_MERGE_MODES = (
-    "none",
-    "rebase_then_merge",
-    "merge_then_rebase",
-    "brace_transport_then_merge",
-    "brace_merge_then_transport",
-    "merge_then_brace_then_transport",
-)
-
-
-_TRANSPORT_THEN_MERGE_MODES = {"rebase_then_merge", "brace_transport_then_merge"}
-
-
-_SINGLE_TRANSPORT_MODES = {
-    "merge_then_rebase",
-    "brace_merge_then_transport",
-    "merge_then_brace_then_transport",
-}
-
-
-def _resolve_merge_mode_config(
-    cfg: dict[str, Any],
-    alpha_selection: str,
-) -> tuple[str, str, dict[str, Any], bool]:
-    """Resolve and validate the merge-mode knobs.
-
-    Returns (merge_mode, merge_method_name, merge_params, global_alpha_search).
-    ``merge_mode="none"`` keeps the historical per-task transfer evaluation;
-    ``rebase_then_merge`` and its explicit campaign alias
-    ``brace_transport_then_merge`` support hierarchical search (per-task alphas
-    followed by a global merge alpha) when ``alpha_selection="per_task"``.
-    """
-    merge_mode = str(cfg.get("merge_mode", "none")).strip().lower()
-    if merge_mode not in _VALID_MERGE_MODES:
-        raise ValueError(f"merge_mode must be one of: {', '.join(_VALID_MERGE_MODES)}")
-
-    if merge_mode not in _TRANSPORT_THEN_MERGE_MODES and merge_mode != "none" and alpha_selection == "per_task":
-        raise ValueError(
-            f"{merge_mode} requires alpha_selection='shared': per-task alpha search "
-            "is only defined for individually transported deltas on the target base. "
-            "Use merge_mode='brace_transport_then_merge' for hierarchical per-task alphas."
-        )
-
-    merge_method_name = str(cfg.get("merge_method", "task_arithmetic"))
-    get_merge_method(merge_method_name)  # validate early for clearer UX
-
-    raw_params = cfg.get("merge_params", {}) or {}
-    if not isinstance(raw_params, dict):
-        raise ValueError("merge_params must be a JSON object / mapping when provided.")
-
-    global_alpha_search = cfg.get("global_alpha_search", True)
-    if not isinstance(global_alpha_search, bool):
-        raise ValueError("global_alpha_search must be a boolean (true/false).")
-    return merge_mode, merge_method_name, dict(raw_params), global_alpha_search
 
 
 def _pseudo_tuned(

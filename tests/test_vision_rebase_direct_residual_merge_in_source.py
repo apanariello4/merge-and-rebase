@@ -113,7 +113,7 @@ def test_final_summary_carries_alignment_and_correction_fit_timing_keys():
     """
     import inspect
 
-    from merge_and_rebase.eval import vision_rebase_summary
+    from merge_and_rebase.eval.vision_rebase import summary as vision_rebase_summary
 
     summary_source = inspect.getsource(vision_rebase_summary.assemble_summary)
     assert '"alignment_calibration_timings": record.alignment_calibration_timings' in summary_source

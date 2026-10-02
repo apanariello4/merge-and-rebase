@@ -31,13 +31,10 @@ import torch
 
 from merge_and_rebase.utils.helpers import parse_csv
 
-from ..eval.block_extension import BlockExtensionConfig, resolve_block_extension_config
-from ..eval.target_residual_completion import validate_residual_completion_depth_direction
-from ..eval.vision_rebase_merge import (
-    _SINGLE_TRANSPORT_MODES,
-    _resolve_merge_mode_config,
-)
 from . import get_method
+from .block_extension.completion_config import validate_residual_completion_depth_direction
+from .block_extension.config import BlockExtensionConfig, resolve_block_extension_config
+from .merge_modes import _SINGLE_TRANSPORT_MODES, _resolve_merge_mode_config
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
 from .registry import canonical_method_name
 from .runtime import format_rebase_method_label, resolve_rebase_method_config

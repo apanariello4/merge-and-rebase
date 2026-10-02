@@ -16,7 +16,7 @@ import torch.nn.functional as F  # noqa: F401  (kept importable)
 
 from merge_and_rebase.utils.helpers import load_json
 
-from ..cli_args import (
+from ...cli_args import (
     add_alpha_args,
     add_config_arg,
     add_device_dtype_args,
@@ -27,61 +27,54 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
-from ..data.balanced_calibration import (  # noqa: F401  (kept importable)
+from ...data.balanced_calibration import (  # noqa: F401  (kept importable)
     Vision8TaskContext,
     build_balanced_vision8_calibration_loaders,
 )
-from ..data.templates import get_templates  # noqa: F401  (kept importable)
-from ..data.vision_loaders import (  # noqa: F401  (kept importable)
+from ...data.templates import get_templates  # noqa: F401  (kept importable)
+from ...data.vision_loaders import (  # noqa: F401  (kept importable)
     build_vision_calibration_loader,
     build_vision_loaders,
     extract_classnames,
     load_hf_splits,
 )
-from ..eval.utils import (
+from ...eval.utils import (
     eval_task_top1,
     humanize,  # noqa: F401  (kept importable)
     patch_base_for_attn,
     resolve_eval_split_loader,  # noqa: F401  (kept importable)
     to_cpu_fp32,
 )
-from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
-from ..io.peft_helpers import normalize_attn_patch_cfg
-from ..merge.base import PreparedMergeMethod  # noqa: F401  (kept importable)
-from ..merge.methods._common import axpy_state_dict
-from ..merge.registry import get_method as get_merge_method  # noqa: F401  (kept importable)
-from ..merge.registry import list_methods as list_merge_methods
-from ..merge.task_vectors import TaskVector
-from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..rebase import list_methods
-from ..rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
-from ..rebase.methods.ariadne import (
+from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
+from ...io.peft_helpers import normalize_attn_patch_cfg
+from ...merge.base import PreparedMergeMethod  # noqa: F401  (kept importable)
+from ...merge.methods._common import axpy_state_dict
+from ...merge.registry import get_method as get_merge_method  # noqa: F401  (kept importable)
+from ...merge.registry import list_methods as list_merge_methods
+from ...merge.task_vectors import TaskVector
+from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...rebase import list_methods
+from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_model
+from ...rebase.methods.ariadne import (
     AriadneRebase,
     apply_depth_pairing_override,
 )
-from ..rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
-from ..rebase.methods.theseus import InterpolatedBlockActivations
-from ..rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
-from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
-from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
-from ..utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
-from .block_extension import (
+from ...rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
+from ...rebase.methods.theseus import InterpolatedBlockActivations
+from ...rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
+from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from ...utils.alpha_search import PerTaskAlphaTracker, average_scores
+from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
+from ..block_extension import (
     block_extension_protocol,  # noqa: F401  (kept importable)
     calibration_dataset_spec,
     run_block_extension,
     select_loader,
 )
-from .datasets.vision8_14_20 import SUITES
-from .print_utils import pretty_print_task_accuracies
-from .rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)
-from .source_lmc import (  # noqa: F401  (re-exported for tests)
-    _ZERO_SHOT_CACHE_DIR,
-    _evaluate_all_task_star_lmc,
-    _evaluate_cross_task_source_lmc,
-    _evaluate_source_lmc,
-    _evaluate_source_model_top1,
-)
-from .target_informed_runtime import (
+from ..datasets.vision8_14_20 import SUITES
+from ..print_utils import pretty_print_task_accuracies
+from ..rebase_metrics import normalized_accuracy_ratio  # noqa: F401  (kept importable)
+from ..target_informed_runtime import (
     capture_residual_references,
     capture_resized_joint_source_inputs,
     complete_direct_p1_shared_correction,
@@ -91,21 +84,21 @@ from .target_informed_runtime import (
     projection_transforms,
     scale_completion,
 )
-from .target_residual_completion import (
+from ..target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,
 )
-from .vision_alpha_search import (  # noqa: F401  (re-exported for tests)
+from .alpha_search import (  # noqa: F401  (re-exported for tests)
     _average_defined,
     _norm_acc,
 )
-from .vision_artifacts import (  # noqa: F401  (re-exported for tests)
+from .artifacts import (  # noqa: F401  (re-exported for tests)
     _legacy_visual_delta,
     _legacy_visual_key,
     _load_saved_sequential_tv,
     _state_dict_sha256,
 )
-from .vision_rebase_context import (  # noqa: F401  (re-exported for tests)
+from .context import (  # noqa: F401  (re-exported for tests)
     DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
     TRANSPORT_CALIBRATION_DATA,
     _build_balanced_calibration_context,
@@ -117,7 +110,7 @@ from .vision_rebase_context import (  # noqa: F401  (re-exported for tests)
     _select_dedicated_brace_loader,
     _TaskContext,
 )
-from .vision_rebase_merge import (  # noqa: F401  (re-exported for tests)
+from .merge import (  # noqa: F401  (re-exported for tests)
     _SINGLE_TRANSPORT_MODES,
     _TRANSPORT_THEN_MERGE_MODES,
     _VALID_MERGE_MODES,
@@ -133,7 +126,14 @@ from .vision_rebase_merge import (  # noqa: F401  (re-exported for tests)
     _scale_deltas_by,
     _visual_key_fingerprint,
 )
-from .vision_rebase_summary import (  # noqa: F401  (re-exported for tests)
+from .source_lmc import (  # noqa: F401  (re-exported for tests)
+    _ZERO_SHOT_CACHE_DIR,
+    _evaluate_all_task_star_lmc,
+    _evaluate_cross_task_source_lmc,
+    _evaluate_source_lmc,
+    _evaluate_source_model_top1,
+)
+from .summary import (  # noqa: F401  (re-exported for tests)
     RunRecord,
     assemble_summary,
 )
@@ -236,8 +236,8 @@ def _build_rebase_prepared(
     from the validation/test split seed.
     """
     if method_name == "gradfix":
-        from ..eval.utils import build_grad_dataloader
-        from ..models.grad_recipes import clip_contrastive_recipe
+        from ...eval.utils import build_grad_dataloader
+        from ...models.grad_recipes import clip_contrastive_recipe
 
         grad_loader = build_grad_dataloader(
             loaders.train,
@@ -332,7 +332,7 @@ def _build_rebase_prepared(
         )
 
     if bico_mode:
-        from ..models.grad_recipes import clip_contrastive_recipe
+        from ...models.grad_recipes import clip_contrastive_recipe
 
         bico_params = dict(method_params)
         transport_seed = int(bico_params.pop("seed", cfg.get("seed", 42)))

@@ -8,17 +8,17 @@ from typing import Any
 
 import torch
 
-from ..data.balanced_calibration import Vision8TaskContext, build_balanced_vision8_calibration_loaders
-from ..data.templates import get_templates
-from ..data.vision_loaders import (
+from ...data.balanced_calibration import Vision8TaskContext, build_balanced_vision8_calibration_loaders
+from ...data.templates import get_templates
+from ...data.vision_loaders import (
     build_vision_calibration_loader,
     build_vision_loaders,
     extract_classnames,
     load_hf_splits,
 )
-from ..eval.utils import humanize
-from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from .block_extension import select_loader
+from ...eval.utils import humanize
+from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ..block_extension import select_loader
 
 
 @dataclass(frozen=True)

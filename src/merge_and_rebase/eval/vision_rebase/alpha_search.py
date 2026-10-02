@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from ..utils.alpha_search import average_scores
-from .rebase_metrics import normalized_accuracy_ratio
+from ...utils.alpha_search import average_scores
+from ..rebase_metrics import normalized_accuracy_ratio
 
 
 def _norm_acc(result_acc: float, baseline_acc: float) -> float:
