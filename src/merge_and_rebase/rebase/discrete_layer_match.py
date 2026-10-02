@@ -139,3 +139,29 @@ def build_discrete_indexed_model(
     setattr(parent, attr_name, new_resblocks)
 
     return result
+
+
+def build_discrete_indexed_decoder(
+    source_model: nn.Module,
+    pairing: DiscreteLayerPairing,
+    family_adapter,
+) -> nn.Module:
+    """Depth-reindexed deep copy of an HF decoder per ``pairing`` (family-adapter layout).
+
+    Target block ``j`` is a deep copy of source block ``pairing.pairing[j]``. Installation goes
+    through ``family_adapter.set_layers`` so ``num_hidden_layers``, per-layer ``layer_idx`` (KV
+    cache slots) and ``layer_types`` stay consistent with the realized depth. ``source_model`` is
+    never mutated. No correction, interpolation or fit is applied.
+    """
+    result = deepcopy(source_model)
+    orig = family_adapter.layers(result)
+    if len(orig) != pairing.source_depth:
+        raise ValueError(f"pairing.source_depth={pairing.source_depth} != model depth {len(orig)}")
+    layer_types = getattr(getattr(result, "config", None), "layer_types", None)
+    paired_types = [layer_types[i] for i in pairing.pairing] if layer_types is not None else None
+    new_layers = [deepcopy(orig[i]) for i in pairing.pairing]
+    family_adapter.set_layers(result, new_layers)
+    if paired_types is not None:
+        result.config.layer_types = paired_types
+        family_adapter.set_layers(result, list(family_adapter.layers(result)))
+    return result
