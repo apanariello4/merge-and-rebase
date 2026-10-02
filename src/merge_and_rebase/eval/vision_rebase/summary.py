@@ -85,10 +85,12 @@ class RunRecord:
     direct_residual_preset: Any
     single_tv_val_best_alpha: Any
     single_tv_val_best_acc: Any
+    #: Additive ``save_policy`` entry; ``None`` (key omitted) unless the config named ``save_transported_tvs``.
+    save_policy: Any = None
 
 
 def assemble_summary(record: RunRecord) -> dict[str, Any]:
-    return {
+    summary = {
         "suite": record.suite_name,
         "tasks": record.tasks,
         "method": record.method.name,
@@ -294,3 +296,6 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         ),
         "saved_merged_path": record.saved_merged_path,
     }
+    if record.save_policy is not None:
+        summary["save_policy"] = record.save_policy
+    return summary

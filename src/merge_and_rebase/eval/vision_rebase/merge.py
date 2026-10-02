@@ -228,6 +228,8 @@ class MergePlan:
     single_tv_deltas: list[dict[str, torch.Tensor]] | None
     #: Calibration provenance of the single-transport modes, else ``None``.
     calibration_metadata: dict[str, Any] | None
+    #: The merged-then-transported delta of the single-transport modes (additive; saved under ``save_transported_tvs="auto"``).
+    single_transport_delta: dict[str, torch.Tensor] | None = None
 
 
 def compose_rebased_deltas(
@@ -281,6 +283,7 @@ def compose_rebased_deltas(
     can_eval_untransported_by_task: list[bool] = []
     single_tv_deltas_for_diagnostic: list[dict[str, torch.Tensor]] | None = None
     single_transport_calibration_metadata: dict[str, Any] | None = None
+    single_transport_delta: dict[str, torch.Tensor] | None = None
     if merge_mode == "none":
         rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
         untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
@@ -561,6 +564,7 @@ def compose_rebased_deltas(
                 "calibration": calibration_metadata,
             },
         )
+        single_transport_delta = transported_merged_delta
         rebased_deltas = [transported_merged_delta] * len(tasks)
         untransported_deltas = original_deltas
 
@@ -576,4 +580,5 @@ def compose_rebased_deltas(
         can_eval_untransported=can_eval_untransported_by_task,
         single_tv_deltas=single_tv_deltas_for_diagnostic,
         calibration_metadata=single_transport_calibration_metadata,
+        single_transport_delta=single_transport_delta,
     )

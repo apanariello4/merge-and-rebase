@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import itertools  # noqa: F401  (kept importable)
-import json
-import os
+import json  # noqa: F401  (kept importable)
+import os  # noqa: F401  (kept importable)
 import time  # noqa: F401  (kept importable)
 from collections.abc import Mapping, Sequence  # noqa: F401  (kept importable)
 from copy import deepcopy  # noqa: F401  (kept importable)
@@ -97,6 +97,8 @@ from .alpha_search import (  # noqa: F401  (re-exported for tests)
     run_alpha_search,
 )
 from .artifacts import (  # noqa: F401  (re-exported for tests)
+    TransportedTvSaver,
+    TransportedTvSaveSpec,
     _legacy_visual_delta,
     _legacy_visual_key,
     _load_saved_sequential_tv,
@@ -567,7 +569,6 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
         transport_timings: dict[str, dict[str, float]] = {}
-        transported_artifacts: dict[str, list[str]] = {}
         cross_task_lmc_rows: list[dict[str, Any]] = []
         all_task_lmc_rows: list[dict[str, Any]] = []
         # Last realized per-task extension layout. The insertion schedule
@@ -617,6 +618,15 @@ def main() -> None:
             block_extension_calibration_loader=block_extension_calibration_loader,
             run_logger=run_logger,
         )
+        save_spec = TransportedTvSaveSpec.from_config(
+            cfg,
+            method_name=method.name,
+            ariadne_like=direct_residual_like,
+            ariadne_cfg=direct_residual_cfg,
+            summary_dir=run_summary_path.parent,
+        )
+        saver = TransportedTvSaver(save_spec, stage_env)
+        save_transported = saver
         prestep = build_prestep(plan)
         eval_observer, lmc_observer = build_prestep_observers()
         prestep_observers = (eval_observer, lmc_observer)
@@ -724,41 +734,7 @@ def main() -> None:
                     context={"task": task, "method": method.name},
                 )
 
-                save_transport_dir = cfg.get("save_transported_tvs_dir", None)
-                save_transported_artifacts = bool(cfg.get("save_transported_artifacts", bool(save_transport_dir)))
-                if save_transported_artifacts and not save_transport_dir:
-                    raise ValueError("save_transported_artifacts=true requires save_transported_tvs_dir.")
-                if save_transported_artifacts and save_transport_dir:
-                    os.makedirs(save_transport_dir, exist_ok=True)
-                    native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
-                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
-                        if os.path.exists(native_path) or os.path.exists(os.path.splitext(native_path)[0] + ".json"):
-                            raise FileExistsError(f"refusing to overwrite sequential DR vector: {native_path}")
-                    torch.save(to_cpu_fp32(transported_delta), native_path)
-                    if direct_residual_like and direct_residual_cfg.endpoint_construction in {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}:
-                        meta_path = os.path.splitext(native_path)[0] + ".json"
-                        metadata = {
-                            "task": task,
-                            "endpoint_construction": direct_residual_cfg.endpoint_construction,
-                            "target_base_sha256": _state_dict_sha256(target_base_sd),
-                            "vector_sha256": _state_dict_sha256(transported_delta),
-                            "calibration_seed": direct_residual_cfg.seed,
-                            "num_batches": direct_residual_cfg.num_batches,
-                            "direct_residual_config": asdict(direct_residual_cfg),
-                        }
-                        Path(meta_path).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-                    print(f"  {task}: saved transported TV -> {native_path}")
-                    transported_artifacts[task] = [native_path]
-                    if bool(cfg.get("save_transported_tvs_legacy", False)):
-                        legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
-                        legacy_no_conv1_path = os.path.join(
-                            save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
-                        )
-                        torch.save(_legacy_visual_delta(transported_delta), legacy_path)
-                        torch.save(_legacy_visual_delta(transported_delta, drop_conv1=True), legacy_no_conv1_path)
-                        print(f"  {task}: saved legacy visual TV -> {legacy_path}")
-                        print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
-                        transported_artifacts[task] += [legacy_path, legacy_no_conv1_path]
+                save_transported(task, transported_delta)
             else:
                 original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
@@ -773,6 +749,8 @@ def main() -> None:
             target_cfg=target_cfg,
         )
         single_transport_calibration_metadata = merge_plan.calibration_metadata
+        if saver.merged_single_transport_enabled and merge_plan.single_transport_delta is not None:
+            save_transported(f"merged_{merge_mode}", merge_plan.single_transport_delta, merged=True)
 
         evaluator = TargetEvaluator.from_plan(stage_env, merge_plan, per_task=per_task)
         alpha_result = run_alpha_search(
@@ -875,7 +853,8 @@ def main() -> None:
                 source_lmc_rows=source_lmc_rows,
                 cross_task_lmc_rows=cross_task_lmc_rows,
                 all_task_lmc_rows=all_task_lmc_rows,
-                transported_artifacts=transported_artifacts,
+                transported_artifacts=saver.artifacts,
+                save_policy=save_spec.summary_record(),
                 transport_timings=transport_timings,
                 transport_calibration_meta=transport_calibration_meta,
                 cost_phase_timings=cost_phase_timings,
