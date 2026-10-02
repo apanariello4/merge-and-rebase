@@ -118,11 +118,14 @@ class DirectResidualConfig:
     # Streaming only: relative tolerance of the pass-A/pass-B target boundary fingerprint check (detects a target
     # model mutated between passes). 1e-9 = historical; loosen only if non-deterministic kernels trip it.
     streaming_fingerprint_tol: float = 1e-9
+    # Ablation (default off): besides the fit, also copy source task-vector deltas whose shapes match the target's
+    # (decoder/LLM runs; by default the Ariadne task vector is only its own fit). Serialized only when True.
+    copy_shape_matching_source_deltas: bool = False
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
 # artifact and golden hash of a default run stays byte-identical.
-_SERIALIZED_WHEN_NON_DEFAULT = {"streaming_fingerprint_tol": 1e-9}
+_SERIALIZED_WHEN_NON_DEFAULT = {"streaming_fingerprint_tol": 1e-9, "copy_shape_matching_source_deltas": False}
 
 
 def direct_residual_config_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
@@ -202,6 +205,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "fidelity_holdout",
         "fidelity_holdout_batches",
         "streaming_fingerprint_tol",
+        "copy_shape_matching_source_deltas",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -228,6 +232,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("strength must be >= 0")
     if not isinstance(cfg.exact_form, bool):
         raise TypeError("exact_form must be bool")
+    if not isinstance(cfg.copy_shape_matching_source_deltas, bool):
+        raise TypeError("copy_shape_matching_source_deltas must be bool")
     if cfg.component_target in {"output_local", "output_total"}:
         raise ValueError(
             f"component_target={cfg.component_target!r} was retired (closed dead end) in the release "
@@ -393,4 +399,48 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     tol = cfg.streaming_fingerprint_tol
     if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
         raise ValueError("streaming_fingerprint_tol must be a positive finite number")
+    return cfg
+
+
+#: Defaults applied to decoder (LLM) runs when the key is absent (dataclass defaults are unchanged).
+DECODER_DEFAULTS: dict[str, Any] = {
+    "components": ("mlp.c_proj",),  # mapped to mlp.down_proj by the family adapter
+    "activation_storage": "streaming",
+    "ridge_estimator": "empirical_bayes",
+    "missing_bias": "materialize",
+    "exact_form": True,
+}
+
+#: (field, required value, why) for options that are vision-only.
+_DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
+    ("procrustes_source", "activation"),
+    ("tv_scaling", "none"),
+    ("fidelity_holdout", False),
+    ("block_split", "none"),
+    ("alignment_row_weighting", "uniform"),
+    ("endpoint_construction", "native_delta"),
+    ("calibration_data", "task_local"),
+)
+
+
+def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapter: Any) -> DirectResidualConfig:
+    """Parse an Ariadne config for a decoder (LLM) run: fill decoder defaults for absent keys, reject vision-only options.
+
+    ``family_adapter`` must be given (the family is what maps ``mlp.c_proj`` onto the decoder's down projection).
+    """
+    if family_adapter is None:
+        raise ValueError("resolve_ariadne_decoder_config requires the model family adapter")
+    raw = dict(value or {})
+    preset = resolve_direct_residual_preset(raw)
+    if preset is not None:
+        raw.pop("preset")
+        raw = {**_PRESETS[preset], **raw}
+    cfg = parse_direct_residual_config({**DECODER_DEFAULTS, **raw})
+    for name, required in _DECODER_REQUIRED:
+        got = getattr(cfg, name)
+        if got != required:
+            raise ValueError(
+                f"Ariadne on decoder models does not support {name}={got!r} (must be {required!r}): "
+                "this option is vision-only"
+            )
     return cfg
