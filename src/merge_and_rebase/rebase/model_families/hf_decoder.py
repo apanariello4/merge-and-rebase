@@ -89,7 +89,7 @@ def _set_depth(model: nn.Module, scope: nn.Module, depth: int) -> None:
 
 
 def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] | None:
-    """Grow `config.layer_types` to the new depth, keeping it authoritative.
+    """Resize `config.layer_types` (grow or truncate) to the new depth, keeping it authoritative.
 
     Models with alternating attention patterns key off this list, and the
     reindex below reads it positionally. Left short, every layer past the
@@ -102,7 +102,10 @@ def _resolve_layer_types(model: nn.Module, layers: nn.ModuleList) -> list[str] |
         return None
     resolved = list(layer_types)
     if len(resolved) >= len(layers):
-        return resolved[: len(layers)]
+        # Shrink: the config must follow the new depth too (correctness, unconditional).
+        resolved = resolved[: len(layers)]
+        config.layer_types = resolved
+        return resolved
     for idx in range(len(resolved), len(layers)):
         own = getattr(layers[idx], "attention_type", None)
         resolved.append(own if own is not None else resolved[-1])
