@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from functools import partial
 from typing import Any
 
 import torch
@@ -15,7 +16,7 @@ except Exception:
     tqdm = None
 
 from ..rebase.block_extension.adapters import DecoderAdapter
-from ..rebase.block_extension.core import BlockExtenderCore
+from ..rebase.block_extension.core import BlockExtenderCore, EagerProvider
 from ..rebase.block_extension.schedules import decoder_collapse_schedule, decoder_locate_collapse_pos
 from .block_extension import (
     BlockExtensionConfig,
@@ -90,6 +91,9 @@ class DecoderBlockExtender(BlockExtenderCore):
         # Realized block chain, set by the extend path; None when no extension
         # ran (shrink, or depth already matching).
         self.realized_layout: dict[str, Any] | None = None
+
+    def _make_reference_provider(self) -> EagerProvider:
+        return EagerProvider(self)
 
     @staticmethod
     def _build_collapse_schedule(
@@ -404,12 +408,7 @@ class DecoderBlockExtender(BlockExtenderCore):
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight extension (mode={per_weight_mode})")
-        if not skip_correction:
-            self.capture_reference_inputs(loader, n_batches)
-            self._capture_component_references(loader, n_batches)
-            self._vprint("reference activation and component capture completed")
-        else:
-            self._vprint("skip_correction enabled: skipping reference capture")
+        provider = self._open_references(skip_correction, loader, n_batches)
 
         layers_base = _get_layers(self.model_base, self.family_adapter)
         curr_layers = len(layers_base)
@@ -472,54 +471,18 @@ class DecoderBlockExtender(BlockExtenderCore):
             self._set_layers(self.model_ft, [x["mod"] for x in chain_ft])
 
             if not skip_correction:
-                base_ref = "ft" if share_ft_refs else None
-                if lmc_mode == "independent":
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                    )
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                    )
-                elif lmc_mode == "steer":
-                    base_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_targets=base_corrections,
-                    )
-                elif lmc_mode == "shared":
-                    base_corrections = {}
-                    self._correct_block_weights_cascade(
-                        "base", self.model_base, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._apply_block_corrections(self.model_ft, insert_pos, base_corrections)
-                elif lmc_mode == "shared_ft":
-                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_block_weights_cascade(
-                        "ft", self.model_ft, insert_pos, src_idx, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_store=ft_corrections,
-                    )
-                    self._apply_block_corrections(self.model_base, insert_pos, ft_corrections)
-                else:
-                    raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_ft'."
-                    )
+                self._correct_one_block(
+                    provider=provider,
+                    position=insert_pos,
+                    ref_block_idx=src_idx,
+                    loader=loader,
+                    n_batches=n_batches,
+                    ridge_identity=ridge_identity,
+                    n_cascade_iters=n_cascade_iters,
+                    share_ft_refs=share_ft_refs,
+                    component_ridge=component_ridge,
+                    lmc_mode=lmc_mode,
+                )
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
         # Describe the realized chain with the same builder vision uses, so a
@@ -554,12 +517,7 @@ class DecoderBlockExtender(BlockExtenderCore):
         if per_weight_mode not in {"cascade", "duplicate"}:
             raise ValueError(f"Unsupported per_weight_mode '{per_weight_mode}'. Expected 'cascade' or 'duplicate'.")
         self._vprint(f"starting per-weight shrink (mode={per_weight_mode})")
-        if not skip_correction:
-            self.capture_reference_inputs(loader, n_batches)
-            self._capture_component_references(loader, n_batches)
-            self._vprint("reference activation and component capture completed")
-        else:
-            self._vprint("skip_correction enabled: skipping reference capture")
+        self._open_references(skip_correction, loader, n_batches)
 
         layers_base = _get_layers(self.model_base, self.family_adapter)
         curr_layers = len(layers_base)
@@ -620,60 +578,20 @@ class DecoderBlockExtender(BlockExtenderCore):
                 span_start = merged_origs[0]
                 span_end = merged_origs[-1]
                 output_ref_key = f"{span_end}.input"
-                base_ref = "ft" if share_ft_refs else None
-                if lmc_mode == "independent":
-                    self._correct_collapsed_block_weights_cascade(
-                        "base", self.model_base, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                    )
-                    self._correct_collapsed_block_weights_cascade(
-                        "ft", self.model_ft, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                    )
-                elif lmc_mode == "steer":
-                    base_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_collapsed_block_weights_cascade(
-                        "base", self.model_base, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._correct_collapsed_block_weights_cascade(
-                        "ft", self.model_ft, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_targets=base_corrections,
-                    )
-                elif lmc_mode == "shared":
-                    base_corrections = {}
-                    self._correct_collapsed_block_weights_cascade(
-                        "base", self.model_base, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        ref_source=base_ref, component_ridge=component_ridge,
-                        lmc_store=base_corrections,
-                    )
-                    self._apply_block_corrections(self.model_ft, collapse_pos, base_corrections)
-                elif lmc_mode == "shared_ft":
-                    ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-                    self._correct_collapsed_block_weights_cascade(
-                        "ft", self.model_ft, collapse_pos, span_start, span_end,
-                        output_ref_key, loader, n_batches,
-                        ridge_identity=ridge_identity, n_iters=n_cascade_iters,
-                        component_ridge=component_ridge,
-                        lmc_store=ft_corrections,
-                    )
-                    self._apply_block_corrections(self.model_base, collapse_pos, ft_corrections)
-                else:
-                    raise ValueError(
-                        f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_ft'."
-                    )
+
+                correct = partial(
+                    self._correct_collapsed_block_weights_cascade,
+                    block_idx=collapse_pos,
+                    span_start_idx=span_start,
+                    span_end_idx=span_end,
+                    output_ref_key=output_ref_key,
+                    loader=loader,
+                    n_batches=n_batches,
+                    ridge_identity=ridge_identity,
+                    n_iters=n_cascade_iters,
+                    component_ridge=component_ridge,
+                )
+                self._dispatch_lmc(lmc_mode, share_ft_refs, collapse_pos, correct)
 
         final_depth = len(_get_layers(self.model_base, self.family_adapter))
         # Publish the realized many-to-one ancestry for consumers such as

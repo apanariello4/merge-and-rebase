@@ -14,7 +14,8 @@ The two known differences are kept as class attributes rather than unified:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,69 @@ import torch.nn as nn
 
 from .adapters import ComponentAdapter, ComponentSpec
 from .schedules import spread_anchor_schedule
+
+
+class EagerProvider:
+    """Reference activations of every block of both endpoints, captured once before the structural loop.
+
+    This is the decoder policy. The captures live on the extender (``capture_reference_inputs`` and
+    ``_capture_component_references`` fill ``reference_inputs``), so ``ensure`` has nothing left to do.
+    """
+
+    def __init__(self, extender: Any):
+        self.extender = extender
+
+    def start(self, loader: Iterable[Any], n_batches: int) -> None:
+        self.extender.capture_reference_inputs(loader, n_batches)
+        self.extender._capture_component_references(loader, n_batches)
+        self.extender._vprint("reference activation and component capture completed")
+
+    def ensure(self, **_kwargs: Any) -> None:
+        return None
+
+    def finish(self) -> None:
+        return None
+
+
+class LazyProvider:
+    """Pristine CPU endpoint copies; only the references the current structural step needs are captured.
+
+    This is the vision policy (``reference_capture`` ``lazy`` and ``eager`` are both handled inside the
+    extender's ``_capture_per_weight_reference_subset``).
+    """
+
+    def __init__(self, extender: Any):
+        self.extender = extender
+        self.models: dict[str, nn.Module] = {}
+
+    def start(self, loader: Iterable[Any], n_batches: int) -> None:
+        del loader, n_batches
+        self.models = {
+            "base": deepcopy(self.extender.model_base).cpu(),
+            "ft": deepcopy(self.extender.model_ft).cpu(),
+        }
+        self.extender._vprint("created pristine CPU reference endpoints for lazy capture")
+
+    def ensure(
+        self,
+        *,
+        endpoints: Sequence[str],
+        block_indices: Sequence[int],
+        input_indices: Sequence[int | str],
+        loader: Iterable[Any],
+        n_batches: int,
+    ) -> None:
+        self.extender._capture_per_weight_reference_subset(
+            self.models,
+            endpoints=endpoints,
+            block_indices=block_indices,
+            input_indices=input_indices,
+            loader=loader,
+            n_batches=n_batches,
+        )
+
+    def finish(self) -> None:
+        self.models.clear()
 
 
 class BlockExtenderCore:
@@ -122,6 +186,116 @@ class BlockExtenderCore:
     def _record_corrections(self, endpoint: str, corrections: Mapping[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
         for component, (W, b) in corrections.items():
             self._record_correction(endpoint, component, W, b)
+
+    # ---- references and lmc dispatch -----------------------------------------------------------------------------
+
+    def _make_reference_provider(self) -> EagerProvider | LazyProvider:
+        raise NotImplementedError
+
+    def _open_references(
+        self, skip_correction: bool, loader: Iterable[Any], n_batches: int
+    ) -> EagerProvider | LazyProvider | None:
+        if skip_correction:
+            self._vprint("skip_correction enabled: skipping reference capture")
+            return None
+        provider = self._make_reference_provider()
+        provider.start(loader, n_batches)
+        return provider
+
+    @staticmethod
+    def _reference_endpoint_names(lmc_mode: str, share_ft_refs: bool) -> tuple[str, ...]:
+        if lmc_mode == "shared":
+            return ("ft",) if share_ft_refs else ("base",)
+        if lmc_mode == "shared_ft" or share_ft_refs:
+            return ("ft",)
+        return ("base", "ft")
+
+    def _dispatch_lmc(
+        self,
+        lmc_mode: str,
+        share_ft_refs: bool,
+        position: int,
+        correct: Callable[..., None],
+    ) -> None:
+        """Run ``correct(model_name, model, ref_source=, lmc_store=, lmc_targets=)`` for the lmc mode.
+
+        ``independent``: both endpoints fitted on their own references. ``steer``: the ft fit is pulled
+        towards the base maps. ``shared`` / ``shared_ft``: one endpoint is fitted and its maps applied to
+        the other.
+        """
+        base_ref = "ft" if share_ft_refs else None
+        if lmc_mode == "independent":
+            correct("base", self.model_base, ref_source=base_ref)
+            correct("ft", self.model_ft)
+        elif lmc_mode == "steer":
+            base_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            correct("base", self.model_base, ref_source=base_ref, lmc_store=base_corrections)
+            correct("ft", self.model_ft, lmc_targets=base_corrections)
+        elif lmc_mode == "shared":
+            base_corrections = {}
+            correct("base", self.model_base, ref_source=base_ref, lmc_store=base_corrections)
+            self._apply_block_corrections(self.model_ft, position, base_corrections)
+            self._record_corrections("ft", base_corrections)
+        elif lmc_mode == "shared_ft":
+            ft_corrections: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            correct("ft", self.model_ft, lmc_store=ft_corrections)
+            self._apply_block_corrections(self.model_base, position, ft_corrections)
+            self._record_corrections("base", ft_corrections)
+        else:
+            raise ValueError(
+                f"Unsupported lmc_mode '{lmc_mode}'. Expected 'independent', 'steer', 'shared', or 'shared_ft'."
+            )
+
+    @torch.no_grad()
+    def _correct_one_block(
+        self,
+        *,
+        provider: EagerProvider | LazyProvider,
+        position: int,
+        ref_block_idx: int,
+        loader: Iterable[Any],
+        n_batches: int,
+        ridge_identity: float,
+        n_cascade_iters: int,
+        share_ft_refs: bool,
+        component_ridge: dict[str, float] | None,
+        lmc_mode: str,
+        insertion_target_mode: str = "direct",
+        target_reference: torch.Tensor | None = None,
+        target_weight: float = 0.0,
+    ) -> None:
+        """Capture references for one block and fit/absorb its correction.
+
+        ``position`` is the block's index in the current chain; ``ref_block_idx`` is the original block whose
+        pristine activations are the target. For an inserted block those differ; for an original block being
+        repaired they refer to the same block at its shifted position.
+        """
+        provider.ensure(
+            endpoints=self._reference_endpoint_names(lmc_mode, share_ft_refs),
+            block_indices=(ref_block_idx,),
+            input_indices=(),
+            loader=loader,
+            n_batches=n_batches,
+        )
+
+        def correct(model_name: str, model: nn.Module, **lmc: Any) -> None:
+            self._correct_block_weights_cascade(
+                model_name,
+                model,
+                position,
+                ref_block_idx,
+                loader,
+                n_batches,
+                ridge_identity=ridge_identity,
+                n_iters=n_cascade_iters,
+                component_ridge=component_ridge,
+                insertion_target_mode=insertion_target_mode,
+                target_reference=target_reference,
+                target_weight=target_weight,
+                **lmc,
+            )
+
+        self._dispatch_lmc(lmc_mode, share_ft_refs, position, correct)
 
     # ---- correction cascade (one loop over ``adapter.components``) -------------------------------------------------
 
