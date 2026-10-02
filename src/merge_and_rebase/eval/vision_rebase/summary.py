@@ -182,6 +182,15 @@ class RunRecord:
         )
 
 
+def _protocol_record(record: RunRecord) -> dict[str, Any]:
+    """``block_extension_protocol`` with the structural rule that actually ran (B7)."""
+    protocol = block_extension_protocol(record.block_extension_cfg)
+    if (record.depth_rule_resolved or {}).get("rule") == "discrete_index_match":
+        # No BRACE step ran: the label used to say "ariadne" for BiCo/THESEUS discrete-index-match runs.
+        protocol = {**protocol, "label": "discrete_index_match"}
+    return protocol
+
+
 def assemble_summary(record: RunRecord) -> dict[str, Any]:
     summary = {
         "suite": record.suite_name,
@@ -196,7 +205,7 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         "strict_diagnostics": {"missing": 0, "failures": 0, "wrong_shape": 0},
         "single_transport_calibration": record.single_transport_calibration_metadata,
         "brace_calibration": record.brace_calibration_metadata,
-        "block_extension_protocol": block_extension_protocol(record.block_extension_cfg),
+        "block_extension_protocol": _protocol_record(record),
         "base_construction": record.base_construction,
         "independent_endpoint_baseline": (
             {
