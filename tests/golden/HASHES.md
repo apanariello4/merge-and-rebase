@@ -454,3 +454,32 @@ GOLDEN_CAPTURE=/tmp/brace_x.txt .venv/bin/python -m pytest tests/golden/test_bra
 # paste both into the EXPECTED / TABLES literals at the bottom of the test file, then
 .venv/bin/ruff check --fix tests/golden/test_brace_extra_golden.py && .venv/bin/ruff format tests/golden/test_brace_extra_golden.py
 ```
+
+## `llm_rebase.main()` end-to-end pins (`test_llm_main_golden.py`, S10a safety net)
+
+Drives the real `eval.llm_rebase.main()` on tiny real `Qwen2ForCausalLM` source/target (built from config) with an
+in-memory whitespace tokenizer. Faked by name over `PATCH_MODULES` (`raising=False`, so the file also runs on the
+pre-package single-module layout): `TextLM.build`, `load_aligned_tuned_from_ref`, `load_ckpt`, `build_nli_task_data`,
+the harness `run` (sigmoid of the negative cross-entropy of the evaluated weights, so it is weight sensitive) and
+`start_run`. Calibration text is `calibration_prompts` (real resolver); one case fakes `resolve_calibration_texts` to
+exercise the hold-out plumbing. Per case it pins `summary`, `resolved_config`, the harness call log (tasks, shots,
+limit, samples, depth, hash of the evaluated state dict per call), the `TextLM.build` log, the tuned/base checkpoint
+load log and every saved `.pt`; each case is run twice in-process and must be identical.
+
+- Cases (24): THESEUS same depth (fixed alpha; alpha search + `save_merged` + base ckpts; weights/limit/fewshot),
+  extend 2->3 with BRACE `skip_correction` true/false, default, `eval_before_rebase` (+ `eval_source_before_extension`),
+  shrink 3->2 (`interpolate_per_weight`), `theseus_gqa` (kv 2->1) same depth and extend, BiCo same depth and extend,
+  `delta_norm_match` {`uncorrected` x `transport_delta_source` corrected/uncorrected, literal `none`, same depth},
+  sequential/discrete/sobol alpha search, `save_merged`, `eval_before_rebase_only` (same depth, extend), NLI prompt-eval
+  backend with alpha search, hold-out samples + `harness_test_samples` re-scoring.
+- Error table (24 invalid configs): exception type, message, number of model builds and runs started, recorder status.
+  Config-only errors (missing model names, unknown method, Ariadne, `method_params.n_batches`) fire with 0 builds and
+  0 runs; everything resolved after the build fires with 2 builds, 1 run and status `failed`. Ariadne (both spellings)
+  is the explicit "Ariadne LLM entrypoint lands in S10" `ValueError`.
+- Perturbation sanity: a different tuned-checkpoint scale changes `summary` and the harness log, not `resolved_config`.
+- Cross-check: the identical file (hashes unchanged) passes 53/53 against a detached worktree of `bbcb59b`
+  (pre-package `eval/llm_rebase.py`, `PYTHONPATH=<wt>/src`), i.e. the S10a package split is behaviour neutral.
+- Not pinned: the LLM main has no alpha early stopping (only sequential/sobol planners); `head_logits` NLI eval and
+  `task_heads`; real lm-eval / dataset loading; bf16/fp16 or GPU; LoRA tuned references; Llama/Qwen3 families through
+  `main()`; `eval_only` entrypoint.
+- Runtime about 27 s (53 tests). Regenerate with `GOLDEN_CAPTURE=out.txt pytest tests/golden/test_llm_main_golden.py`.
