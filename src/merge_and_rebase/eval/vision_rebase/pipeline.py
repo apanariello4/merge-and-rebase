@@ -198,6 +198,18 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                         )
                 print(f"  {task}: source checkpoint (transport required)")
             del raw_sd
+    else:
+        # auto_detect_ckpt_base=false with no native_target_tasks: nothing may be classified as native, but a
+        # target-architecture checkpoint must still be refused (B3: it used to be treated as a source checkpoint
+        # and silently produced an empty task vector).
+        for task in tasks:
+            raw_sd = load_ckpt(str(tuned_by_task[task]))
+            if _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd) == "target":
+                raise ValueError(
+                    f"Tuned checkpoint for task '{task}' matches the target architecture; "
+                    "add it to native_target_tasks or set auto_detect_ckpt_base=true."
+                )
+            del raw_sd
 
     if native_tasks:
         if merge_mode == "none":

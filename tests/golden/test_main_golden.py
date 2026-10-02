@@ -1388,6 +1388,15 @@ ERRORS: dict[str, Err] = {
         run_started=True,
         world=dict(_NATIVE_DTD),
     ),
+    # B3 (fixed in P5.14): used to complete with an empty task vector.
+    "target_architecture_checkpoint_without_auto_detect_or_native_list": Err(
+        {"auto_detect_ckpt_base": False, "merge_mode": "rebase_then_merge"},
+        ValueError,
+        P("Tuned checkpoint for task 'DTD' matches the target architecture; add it to native_target_tasks or set "),
+        before_build=False,
+        run_started=True,
+        world=dict(_NATIVE_DTD),
+    ),
     "strict_load_partial_visual_coverage": Err(
         {"strict_load": True},
         ValueError,
