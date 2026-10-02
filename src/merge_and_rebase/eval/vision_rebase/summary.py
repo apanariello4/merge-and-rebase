@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ...rebase.methods._ariadne.config import config_as_dict
 from ...rebase.registry import canonical_method_name
 from ..block_extension import block_extension_protocol
 
@@ -310,7 +311,7 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         "correction_fit_timings": record.correction_fit_timings,
         "direct_residual": (
             {
-                "config": asdict(record.direct_residual_cfg),
+                "config": config_as_dict(record.direct_residual_cfg),
                 # Canonical registry name ("direct_residual" is an alias of "ariadne");
                 # the top-level "method" keeps whatever spelling the config used.
                 "canonical_method": canonical_method_name(record.method_name),

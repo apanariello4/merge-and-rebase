@@ -16,7 +16,9 @@ from .layouts import _aligned, _rows
 Tensor = torch.Tensor
 
 
-def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: str) -> DiscreteLayerPairing:
+def apply_depth_pairing_override(
+    pairing: DiscreteLayerPairing, depth_pairing: str, *, ancestry: DiscreteLayerPairing | None = None
+) -> DiscreteLayerPairing:
     """Ablation: rewrite ``pairing.pairing`` per ``DirectResidualConfig.depth_pairing``.
 
     Called right after ``DiscreteLayerPairing.compute`` and before any capture. Every consumer
@@ -28,11 +30,19 @@ def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: s
     ``"relative"`` returns ``pairing`` unchanged (bit-for-bit; the default, golden-hash-pinned
     path). The other modes derive from the ORIGINAL relative pairing, not from each other:
     ``"reversed"``: ``source_depth - 1 - pi(j)``; ``"shift_plus1"``: ``min(source_depth - 1, pi(j) + 1)``;
-    ``"shift_minus1"``: ``max(0, pi(j) - 1)``. Only valid for ``component_target="block_boundary"``
+    ``"shift_minus1"``: ``max(0, pi(j) - 1)``; ``"brace_ancestry"``: the BRACE ancestor of ``j`` (``ancestry``).
+    Only valid for ``component_target="block_boundary"``
     (validated by ``parse_direct_residual_config``, not here).
     """
     if depth_pairing == "relative":
         return pairing
+    if depth_pairing == "brace_ancestry":
+        # pi(j) = the BRACE ancestor of target position j (rebase.depth_pairing.brace_ancestry_pairing).
+        if ancestry is None:
+            raise ValueError("depth_pairing='brace_ancestry' needs the ancestry pairing (brace_ancestry_pairing)")
+        if (ancestry.source_depth, ancestry.target_depth) != (pairing.source_depth, pairing.target_depth):
+            raise ValueError("ancestry pairing depths do not match the source/target depths")
+        return ancestry
     source_depth = pairing.source_depth
     if depth_pairing == "reversed":
         new_pairing = tuple(source_depth - 1 - i for i in pairing.pairing)
@@ -42,7 +52,7 @@ def apply_depth_pairing_override(pairing: DiscreteLayerPairing, depth_pairing: s
         new_pairing = tuple(max(0, i - 1) for i in pairing.pairing)
     else:
         raise ValueError(
-            f"depth_pairing must be 'relative', 'reversed', 'shift_plus1' or 'shift_minus1', got {depth_pairing!r}"
+            f"depth_pairing must be 'relative', 'reversed', 'shift_plus1', 'shift_minus1' or 'brace_ancestry', got {depth_pairing!r}"
         )
     return DiscreteLayerPairing(
         source_depth=pairing.source_depth, target_depth=pairing.target_depth, pairing=new_pairing
