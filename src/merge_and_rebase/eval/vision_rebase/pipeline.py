@@ -57,6 +57,17 @@ class VisionRuntime:
     summary_dir: Path | None
 
 
+def _owned_cpu_fp32(sd: Any) -> dict[str, torch.Tensor]:
+    """``to_cpu_fp32`` that never aliases the live model (B4).
+
+    On a CPU fp32 model ``.cpu().to(float32)`` returns views, so a later ``load_into_model`` would mutate the
+    "base" snapshot in place and trip the target-base-mutation guard. On CUDA the CPU copy is already real and
+    is kept as is (no second copy).
+    """
+    out = to_cpu_fp32(sd)
+    return {k: (v.clone() if v.data_ptr() == sd[k].data_ptr() else v) for k, v in out.items()}
+
+
 def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[str, Any]:
     """Run the per-task transport, merge dispatch and alpha search; returns the final summary dictionary."""
     cfg = runtime.cfg
@@ -131,7 +142,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
 
     if patch_attn_before_rebase:
         print(f"Patching source/target attention before rebase: {attn_patch_cfg}")
-        source_base_sd = to_cpu_fp32(
+        source_base_sd = _owned_cpu_fp32(
             patch_base_for_attn(
                 clf=clf_source,
                 base_ckpt=None,
@@ -139,7 +150,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 attn_patch_cfg=attn_patch_cfg,
             )
         )
-        target_base_sd = to_cpu_fp32(
+        target_base_sd = _owned_cpu_fp32(
             patch_base_for_attn(
                 clf=clf_target,
                 base_ckpt=None,
@@ -148,8 +159,8 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             )
         )
     else:
-        source_base_sd = to_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
-        target_base_sd = to_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
+        source_base_sd = _owned_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
+        target_base_sd = _owned_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
     target_hash_before = _state_dict_sha256(target_base_sd)
 
     use_humanized_classnames = not bool(cfg.get("no_humanize", True))
