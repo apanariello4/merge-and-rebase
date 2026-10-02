@@ -277,6 +277,7 @@ the Hasher bullet above is historical).
 - 2026-10-02, P5.14/B7: `block_extension_protocol.label` is `discrete_index_match` (was `ariadne`) when the resolved depth rule is `discrete_index_match`. `test_main_golden.py` `summary` hashes changed: `bico_extend_discrete_index_match`, `bico_extend_depth_defaults_method` (2). No events/file hash moved.
 - 2026-10-02, P5.14/B10: an unknown `merge_method` in a run config is a `ValueError` (same text, no KeyError quoting) instead of the registry's `KeyError`; the registry itself is unchanged. ERRORS pin `merge_method_unknown` updated. No hash changed.
 - 2026-10-02, P5.14/B9: a `weights` list whose length differs from the tuned checkpoints is rejected up front (before any model is built) with `weights length must match tuned checkpoints` in every merge mode; merge_mode `none` used to fail late with a bare `zip()` error. ERRORS pins `weights_length_mismatch_merge_mode_none` and `weights_length_mismatch_merge` updated (both now `before_build`). No hash changed.
+- 2026-10-02, P5.14/B5 (D-P5c): `cross_task_lmc_pairs` / `all_task_lmc_tasks` are deprecated (`DeprecationWarning` when non-empty; keys kept, outputs stay `[]`); the per-task `corrected_ft_states` / `corrected_ft_templates` bookkeeping (a CPU `deepcopy` of a model per task, never read) is no longer filled. No hash changed.
 
 `test_main_golden.py` (+ `main_golden_structure.json`) drives the REAL `eval/vision_rebase.py::main()`
 end to end on a tiny offline world and pins everything it produces, so each Phase 5 move out of

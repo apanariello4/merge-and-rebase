@@ -25,6 +25,7 @@ Ariadne never reaches ``get_method`` or ``resolve_block_extension_config`` (see
 from __future__ import annotations
 
 import enum
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -522,6 +523,15 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
     if all_task_lmc_split not in {"val", "test"}:
         raise ValueError("all_task_lmc_eval_split must be one of: val, test")
+    if cross_task_lmc_pairs or all_task_lmc_tasks:
+        # B5 / D-P5c: the cross-task and all-task LMC evaluators are never called, so these keys only ever
+        # produced empty summary entries. Keys are kept (deprecated) so old configs still load.
+        warnings.warn(
+            "cross_task_lmc_pairs / all_task_lmc_tasks are deprecated: the cross-task and all-task source-LMC "
+            "evaluations are not implemented and their summary entries are always empty.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     source_only = bool(cfg.get("source_only", False))
     strict_load = bool(cfg.get("strict_load", False))
     device = str(cfg.get("device", "cuda"))

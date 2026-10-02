@@ -84,6 +84,7 @@ class IndependentEndpoints:
     base_by_task: dict[str, dict[str, Any]] = field(default_factory=dict)
     ft_by_task: dict[str, dict[str, Any]] = field(default_factory=dict)
     corrected_source_template: Any | None = None
+    # Deprecated (P5.14/B5): never filled or read any more; kept so older code can still construct the record.
     corrected_ft_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     corrected_ft_templates: dict[str, Any] = field(default_factory=dict)
 

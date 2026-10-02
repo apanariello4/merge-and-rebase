@@ -316,10 +316,6 @@ class BracePrestep:
         if merge_mode == "brace_merge_then_transport" and endpoints.corrected_source_template is None:
             endpoints.corrected_source_template = deepcopy(source_base_model_task).cpu()
 
-        if resolved.lmc.cross_task_pairs or resolved.lmc.all_task_tasks:
-            endpoints.corrected_ft_states[t] = task_source_ft_sd
-            endpoints.corrected_ft_templates[t] = deepcopy(source_ft_model_task).cpu()
-
         return PrestepResult(
             kind=self.kind,
             source_base_sd=task_source_base_sd,
