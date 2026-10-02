@@ -10,9 +10,12 @@ Nothing here builds a model or touches a dataset. The only environment dependenc
 registry, which the caller passes in (``suites=``) so that harnesses that patch ``SUITES`` on the
 CLI module keep working; when omitted the real registry is imported lazily.
 
-Legacy depth semantics only: ``DepthRule`` is built from the top-level ``depth_alignment`` key
-(default ``"ariadne"`` == BRACE interpolation). Per-method depth defaults are a later, separately
-declared behaviour change and are deliberately NOT implemented here.
+Depth rule: ``depth_defaults: "legacy"`` builds ``DepthRule`` from the top-level ``depth_alignment``
+key only (default ``"ariadne"`` == BRACE interpolation), byte-identical to the pre-P5.12 code.
+``"method"`` applies the per-method defaults (THESEUS-like: BRACE + ``skip_correction=True``;
+BiCo-like: ``discrete_index_match``; Ariadne / others: none). When the key is absent the method
+defaults apply too, but a configuration whose outcome would change raises
+``ConfigMeaningChangedError`` naming both fixes (see ``resolve_depth_rule``).
 
 Ariadne never reaches ``get_method`` or ``resolve_block_extension_config`` (see
 ``tests/test_vision_rebase_direct_residual_dispatch.py``): its branch builds a default
@@ -23,7 +26,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -33,7 +36,12 @@ from merge_and_rebase.utils.helpers import parse_csv
 
 from . import get_method
 from .block_extension.completion_config import validate_residual_completion_depth_direction
-from .block_extension.config import BlockExtensionConfig, resolve_block_extension_config
+from .block_extension.config import (
+    BlockExtensionConfig,
+    parse_depth_rule_schema,
+    resolve_block_extension_config,
+    warn_brace_only_fields_under_discrete,
+)
 from .merge_modes import _SINGLE_TRANSPORT_MODES, _resolve_merge_mode_config
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
 from .registry import canonical_method_name
@@ -142,6 +150,9 @@ class ResolvedRunConfig:
     suite_name: str
     suite: Any
     tasks: list[str]
+    # Additive summary record of the resolved depth rule, and the post-model guard (P5.12).
+    depth_rule_resolved: dict = field(default_factory=dict)
+    depth_guard: str | None = None
 
     # -- method-kind predicates (exactly the legacy boolean sets) ----------------------------
     @property
@@ -170,6 +181,8 @@ class ResolvedRunConfig:
 
     def bind(self, source_depth: int, target_depth: int) -> RunPlan:
         """Post-model guards and prestep flags (needs the real source/target depths)."""
+        if self.depth_guard is not None and source_depth != target_depth:
+            raise ConfigMeaningChangedError(self.depth_guard)
         block_extension_cfg = self.block_extension_cfg
         blockext_like_method = self.blockext_like_method
         validate_residual_completion_depth_direction(
@@ -246,6 +259,130 @@ class RunPlan:
     task_discrete_layer_match_prestep: bool
 
 
+class ConfigMeaningChangedError(ValueError):
+    """The config's outcome would differ under the per-method depth defaults (P5.12)."""
+
+
+_DEPTH_DEFAULTS_MODES = ("legacy", "method")
+
+
+def _parse_depth_defaults(cfg: Mapping[str, Any]) -> str | None:
+    raw = cfg.get("depth_defaults")
+    if raw is None:
+        return None
+    mode = str(raw).strip().lower()
+    if mode not in _DEPTH_DEFAULTS_MODES:
+        raise ValueError("depth_defaults must be one of: legacy, method")
+    return mode
+
+
+def _meaning_changed_message(method_name: str, reason: str, old_fix: str) -> str:
+    return (
+        f"{method_name}: {reason}. The per-method depth defaults would change this run's result. "
+        f"Either keep the previous behaviour with {old_fix} (or \"depth_defaults\": \"legacy\"), "
+        'or accept the new method default with "depth_defaults": "method".'
+    )
+
+
+def resolve_depth_rule(
+    method_kind: MethodKind,
+    method_name: str,
+    cfg: Mapping[str, Any],
+    block_extension_enabled: bool,
+    block_extension_cfg: BlockExtensionConfig,
+) -> tuple[DepthRule, BlockExtensionConfig, str | None]:
+    """Resolve the depth rule once. Returns ``(depth_rule, block_extension_cfg, depth_guard)``.
+
+    ``depth_guard`` is a message that ``ResolvedRunConfig.bind`` raises as ``ConfigMeaningChangedError``
+    when the source/target depths turn out to differ (the depths are unknown before the models exist).
+    """
+    mode = _parse_depth_defaults(cfg)
+    if mode == "legacy" or method_kind not in (MethodKind.THESEUS_LIKE, MethodKind.BICO_LIKE):
+        return _resolve_depth_rule(cfg), block_extension_cfg, None
+    schema = parse_depth_rule_schema(cfg, warn=False)
+    raw_params = cfg.get("block_extension_params") or {}
+    source = schema.source or "method_default"
+    guard: str | None = None
+    if method_kind is MethodKind.BICO_LIKE:
+        rule = "discrete_index_match" if schema.rule == "method_default" else schema.rule
+        if rule == "discrete_index_match":
+            warn_brace_only_fields_under_discrete(raw_params, stacklevel=3)
+        if mode is None and schema.rule == "method_default":
+            guard = _meaning_changed_message(
+                method_name,
+                "depth-mismatched pair without depth_alignment / block_extension_params.depth_rule "
+                "(the previous default was the BRACE interpolation with a fitted correction)",
+                '"depth_alignment": "ariadne"',
+            )
+        return DepthRule(kind=rule, source=source), block_extension_cfg, guard  # type: ignore[arg-type]
+    rule = "brace" if schema.rule == "method_default" else schema.rule
+    if rule == "discrete_index_match":
+        return DepthRule(kind=rule, source=source), block_extension_cfg, None  # type: ignore[arg-type]
+    if schema.skip_correction is not None:
+        return DepthRule(kind="brace", source=source), block_extension_cfg, None
+    # skip_correction absent: the THESEUS default pair (interpolate_per_weight + skip_correction=True).
+    old_fix = '"block_extension_params": {"skip_correction": false}'
+    if mode is None:
+        blocking = [
+            name
+            for name, active in (
+                (
+                    "target_shared_correction",
+                    block_extension_cfg.target_shared_correction is not None
+                    and block_extension_cfg.target_shared_correction.active,
+                ),
+                ("correction_scope!='inserted'", block_extension_cfg.correction_scope != "inserted"),
+                ("target_residual_completion", block_extension_cfg.target_residual_completion.enabled),
+                ("joint_blockwise_correction", block_extension_cfg.joint_blockwise_correction.enabled),
+                ("direct_p1_correction", block_extension_cfg.direct_p1_correction.enabled),
+            )
+            if active
+        ]
+        if blocking:
+            raise ConfigMeaningChangedError(
+                _meaning_changed_message(
+                    method_name, f"{', '.join(blocking)} requires skip_correction=false but it is not given", old_fix
+                )
+            )
+        if block_extension_enabled:
+            guard = _meaning_changed_message(
+                method_name, "depth-mismatched pair without an explicit skip_correction", old_fix
+            )
+    injected = dict(raw_params)
+    injected["skip_correction"] = True
+    new_cfg_raw = dict(cfg)
+    new_cfg_raw["block_extension_params"] = injected
+    _, new_cfg = resolve_block_extension_config(new_cfg_raw)
+    return (
+        DepthRule(
+            kind="brace",
+            extension_strategy=new_cfg.extension_strategy,
+            skip_correction=True,
+            source=source if schema.source else "method_default",
+        ),
+        new_cfg,
+        guard,
+    )
+
+
+def _depth_rule_record(
+    method_kind: MethodKind,
+    depth_rule: DepthRule,
+    block_extension_cfg: BlockExtensionConfig,
+    ariadne_cfg: Any,
+) -> dict:
+    """Additive summary record ``depth_rule_resolved`` (rule, extension_strategy, skip_correction, ...)."""
+    blockext = method_kind in (MethodKind.THESEUS_LIKE, MethodKind.BICO_LIKE)
+    brace = blockext and depth_rule.kind == "brace"
+    return {
+        "rule": depth_rule.kind if blockext else "none",
+        "extension_strategy": block_extension_cfg.extension_strategy if brace else None,
+        "skip_correction": bool(block_extension_cfg.skip_correction) if brace else None,
+        "depth_pairing": getattr(ariadne_cfg, "depth_pairing", None) if ariadne_cfg is not None else None,
+        "source": depth_rule.source if blockext else "method_default",
+    }
+
+
 def _resolve_depth_rule(cfg: Mapping[str, Any]) -> DepthRule:
     # "ariadne" (default) preserves every existing behavior: the block-extension prestep resizes
     # the source model's depth via ARIADNE's insertion/collapse machinery (BRACE).
@@ -316,7 +453,10 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         direct_residual_preset = None
     method_label = format_rebase_method_label(method_name, method_params)
     blockext_like_method = method_name in (_THESEUS_LIKE | _BICO_LIKE)
-    depth_rule = _resolve_depth_rule(cfg)
+    depth_rule, block_extension_cfg, depth_guard = resolve_depth_rule(
+        method_kind, method_name, cfg, block_extension_enabled, block_extension_cfg
+    )
+    depth_rule_resolved = _depth_rule_record(method_kind, depth_rule, block_extension_cfg, direct_residual_cfg)
     if (
         direct_residual_like
         and direct_residual_cfg.merge_mode == "merge_in_source_then_fit"
@@ -508,4 +648,6 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         suite_name=suite_name,
         suite=suite,
         tasks=tasks,
+        depth_rule_resolved=depth_rule_resolved,
+        depth_guard=depth_guard,
     )

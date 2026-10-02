@@ -40,6 +40,7 @@ class RunRecord:
     alignment_calibration_timings: Any
     correction_fit_timings: Any
     depth_alignment_mode: Any
+    depth_rule_resolved: Any
     saved_merged_path: Any
     method: Any
     merge_method_name: Any
@@ -136,6 +137,7 @@ class RunRecord:
             alignment_calibration_timings=loop_outputs.alignment_calibration_timings,
             correction_fit_timings=loop_outputs.correction_fit_timings,
             depth_alignment_mode=resolved.depth_alignment_mode,
+            depth_rule_resolved=resolved.depth_rule_resolved,
             saved_merged_path=saved_merged_path,
             method=resolved.method,
             merge_method_name=resolved.merge.method_name,
@@ -360,6 +362,7 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
         # on the key, even though the default "ariadne" path never touches
         # anything new added by this change.
         "depth_alignment": record.depth_alignment_mode,
+        "depth_rule_resolved": record.depth_rule_resolved,
         "target_residual_completion": (
             {
                 "config": asdict(record.block_extension_cfg.target_residual_completion),
