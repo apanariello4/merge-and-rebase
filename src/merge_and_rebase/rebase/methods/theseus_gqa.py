@@ -7,12 +7,8 @@ from typing import Any
 import torch
 
 from ..registry import register
-from .theseus import (
-    ActivationStore,
-    TheseusRebase,
-    _compute_procrustes_map_from_cov,
-    _LayerTransform,
-)
+from ._shared import ActivationStore, _compute_procrustes_map_from_cov, _LayerTransform
+from .theseus import TheseusRebase
 
 logger = logging.getLogger(__name__)
 

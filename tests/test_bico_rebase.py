@@ -281,7 +281,7 @@ def test_bico_split_qkv_apply_unpacks_transform_diagnostics(monkeypatch) -> None
         return kwargs["visual_delta"], object()
 
     monkeypatch.setattr(
-        bico_method._t,
+        bico_method._shared,
         "_apply_transforms_to_visual_delta",
         fake_apply_transforms,
     )

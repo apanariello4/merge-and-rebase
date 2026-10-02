@@ -275,7 +275,7 @@ class BlockExtender(BlockExtenderCore):
         if n_samples <= 0:
             raise ValueError("Target reference blending needs a positive calibration sample count.")
 
-        from ..methods.theseus import _compute_procrustes_map_from_cov, _interp_2d_tokens
+        from ..methods._shared import _compute_procrustes_map_from_cov, _interp_2d_tokens
 
         rows = int(source_ref.shape[0])
         if rows % n_samples != 0:

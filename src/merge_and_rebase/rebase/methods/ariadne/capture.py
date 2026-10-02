@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 from ....utils.cost_accounting import cost_phase
 from ...discrete_layer_match import DiscreteLayerPairing
-from ..theseus import _to_tokens
+from .._shared import _to_tokens
 from .layouts import _ATTN_CAPTURE_KINDS, _ATTN_QUERY_KINDS, _CAPTURE_KINDS, _INPUT_CAPTURE_KINDS, _layout_for
 
 

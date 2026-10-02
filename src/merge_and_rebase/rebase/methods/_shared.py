@@ -1,0 +1,1426 @@
+"""Helpers shared by more than one rebase method (THESEUS, theseus_gqa, BiCo, Ariadne).
+
+Moved verbatim out of ``theseus.py`` (Phase 7 step S3); behaviour-neutral. This module
+must not import any method module. ``theseus.py`` re-exports every name moved here.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
+
+from ...models.patch_openclip_attention import split_openclip_vit_attn
+from ...utils.cost_accounting import cost_phase_decorator
+from ..base import TensorDict
+
+logger = logging.getLogger(__name__)
+
+_ACTIVATION_COVARIANCE_MODES = {"activation", "activations"}
+_DATA_FREE_COVARIANCE_MODES = {"data_free", "data-free", "weight", "weights", "weight_space", "weight-space"}
+
+
+_VISUAL_PREFIX = "visual."
+_ZERO_KEYS = {"class_embedding", "positional_embedding", "conv1.weight"}
+_FUSED_IN_PROJ_WEIGHT = ".attn.in_proj_weight"
+_FUSED_IN_PROJ_BIAS = ".attn.in_proj_bias"
+_Q_PROJ_WEIGHT = ".attn.q_proj.weight"
+_K_PROJ_WEIGHT = ".attn.k_proj.weight"
+_V_PROJ_WEIGHT = ".attn.v_proj.weight"
+_Q_PROJ_BIAS = ".attn.q_proj.bias"
+_K_PROJ_BIAS = ".attn.k_proj.bias"
+_V_PROJ_BIAS = ".attn.v_proj.bias"
+
+
+def _resolve_device(device: str | torch.device) -> torch.device:
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return dev
+
+
+def _extract_model_inputs(batch: Any) -> torch.Tensor:
+    if torch.is_tensor(batch):
+        return batch
+    if isinstance(batch, Mapping):
+        for key in ("pixel_values", "images", "image", "inputs", "x"):
+            value = batch.get(key, None)
+            if torch.is_tensor(value):
+                return value
+    if isinstance(batch, (tuple, list)) and batch:
+        first = batch[0]
+        if torch.is_tensor(first):
+            return first
+    raise TypeError("Unsupported batch format for Theseus calibration.")
+
+
+def _extract_output_tensor(output: Any) -> torch.Tensor:
+    if torch.is_tensor(output):
+        return output
+    if isinstance(output, (tuple, list)) and output:
+        first = output[0]
+        if torch.is_tensor(first):
+            return first
+    raise TypeError("Unsupported module output while collecting Theseus activations.")
+
+
+def _visual_module(model: torch.nn.Module) -> torch.nn.Module:
+    return model.visual if hasattr(model, "visual") else model
+
+
+def _has_fused_mha(visual: torch.nn.Module) -> bool:
+    transformer = getattr(visual, "transformer", None)
+    resblocks = getattr(transformer, "resblocks", None)
+    if resblocks is None:
+        return False
+    for block in resblocks:
+        if isinstance(getattr(block, "attn", None), nn.MultiheadAttention):
+            return True
+    return False
+
+
+def _split_fused_qkv_if_needed(model: torch.nn.Module) -> int:
+    visual = _visual_module(model)
+    if not _has_fused_mha(visual):
+        return 0
+
+    ref_param = next(visual.parameters(), None)
+    ref_device = ref_param.device if ref_param is not None else torch.device("cpu")
+    ref_dtype = ref_param.dtype if ref_param is not None else None
+
+    n_patched = int(
+        split_openclip_vit_attn(
+            visual,
+            proj_dropout=0.0,
+            attn_impl="softmax",
+        )
+    )
+
+    if n_patched > 0:
+        if ref_dtype is None:
+            visual.to(device=ref_device)
+        else:
+            visual.to(device=ref_device, dtype=ref_dtype)
+
+    return n_patched
+
+
+def _visual_state_dict(sd: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    visual = {key[len(_VISUAL_PREFIX) :]: value for key, value in sd.items() if key.startswith(_VISUAL_PREFIX)}
+    return visual if visual else dict(sd)
+
+
+def _visual_delta_keys(delta: Mapping[str, torch.Tensor]) -> dict[str, str]:
+    visual = {key[len(_VISUAL_PREFIX) :]: key for key in delta if key.startswith(_VISUAL_PREFIX)}
+    if visual:
+        return visual
+    return {key: key for key in delta}
+
+
+def _split_fused_qkv_state(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if key.endswith(_FUSED_IN_PROJ_WEIGHT) and value.ndim == 2 and value.shape[0] % 3 == 0:
+            base = key[: -len(_FUSED_IN_PROJ_WEIGHT)]
+            c = value.shape[0] // 3
+            out[f"{base}{_Q_PROJ_WEIGHT}"] = value[:c, :]
+            out[f"{base}{_K_PROJ_WEIGHT}"] = value[c : 2 * c, :]
+            out[f"{base}{_V_PROJ_WEIGHT}"] = value[2 * c :, :]
+            continue
+
+        if key.endswith(_FUSED_IN_PROJ_BIAS) and value.ndim == 1 and value.shape[0] % 3 == 0:
+            base = key[: -len(_FUSED_IN_PROJ_BIAS)]
+            c = value.shape[0] // 3
+            out[f"{base}{_Q_PROJ_BIAS}"] = value[:c]
+            out[f"{base}{_K_PROJ_BIAS}"] = value[c : 2 * c]
+            out[f"{base}{_V_PROJ_BIAS}"] = value[2 * c :]
+            continue
+
+        out[key] = value
+    return out
+
+
+def _merge_split_qkv_state(
+    state: Mapping[str, torch.Tensor],
+    *,
+    reference: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = dict(state)
+
+    def _merge_triplet(q_suffix: str, k_suffix: str, v_suffix: str, fused_suffix: str) -> None:
+        prefixes: set[str] = set()
+        for k in tuple(out.keys()):
+            if k.endswith(q_suffix):
+                prefixes.add(k[: -len(q_suffix)])
+            elif k.endswith(k_suffix):
+                prefixes.add(k[: -len(k_suffix)])
+            elif k.endswith(v_suffix):
+                prefixes.add(k[: -len(v_suffix)])
+
+        for p in prefixes:
+            qk = f"{p}{q_suffix}"
+            kk = f"{p}{k_suffix}"
+            vk = f"{p}{v_suffix}"
+            fused = f"{p}{fused_suffix}"
+            if qk not in out or kk not in out or vk not in out:
+                continue
+            if reference is not None and fused not in reference:
+                continue
+
+            merged = torch.cat([out[qk], out[kk], out[vk]], dim=0)
+            out[fused] = merged
+            del out[qk]
+            del out[kk]
+            del out[vk]
+
+    _merge_triplet(_Q_PROJ_WEIGHT, _K_PROJ_WEIGHT, _V_PROJ_WEIGHT, _FUSED_IN_PROJ_WEIGHT)
+    _merge_triplet(_Q_PROJ_BIAS, _K_PROJ_BIAS, _V_PROJ_BIAS, _FUSED_IN_PROJ_BIAS)
+    return out
+
+
+def _is_square(n: int) -> bool:
+    if n <= 0:
+        return False
+    r = int(n**0.5)
+    return r * r == n
+
+
+def _standardize_tokens(x: torch.Tensor, *, batch_size: int) -> torch.Tensor:
+    if x.ndim == 1:
+        return x.view(1, 1, -1)
+    if x.ndim == 2:
+        return x.unsqueeze(1)
+    if x.ndim == 3:
+        if x.shape[0] == batch_size:
+            return x
+        if x.shape[1] == batch_size:
+            return x.transpose(0, 1)
+        return x
+    if x.ndim == 4:
+        return x
+    return x.reshape(batch_size, -1, x.shape[-1])
+
+
+def _to_tokens(x: torch.Tensor, *, batch_size: int) -> torch.Tensor:
+    x = _standardize_tokens(x, batch_size=batch_size)
+    if x.ndim == 4:
+        return x.permute(0, 2, 3, 1).reshape(x.shape[0], -1, x.shape[1])
+    if x.ndim == 3:
+        return x
+    return x.reshape(batch_size, -1, x.shape[-1])
+
+
+def _interp_linear_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    if tokens.shape[1] == target_tokens:
+        return tokens
+    tokens_t = tokens.transpose(1, 2)
+    tokens_t = F.interpolate(tokens_t, size=target_tokens, mode="linear", align_corners=False)
+    return tokens_t.transpose(1, 2)
+
+
+def _interp_2d_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    if tokens.shape[1] == target_tokens:
+        return tokens
+
+    has_cls = _is_square(tokens.shape[1] - 1) and _is_square(target_tokens - 1)
+    cls_token: torch.Tensor | None = None
+    patch_tokens = tokens
+    target_patch_tokens = target_tokens
+
+    if has_cls:
+        cls_token = tokens[:, :1, :]
+        patch_tokens = tokens[:, 1:, :]
+        target_patch_tokens = target_tokens - 1
+
+    if not _is_square(patch_tokens.shape[1]) or not _is_square(target_patch_tokens):
+        resized = _interp_linear_tokens(patch_tokens, target_patch_tokens)
+        return torch.cat([cls_token, resized], dim=1) if cls_token is not None else resized
+
+    src_side = int(patch_tokens.shape[1] ** 0.5)
+    tgt_side = int(target_patch_tokens**0.5)
+    x = patch_tokens.reshape(tokens.shape[0], src_side, src_side, patch_tokens.shape[-1]).permute(0, 3, 1, 2)
+    x = F.interpolate(x, size=(tgt_side, tgt_side), mode="bilinear", align_corners=False)
+    resized = x.permute(0, 2, 3, 1).reshape(tokens.shape[0], tgt_side * tgt_side, patch_tokens.shape[-1])
+    return torch.cat([cls_token, resized], dim=1) if cls_token is not None else resized
+
+
+def _align_features(
+    source_feat: torch.Tensor,
+    target_feat: torch.Tensor,
+    *,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if source_feat.shape[0] != target_feat.shape[0]:
+        raise ValueError(
+            f"Theseus calibration expects aligned batch sizes. Got {source_feat.shape[0]} and {target_feat.shape[0]}."
+        )
+
+    source_tokens = _to_tokens(source_feat, batch_size=int(source_feat.shape[0]))
+    target_tokens = _to_tokens(target_feat, batch_size=int(target_feat.shape[0]))
+
+    if mode == "cls":
+        source_tokens = source_tokens[:, :1, :]
+        target_tokens = target_tokens[:, :1, :]
+    elif mode == "mean":
+        source_tokens = source_tokens.mean(dim=1, keepdim=True)
+        target_tokens = target_tokens.mean(dim=1, keepdim=True)
+    elif mode in {"interpolate2d", "interpolate_2d"}:
+        source_tokens = _interp_2d_tokens(source_tokens, int(target_tokens.shape[1]))
+    elif mode == "interpolate":
+        source_tokens = _interp_linear_tokens(source_tokens, int(target_tokens.shape[1]))
+
+    return source_tokens.reshape(-1, source_tokens.shape[-1]), target_tokens.reshape(-1, target_tokens.shape[-1])
+
+
+def _content_row_mask(
+    source_attention_mask: torch.Tensor | None,
+    target_attention_mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Flat (batch*tokens,) bool mask selecting the non-padding activation rows.
+
+    Text calibration batches are padded to a fixed length, so most positions in
+    a short prompt are pad tokens. Their activations carry no signal about how
+    the two models represent content, and folding them into the cross-covariance
+    lets padding dominate the fitted Procrustes maps. Returns None whenever a
+    trustworthy mask can't be built, in which case callers keep every row.
+    """
+    masks = [
+        m.detach().to(device="cpu").reshape(-1).bool()
+        for m in (source_attention_mask, target_attention_mask)
+        if isinstance(m, torch.Tensor) and m.ndim == 2
+    ]
+    if not masks:
+        return None
+    if len({int(m.numel()) for m in masks}) != 1:
+        # Source and target tokenized to different lengths, so rows no longer
+        # correspond one-to-one after sequence alignment; don't guess.
+        return None
+    mask = masks[0]
+    for extra in masks[1:]:
+        mask = mask & extra
+    if bool(mask.all()) or not bool(mask.any()):
+        return None
+    return mask
+
+
+def _drop_padding_rows(
+    source_rows: torch.Tensor,
+    target_rows: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mask is None:
+        return source_rows, target_rows
+    n = int(mask.numel())
+    if int(source_rows.shape[0]) != n or int(target_rows.shape[0]) != n:
+        # Not one row per input token (pooled/head-split features); leave as-is.
+        return source_rows, target_rows
+    return source_rows[mask], target_rows[mask]
+
+
+class ActivationStore:
+    """Streaming activation statistics with optional Gram and raw storage."""
+
+    def __init__(self, *, store_raw: bool = False, store_a_gram: bool = False, store_b_gram: bool = False) -> None:
+        self.store_raw = bool(store_raw)
+        self.store_a_gram = bool(store_a_gram)
+        self.store_b_gram = bool(store_b_gram)
+
+        self.at_b: torch.Tensor | None = None
+        self.at_a: torch.Tensor | None = None
+        self.bt_b: torch.Tensor | None = None
+        self.sum_a: torch.Tensor | None = None
+        self.sum_b: torch.Tensor | None = None
+        self.n_samples = 0
+
+        self.h_a_list: list[torch.Tensor] = []
+        self.h_b_list: list[torch.Tensor] = []
+
+    @cost_phase_decorator("transformation")
+    def update(self, batch_a: torch.Tensor, batch_b: torch.Tensor) -> None:
+        a = batch_a.detach().cpu().to(torch.float64)
+        b = batch_b.detach().cpu().to(torch.float64)
+
+        if self.store_raw:
+            self.h_a_list.append(a.float())
+            self.h_b_list.append(b.float())
+
+        if self.at_b is None:
+            self.at_b = a.T @ b
+            self.sum_a = a.sum(dim=0)
+            self.sum_b = b.sum(dim=0)
+            if self.store_a_gram:
+                self.at_a = a.T @ a
+            if self.store_b_gram:
+                self.bt_b = b.T @ b
+        else:
+            self.at_b += a.T @ b
+            self.sum_a += a.sum(dim=0)
+            self.sum_b += b.sum(dim=0)
+            if self.store_a_gram and self.at_a is not None:
+                self.at_a += a.T @ a
+            if self.store_b_gram and self.bt_b is not None:
+                self.bt_b += b.T @ b
+
+        self.n_samples += int(a.shape[0])
+
+    def rows(self, *, center: bool = False) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.store_raw or not self.h_a_list:
+            return None, None
+        source = torch.cat(self.h_a_list, dim=0)
+        target = torch.cat(self.h_b_list, dim=0)
+        if center:
+            source = source - source.mean(dim=0, keepdim=True)
+            target = target - target.mean(dim=0, keepdim=True)
+        return source, target
+
+    def get_covariance(self, *, center: bool = False, epsilon: float = 0.0) -> torch.Tensor | None:
+        if self.at_b is None:
+            return None
+        cov = self.at_b.clone()
+        if center:
+            assert self.sum_a is not None and self.sum_b is not None
+            mu_a = self.sum_a / self.n_samples
+            mu_b = self.sum_b / self.n_samples
+            cov = cov - self.n_samples * torch.outer(mu_a, mu_b)
+        if epsilon > 0 and cov.shape[0] == cov.shape[1]:
+            cov = cov + epsilon * torch.eye(cov.shape[0], dtype=cov.dtype, device=cov.device)
+        return cov
+
+    def get_a_gram(self, *, center: bool = False, epsilon: float = 0.0) -> torch.Tensor | None:
+        if self.at_a is None:
+            return None
+        gram = self.at_a.clone()
+        if center:
+            assert self.sum_a is not None
+            mu_a = self.sum_a / self.n_samples
+            gram = gram - self.n_samples * torch.outer(mu_a, mu_a)
+        if epsilon > 0 and gram.shape[0] == gram.shape[1]:
+            gram = gram + epsilon * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
+        return gram
+
+    def get_b_gram(self, *, center: bool = False, epsilon: float = 0.0) -> torch.Tensor | None:
+        if self.bt_b is None:
+            return None
+        gram = self.bt_b.clone()
+        if center:
+            assert self.sum_b is not None
+            mu_b = self.sum_b / self.n_samples
+            gram = gram - self.n_samples * torch.outer(mu_b, mu_b)
+        if epsilon > 0 and gram.shape[0] == gram.shape[1]:
+            gram = gram + epsilon * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
+        return gram
+
+
+@dataclass(frozen=True)
+class InterpolatedBlockActivations:
+    """Source-side activation override for the ARIADNE interpolated-activation baseline.
+
+    ARIADNE inserts a block into the source model and fits it so that its
+    activations reproduce a reference bank. This baseline asks what a width
+    transport method would do if the inserted position carried no computed
+    activations at all: at every component module of an inserted block, the
+    source rows are replaced by the midpoint of the same component's rows in
+    the two original blocks whose weights initialized it. Target rows and
+    original source positions are never touched, so the substitution ablates
+    exactly one thing — the inserted block's own forward pass.
+
+    ``entries`` holds ``(inserted_position, left_position, right_position)``
+    triples over the extended block list, as produced by
+    ``merge_and_rebase.eval.block_extension.build_extension_layout``.
+    """
+
+    entries: tuple[tuple[int, int, int], ...]
+    block_prefix: str = "transformer.resblocks"
+
+    @classmethod
+    def from_extension_layout(
+        cls,
+        layout: Mapping[str, Any],
+        *,
+        block_prefix: str = "transformer.resblocks",
+    ) -> InterpolatedBlockActivations:
+        entries = tuple(
+            (int(block["position"]), int(block["source_position"]), int(block["neighbour_position"]))
+            for block in layout.get("inserted_blocks", ())
+        )
+        if not entries:
+            raise ValueError(
+                "The interpolated-activation baseline needs at least one inserted block; "
+                "the recorded extension layout has none."
+            )
+        return cls(entries=entries, block_prefix=str(block_prefix))
+
+    def fingerprint(self) -> str:
+        payload = (
+            self.block_prefix + "|" + ";".join(f"{position}:{left}:{right}" for position, left, right in self.entries)
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def apply(self, store: dict[str, torch.Tensor]) -> None:
+        """Replace every inserted-position tensor in ``store`` with the neighbour midpoint."""
+
+        if not self.entries:
+            return
+        # Snapshot first: inserted positions read only original positions, but
+        # a snapshot makes that independent of iteration order.
+        captured = dict(store)
+        for position, left, right in self.entries:
+            prefix = f"{self.block_prefix}.{position}"
+            for key in list(store.keys()):
+                if key != prefix and not key.startswith(f"{prefix}."):
+                    continue
+                suffix = key[len(prefix) :]
+                left_key = f"{self.block_prefix}.{left}{suffix}"
+                right_key = f"{self.block_prefix}.{right}{suffix}"
+                left_rows = captured.get(left_key)
+                right_rows = captured.get(right_key)
+                if left_rows is None or right_rows is None:
+                    missing = left_key if left_rows is None else right_key
+                    raise KeyError(
+                        "Interpolated-activation baseline needs both neighbour activations for "
+                        f"'{key}'; '{missing}' was not captured."
+                    )
+                if left_rows.shape != right_rows.shape:
+                    raise ValueError(
+                        f"Neighbour activations for '{key}' disagree in shape: "
+                        f"{tuple(left_rows.shape)} vs {tuple(right_rows.shape)}."
+                    )
+                store[key] = (0.5 * (left_rows.float() + right_rows.float())).to(store[key].dtype)
+
+
+class _ActivationHook:
+    def __init__(self, model: torch.nn.Module, *, scope: torch.nn.Module | None = None):
+        self.model = scope if scope is not None else _visual_module(model)
+        self.inputs: dict[str, torch.Tensor] = {}
+        self.outputs: dict[str, torch.Tensor] = {}
+        self.handles: list[Any] = []
+        self._register_hooks()
+
+    def _register_hooks(self) -> None:
+        self.handles.append(self.model.register_forward_hook(self._make_hook("")))
+        for name, module in self.model.named_modules():
+            if name == "":
+                continue
+            if list(module.parameters(recurse=False)):
+                self.handles.append(module.register_forward_hook(self._make_hook(name)))
+
+    def _make_hook(self, name: str):
+        def hook_fn(_module: torch.nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+            inp = inputs[0] if isinstance(inputs, (tuple, list)) and inputs else inputs
+            if torch.is_tensor(inp):
+                self.inputs[name] = inp.detach().cpu()
+            try:
+                out = _extract_output_tensor(output)
+            except TypeError:
+                out = None
+            if out is not None and torch.is_tensor(out):
+                self.outputs[name] = out.detach().cpu()
+
+        return hook_fn
+
+    def clear(self) -> None:
+        self.inputs.clear()
+        self.outputs.clear()
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+
+
+def _compute_procrustes_map(source_rows: torch.Tensor, target_rows: torch.Tensor, *, center: bool) -> torch.Tensor:
+    if center:
+        source_rows = source_rows - source_rows.mean(dim=0, keepdim=True)
+        target_rows = target_rows - target_rows.mean(dim=0, keepdim=True)
+    cov = source_rows.double().T @ target_rows.double()
+    u, _, v_h = torch.linalg.svd(cov, full_matrices=False)
+    return (u @ v_h).float()
+
+
+def _compute_procrustes_map_from_cov(cov: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+    if device != "cpu":
+        cov = cov.to(device=device)
+    u, _, v_h = torch.linalg.svd(cov.double(), full_matrices=False)
+    return (u @ v_h).float()
+
+
+def _matrix_power_psd(matrix: torch.Tensor, *, power: float, eps: float) -> torch.Tensor:
+    sym = 0.5 * (matrix + matrix.T)
+    evals, evecs = torch.linalg.eigh(sym)
+    powered = evals.clamp_min(float(eps)).pow(float(power))
+    return (evecs * powered.unsqueeze(0)) @ evecs.T
+
+
+def _partially_whiten_covariance(
+    cov: torch.Tensor,
+    *,
+    a_gram: torch.Tensor,
+    b_gram: torch.Tensor,
+    power: float,
+    eps: float,
+) -> torch.Tensor:
+    if power <= 0.0:
+        return cov
+    left = _matrix_power_psd(a_gram, power=-power, eps=eps)
+    right = _matrix_power_psd(b_gram, power=-power, eps=eps)
+    return left @ cov @ right
+
+
+def _compute_alignment_map(
+    store: ActivationStore,
+    *,
+    center: bool,
+    whiten_power: float,
+    whiten_eps: float,
+) -> torch.Tensor | None:
+    cov = store.get_covariance(center=center)
+    if cov is None:
+        return None
+    if whiten_power > 0.0:
+        a_gram = store.get_a_gram(center=center, epsilon=whiten_eps)
+        b_gram = store.get_b_gram(center=center, epsilon=whiten_eps)
+        if a_gram is not None and b_gram is not None:
+            cov = _partially_whiten_covariance(
+                cov,
+                a_gram=a_gram,
+                b_gram=b_gram,
+                power=whiten_power,
+                eps=whiten_eps,
+            )
+        else:
+            logger.warning(
+                "Theseus whitening requested but Gram statistics were unavailable; falling back to raw Procrustes."
+            )
+    return _compute_procrustes_map_from_cov(cov, device="cpu")
+
+
+def _resolve_covariance_mode(mode: str) -> str:
+    key = str(mode).strip().lower()
+    if key in _ACTIVATION_COVARIANCE_MODES:
+        return "activations"
+    if key in _DATA_FREE_COVARIANCE_MODES:
+        return "data_free"
+    raise ValueError(
+        "Theseus covariance_mode must be one of: activations, activation, data_free, data-free, weights, weight_space."
+    )
+
+
+def _compute_alignment_map_from_matrix_proxies(
+    source_proxy: torch.Tensor,
+    target_proxy: torch.Tensor,
+    *,
+    side: str,
+    whiten_power: float,
+    whiten_eps: float,
+) -> torch.Tensor:
+    source = source_proxy.detach().cpu().to(torch.float64)
+    target = target_proxy.detach().cpu().to(torch.float64)
+
+    if side == "input":
+        a_gram = source.T @ source
+        b_gram = target.T @ target
+    elif side == "output":
+        a_gram = source @ source.T
+        b_gram = target @ target.T
+    else:
+        raise ValueError(f"Unsupported alignment side '{side}'.")
+
+    u_a, s_a, _ = torch.linalg.svd(a_gram, full_matrices=False)
+    u_b, s_b, _ = torch.linalg.svd(b_gram, full_matrices=False)
+    rank = min(int(u_a.shape[1]), int(u_b.shape[1]))
+    basis_power = 0.5 - float(whiten_power)
+    scale_a = s_a[:rank].clamp_min(float(whiten_eps)).pow(basis_power)
+    scale_b = s_b[:rank].clamp_min(float(whiten_eps)).pow(basis_power)
+    source_basis = u_a[:, :rank] * scale_a.unsqueeze(0)
+    target_basis = u_b[:, :rank] * scale_b.unsqueeze(0)
+    cov = source_basis @ target_basis.T
+
+    return _compute_procrustes_map_from_cov(cov, device="cpu")
+
+
+def _transport_weight(delta_weight: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor, *, key: str) -> torch.Tensor:
+    if key == "proj":
+        return (t_out.T @ delta_weight.T @ t_in).T
+    return t_out.T @ delta_weight @ t_in
+
+
+def _transport_bias(delta_vec: torch.Tensor, t_out: torch.Tensor) -> torch.Tensor:
+    return delta_vec @ t_out
+
+
+def _param_to_module(visual_model: torch.nn.Module) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for module_name, module in visual_model.named_modules():
+        for param_name, _ in module.named_parameters(recurse=False):
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            out[full_name] = module_name
+    return out
+
+
+_RESBLOCK_RE = re.compile(r"^transformer\.resblocks\.(\d+)(?:\.(.*))?$")
+
+
+def _activation_group(module_name: str, *, granularity: str) -> str:
+    if granularity == "param":
+        return module_name
+    if granularity == "global":
+        return "global"
+
+    match = _RESBLOCK_RE.match(module_name)
+    if match is None:
+        return module_name
+
+    block_idx = match.group(1)
+    suffix = match.group(2) or ""
+
+    if granularity == "block":
+        return f"transformer.resblocks.{block_idx}"
+
+    if granularity == "module_type":
+        if suffix:
+            return f"transformer.resblocks.*.{suffix}"
+        return "transformer.resblocks.*"
+
+    raise ValueError(
+        f"Unsupported transform_granularity. Expected one of: param, module_type, block, global. Got: {granularity}"
+    )
+
+
+def _build_grouped_covariances(
+    activation_registry: Mapping[str, ActivationStore],
+    *,
+    center_acts: bool,
+    granularity: str,
+) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
+    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+
+    for act_key, store in activation_registry.items():
+        if act_key.endswith(".in"):
+            side = "in"
+            module_name = act_key[: -len(".in")]
+        elif act_key.endswith(".out"):
+            side = "out"
+            module_name = act_key[: -len(".out")]
+        else:
+            continue
+
+        cov = store.get_covariance(center=center_acts)
+        if cov is None:
+            continue
+
+        group = _activation_group(module_name, granularity=granularity)
+        shape_key = (int(cov.shape[0]), int(cov.shape[1]))
+        key = (group, side, shape_key)
+        if key in grouped_covariances:
+            grouped_covariances[key] = grouped_covariances[key] + cov
+        else:
+            grouped_covariances[key] = cov.clone()
+
+    return grouped_covariances
+
+
+def _build_grouped_transforms(
+    grouped_covariances: Mapping[tuple[str, str, tuple[int, int]], torch.Tensor],
+    *,
+    show_progress: bool,
+    method_name: str,
+    device: str = "cpu",
+) -> dict[tuple[str, str, tuple[int, int]], torch.Tensor]:
+    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+    items = _iter_with_progress(
+        grouped_covariances.items(),
+        total=len(grouped_covariances),
+        desc=f"{method_name}.prepare: compute shared transforms",
+        enabled=show_progress,
+    )
+    for key, cov in items:
+        grouped_transforms[key] = _compute_procrustes_map_from_cov(cov, device=device)
+    return grouped_transforms
+
+
+def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) -> Any:
+    if not enabled or tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, leave=False)
+
+
+def _iter_random_dataset_batches(
+    source_dataloader: Iterable[Any],
+    target_dataloader: Iterable[Any],
+    *,
+    n_batches: int | None,
+    seed: int,
+    batch_size: int | None,
+) -> Iterable[tuple[Any, Any]] | None:
+    source_dataset = getattr(source_dataloader, "dataset", None)
+    target_dataset = getattr(target_dataloader, "dataset", None)
+    if source_dataset is None or target_dataset is None:
+        return None
+
+    try:
+        n_source = int(len(source_dataset))
+        n_target = int(len(target_dataset))
+    except Exception:
+        return None
+
+    n_samples = min(n_source, n_target)
+    if n_samples <= 0:
+        return iter(())
+
+    if batch_size is None:
+        source_bs = getattr(source_dataloader, "batch_size", None)
+        target_bs = getattr(target_dataloader, "batch_size", None)
+        if source_bs is None or target_bs is None:
+            return None
+        batch_size = min(int(source_bs), int(target_bs))
+    else:
+        batch_size = int(batch_size)
+
+    if batch_size <= 0:
+        return None
+
+    source_collate = getattr(source_dataloader, "collate_fn", None)
+    target_collate = getattr(target_dataloader, "collate_fn", None)
+    if not callable(source_collate) or not callable(target_collate):
+        return None
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(n_samples, generator=generator)
+
+    if n_batches is not None:
+        max_items = min(n_samples, int(n_batches) * batch_size)
+        perm = perm[:max_items]
+
+    def _iterator() -> Iterable[tuple[Any, Any]]:
+        for start in range(0, int(perm.numel()), batch_size):
+            indices = perm[start : start + batch_size].tolist()
+            source_items = [source_dataset[i] for i in indices]
+            target_items = [target_dataset[i] for i in indices]
+            yield source_collate(source_items), target_collate(target_items)
+
+    return _iterator()
+
+
+@dataclass(frozen=True)
+class _LayerTransform:
+    kind: str
+    t_in: torch.Tensor | None = None
+    t_out: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class _PrecomputeDiagnostics:
+    slots: int
+    usable: int
+    intentional_zero: int
+    incomplete: int
+    unsupported: int
+    skipped_not_in_target: int
+    examples: Mapping[str, tuple[str, ...]]
+    assigned_keys: int
+    shared_transform_count: int
+    shared_group_count: int
+
+
+@dataclass(frozen=True)
+class _ApplyDiagnostics:
+    actively_transported: int
+    intentional_zero: int
+    missing_transform_zero: int
+    unsupported_zero: int
+    transport_failure_zero: int
+    wrong_shape_zero: int
+    out_of_scope_zero: int
+    skipped_not_in_target: int
+    examples: Mapping[str, tuple[str, ...]]
+    transformed_weight: int
+    transformed_bias: int
+
+    @property
+    def missing_transform(self) -> int:
+        return self.missing_transform_zero
+
+    @property
+    def transport_failures(self) -> int:
+        return self.transport_failure_zero
+
+    @property
+    def wrong_shape(self) -> int:
+        return self.wrong_shape_zero
+
+    @property
+    def zero_passthrough(self) -> int:
+        return self.intentional_zero
+
+    @property
+    def skipped_not_in_target_visual(self) -> int:
+        return self.skipped_not_in_target
+
+
+_DIAGNOSTIC_EXAMPLE_LIMIT = 5
+
+
+def _append_diagnostic_example(examples: dict[str, list[str]], category: str, key: str) -> None:
+    bucket = examples.setdefault(category, [])
+    if len(bucket) < _DIAGNOSTIC_EXAMPLE_LIMIT:
+        bucket.append(str(key))
+
+
+def _freeze_diagnostic_examples(examples: Mapping[str, list[str]]) -> dict[str, tuple[str, ...]]:
+    return {category: tuple(keys) for category, keys in examples.items() if keys}
+
+
+def _precompute_diagnostics_from_transforms(
+    *,
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    transforms_by_key: Mapping[str, _LayerTransform],
+) -> _PrecomputeDiagnostics:
+    counts = {"intentional_zero": 0, "incomplete": 0, "unsupported": 0, "skipped_not_in_target": 0}
+    examples: dict[str, list[str]] = {}
+    usable = 0
+    for key, delta_source in visual_delta.items():
+        if key not in target_visual_base:
+            counts["skipped_not_in_target"] += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
+            continue
+        transform = transforms_by_key.get(key)
+        if key in _ZERO_KEYS or (transform is not None and transform.kind == "zero"):
+            counts["intentional_zero"] += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
+        elif transform is None:
+            counts["incomplete"] += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+        elif transform.kind == "unsupported" or delta_source.ndim not in {1, 2}:
+            counts["unsupported"] += 1
+            _append_diagnostic_example(examples, "unsupported", key)
+        elif (
+            transform.kind == "weight"
+            and delta_source.ndim == 2
+            and transform.t_in is not None
+            and transform.t_out is not None
+        ) or (transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None):
+            usable += 1
+        else:
+            counts["incomplete"] += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+    return _PrecomputeDiagnostics(
+        slots=len(visual_delta),
+        usable=usable,
+        intentional_zero=counts["intentional_zero"],
+        incomplete=counts["incomplete"],
+        unsupported=counts["unsupported"],
+        skipped_not_in_target=counts["skipped_not_in_target"],
+        examples=_freeze_diagnostic_examples(examples),
+        assigned_keys=len(transforms_by_key),
+        shared_transform_count=0,
+        shared_group_count=0,
+    )
+
+
+def _report_precompute_diagnostics(
+    *,
+    method_name: str,
+    diagnostics: _PrecomputeDiagnostics,
+    verbose: bool,
+) -> None:
+    if verbose:
+        print(
+            f"[{method_name}] prepare: transport slots={diagnostics.slots} "
+            f"usable={diagnostics.usable} intentional_zero={diagnostics.intentional_zero} "
+            f"incomplete={diagnostics.incomplete} unsupported={diagnostics.unsupported} "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}"
+        )
+        if diagnostics.examples:
+            print(f"[{method_name}] prepare: transport examples={diagnostics.examples}")
+    unexpected = {
+        category: count
+        for category, count in {
+            "incomplete": diagnostics.incomplete,
+            "unsupported": diagnostics.unsupported,
+            "skipped_not_in_target": diagnostics.skipped_not_in_target,
+        }.items()
+        if count
+    }
+    if unexpected:
+        logger.warning(
+            "[%s] prepare: transport coverage loss %s; examples=%s",
+            method_name,
+            unexpected,
+            diagnostics.examples,
+        )
+
+
+def _report_apply_diagnostics(*, method_name: str, diagnostics: _ApplyDiagnostics, verbose: bool) -> None:
+    if verbose:
+        print(
+            f"[{method_name}] apply: diagnostics "
+            f"active={diagnostics.actively_transported} "
+            f"matrices={diagnostics.transformed_weight} "
+            f"vectors={diagnostics.transformed_bias} "
+            f"intentional_zero={diagnostics.intentional_zero} "
+            f"missing_transform_zero={diagnostics.missing_transform_zero} "
+            f"unsupported_zero={diagnostics.unsupported_zero} "
+            f"transport_failure_zero={diagnostics.transport_failure_zero} "
+            f"wrong_shape_zero={diagnostics.wrong_shape_zero} "
+            f"out_of_scope_zero={diagnostics.out_of_scope_zero} "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}"
+        )
+        if diagnostics.examples:
+            print(f"[{method_name}] apply: transport examples={diagnostics.examples}")
+
+
+@cost_phase_decorator("transformation")
+def _precompute_transforms(
+    *,
+    target_model: torch.nn.Module,
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    activation_registry: Mapping[str, ActivationStore],
+    center_acts: bool,
+    transform_granularity: str,
+    show_progress: bool,
+    method_name: str,
+    svd_device: str = "cpu",
+    family_adapter: Any = None,
+    whiten_power: float = 0.0,
+    whiten_eps: float = 1e-6,
+    projection_in_key: str = "ln_post.out",
+) -> tuple[dict[str, _LayerTransform], _PrecomputeDiagnostics]:
+    transforms_by_key: dict[str, _LayerTransform] = {}
+    t_out_cache: dict[str, torch.Tensor] = {}
+    examples: dict[str, list[str]] = {}
+    intentional_zero = 0
+    incomplete = 0
+    unsupported = 0
+    skipped_not_in_target = 0
+    usable = 0
+    if family_adapter is not None:
+        param_to_module = family_adapter.param_to_module(target_model)
+    else:
+        visual_model = _visual_module(target_model)
+        param_to_module = _param_to_module(visual_model)
+    grouped_covariances: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+    grouped_transforms: dict[tuple[str, str, tuple[int, int]], torch.Tensor] = {}
+
+    if transform_granularity != "param":
+        grouped_covariances = _build_grouped_covariances(
+            activation_registry,
+            center_acts=center_acts,
+            granularity=transform_granularity,
+        )
+        grouped_transforms = _build_grouped_transforms(
+            grouped_covariances,
+            show_progress=show_progress,
+            method_name=method_name,
+            device=svd_device,
+        )
+
+    def _transform_for(
+        module_name: str,
+        *,
+        side: str,
+        expected_shape: tuple[int, int],
+        fallback_key: str,
+    ) -> torch.Tensor | None:
+        if transform_granularity == "param":
+            store = activation_registry.get(fallback_key)
+            if store is None:
+                return None
+            if whiten_power > 0.0:
+                return _compute_alignment_map(
+                    store,
+                    center=center_acts,
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+            cov = store.get_covariance(center=center_acts)
+            if cov is None:
+                return None
+            if (int(cov.shape[0]), int(cov.shape[1])) != expected_shape:
+                return None
+            return _compute_procrustes_map_from_cov(cov, device=svd_device)
+
+        group = _activation_group(module_name, granularity=transform_granularity)
+        return grouped_transforms.get((group, side, expected_shape))
+
+    items = _iter_with_progress(
+        visual_delta.items(),
+        total=len(visual_delta),
+        desc=f"{method_name}.prepare: assign transforms",
+        enabled=show_progress,
+    )
+    for key, delta_source in items:
+        if key not in target_visual_base:
+            skipped_not_in_target += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
+            continue
+
+        if key in _ZERO_KEYS:
+            transforms_by_key[key] = _LayerTransform(kind="zero")
+            intentional_zero += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
+            continue
+
+        module_name = param_to_module.get(key, key.rsplit(".", 1)[0] if "." in key else "")
+        if key == "proj":
+            in_key = projection_in_key
+            out_key = ".out"
+            in_module = "ln_post"
+            out_module = ""
+        else:
+            in_key = f"{module_name}.in"
+            out_key = f"{module_name}.out"
+            in_module = module_name
+            out_module = module_name
+
+        if delta_source.ndim == 2:
+            target_ref = target_visual_base[key]
+            if key == "proj":
+                expected_in = (int(delta_source.shape[0]), int(target_ref.shape[0]))
+                expected_out = (int(delta_source.shape[1]), int(target_ref.shape[1]))
+            else:
+                expected_in = (int(delta_source.shape[1]), int(target_ref.shape[1]))
+                expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
+
+            t_in = _transform_for(in_module, side="in", expected_shape=expected_in, fallback_key=in_key)
+            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
+            if t_in is not None and t_out is not None:
+                transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+                usable += 1
+                continue
+            transforms_by_key[key] = _LayerTransform(kind="weight")
+            incomplete += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+            continue
+
+        if delta_source.ndim == 1:
+            if key.endswith(".bias"):
+                weight_key = f"{key[: -len('.bias')]}.weight"
+                weight_transform = transforms_by_key.get(weight_key)
+                if weight_transform is not None and weight_transform.t_out is not None:
+                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
+                    usable += 1
+                    continue
+
+            # Robustness fallback: covers uncommon ordering/edge cases where
+            # the bias has no directly available weight transform yet.
+            cached_t_out = t_out_cache.get(out_key)
+            if cached_t_out is not None:
+                transforms_by_key[key] = _LayerTransform(kind="bias", t_out=cached_t_out)
+                usable += 1
+                continue
+
+            target_ref = target_visual_base[key]
+            expected_out = (int(delta_source.shape[0]), int(target_ref.shape[0]))
+            t_out = _transform_for(out_module, side="out", expected_shape=expected_out, fallback_key=out_key)
+            if t_out is not None:
+                t_out_cache[out_key] = t_out
+                transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+                usable += 1
+                continue
+            transforms_by_key[key] = _LayerTransform(kind="bias")
+            incomplete += 1
+            _append_diagnostic_example(examples, "incomplete", key)
+            continue
+
+        transforms_by_key[key] = _LayerTransform(kind="unsupported")
+        unsupported += 1
+        _append_diagnostic_example(examples, "unsupported", key)
+
+    diagnostics = _PrecomputeDiagnostics(
+        slots=len(visual_delta),
+        usable=usable,
+        intentional_zero=intentional_zero,
+        incomplete=incomplete,
+        unsupported=unsupported,
+        skipped_not_in_target=skipped_not_in_target,
+        examples=_freeze_diagnostic_examples(examples),
+        assigned_keys=len(transforms_by_key),
+        shared_transform_count=(len(grouped_transforms) if transform_granularity != "param" else 0),
+        shared_group_count=(len(grouped_covariances) if transform_granularity != "param" else 0),
+    )
+    return transforms_by_key, diagnostics
+
+
+@cost_phase_decorator("transformation")
+def _precompute_transforms_data_free(
+    *,
+    source_visual_base: Mapping[str, torch.Tensor],
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    whiten_power: float,
+    whiten_eps: float,
+    show_progress: bool,
+    method_name: str,
+) -> dict[str, _LayerTransform]:
+    transforms_by_key: dict[str, _LayerTransform] = {}
+
+    items = _iter_with_progress(
+        visual_delta.items(),
+        total=len(visual_delta),
+        desc=f"{method_name}.prepare: compute data-free transforms",
+        enabled=show_progress,
+    )
+    for key, delta_source in items:
+        if key not in target_visual_base or key not in source_visual_base:
+            logger.warning(
+                "%s prepare: skipping transform for %s because it is absent from the source or target base",
+                method_name,
+                key,
+            )
+            continue
+
+        if key in _ZERO_KEYS:
+            transforms_by_key[key] = _LayerTransform(kind="zero")
+            continue
+
+        w_src_base = source_visual_base[key].detach().cpu().to(torch.float64)
+        w_tgt_base = target_visual_base[key].detach().cpu().to(torch.float64)
+        w_delta = delta_source.detach().cpu().to(torch.float64)
+
+        if w_delta.ndim == 2:
+            w_src_proxy = w_src_base + w_delta
+            if key == "proj":
+                t_in = _compute_alignment_map_from_matrix_proxies(
+                    w_src_proxy,
+                    w_tgt_base,
+                    side="output",
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+                t_out = _compute_alignment_map_from_matrix_proxies(
+                    w_src_proxy,
+                    w_tgt_base,
+                    side="input",
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+            else:
+                t_in = _compute_alignment_map_from_matrix_proxies(
+                    w_src_proxy,
+                    w_tgt_base,
+                    side="input",
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+                t_out = _compute_alignment_map_from_matrix_proxies(
+                    w_src_proxy,
+                    w_tgt_base,
+                    side="output",
+                    whiten_power=whiten_power,
+                    whiten_eps=whiten_eps,
+                )
+            transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
+        elif w_delta.ndim == 1:
+            if key.endswith(".bias"):
+                weight_key = f"{key[: -len('.bias')]}.weight"
+                weight_transform = transforms_by_key.get(weight_key)
+                if weight_transform is not None and weight_transform.t_out is not None:
+                    transforms_by_key[key] = _LayerTransform(kind="bias", t_out=weight_transform.t_out)
+                    continue
+
+            # Fall back to a one-row weight-space alignment for uncommon
+            # standalone vectors whose parent weight transform is unavailable.
+            t_out = _compute_alignment_map_from_matrix_proxies(
+                w_src_base.unsqueeze(0),
+                w_tgt_base.unsqueeze(0),
+                side="input",
+                whiten_power=whiten_power,
+                whiten_eps=whiten_eps,
+            )
+            transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
+        else:
+            transforms_by_key[key] = _LayerTransform(kind="unsupported")
+
+    return transforms_by_key
+
+
+class _WrongTransportShape(ValueError):
+    def __init__(self, actual: torch.Size, expected: torch.Size):
+        self.actual = tuple(actual)
+        self.expected = tuple(expected)
+        super().__init__(f"got {self.actual}, expected {self.expected}")
+
+
+def _apply_transforms_to_visual_delta(
+    *,
+    target_visual_base: Mapping[str, torch.Tensor],
+    visual_delta: Mapping[str, torch.Tensor],
+    transforms_by_key: Mapping[str, _LayerTransform],
+    show_progress: bool,
+    method_name: str,
+    device: str = "cpu",
+    strict: bool = False,
+    out_of_scope_keys: Iterable[str] = (),
+    skipped_not_in_target_keys: Iterable[str] = (),
+) -> tuple[TensorDict, _ApplyDiagnostics]:
+    aligned: TensorDict = {}
+    actively_transported = 0
+    intentional_zero = 0
+    missing_transform_zero = 0
+    unsupported_zero = 0
+    transport_failure_zero = 0
+    wrong_shape_zero = 0
+    out_of_scope_zero = 0
+    skipped_not_in_target = 0
+    transformed_weight = 0
+    transformed_bias = 0
+    examples: dict[str, list[str]] = {}
+
+    for key in out_of_scope_keys:
+        out_of_scope_zero += 1
+        _append_diagnostic_example(examples, "out_of_scope_zero", key)
+    for key in skipped_not_in_target_keys:
+        skipped_not_in_target += 1
+        _append_diagnostic_example(examples, "skipped_not_in_target", key)
+
+    items = _iter_with_progress(
+        visual_delta.items(),
+        total=len(visual_delta),
+        desc=f"{method_name}.apply: transport params",
+        enabled=show_progress,
+    )
+    for key, delta_source in items:
+        if key not in target_visual_base:
+            skipped_not_in_target += 1
+            _append_diagnostic_example(examples, "skipped_not_in_target", key)
+            continue
+
+        target_ref = target_visual_base[key]
+        transported = torch.zeros_like(target_ref, dtype=torch.float32, device=device)
+
+        transform = transforms_by_key.get(key)
+        if transform is not None and transform.kind == "zero":
+            intentional_zero += 1
+            _append_diagnostic_example(examples, "intentional_zero", key)
+        elif transform is None:
+            missing_transform_zero += 1
+            _append_diagnostic_example(examples, "missing_transform_zero", key)
+        elif transform.kind == "unsupported" or delta_source.ndim not in {1, 2}:
+            unsupported_zero += 1
+            _append_diagnostic_example(examples, "unsupported_zero", key)
+        elif (
+            transform.kind == "weight"
+            and delta_source.ndim == 2
+            and transform.t_in is not None
+            and transform.t_out is not None
+        ):
+            try:
+                candidate = _transport_weight(
+                    delta_source.float().to(device=device), transform.t_in, transform.t_out, key=key
+                )
+                if candidate.shape != target_ref.shape:
+                    raise _WrongTransportShape(candidate.shape, target_ref.shape)
+                transported = candidate
+                transformed_weight += 1
+                actively_transported += 1
+            except _WrongTransportShape as exc:
+                wrong_shape_zero += 1
+                _append_diagnostic_example(examples, "wrong_shape_zero", key)
+                logger.warning(
+                    "%s transport produced wrong shape for %s: got %s expected %s; zeroing",
+                    method_name,
+                    key,
+                    exc.actual,
+                    exc.expected,
+                )
+            except (RuntimeError, ValueError) as exc:
+                transport_failure_zero += 1
+                _append_diagnostic_example(examples, "transport_failure_zero", key)
+                logger.warning("%s transport failed for %s: %s; zeroing", method_name, key, exc)
+        elif transform.kind == "bias" and delta_source.ndim == 1 and transform.t_out is not None:
+            try:
+                candidate = _transport_bias(delta_source.float().to(device=device), transform.t_out)
+                if candidate.shape != target_ref.shape:
+                    raise _WrongTransportShape(candidate.shape, target_ref.shape)
+                transported = candidate
+                transformed_bias += 1
+                actively_transported += 1
+            except _WrongTransportShape as exc:
+                wrong_shape_zero += 1
+                _append_diagnostic_example(examples, "wrong_shape_zero", key)
+                logger.warning(
+                    "%s transport produced wrong shape for %s: got %s expected %s; zeroing",
+                    method_name,
+                    key,
+                    exc.actual,
+                    exc.expected,
+                )
+            except (RuntimeError, ValueError) as exc:
+                transport_failure_zero += 1
+                _append_diagnostic_example(examples, "transport_failure_zero", key)
+                logger.warning("%s vector transport failed for %s: %s; zeroing", method_name, key, exc)
+        else:
+            missing_transform_zero += 1
+            _append_diagnostic_example(examples, "missing_transform_zero", key)
+
+        aligned[key] = transported.to(dtype=target_ref.dtype, device=target_ref.device)
+
+    diagnostics = _ApplyDiagnostics(
+        actively_transported=actively_transported,
+        intentional_zero=intentional_zero,
+        missing_transform_zero=missing_transform_zero,
+        unsupported_zero=unsupported_zero,
+        transport_failure_zero=transport_failure_zero,
+        wrong_shape_zero=wrong_shape_zero,
+        out_of_scope_zero=out_of_scope_zero,
+        skipped_not_in_target=skipped_not_in_target,
+        examples=_freeze_diagnostic_examples(examples),
+        transformed_weight=transformed_weight,
+        transformed_bias=transformed_bias,
+    )
+    unexpected = {
+        category: count
+        for category, count in {
+            "missing_transform_zero": missing_transform_zero,
+            "unsupported_zero": unsupported_zero,
+            "transport_failure_zero": transport_failure_zero,
+            "wrong_shape_zero": wrong_shape_zero,
+            "skipped_not_in_target": skipped_not_in_target,
+        }.items()
+        if count
+    }
+    if unexpected:
+        logger.warning(
+            "%s transport diagnostics: unexpected loss %s; examples=%s",
+            method_name,
+            unexpected,
+            diagnostics.examples,
+        )
+    # A run where every key was zeroed for an *unintended* reason returns a full set of
+    # correctly shaped zeros, which downstream code cannot distinguish from a legitimate
+    # result. Refuse to hand that back silently, whether or not ``strict`` is set.
+    # Deliberate zeroing (``intentional_zero``/``out_of_scope_zero``, e.g. the depth
+    # baselines) is a valid all-zero outcome and is exempt.
+    if visual_delta and actively_transported == 0 and not (intentional_zero or out_of_scope_zero):
+        raise RuntimeError(
+            f"{method_name} transported no keys: every one of {len(visual_delta)} delta keys "
+            f"was zeroed (missing_transform_zero={missing_transform_zero}, "
+            f"transport_failure_zero={transport_failure_zero}, "
+            f"unsupported_zero={unsupported_zero}, wrong_shape_zero={wrong_shape_zero}). "
+            f"The transported delta would be identically zero. Examples: {diagnostics.examples}"
+        )
+    if strict and unexpected:
+        raise RuntimeError(
+            f"{method_name} strict transport failed: "
+            f"missing_transform_zero={diagnostics.missing_transform_zero}, "
+            f"unsupported_zero={diagnostics.unsupported_zero}, "
+            f"transport_failure_zero={diagnostics.transport_failure_zero}, "
+            f"wrong_shape_zero={diagnostics.wrong_shape_zero}, "
+            f"skipped_not_in_target={diagnostics.skipped_not_in_target}, "
+            f"examples={diagnostics.examples}"
+        )
+    return aligned, diagnostics

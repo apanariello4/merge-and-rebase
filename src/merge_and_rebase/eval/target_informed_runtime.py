@@ -25,6 +25,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from ..models.vision_utils import _encode_image  # noqa: F401  (re-exported for existing importers)
+from ..rebase.methods._shared import _interp_2d_tokens, _to_tokens  # noqa: F401  (re-exported for existing importers)
 from ..rebase.methods.ariadne.ablations import (  # noqa: F401  (re-exported for existing importers)
     _apply_bias_correction,
     _backfit_data_fit_sq,
@@ -84,7 +85,6 @@ from ..rebase.methods.ariadne.layouts import (  # noqa: F401  (re-exported for e
     _rows,
     _VisionLayout,
 )
-from ..rebase.methods.theseus import _interp_2d_tokens, _to_tokens  # noqa: F401  (re-exported for existing importers)
 from .target_residual_completion import (
     JointCorrectionConfig,
     ResidualCompletionConfig,

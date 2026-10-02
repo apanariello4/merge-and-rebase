@@ -7,7 +7,7 @@ from torch import nn
 
 from ....models.vision_utils import _encode_image
 from ...model_families import accessors as _fam
-from ..theseus import _interp_2d_tokens
+from .._shared import _interp_2d_tokens
 
 # --- architecture abstraction -------------------------------------------------
 # Only this layer touches the model's module tree: the two layouts name where blocks live, which
