@@ -33,6 +33,21 @@ class MethodStage(Protocol):
     def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult: ...
 
 
+class CompletionStage(Protocol):
+    """Target-informed correction applied to a fitted task vector (target residual, joint, direct P1)."""
+
+    def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult, result: MethodResult) -> MethodResult: ...
+
+
+@dataclass
+class CompletionRecord:
+    """Per-task diagnostics of the completion stages (summary keys keep their legacy names)."""
+
+    residual: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    joint_blockwise: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    direct_p1: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+
 def direct_target_p1_requested(plan: Any, block_extension_cfg: Any) -> bool:
     """Transport-free proposal-1 arm: ordinary parameter transport is skipped entirely."""
     return bool(

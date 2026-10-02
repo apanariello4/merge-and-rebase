@@ -58,7 +58,7 @@ from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override  # noqa: F401  (kept importable)
 from ...rebase.methods.ariadne.fit import _task_vector_sha256  # noqa: F401  (kept importable)
 from ...rebase.methods.theseus import InterpolatedBlockActivations  # noqa: F401  (kept importable)
-from ...rebase.orchestration import AriadneRunRecord
+from ...rebase.orchestration import AriadneRunRecord, CompletionRecord, direct_target_p1_requested
 from ...rebase.prestep import StageEnv, TaskInputs
 from ...rebase.run_config import _BASE_CONSTRUCTION_MODES, resolve_run_config  # noqa: F401  (kept importable)
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
@@ -83,10 +83,7 @@ from ..target_informed_runtime import (  # noqa: F401  (kept importable)
     projection_transforms,
     scale_completion,
 )
-from ..target_residual_completion import (
-    JointCorrectionConfig,
-    ResidualCompletionConfig,
-)
+from ..target_residual_completion import JointCorrectionConfig, ResidualCompletionConfig  # noqa: F401
 from .alpha_search import (  # noqa: F401  (re-exported for tests)
     _average_defined,
     _norm_acc,
@@ -97,7 +94,13 @@ from .artifacts import (  # noqa: F401  (re-exported for tests)
     _load_saved_sequential_tv,
     _state_dict_sha256,
 )
-from .completion import _maybe_capture_target_residual_references  # noqa: F401  (re-exported for tests)
+from .completion import (  # noqa: F401  (re-exported for tests)
+    _maybe_capture_target_residual_references,
+    _maybe_complete_direct_p1_task_vector,
+    _maybe_complete_joint_blockwise_task_vector,
+    _maybe_complete_target_residual_task_vector,
+    build_completion_stages,
+)
 from .context import (  # noqa: F401  (re-exported for tests)
     DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
     TRANSPORT_CALIBRATION_DATA,
@@ -176,154 +179,6 @@ def _set_deterministic_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def _maybe_complete_target_residual_task_vector(
-    *,
-    config: ResidualCompletionConfig,
-    references: dict[str, Any] | None,
-    prepared: Any,
-    layout: Mapping[str, Any],
-    target_model: torch.nn.Module,
-    target_base_sd: Mapping[str, torch.Tensor],
-    transported_delta: dict[str, torch.Tensor],
-    target_loader: Any,
-    device: str,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
-    """Complete the transported task vector's residual-writing keys, or no-op.
-
-    Which projections those are is ``config.components``: ``mlp.c_proj`` alone
-    by default, optionally ``attn.out_proj`` as well in ``direct_target`` mode.
-
-    Runs after transport is fitted, using the already-fitted ``prepared``
-    transforms; it only ever adds to the *task vector*, never the target base
-    weights. ``config.enabled=False`` or missing ``references`` (the option
-    was disabled when references would have been captured) returns
-    ``transported_delta`` completely unchanged -- same dict object, so a
-    caller comparing state-dict hashes sees byte-identical output. Fitting
-    always happens at gamma=1 (see ``complete_residuals``); ``config.strength``
-    is applied afterwards by ``scale_completion``, and ``strength=0.0`` is a
-    true null ablation because ``scale_completion`` short-circuits to the
-    baseline in that case.
-    """
-    if not config.enabled or references is None:
-        return transported_delta, None
-    if config.mode == "direct_target":
-        # Transport-free arm. There is no tau_t to complete: the caller has
-        # already skipped the transport fit, so ``transported_delta`` must be
-        # empty and the fitted correction is the entire task vector. The
-        # baseline it is scaled against is therefore an explicit zero delta,
-        # which keeps gamma=0 an exact native-target-base control (identical
-        # semantics to the transport-aware arm's gamma=0).
-        if transported_delta:
-            raise ValueError(
-                "mode='direct_target' requires an empty transported task vector: the "
-                f"caller passed {len(transported_delta)} transported keys, so the arm would "
-                "not be transport-free"
-            )
-        target_corrections, diagnostics = complete_residuals_direct(
-            target_model,
-            target_base_sd,
-            references,
-            layout,
-            target_loader,
-            config=config,
-            device=device,
-        )
-        zero_baseline = {key: torch.zeros_like(value) for key, value in target_corrections.items()}
-        return scale_completion(zero_baseline, target_corrections, config.strength), diagnostics
-    transforms = projection_transforms(prepared, layout, target_scope=config.target_scope)
-    _source_corrections, target_corrections, diagnostics = complete_residuals(
-        target_model,
-        target_base_sd,
-        transported_delta,
-        references,
-        transforms,
-        layout,
-        target_loader,
-        config=config,
-        device=device,
-    )
-    completed_delta = scale_completion(transported_delta, target_corrections, config.strength)
-    return completed_delta, diagnostics
-
-
-def _maybe_complete_joint_blockwise_task_vector(
-    *,
-    config: JointCorrectionConfig,
-    references: dict[str, Any] | None,
-    prepared: Any,
-    layout: Mapping[str, Any],
-    target_model: torch.nn.Module,
-    target_base_sd: Mapping[str, torch.Tensor],
-    transported_delta: dict[str, torch.Tensor],
-    target_loader: Any,
-    device: str,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
-    """Run the opt-in frozen-map Option 3 blockwise solve."""
-    if not config.enabled or references is None:
-        return transported_delta, None
-    transforms = projection_transforms(prepared, layout, target_scope="inserted")
-    _source, target_corrections, diagnostics = complete_joint_blockwise(
-        target_model,
-        target_base_sd,
-        transported_delta,
-        references,
-        transforms,
-        layout,
-        target_loader,
-        config=config,
-        device=device,
-    )
-    completed = dict(transported_delta)
-    for key, correction in target_corrections.items():
-        if key in completed:
-            completed[key] = completed[key] + correction.to(completed[key])
-        else:
-            completed[key] = correction
-    return completed, diagnostics
-
-
-def _maybe_complete_direct_p1_task_vector(
-    *,
-    config: JointCorrectionConfig,
-    references: dict[str, Any] | None,
-    prepared: Any,
-    layout: Mapping[str, Any],
-    source_base_model: torch.nn.Module,
-    source_ft_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    target_base_sd: Mapping[str, torch.Tensor],
-    transported_delta: dict[str, torch.Tensor],
-    source_loader: Any,
-    target_loader: Any,
-    device: str,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]] | None]:
-    """Fit the direct shared-geometry/P1 correction with frozen maps."""
-    if not config.enabled or references is None:
-        return transported_delta, None
-    transforms = projection_transforms(prepared, layout, target_scope="inserted")
-    target_corrections, diagnostics = complete_direct_p1_shared_correction(
-        source_base_model,
-        source_ft_model,
-        target_model,
-        target_base_sd,
-        transported_delta,
-        references,
-        transforms,
-        layout,
-        source_loader,
-        target_loader,
-        config=config,
-        device=device,
-    )
-    completed = dict(transported_delta)
-    for key, correction in target_corrections.items():
-        if key in completed:
-            completed[key] = completed[key] + correction.to(completed[key])
-        else:
-            completed[key] = correction
-    return completed, diagnostics
 
 
 def main() -> None:
@@ -550,7 +405,6 @@ def main() -> None:
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
         plan = resolved.bind(source_depth, target_depth)
         run_block_extension_prestep = plan.run_block_extension_prestep
-        run_same_depth_direct_target = plan.run_same_depth_direct_target
         if blockext_like_method:
             calibration_dataset = calibration_dataset_spec(block_extension_cfg)
             if run_block_extension_prestep:
@@ -710,9 +564,6 @@ def main() -> None:
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
         transport_timings: dict[str, dict[str, float]] = {}
-        residual_completion_diagnostics: dict[str, list[dict[str, Any]]] = {}
-        joint_blockwise_diagnostics: dict[str, list[dict[str, Any]]] = {}
-        direct_p1_diagnostics: dict[str, list[dict[str, Any]]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         cross_task_lmc_rows: list[dict[str, Any]] = []
         all_task_lmc_rows: list[dict[str, Any]] = []
@@ -851,11 +702,15 @@ def main() -> None:
             ariadne_calibration_meta=direct_residual_calibration_meta,
         )
         ariadne_record = method_stage.record if direct_residual_like else AriadneRunRecord()
+        completion_record = CompletionRecord()
+        completion_stages = build_completion_stages(plan, block_extension_cfg, completion_record)
+        residual_completion_diagnostics = completion_record.residual
+        joint_blockwise_diagnostics = completion_record.joint_blockwise
+        direct_p1_diagnostics = completion_record.direct_p1
         transfusion_prepared: dict[str, Any] | None = None
         # merge_then_brace_then_transport merges deltas on the native source base first and only
         # then runs its own once-only structural step, so neither prestep fires per-task under it
         # (gating resolved in `ResolvedRunConfig.bind`).
-        task_block_extension_prestep = plan.task_block_extension_prestep
         # Timing/memory brackets (wandb-visible), parallel to transport_timings:
         # alignment_calibration_timings covers whatever depth/width-alignment
         # step runs before any correction is fitted (build_discrete_indexed_model
@@ -907,22 +762,8 @@ def main() -> None:
             target_hash_before = stage_env.target_hash_before
             transfusion_prepared = stage_env.transfusion_prepared
             task_delta = pre.task_delta
-            source_base_model_task = pre.source_base_model
-            source_ft_model_task = pre.source_ft_model
-            task_extension_layout = pre.layout
-            task_residual_references = pre.references.residual
-            task_residual_target_loader = pre.references.residual_target_loader
-            task_joint_references = pre.references.joint
-            task_joint_target_loader = pre.references.joint_target_loader
-            task_direct_p1_references = pre.references.direct_p1
-            task_direct_p1_target_loader = pre.references.direct_p1_target_loader
-            calibration_loader = pre.references.source_calibration_loader
 
-            direct_target_p1 = bool(
-                (task_block_extension_prestep or run_same_depth_direct_target)
-                and block_extension_cfg.target_residual_completion.enabled
-                and block_extension_cfg.target_residual_completion.mode == "direct_target"
-            )
+            direct_target_p1 = direct_target_p1_requested(plan, block_extension_cfg)
             if direct_target_p1:
                 print(
                     f"\n--- Direct-target P1 for '{task}' "
@@ -933,7 +774,6 @@ def main() -> None:
             if merge_mode not in _SINGLE_TRANSPORT_MODES:
                 method_result = method_stage.run(stage_env, task_in, pre)
                 transported_delta = method_result.transported_delta
-                prepared = method_result.prepared
                 transport_timings[task] = method_result.transport_timing
                 cost_phase_timings[task] = method_result.cost_phases
                 if method_result.alignment_calibration is not None:
@@ -941,75 +781,9 @@ def main() -> None:
                 if method_result.correction_fit is not None:
                     correction_fit_timings[task] = method_result.correction_fit
 
-                if (task_block_extension_prestep or run_same_depth_direct_target) and block_extension_cfg.target_residual_completion.enabled:
-                    # Proposal 1 completes the transported task vector's
-                    # residual projections. In the same-depth direct-target
-                    # path, references and the identity layout are prepared
-                    # separately; both cases leave the target base unchanged.
-                    transported_delta, task_residual_diagnostics = _maybe_complete_target_residual_task_vector(
-                        config=block_extension_cfg.target_residual_completion,
-                        references=task_residual_references,
-                        prepared=prepared,
-                        layout=task_extension_layout,
-                        target_model=clf_target.model,
-                        target_base_sd=target_base_sd,
-                        transported_delta=transported_delta,
-                        target_loader=task_residual_target_loader,
-                        device=device,
-                    )
-                    if task_residual_diagnostics is not None:
-                        residual_completion_diagnostics[task] = task_residual_diagnostics
-                if task_block_extension_prestep and block_extension_cfg.joint_blockwise_correction.enabled:
-                    transported_delta, task_joint_diagnostics = _maybe_complete_joint_blockwise_task_vector(
-                        config=block_extension_cfg.joint_blockwise_correction,
-                        references=task_joint_references,
-                        prepared=prepared,
-                        layout=task_extension_layout,
-                        target_model=clf_target.model,
-                        target_base_sd=target_base_sd,
-                        transported_delta=transported_delta,
-                        target_loader=task_joint_target_loader,
-                        device=device,
-                    )
-                    if task_joint_diagnostics is not None:
-                        joint_blockwise_diagnostics[task] = task_joint_diagnostics
-                        run_logger.log_event(
-                            "joint_blockwise_correction",
-                            metrics={
-                                f"rebase/{task}/joint_blocks": float(len(task_joint_diagnostics)),
-                                f"rebase/{task}/joint_objective_after": float(
-                                    sum(row["objective_after"] for row in task_joint_diagnostics)
-                                ),
-                            },
-                            context={"task": task, "method": method.name},
-                        )
-                if task_block_extension_prestep and block_extension_cfg.direct_p1_correction.enabled:
-                    transported_delta, task_direct_p1_diagnostics = _maybe_complete_direct_p1_task_vector(
-                        config=block_extension_cfg.direct_p1_correction,
-                        references=task_direct_p1_references,
-                        prepared=prepared,
-                        layout=task_extension_layout,
-                        source_base_model=source_base_model_task,
-                        source_ft_model=source_ft_model_task,
-                        target_model=clf_target.model,
-                        target_base_sd=target_base_sd,
-                        transported_delta=transported_delta,
-                        source_loader=calibration_loader,
-                        target_loader=task_direct_p1_target_loader,
-                        device=device,
-                    )
-                    if task_direct_p1_diagnostics is not None:
-                        direct_p1_diagnostics[task] = task_direct_p1_diagnostics
-                        run_logger.log_event(
-                            "direct_p1_correction",
-                            metrics={
-                                f"rebase/{task}/direct_p1_blocks": float(len(task_direct_p1_diagnostics)),
-                                f"rebase/{task}/direct_p1_objective_after": float(
-                                    sum(row["objective_after"] for row in task_direct_p1_diagnostics)
-                                ),
-                            },
-                            context={"task": task, "method": method.name},
-                        )
+                for completion_stage in completion_stages:
+                    method_result = completion_stage.run(stage_env, task_in, pre, method_result)
+                transported_delta = method_result.transported_delta
 
                 transported_deltas.append(transported_delta)
                 original_deltas.append(task_delta)
