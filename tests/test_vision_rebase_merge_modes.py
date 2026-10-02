@@ -396,7 +396,7 @@ def test_ckpt_visual_base_coverage_partial() -> None:
 
 
 def test_resolve_merge_mode_config_rejects_unknown_merge_method() -> None:
-    with pytest.raises(KeyError, match="no_such_merge"):
+    with pytest.raises(ValueError, match="no_such_merge"):
         _resolve_merge_mode_config({"merge_mode": "none", "merge_method": "no_such_merge"}, "shared")
 
 

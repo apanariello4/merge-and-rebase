@@ -1214,8 +1214,8 @@ ERRORS: dict[str, Err] = {
     ),
     "merge_method_unknown": Err(
         {"merge_mode": "rebase_then_merge", "merge_method": "x"},
-        KeyError,
-        r"\"Unknown merge method 'x'\. Available: .*",
+        ValueError,
+        r"Unknown merge method 'x'\. Available: .*",
     ),
     "merge_params_not_a_mapping": Err(
         {"merge_mode": "rebase_then_merge", "merge_params": [1]},

@@ -54,7 +54,10 @@ def _resolve_merge_mode_config(
         )
 
     merge_method_name = str(cfg.get("merge_method", "task_arithmetic"))
-    get_merge_method(merge_method_name)  # validate early for clearer UX
+    try:
+        get_merge_method(merge_method_name)  # validate early for clearer UX
+    except KeyError as exc:  # B10: a config error is a ValueError (the registry keeps its KeyError)
+        raise ValueError(str(exc.args[0])) from None
 
     raw_params = cfg.get("merge_params", {}) or {}
     if not isinstance(raw_params, dict):
