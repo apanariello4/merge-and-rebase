@@ -279,7 +279,8 @@ def resolve_depth_rule(
             guard = _meaning_changed_message(
                 method_name,
                 "depth-mismatched pair without depth_alignment / block_extension_params.depth_rule "
-                "(the previous default was the BRACE interpolation with a fitted correction)",
+                "(the previous default ran the BRACE block-extension prestep with the block_extension_params "
+                "settings; the new BiCo default is the discrete index match)",
                 '"depth_alignment": "ariadne"',
             )
         return DepthRule(kind=rule, source=source), block_extension_cfg, guard  # type: ignore[arg-type]
