@@ -294,7 +294,7 @@ flowchart TD
     A[vision config YAML]
     B[train_vision.py]
     C[fine-tuned checkpoints .pt]
-    D[vision_merge.py or vision_rebase.py]
+    D[vision_merge.py or vision_rebase/]
     E[merged or transported checkpoint]
     F[per-task accuracy + normalized accuracy]
 

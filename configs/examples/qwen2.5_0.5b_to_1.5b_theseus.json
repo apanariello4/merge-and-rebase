@@ -1,0 +1,33 @@
+{
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "model_kind": "causal_lm",
+  "model_arch": "qwen",
+  "tuned_bodies": {
+    "it": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "method": "theseus",
+  "method_params": {
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate",
+    "device_transform": "gpu"
+  },
+  "depth_defaults": "method",
+  "seed": 0,
+  "alpha_search": false,
+  "alpha": 1.0,
+  "harness_tasks": [
+    "ifeval"
+  ],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 192,
+  "block_extension_params": {
+    "n_batches_act": 100
+  },
+  "save_transported_tvs": "auto",
+  "device": "cuda",
+  "dtype": "bf16"
+}

@@ -71,23 +71,20 @@ rows are paired. For decoder models, each model's rows are masked by its own att
 never enters any statistic**; if source and target rows cannot be paired after masking (tokenizer mismatch)
 Ariadne raises an error instead of falling back to rows that include padding.
 
-<!-- CHECK: PDF describes interpolating source tokens to the target grid when token grids differ; this page states it for vision as the PDF does, but the exact code path was not verified here. -->
 
 ### Depth pairing
 
-The paper treats the target-to-source block map `pi` as a user-specified, possibly partial prior. The code
-uses one flat closed-form map for extension, reduction and same-architecture runs:
+In the method, the target-to-source block map `pi` can be any (possibly partial) map. This implementation
+provides two maps, selected with `depth_pairing`:
 
-```
-i(j) = round( j (D_source - 1) / (D_target - 1) )
-```
+- `"relative"` (default): uniform nearest index, `i(j) = round( j (D_source - 1) / (D_target - 1) )`, with
+  Python's round-half-to-even and `D_source`/`D_target` the numbers of blocks. Several target blocks may share a
+  source block (extension) and some source blocks may go unused (reduction).
+- `"spread_duplicate"`: every source block maps to its own target block in order; the extra target blocks are
+  duplicates of source blocks chosen at evenly spread positions (the default BRACE spread schedule), and a
+  reduction merges evenly spread groups of source blocks.
 
-with Python's round-half-to-even, `D_source`/`D_target` the numbers of blocks. This is
-`depth_pairing: "relative"`. The map need not be one-to-one: several target blocks may share a source block
-(extension) and some source blocks may go unused (reduction). Other pairings exist as ablations only (see the
-option table).
-
-<!-- CHECK: the PDF defines pi as an arbitrary user-specified (possibly partial) map; the code exposes only the uniform nearest-index map plus the ablation overrides (reversed, shift_plus1, shift_minus1), not an arbitrary user map. -->
+`reversed`, `shift_plus1` and `shift_minus1` are ablations only (see the option table).
 
 ## The main method
 
@@ -166,7 +163,9 @@ method; **retired** = rejected with an error; **kept** = supported but not used 
 | `alignment_seed` | `0` | integer | ablation: seed base for `random_isometry` (per-position seed derived from it) |
 | `procrustes_source` | `"activation"` | `activation`, `gradient` | main: `activation`. `gradient` (vision only) fits `Q_j` on boundary gradients of a zero-shot contrastive loss; ablation |
 | `residual_target` | `"transported_delta"` | `transported_delta`, `transported_endpoint` | main: `transported_delta`, `D_j = (S_ft - S_base) Q_j`. `transported_endpoint` is an ablation that differs by the Procrustes residual (activation Procrustes only) |
-| `depth_pairing` | `"relative"` | `relative`, `reversed`, `shift_plus1`, `shift_minus1` | main: `relative`; the others are ablations that change both `D_j` and `Q_j` |
+| `depth_pairing` | `"relative"` | `relative`, `spread_duplicate`, `reversed`, `shift_plus1`, `shift_minus1` | main: `relative`; the others are ablations that change both `D_j` and `Q_j` |
+| `streaming_fingerprint_tol` | `1e-9` | positive float | streaming check that the target model was not mutated between capture passes; serialized only when non-default |
+| `copy_shape_matching_source_deltas` | `false` | bool | ablation: add shape-matching source deltas of non-fitted parameters to the task vector; serialized only when true |
 | `activation_storage` | `"resident"` | `resident`, `streaming` | main: `streaming` (preset). See [storage paths](#storage-paths) |
 | `streaming_position_chunk` | `null` | `null` or positive integer | streaming only: fit target positions in chunks (one capture sweep each) to bound host memory |
 | `block_split` | `"none"` | `none`, `backfit`, `joint` | main: `none`. `joint` is an ablation (closed-form joint ridge over attention and MLP projections; equals `none` for one component). `backfit` is kept but not used in current experiments |
@@ -182,8 +181,6 @@ method; **retired** = rejected with an error; **kept** = supported but not used 
 | `fidelity_holdout` | `false` | bool | diagnostic only, never read by a fit: measures reproduction of `D_j` on a disjoint held-out slice |
 | `fidelity_holdout_batches` | `10` | positive integer | with `fidelity_holdout` |
 
-<!-- CHECK: the PDF names only the main configuration (MLP output projection, empirical-Bayes ridge, relative pairing); every ablation row above is taken from config.py and has no PDF counterpart. -->
-<!-- CHECK: the PDF writes the exact form with the fixed map L (e.g. LayerScale) and a bias update beta; in code exact_form=true is the default and the dataclass default for ridge_estimator remains fixed_relative, so the paper's empirical-Bayes ridge is only active through the preset or an explicit key. -->
 
 Cross-field validation (all raise `ValueError` at parse time):
 
@@ -236,12 +233,11 @@ identifiers, so that transported-delta and task-vector hashes can be compared be
 | --- | --- |
 | `"method": "direct_residual"` | `"method": "ariadne"` (registry alias; same object) |
 | `direct_residual_params` | `ariadne_params` (alias of the params block) |
-| `merge_and_rebase.eval.direct_residual` | `merge_and_rebase.rebase.methods.ariadne` |
 
 - Specifying both `direct_residual_params` and `ariadne_params` in one config is an error.
-- `merge_and_rebase.eval.direct_residual` is a **deprecated shim** that re-exports the new package
-  (including some private names that older scripts imported). It emits no warning; use the new import path in
-  new code.
+- The old import path `merge_and_rebase.eval.direct_residual` was removed; import from
+  `merge_and_rebase.rebase.methods.ariadne` (public API) — internal stage modules live in
+  `merge_and_rebase.rebase.methods._ariadne`.
 - The config dataclass keeps its historical name `DirectResidualConfig` and the parser
   `parse_direct_residual_config`; they are exported from the new package.
 - The `ariadne` preset was added without changing any dataclass default, so existing configs and results are
@@ -249,27 +245,25 @@ identifiers, so that transported-delta and task-vector hashes can be compared be
 
 ## Decoder (LLM) support
 
-> **Status: planned (Phase 7).** Decoder support for Ariadne is being added. The items below are the intended
-> behavior, not yet available in the released code path.
+Ariadne runs on Hugging Face decoders (Llama, Qwen2/2.5, Qwen3) through `python -m merge_and_rebase.eval.llm_rebase`
+with `"method": "ariadne"`. Absent keys of `ariadne_params` get decoder defaults (the dataclass defaults are not
+changed):
 
-Planned decoder defaults:
-
-- **Component:** the residual-writing MLP projection only (`mlp.c_proj` maps to `mlp.down_proj`); the
-  attention output projection is not fitted by default.
-- **Storage:** `streaming`.
-- **Ridge:** `empirical_bayes`.
-- **Bias:** `exact_form=true` with `missing_bias="materialize"`, which adds a `down_proj.bias` entry to the
-  task vector because stock decoder blocks have no bias on that projection. A selectable alternative will let
-  you avoid materializing it (`missing_bias="skip"` with `exact_form=false`), which keeps the stock
-  architecture at the cost of a first-order, intercept-free fit.
-- **Padding:** rows are removed by each model's attention mask before any statistic is accumulated; a
-  tokenizer mismatch that prevents pairing is an error.
-- **Task vector:** only the fit. Copying shape-matching source deltas for non-fitted parameters (embeddings,
-  norms, output head) will exist only as an explicit, default-off ablation recorded in the run summary.
-- Vision-only options (`procrustes_source="gradient"`, `calibration_data` other than the default) are
-  expected to be rejected for decoders. Mixture-of-experts decoders are out of scope and fail fast.
-
-<!-- CHECK: decoder behavior is taken from the Phase 7 plan (decisions D-P7c, D-P7d, D-P7f, D-P7g), not from released code or the PDF, which describes only the vision instantiation. Update this section when Phase 7 lands. -->
+- **Component:** the residual-writing MLP projection only (`mlp.c_proj` maps to `mlp.down_proj` through the model
+  family adapter).
+- **Storage:** `streaming`. **Ridge:** `empirical_bayes`.
+- **Bias:** `exact_form=true` with `missing_bias="materialize"`: a zero `down_proj.bias` is added once to the
+  target model and base state, and the task vector carries its fitted value. To keep the stock architecture use
+  `missing_bias="skip"` with `exact_form=false` (first-order, intercept-free fit).
+- **Calibration:** text from the LLM calibration loader; padding rows are removed with each model's attention
+  mask before any statistic is accumulated; an unpairable mask (e.g. tokenizer mismatch) is an error.
+- **Task vector:** only the fit. `copy_shape_matching_source_deltas` (default off) is an ablation that adds
+  shape-matching source deltas of the other parameters.
+- **Depth:** no structural prestep; Ariadne pairs blocks with `depth_pairing`.
+- **Rejected on decoders:** `procrustes_source="gradient"`, `tv_scaling`, `fidelity_holdout`, `block_split`
+  other than `none`, weighted alignment rows, sequential endpoints, non-default `calibration_data`,
+  `merge_mode="merge_in_source_then_fit"`, `transport_delta_source`/`delta_norm_match`. Mixture-of-experts
+  decoders fail fast.
 
 ## Reproducibility notes
 
