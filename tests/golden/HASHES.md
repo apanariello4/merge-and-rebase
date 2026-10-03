@@ -496,3 +496,12 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   `task_heads`; real lm-eval / dataset loading; bf16/fp16 or GPU; LoRA tuned references; Llama/Qwen3 families through
   `main()`; `eval_only` entrypoint.
 - Runtime about 27 s (53 tests). Regenerate with `GOLDEN_CAPTURE=out.txt pytest tests/golden/test_llm_main_golden.py`.
+
+### Declared changes — 2026-10-03, P7.S10b (commit 914b8bf), tests/golden/test_llm_main_golden.py
+- `resolved_config` only for 5 depth-changing cases that now pin `"depth_defaults": "legacy"`: bico_extend,
+  eval_before_rebase_only_extend, theseus_extend_defaults_alpha_search, theseus_extend_eval_before_rebase,
+  theseus_shrink_per_weight. Summaries, evaluated weights (harness_calls), builds, tuned loads and saved files unchanged.
+- Retired error rows: `ariadne_not_yet`, `ariadne_direct_residual_spelling` (Ariadne now runs on LLMs).
+- New cases: ariadne_same_depth, ariadne_extend, direct_residual_spelling_same_depth (same evaluated weights as
+  ariadne_same_depth), theseus_extend_depth_defaults_method, bico_extend_discrete_index_match; new error row
+  theseus_extend_depth_defaults_guard (ConfigMeaningChangedError).
