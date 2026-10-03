@@ -18,18 +18,21 @@ class _PairSupport:
     unavailable_reason: str | None = None
     # Depth-mismatched pairs are handled by the method itself (no block-extension prealign needed).
     any_depth: bool = False
+    # The method reads calibration activations; on LLM harness runs that calibration text is held out of the
+    # evaluation docs, so the evaluation slice must be resolved before the first evaluation.
+    calibrates: bool = False
 
 
 _METHOD_SUPPORT: dict[str, _PairSupport] = {
-    "theseus": _PairSupport(cross_size=True),
-    "theseus_gqa": _PairSupport(cross_size=True),
-    "bico": _PairSupport(cross_size=True),
+    "theseus": _PairSupport(cross_size=True, calibrates=True),
+    "theseus_gqa": _PairSupport(cross_size=True, calibrates=True),
+    "bico": _PairSupport(cross_size=True, calibrates=True),
     "identity": _PairSupport(cross_size=False),
     "orthogonal_shift": _PairSupport(cross_size=False),
     "gradfix": _PairSupport(cross_size=False),
     "transfusion": _PairSupport(cross_size=False, required=False),
     # "direct_residual" is a registry alias of "ariadne" and resolves to this entry.
-    "ariadne": _PairSupport(cross_size=True, any_depth=True),
+    "ariadne": _PairSupport(cross_size=True, any_depth=True, calibrates=True),
 }
 
 
@@ -51,6 +54,12 @@ def is_text_supported(method_name: str) -> bool:
     if support is None:
         raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(_METHOD_SUPPORT)}")
     return support.required
+
+
+def uses_calibration(method_name: str) -> bool:
+    """Whether the method fits on calibration activations (unknown methods: no)."""
+    support = _support_for(method_name)
+    return bool(support is not None and support.calibrates)
 
 
 # Families that don't share a model_type but are the same "hf_decoder" shape

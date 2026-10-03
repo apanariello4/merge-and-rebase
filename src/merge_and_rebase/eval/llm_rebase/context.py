@@ -20,7 +20,7 @@ from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
-from ...rebase.capabilities import check_pair
+from ...rebase.capabilities import check_pair, uses_calibration
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
 from ...rebase.run_config import MethodKind
@@ -415,11 +415,9 @@ def build_runtime(
                 )
             configured_harness_samples[str(task_name)] = list(indices)
 
-    needs_calibration = run_block_extension_prestep or method_name in (
-        "theseus",
-        "theseus_gqa",
-        "bico",
-    )
+    # Every calibrating method (THESEUS, theseus_gqa, BiCo, Ariadne) must evaluate on the hold-out only;
+    # without it the harness scores the very documents the calibration text came from.
+    needs_calibration = run_block_extension_prestep or uses_calibration(method_name)
     # The eval slice must be known before the first before-rebase eval, so
     # resolve up front whenever this run will calibrate at all.
     calibration_eval_samples = _calibration().eval_samples or None if needs_calibration else None
