@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from ...rebase.methods._ariadne.config import direct_residual_config_dict
+from ...rebase.methods._ariadne.config import direct_residual_config_dict, normalize_direct_residual_config_dict
 from ...rebase.methods._ariadne.fit import _task_vector_sha256
 from ...rebase.registry import canonical_method_name
 from ..utils import to_cpu_fp32
@@ -50,7 +50,10 @@ def _load_saved_sequential_tv(directory, task, target_base_sd, config):
         "direct_residual_config": json.loads(json.dumps(direct_residual_config_dict(config))),
     }
     for key, value in expected.items():
-        if meta.get(key) != value:
+        actual = meta.get(key)
+        if key == "direct_residual_config" and isinstance(actual, Mapping):
+            actual = normalize_direct_residual_config_dict(actual)
+        if actual != value:
             raise ValueError(f"saved DR vector {path}: {key}={meta.get(key)!r}, expected {value!r}")
     vector = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(vector, dict) or not vector:

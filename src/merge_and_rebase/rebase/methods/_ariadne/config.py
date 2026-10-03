@@ -137,6 +137,15 @@ def direct_residual_config_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
     return out
 
 
+def normalize_direct_residual_config_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop late-added fields that sit at their default, so full and compact serializations compare equal."""
+    out = dict(raw)
+    for name, default in _SERIALIZED_WHEN_NON_DEFAULT.items():
+        if name in out and out[name] == default:
+            del out[name]
+    return out
+
+
 # Named bundles of config fields, selected with the optional ``"preset"`` key of the
 # params mapping. A preset only sets the fields listed here (explicit keys in the same
 # mapping override them); every other field keeps the dataclass default, and

@@ -481,8 +481,17 @@ def build_runtime(
         load_tuned=load_aligned_tuned_from_ref,
         resolved=resolved,
         plan=plan,
-        task_contexts={
-            (tasks[i] if i < len(tasks) else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
-            for i, ref in enumerate(tuned_ref_list)
-        },
+        task_contexts=_task_contexts(tasks, tuned_ref_list),
     )
+
+
+def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
+    """One context per tuned body; with named tasks the two lists must have equal length."""
+    if tasks and len(tasks) != len(tuned_ref_list):
+        raise ValueError(
+            f"{len(tuned_ref_list)} tuned bodies for {len(tasks)} tasks: every tuned body needs exactly one task name"
+        )
+    return {
+        (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
+        for i, ref in enumerate(tuned_ref_list)
+    }

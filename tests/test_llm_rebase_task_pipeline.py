@@ -49,3 +49,14 @@ def test_eval_before_rebase_only_never_transports(tmp_path, monkeypatch):
     _launch(_base_cfg(r, **make_cfg(r)), r, monkeypatch, World(**world_kw))
     assert events == ["prepare:task_0", "prepare:task_1"]
 
+
+
+def test_task_names_must_match_tuned_bodies():
+    import pytest
+
+    from merge_and_rebase.eval.llm_rebase.context import _task_contexts
+
+    assert list(_task_contexts([], ["a", "b"])) == ["task_0", "task_1"]
+    assert list(_task_contexts(["x", "y"], ["a", "b"])) == ["x", "y"]
+    with pytest.raises(ValueError, match="tuned bodies"):
+        _task_contexts(["x"], ["a", "b"])
