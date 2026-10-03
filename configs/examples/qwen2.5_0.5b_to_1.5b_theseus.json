@@ -27,7 +27,6 @@
   "block_extension_params": {
     "n_batches_act": 100
   },
-  "save_transported_tvs": "auto",
   "device": "cuda",
   "dtype": "bf16"
 }

@@ -46,7 +46,8 @@ choice stops with an error naming both fixes, so old configs never silently chan
 | `tuned_ckpts`, `tasks` | vision fine-tuned checkpoints and task subset |
 | `method`, `method_params` / `ariadne_params` | method and its parameters; always set `num_batches` and `seed` explicitly |
 | `alpha` / `alpha_search` | fixed task-vector scale or an alpha sweep |
-| `save_transported_tvs` | `"if_dir_given"` (default: save only with `save_transported_tvs_dir`) or `"auto"` (always save next to the summary) |
+| `save_transported_tvs` | vision: `"if_dir_given"` (default: save only with `save_transported_tvs_dir`) or `"auto"` (always save next to the summary) |
 | `calibration_dataset`, `calibration_include_target`, `calibration_n_sequences` | LLM calibration text (decoupled from the evaluation hold-out; defaults unchanged) |
 
-Example configs: `configs/examples/`.
+Example configs: `configs/examples/`. Every accepted key, annotated with its role, default and status (main /
+ablation / diagnostic / legacy), per method and modality: `configs/examples/reference/` (see its `README.md`).

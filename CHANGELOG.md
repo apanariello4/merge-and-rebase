@@ -21,6 +21,9 @@ unless a change below says otherwise.
   `calibration_dataset` decoupled from the evaluation hold-out, `calibration_n_sequences`; calibration provenance in
   the summary.
 - `save_transported_tvs: "auto"`; example configs in `configs/examples/`.
+- Annotated reference configs `configs/examples/reference/{vision,llm}/<method>.yaml` (Ariadne, THESEUS, `theseus_gqa`,
+  BiCo): every accepted key with role, default and status, guarded by `tests/test_reference_configs.py`. The LLM example
+  configs no longer carry `save_transported_tvs`, which is a vision-only key and was a no-op there.
 
 ### Changed
 - Vision and LLM entrypoints are packages (`eval/vision_rebase/`, `eval/llm_rebase/`) on one shared per-task pipeline
