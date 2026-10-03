@@ -36,7 +36,7 @@ from typing import Any
 
 import pytest
 import torch
-from _llm_fixtures import CALIB_TEXTS, local_tokenizer, tiny_qwen2
+from _llm_fixtures import CALIB_TEXTS, local_tokenizer, tiny_qwen2, tiny_qwen3
 
 from ._hashing import deterministic_cpu, hash_json, hash_tensor_dict
 
@@ -84,9 +84,13 @@ class World:
         tgt_hidden: int = 32,
         tgt_heads: int = 4,
         tuned_scale: float = 0.05,
+        src_family: str = "qwen2",
+        tgt_family: str = "qwen2",
     ) -> None:
-        self.src = dict(layers=src_layers, kv_heads=src_kv, seed=0)
-        self.tgt = dict(layers=tgt_layers, kv_heads=tgt_kv, hidden=tgt_hidden, heads=tgt_heads, seed=1)
+        self.src = dict(layers=src_layers, kv_heads=src_kv, seed=0, family=src_family)
+        self.tgt = dict(
+            layers=tgt_layers, kv_heads=tgt_kv, hidden=tgt_hidden, heads=tgt_heads, seed=1, family=tgt_family
+        )
         self.tuned_scale = tuned_scale
 
 
@@ -148,7 +152,8 @@ def _install_fakes(monkeypatch, world: World, calls: Calls, *, fake_calibration:
             {"name": str(cfg.model_name_or_path), "arch": cfg.model_arch, "device": cfg.device, "dtype": cfg.dtype}
         )
         spec = world.src if role == "src" else world.tgt
-        model = tiny_qwen2(
+        builder = tiny_qwen3 if spec.get("family") == "qwen3" else tiny_qwen2
+        model = builder(
             layers=spec["layers"],
             kv_heads=spec["kv_heads"],
             hidden=spec.get("hidden", 32),
