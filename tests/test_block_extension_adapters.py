@@ -13,6 +13,13 @@ from copy import deepcopy
 import numpy as np
 import pytest
 import torch
+from golden._hashing import deterministic_cpu
+from golden.test_release_golden_hashes import (
+    _brace_vision_models,
+    _class_loader,
+    _llm_loader,
+    _llm_source_pair,
+)
 
 from merge_and_rebase.rebase.block_extension.adapters import (
     ComponentSpec,
@@ -22,13 +29,6 @@ from merge_and_rebase.rebase.block_extension.adapters import (
 from merge_and_rebase.rebase.block_extension.decoder import DecoderBlockExtender
 from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 from merge_and_rebase.rebase.model_families import infer_family
-from tests.golden._hashing import deterministic_cpu
-from tests.golden.test_release_golden_hashes import (
-    _brace_vision_models,
-    _class_loader,
-    _llm_loader,
-    _llm_source_pair,
-)
 
 
 @pytest.fixture(autouse=True)

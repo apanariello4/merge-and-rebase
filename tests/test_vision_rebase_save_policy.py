@@ -12,9 +12,8 @@ from pathlib import Path
 
 import pytest
 import torch
-
-from tests.golden._hashing import hash_json, hash_tensor_dict
-from tests.golden.test_main_golden import CASES, World, _base_cfg, _launch
+from golden._hashing import hash_json, hash_tensor_dict
+from golden.test_main_golden import CASES, World, _base_cfg, _launch
 
 PER_TASK_CASE = "theseus_equal_depth_none_fixed_alpha_save_tvs"
 MERGED_CASE = "theseus_merge_then_rebase"

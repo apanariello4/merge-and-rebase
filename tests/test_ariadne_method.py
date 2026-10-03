@@ -13,6 +13,9 @@ from dataclasses import asdict, fields
 
 import pytest
 import torch
+from golden._hashing import deterministic_cpu, hash_json, hash_tensor_dict
+from golden.test_release_golden_hashes import _MAIN, DEPTHS, EXPECTED, _dr_setup
+from test_vision_rebase_direct_residual_dispatch import _run_main_with_cfg
 
 from merge_and_rebase.eval import vision_rebase
 from merge_and_rebase.rebase import capabilities, run_config
@@ -26,9 +29,6 @@ from merge_and_rebase.rebase.methods.ariadne import (
 from merge_and_rebase.rebase.model_families.base import ModelFamilyMetadata
 from merge_and_rebase.rebase.registry import canonical_method_name, get_method, list_methods
 from merge_and_rebase.rebase.runtime import format_rebase_method_label
-from tests.golden._hashing import deterministic_cpu, hash_json, hash_tensor_dict
-from tests.golden.test_release_golden_hashes import _MAIN, DEPTHS, EXPECTED, _dr_setup
-from tests.test_vision_rebase_direct_residual_dispatch import _run_main_with_cfg
 
 # ---- registry / alias --------------------------------------------------------------
 

@@ -11,12 +11,12 @@ from collections import defaultdict
 
 import pytest
 import torch
+from golden.test_release_golden_hashes import _brace_vision_models, _llm_source_pair
 
 from merge_and_rebase.rebase.block_extension.core import BlockExtenderCore
 from merge_and_rebase.rebase.block_extension.decoder import DecoderBlockExtender
 from merge_and_rebase.rebase.block_extension.vision import BlockExtender
 from merge_and_rebase.rebase.model_families import infer_family
-from tests.golden.test_release_golden_hashes import _brace_vision_models, _llm_source_pair
 
 
 def _vision(**kw):
