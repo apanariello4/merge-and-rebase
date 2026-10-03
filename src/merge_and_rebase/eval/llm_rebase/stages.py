@@ -1,8 +1,9 @@
 """Per-task depth prestep for the LLM rebase run (mirrors the roles of eval/vision_rebase/stages.py).
 
 ``NoPrestep`` builds the same-size full-model delta; ``BracePrestep`` resizes a per-task source copy to the target
-depth with the decoder block extension and keeps the exact source context for transport. Both return a
-``_PreparedTaskDelta``; the code is the former ``cli.main`` task loop, moved verbatim.
+depth with the decoder block extension and keeps the exact source context for transport. Both implement
+``rebase.prestep.DepthPrestep`` and return a ``PrestepResult`` (the resize itself still builds a
+``_PreparedTaskDelta``); the per-task loop is ``rebase.orchestration.TaskPipeline``.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from ...io.ckpt import load_into_model
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.decoder import run_block_extension_llm
+from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs, TaskModels, select_prestep_kind
 
 
 @dataclass
@@ -132,86 +134,92 @@ def _prepare_resized_task_delta(
 
 
 
-def build_task_models(rt: Any, ckpt_ref: Any) -> tuple[torch.nn.Module, torch.nn.Module]:
-    """Per-task source base / fine-tuned copies; the fine-tuned copy carries the tuned checkpoint."""
-    source_llm = rt.source_llm
-    source_base_sd = rt.source_base_sd
-    source_build_cfg = rt.source_build_cfg
+@dataclass
+class LlmTaskContext:
+    """What the LLM stages need to know about one task: the tuned checkpoint reference (and its position)."""
+
+    ckpt_ref: Any
+    index: int
+
+
+def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
+    """Per-task source base / fine-tuned copies (block-extension prestep only); the ft copy carries the tuned ckpt."""
+    if not env.plan.task_block_extension_prestep:
+        return None
+    rt = env.runtime
+    ckpt_ref = rt.task_contexts[task].ckpt_ref
     # Each task starts from an immutable source template, then its
     # own copy is resized to the target depth before transport.
     # Keep that depth-matched source model alive below.
-    source_base_model_task = deepcopy(source_llm.model)
-    source_ft_model_task = deepcopy(source_llm.model)
+    source_base_model_task = deepcopy(rt.source_llm.model)
+    source_ft_model_task = deepcopy(rt.source_llm.model)
 
     # Load tuned checkpoint into ft model
     aligned = rt.load_tuned(
         ckpt_ref=ckpt_ref,
-        base_sd=source_base_sd,
-        build_cfg=source_build_cfg,
+        base_sd=rt.source_base_sd,
+        build_cfg=rt.source_build_cfg,
         model=source_ft_model_task,
         prefer_lora_view=False,
     )
     tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
     load_into_model(source_ft_model_task, tuned_sd, strict=False)
-    return source_base_model_task, source_ft_model_task
+    return TaskModels(source_base=source_base_model_task, source_ft=source_ft_model_task)
 
 
 class BracePrestep:
     """Depth mismatch: resize a per-task source copy to the target depth (block extension)."""
 
-    def run(self, rt: Any, task_label: str, ckpt_ref: Any) -> _PreparedTaskDelta:
-        source_base_model_task, source_ft_model_task = build_task_models(rt, ckpt_ref)
-        target_family = rt.target_family
-        source_family = rt.source_family
-        blockext_calib_loader = rt.blockext_calib_loader
-        target_depth = rt.target_depth
-        block_extension_cfg = rt.block_extension_cfg
-        device = rt.device
-        source_depth = rt.source_depth
-        run_before_rebase_eval = rt.run_before_rebase_eval
-        _eval_before_rebase = rt._eval_before_rebase
+    kind = PrestepKind.BRACE
 
-        family_adapter_for_ext = target_family or source_family
+    def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
+        rt = env.runtime
+        family_adapter_for_ext = rt.target_family or rt.source_family
         if family_adapter_for_ext is None:
             raise ValueError("Block extension requires a family adapter but none was inferred.")
 
         prepared_task = _prepare_resized_task_delta(
-            source_base_model=source_base_model_task,
-            source_ft_model=source_ft_model_task,
-            calibration_loader=blockext_calib_loader,
-            target_layers_total=int(target_depth),
-            config=block_extension_cfg,
+            source_base_model=models.source_base,
+            source_ft_model=models.source_ft,
+            calibration_loader=rt.blockext_calib_loader,
+            target_layers_total=int(rt.target_depth),
+            config=rt.block_extension_cfg,
             family_adapter=family_adapter_for_ext,
-            device=device,
+            device=rt.device,
         )
-        print(f"  block extension completed (source_depth={source_depth} -> {target_depth})")
-        # The resized ft model has already been absorbed into the delta;
-        # drop it before the eval below so it is not holding device
-        # memory while lm-harness runs.
-        del source_ft_model_task
-        if run_before_rebase_eval:
-            # Scored here, after extension and before transport: this is
-            # the extended source base that BiCo/Theseus will read from.
-            _eval_before_rebase(
-                source_base_model_task, f"extended_source_base:{task_label}"
-            )
-        source_base_model_task.to("cpu")
-        return prepared_task
+        print(f"  block extension completed (source_depth={rt.source_depth} -> {rt.target_depth})")
+        # The resized ft model has already been absorbed into the delta; drop it before the observers run so it is
+        # not holding device memory while lm-harness runs.
+        models.source_ft = None
+        return PrestepResult(
+            kind=self.kind,
+            source_base_sd=prepared_task.source_base,
+            task_delta=prepared_task.delta,
+            source_base_model=prepared_task.source_model,
+            layout=prepared_task.extension_layout or {},
+            final_depth=int(rt.target_depth),
+            transport_keys=prepared_task.transport_keys,
+            uncorrected_delta=prepared_task.uncorrected_delta,
+        )
+
+    def load_delta(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> PrestepResult:
+        return pre
 
 
 class NoPrestep:
     """Same depth: the plain full-model task vector of the source pair."""
 
-    def run(self, rt: Any, task_label: str, ckpt_ref: Any) -> _PreparedTaskDelta:
+    kind = PrestepKind.NONE
+
+    def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
+        rt = env.runtime
         source_llm = rt.source_llm
         source_base_sd = rt.source_base_sd
-        source_build_cfg = rt.source_build_cfg
         full_fp_keys = rt.full_fp_keys
-        tp_keys = rt.tp_keys
         aligned = rt.load_tuned(
-            ckpt_ref=ckpt_ref,
+            ckpt_ref=task.ctx.ckpt_ref,
             base_sd=source_base_sd,
-            build_cfg=source_build_cfg,
+            build_cfg=rt.source_build_cfg,
             model=source_llm.model,
             prefer_lora_view=False,
         )
@@ -229,16 +237,38 @@ class NoPrestep:
                         f"tuned {tuple(tuned_cpu[k].shape)}"
                     )
 
-        tv = TaskVector.from_checkpoints(
-            source_base_sd, tuned_cpu, strict=False
-        )
-        return _PreparedTaskDelta(
-            delta=tv.delta,
-            source_base=source_base_sd,
-            transport_keys=set(tp_keys or ()),
-            source_model=source_llm.model,
+        tv = TaskVector.from_checkpoints(source_base_sd, tuned_cpu, strict=False)
+        return PrestepResult(
+            kind=self.kind,
+            source_base_sd=source_base_sd,
+            task_delta=tv.delta,
+            source_base_model=source_llm.model,
+            transport_keys=set(rt.tp_keys or ()),
         )
 
+    def load_delta(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> PrestepResult:
+        return pre
 
-def build_prestep(run_block_extension_prestep: bool) -> BracePrestep | NoPrestep:
-    return BracePrestep() if run_block_extension_prestep else NoPrestep()
+
+class ExtendedSourceBaseObserver:
+    """Scores the resized source base before transport (when requested), then parks it on the CPU.
+
+    This is the "before rebase" reference: the extended source base that BiCo/Theseus read from, not the target base.
+    """
+
+    def before(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> None:
+        return None
+
+    def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
+        rt = env.runtime
+        if rt.run_before_rebase_eval:
+            rt._eval_before_rebase(models.source_base, f"extended_source_base:{task.task}")
+        models.source_base.to("cpu")
+
+
+def build_prestep(plan: Any) -> BracePrestep | NoPrestep:
+    return BracePrestep() if select_prestep_kind(plan) is PrestepKind.BRACE else NoPrestep()
+
+
+def build_prestep_observers(plan: Any) -> tuple[ExtendedSourceBaseObserver, ...]:
+    return (ExtendedSourceBaseObserver(),) if plan.task_block_extension_prestep else ()

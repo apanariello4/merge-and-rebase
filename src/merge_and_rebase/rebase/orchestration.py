@@ -27,6 +27,8 @@ class MethodResult:
     #: Ariadne only: ``alignment_calibration`` / ``correction_fit`` timing brackets.
     alignment_calibration: dict[str, float] | None = None
     correction_fit: dict[str, float] | None = None
+    #: LLM only: per-task transported-vs-reference norm record (``task_vectors.per_task`` in the summary).
+    task_vector_norms: dict[str, float] | None = None
 
 
 class MethodStage(Protocol):
@@ -95,6 +97,8 @@ class TaskLoopOutputs:
     correction_fit_timings: dict[str, dict[str, float]] = field(default_factory=dict)
     #: Per-task activation_collection / transformation / transport cost split (``utils.cost_accounting``).
     cost_phase_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: LLM only: one norm record per transported task, in task order.
+    task_vector_norms: list[dict[str, float]] = field(default_factory=list)
 
 
 class TaskPipeline:
@@ -136,6 +140,8 @@ class TaskPipeline:
                 continue
 
             task_in = TaskInputs(task, task_ctx)
+            # Drop the previous task's models / prestep result before building the next ones (peak memory).
+            task_models = pre = None
             task_models = self.build_models(env, task)
             for observer in self.observers:
                 observer.before(env, task_in, task_models)
@@ -160,6 +166,8 @@ class TaskPipeline:
                 method_result = self.method_stage.run(env, task_in, pre)
                 out.transport_timings[task] = method_result.transport_timing
                 out.cost_phase_timings[task] = method_result.cost_phases
+                if method_result.task_vector_norms is not None:
+                    out.task_vector_norms.append(method_result.task_vector_norms)
                 if method_result.alignment_calibration is not None:
                     out.alignment_calibration_timings[task] = method_result.alignment_calibration
                 if method_result.correction_fit is not None:
@@ -170,11 +178,12 @@ class TaskPipeline:
                 out.transported_deltas.append(transported_delta)
                 out.original_deltas.append(task_delta)
                 print(f"  {task}: transported delta computed for {len(transported_delta)} params")
-                env.run_logger.log_event(
-                    "transport_task_end",
-                    metrics={f"rebase/{task}/transported_param_count": float(len(transported_delta))},
-                    context={"task": task, "method": resolved.method.name},
-                )
+                if env.run_logger is not None:
+                    env.run_logger.log_event(
+                        "transport_task_end",
+                        metrics={f"rebase/{task}/transported_param_count": float(len(transported_delta))},
+                        context={"task": task, "method": resolved.method.name},
+                    )
 
                 self.saver(task, transported_delta)
             else:

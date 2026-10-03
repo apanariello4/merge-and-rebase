@@ -110,6 +110,10 @@ class PrestepResult:
     final_depth: int | None = None
     #: Printed by the pipeline after the prestep observers ran (legacy print order).
     completion_note: str | None = None
+    #: LLM: the source-side keys the family adapter marks transportable.
+    transport_keys: set[str] | None = None
+    #: LLM: the same task vector resized without correction (``None`` when the prestep keeps no such reference).
+    uncorrected_delta: dict[str, Any] | None = None
 
 
 @dataclass
@@ -120,16 +124,21 @@ class StageEnv:
     plan: RunPlan
     cfg: Mapping[str, Any]
     device: str
-    clf_source: Any
-    clf_target: Any
-    tuned_by_task: Mapping[str, str]
-    native_tasks: set[str]
-    patch_attn_before_rebase: bool
     source_base_sd: dict[str, Any]
     target_base_sd: dict[str, Any]
-    target_hash_before: str
-    block_extension_calibration_loader: Any
+    #: ``None`` disables the per-task ``transport_task_end`` event (the LLM entrypoint never emitted it).
     run_logger: Any
+    # Vision-only run state: the LLM entrypoint leaves these at their defaults and carries its own
+    # model-family state on ``runtime``.
+    clf_source: Any = None
+    clf_target: Any = None
+    tuned_by_task: Mapping[str, str] = field(default_factory=dict)
+    native_tasks: set[str] = field(default_factory=set)
+    patch_attn_before_rebase: bool = False
+    target_hash_before: str = ""
+    block_extension_calibration_loader: Any = None
+    #: Model-family run bag read by that family's stages (LLM: ``LlmRuntime``); ``None`` for vision.
+    runtime: Any = None
     transfusion_prepared: dict[str, Any] | None = None
     recorded_extension_layout: dict[str, Any] = field(default_factory=dict)
     endpoints: IndependentEndpoints = field(default_factory=IndependentEndpoints)

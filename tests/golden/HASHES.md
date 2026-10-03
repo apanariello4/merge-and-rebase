@@ -235,6 +235,19 @@ tensors), `alignment` (maps), `summary`/`diagnostics`/`brace_and_delta`/`layout`
 
 ## Declared changes
 
+### 2026-10-03 -- S10d: LLM rebase on the shared per-task contracts (ordering-only, 0 hashes changed)
+
+`llm_rebase` now runs `rebase.orchestration.TaskPipeline` (prepare -> transport -> free, one task at a time) instead
+of a two-phase loop (prepare all, then transport all). Declared change: only the ORDER of log lines / model-build
+side effects (each task's resized model is built, scored, transported and freed before the next one is built; the
+"Transporting N task vectors" banner prints before the per-task loop). All 53 `test_llm_main_golden.py` cases
+(summary, resolved_config, harness_calls, builds, tuned_loads, every `file:*.pt`) and the 24 error rows are
+byte-identical to the pre-change commit: **no hash changed**, which is the proof that no number moved and that the
+harness-call sequence (before-rebase evals happen in the per-task prestep, alpha-search evals after the loop) is
+unchanged. `transport_delta_source` / `delta_norm_match` are now resolved before the loop (not after it); their error
+messages and the 2-builds row are unchanged, and `eval_before_rebase_only` still never resolves them.
+`tests/test_llm_rebase_task_pipeline.py` pins the per-task event order and that the resized model is released.
+
 ### 2026-10-01 -- Ariadne diagnostics/schema fixes (task vectors, alignment maps and q unchanged)
 
 Only the four `summary` hashes below changed; every `task_vector`, `alignment`, `diagnostics`

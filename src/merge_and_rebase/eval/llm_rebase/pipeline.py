@@ -1,15 +1,13 @@
 """Per-task rebase pipeline of the LLM entrypoint (mirrors eval/vision_rebase/pipeline.py).
 
-``run_rebase`` is the former middle of ``cli.main``: before-rebase reference evals, the per-task prestep, the
-per-task transport and the weighted merge of the transported deltas. It stays a two-phase loop (all task deltas are
-prepared, then all are transported) and does not use ``rebase.orchestration.TaskPipeline``: that pipeline is driven
-by a ``ResolvedRunConfig`` / ``StageEnv`` the LLM entrypoint has no equivalent of, and its interleaved per-task order
-would change when the before-rebase evals and the model copies happen.
+``run_rebase`` is the former middle of ``cli.main``: before-rebase reference evals, then the shared per-task loop
+(``rebase.orchestration.TaskPipeline``: prepare -> transport -> free, one task at a time) and the weighted merge of the
+transported deltas. The LLM stages (``stages``, ``method_stages``) implement the same ``DepthPrestep`` /
+``MethodStage`` protocols as the vision ones, driven by the ``ResolvedRunConfig`` / ``RunPlan`` on ``LlmRuntime``.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,15 +15,11 @@ import torch
 
 from ...io.ckpt import load_into_model
 from ...merge.runtime import compose_weighted_deltas
-from .merge import (
-    _summarize_merged_delta,
-    norm_match_transported,
-    report_merged_delta,
-    resolve_delta_source,
-    resolve_norm_match,
-)
+from ...rebase.orchestration import TaskPipeline
+from ...rebase.prestep import StageEnv
+from .merge import _summarize_merged_delta, report_merged_delta
 from .method_stages import build_method_stage
-from .stages import _PreparedTaskDelta, build_prestep
+from .stages import build_prestep, build_prestep_observers, build_task_models
 
 
 @dataclass
@@ -76,6 +70,11 @@ class LlmRuntime:
     _eval_before_rebase: Any
     _baseline_summary: Any
     load_tuned: Any
+    #: Shared run contract (``rebase.run_config``): resolved LLM config and its post-model plan.
+    resolved: Any
+    plan: Any
+    #: Task label -> ``LlmTaskContext`` (tuned checkpoint ref + position), in task order.
+    task_contexts: Any
 
 
 @dataclass
@@ -104,8 +103,6 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
     _calibration_provenance = rt._calibration_provenance
     _eval_before_rebase = rt._eval_before_rebase
     _baseline_summary = rt._baseline_summary
-    method_stage = build_method_stage()
-
 
     if run_before_rebase_eval and not run_block_extension_prestep:
         # No depth change: the model transport starts from is the plain
@@ -122,11 +119,38 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         load_into_model(source_llm.model, source_base_sd, strict=False)
         _eval_before_rebase(source_llm.model, "source_base_unextended")
         source_llm.model.to("cpu")
-    prepared_tasks: list[_PreparedTaskDelta] = []
-    prestep = build_prestep(run_block_extension_prestep)
-    for task_idx, ckpt_ref in enumerate(tuned_ref_list):
-        task_label = tasks[task_idx] if task_idx < len(tasks) else f"task_{task_idx}"
-        prepared_tasks.append(prestep.run(rt, task_label, ckpt_ref))
+    weights_raw = cfg.get("weights", None)
+    if weights_raw is None:
+        weights = [1.0] * len(tuned_ref_list)
+    else:
+        w = weights_raw if isinstance(weights_raw, (list, tuple)) else [float(weights_raw)]
+        if len(w) < len(tuned_ref_list):
+            w = w * len(tuned_ref_list)
+        weights = [float(x) for x in w[: len(tuned_ref_list)]]
+
+    # Per task: prepare the depth-matched delta, transport it, free the task-local models.
+    if not eval_before_rebase_only:
+        print(f"\n=== Transporting {len(tasks) if tasks else 1} task vectors with {method_name} ===")
+    env = StageEnv(
+        resolved=rt.resolved,
+        plan=rt.plan,
+        cfg=cfg,
+        device=device,
+        source_base_sd=source_base_sd,
+        target_base_sd=target_base_sd,
+        run_logger=None,  # the LLM entrypoint has never emitted per-task transport events
+        runtime=rt,
+    )
+    # eval_before_rebase_only stops each task after its prestep, so its transport options are never resolved.
+    method_stage = None if eval_before_rebase_only else build_method_stage(cfg)
+    pipeline = TaskPipeline(
+        prestep=build_prestep(rt.plan),
+        observers=build_prestep_observers(rt.plan),
+        method_stage=method_stage,
+        saver=lambda task, delta: None,
+        build_models=build_task_models,
+    )
+    loop = pipeline.run(env, list(rt.task_contexts), rt.task_contexts)
 
     if eval_before_rebase_only:
         # Everything the before-rebase reference needs is done: block
@@ -148,65 +172,15 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
                 "target_depth": target_depth,
             })
             run_logger.finish("success")
-        return
-
-    weights_raw = cfg.get("weights", None)
-    if weights_raw is None:
-        weights = [1.0] * len(tuned_ref_list)
-    else:
-        w = weights_raw if isinstance(weights_raw, (list, tuple)) else [float(weights_raw)]
-        if len(w) < len(tuned_ref_list):
-            w = w * len(tuned_ref_list)
-        weights = [float(x) for x in w[: len(tuned_ref_list)]]
-
-    # Transport each task delta
-    print(f"\n=== Transporting {len(tasks) if tasks else 1} task vectors with {method_name} ===")
-    transported_deltas: list[dict[str, torch.Tensor]] = []
-
-    delta_source = resolve_delta_source(cfg)
-    norm_match = resolve_norm_match(cfg)
-    task_vector_norms: list[dict[str, float]] = []
-    for idx, prepared_task in enumerate(prepared_tasks):
-        corrected_delta = prepared_task.delta
-        reference_delta = prepared_task.uncorrected_delta or corrected_delta
-        delta = reference_delta if delta_source == "uncorrected" else corrected_delta
-        transport_keys = prepared_task.transport_keys
-        if tasks:
-            label = tasks[idx]
-        else:
-            label = f"task_{idx}"
-        print(f"\n--- '{label}' ({idx + 1}/{len(prepared_tasks)}) ---")
-        t0 = time.time()
-
-        if run_block_extension_prestep:
-            prepared_task.source_model.to(device)
-
-        transported = method_stage.run(rt, prepared_task, delta, transport_keys)
-        elapsed = time.time() - t0
-        print(f"  transported {len(transported)} keys in {elapsed:.1f}s")
-
-        transported, norms = norm_match_transported(
-            transported,
-            corrected_delta=corrected_delta,
-            reference_delta=reference_delta,
-            transport_keys=transport_keys,
-            norm_match=norm_match,
-        )
-        task_vector_norms.append(norms)
-        transported_deltas.append(transported)
-        if run_block_extension_prestep:
-            # Release each task-local resized model immediately after its
-            # matching transport completes.
-            prepared_task.source_model.to("cpu")
-            del prepared_task.source_model
+        return None
 
     # Merge transported deltas
-    merged_delta = compose_weighted_deltas(transported_deltas, weights)
+    merged_delta = compose_weighted_deltas(loop.transported_deltas, weights)
     delta_stats = _summarize_merged_delta(merged_delta, target_base_sd)
     task_vector_report = {
-        "transport_delta_source": delta_source,
-        "delta_norm_match": norm_match or "none",
-        "per_task": task_vector_norms,
+        "transport_delta_source": method_stage.delta_source,
+        "delta_norm_match": method_stage.norm_match or "none",
+        "per_task": loop.task_vector_norms,
     }
     report_merged_delta(delta_stats)
     return RebaseOutputs(merged_delta=merged_delta, delta_stats=delta_stats, task_vector_report=task_vector_report)

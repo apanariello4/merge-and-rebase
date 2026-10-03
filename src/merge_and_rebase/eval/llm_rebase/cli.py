@@ -23,14 +23,12 @@ from ...data.llm_calibration import (  # noqa: F401  (old names stay importable 
     build_text_calibration_loader,
 )
 from ...data.text_loaders import NLI_TASKS
-from ...merge.methods._common import get_method_params
 from ...models.text_lm import TextBuildConfig
-from ...rebase import get_method
-from ...rebase.registry import canonical_method_name
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from .alpha_search import run_alpha_search
 from .context import build_runtime
 from .pipeline import run_rebase
+from .run_config import resolve_llm_method
 from .stages import _prepare_resized_task_delta  # noqa: F401
 from .summary import assemble_summary
 
@@ -210,19 +208,7 @@ def main() -> None:
                 "Both source_model_name_or_path and target_model_name_or_path are required."
             )
 
-        method_name = str(cfg.get("method", "theseus"))
-        method = get_method(method_name)
-        if canonical_method_name(method_name) == "ariadne":
-            # Capability-supported, but llm_rebase has no Ariadne branch until S10: fail before loading any model.
-            raise ValueError("Ariadne LLM entrypoint lands in S10; llm_rebase does not run Ariadne yet.")
-        method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
-        if "n_batches" in method_params:
-            raise ValueError(
-                "config['method_params'].n_batches is deprecated: it silently "
-                "raced with method_params.num_batches (whichever the resolver "
-                "checked first won, so the other was ignored without warning). "
-                "Rename it to 'num_batches' in the config."
-            )
+        method_name, method, method_params = resolve_llm_method(cfg)
 
         model_arch = str(cfg.get("model_arch", "auto"))
         model_kind = str(cfg.get("model_kind", "causal_lm"))

@@ -6,12 +6,16 @@ under ``passthrough_to_target``; every other method transports the whole delta d
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
 
 from ...data.llm_calibration import build_text_calibration_loader as _build_text_calibration_loader
-from .stages import _DEFAULT_CALIB_BATCHES, _PreparedTaskDelta
+from ...rebase.orchestration import MethodResult
+from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
+from .merge import norm_match_transported, resolve_delta_source, resolve_norm_match
+from .stages import _DEFAULT_CALIB_BATCHES
 
 HYBRID_METHODS = ("theseus", "theseus_gqa", "bico")
 
@@ -33,12 +37,48 @@ def passthrough_to_target(
 
 
 class TransportMethodStage:
-    """One task's transport: hybrid prepare+transport for THESEUS/theseus_gqa/BiCo, plain transport otherwise."""
+    """One task's transport: hybrid prepare+transport for THESEUS/theseus_gqa/BiCo, plain transport otherwise.
 
-    def run(
+    ``run`` follows ``rebase.orchestration.MethodStage``: it picks the delta to transport (``transport_delta_source``),
+    transports it, norm-matches the result (``delta_norm_match``) and releases the task-local resized model.
+    """
+
+    def __init__(self, *, delta_source: str, norm_match: Any) -> None:
+        self.delta_source = delta_source
+        self.norm_match = norm_match
+
+    def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult:
+        rt = env.runtime
+        corrected_delta = pre.task_delta
+        reference_delta = pre.uncorrected_delta or corrected_delta
+        delta = reference_delta if self.delta_source == "uncorrected" else corrected_delta
+        transport_keys = pre.transport_keys
+        print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) ---")
+        t0 = time.time()
+        resized = env.plan.run_block_extension_prestep
+        if resized:
+            pre.source_base_model.to(rt.device)
+
+        transported = self._transport(rt, pre, delta, transport_keys)
+        print(f"  transported {len(transported)} keys in {time.time() - t0:.1f}s")
+
+        transported, norms = norm_match_transported(
+            transported,
+            corrected_delta=corrected_delta,
+            reference_delta=reference_delta,
+            transport_keys=transport_keys,
+            norm_match=self.norm_match,
+        )
+        if resized:
+            # Release each task-local resized model immediately after its matching transport completes.
+            pre.source_base_model.to("cpu")
+            pre.source_base_model = None
+        return MethodResult(transported_delta=transported, task_vector_norms=norms)
+
+    def _transport(
         self,
         rt: Any,
-        prepared_task: _PreparedTaskDelta,
+        pre: PrestepResult,
         delta: dict[str, torch.Tensor],
         transport_keys: set[str],
     ) -> dict[str, torch.Tensor]:
@@ -78,7 +118,7 @@ class TransportMethodStage:
                 if calib_n_batches is None:
                     transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                 shared_kwargs = dict(
-                    source_model=prepared_task.source_model,
+                    source_model=pre.source_base_model,
                     target_model=target_llm.model,
                     source_dataloader=source_calib,
                     target_dataloader=target_calib,
@@ -86,7 +126,7 @@ class TransportMethodStage:
                     device=device,
                 )
                 transported_body = method.transport(
-                    source_base=prepared_task.source_base,
+                    source_base=pre.source_base_sd,
                     target_base=target_base_sd,
                     delta=body_delta,
                     strict=False,
@@ -100,7 +140,7 @@ class TransportMethodStage:
                 if calib_n_batches is None:
                     transport_kwargs.setdefault("n_batches", _DEFAULT_CALIB_BATCHES)
                 shared_kwargs = dict(
-                    source_model=prepared_task.source_model,
+                    source_model=pre.source_base_model,
                     target_model=target_llm.model,
                     source_dataloader=source_calib,
                     target_dataloader=target_calib,
@@ -110,7 +150,7 @@ class TransportMethodStage:
                     device=device,
                 )
                 transported_body = method.transport(
-                    source_base=prepared_task.source_base,
+                    source_base=pre.source_base_sd,
                     target_base=target_base_sd,
                     delta=body_delta,
                     strict=False,
@@ -126,7 +166,7 @@ class TransportMethodStage:
                 )
         else:
             transported = method.transport(
-                source_base=prepared_task.source_base,
+                source_base=pre.source_base_sd,
                 target_base=target_base_sd,
                 delta=delta,
                 strict=False,
@@ -135,5 +175,6 @@ class TransportMethodStage:
         return transported
 
 
-def build_method_stage() -> TransportMethodStage:
-    return TransportMethodStage()
+def build_method_stage(cfg: Any) -> TransportMethodStage:
+    """Resolves ``transport_delta_source`` / ``delta_norm_match`` (their config errors surface here)."""
+    return TransportMethodStage(delta_source=resolve_delta_source(cfg), norm_match=resolve_norm_match(cfg))

@@ -153,6 +153,8 @@ class ResolvedRunConfig:
     # Additive summary record of the resolved depth rule, and the post-model guard (P5.12).
     depth_rule_resolved: dict = field(default_factory=dict)
     depth_guard: str | None = None
+    #: Methods that run the block-extension prestep. The LLM resolver overrides it (adds ``theseus_gqa``).
+    blockext_methods: frozenset[str] = _THESEUS_LIKE | _BICO_LIKE
 
     # -- method-kind predicates (exactly the legacy boolean sets) ----------------------------
     @property
@@ -169,7 +171,7 @@ class ResolvedRunConfig:
 
     @property
     def blockext_like_method(self) -> bool:
-        return self.method_name in (_THESEUS_LIKE | _BICO_LIKE)
+        return self.method_name in self.blockext_methods
 
     @property
     def transfusion_mode(self) -> bool:

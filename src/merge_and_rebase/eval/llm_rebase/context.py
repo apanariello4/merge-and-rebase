@@ -23,6 +23,8 @@ from ...rebase.capabilities import check_pair
 from ...rebase.model_families import infer_family
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
 from .pipeline import LlmRuntime
+from .run_config import bind_llm_plan, resolve_llm_run_config
+from .stages import LlmTaskContext
 
 
 class TextCalibrationCache:
@@ -177,13 +179,25 @@ def build_runtime(
                 f"Got '{block_extension_cfg.extension_strategy}'."
             )
 
-    run_block_extension_prestep = bool(
-        blockext_like_method
-        and block_extension_enabled
-        and source_meta is not None
-        and target_meta is not None
-        and depth_mismatch
+    eval_before_rebase_only = bool(cfg.get("eval_before_rebase_only", False))
+    resolved = resolve_llm_run_config(
+        cfg,
+        method=method,
+        method_name=method_name,
+        method_params=method_params,
+        block_extension_enabled=block_extension_enabled,
+        block_extension_cfg=block_extension_cfg,
+        device=device,
+        eval_before_rebase_only=eval_before_rebase_only,
     )
+    plan = bind_llm_plan(
+        resolved,
+        source_meta=source_meta,
+        target_meta=target_meta,
+        source_depth=source_depth,
+        target_depth=target_depth,
+    )
+    run_block_extension_prestep = plan.run_block_extension_prestep
     if blockext_like_method:
         if run_block_extension_prestep:
             print(
@@ -219,7 +233,6 @@ def build_runtime(
     # extension, before any task vector is transported. The target base is
     # not a useful reference here -- block extension never touches it, so
     # its score says nothing about how much the extension cost us.
-    eval_before_rebase_only = bool(cfg.get("eval_before_rebase_only", False))
     eval_before_rebase = bool(cfg.get("eval_before_rebase", False)) or eval_before_rebase_only
     if eval_before_rebase_only and not harness_tasks_resolved:
         raise ValueError(
@@ -466,4 +479,10 @@ def build_runtime(
         _eval_before_rebase=_eval_before_rebase,
         _baseline_summary=_baseline_summary,
         load_tuned=load_aligned_tuned_from_ref,
+        resolved=resolved,
+        plan=plan,
+        task_contexts={
+            (tasks[i] if i < len(tasks) else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
+            for i, ref in enumerate(tuned_ref_list)
+        },
     )
