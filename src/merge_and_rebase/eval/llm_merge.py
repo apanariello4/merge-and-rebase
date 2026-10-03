@@ -55,6 +55,8 @@ from ..io.text_checkpoints import (
     _base_key_candidates_from_modules_to_save_key,  # noqa: F401
     _build_hf_model_for_materialization,  # noqa: F401
     _build_lora_aligned_adapter_view,  # noqa: F401
+    _is_hf_dense_ref,
+    _load_dense_hf_state_dict,
     _lookup_layer_pattern,  # noqa: F401
     _lora_scaling_for_layer,  # noqa: F401
     _LoRAAlignedAdapterView,  # noqa: F401
@@ -471,32 +473,39 @@ def _load_aligned_tuned_from_ref(
     resolved_ref = _resolve_checkpoint_reference(str(ckpt_ref))
     used_adapter = False
 
-    if _is_adapter_reference(resolved_ref):
-        if prefer_lora_view:
-            if adapter_view_cache is not None and resolved_ref in adapter_view_cache:
-                view = adapter_view_cache[resolved_ref]
-                print(f"Reusing cached LoRA adapter view: {resolved_ref} ({len(view)} aligned tensors)")
-                return view
-            try:
-                view = _build_lora_aligned_adapter_view(adapter_ref=resolved_ref, base_sd=base_sd)
-            except Exception as exc:
-                print(
-                    f"[warn] LoRA adapter fast-path failed for {resolved_ref}: {exc}. Falling back to full materialization."
-                )
-                view = None
-            if view is not None:
-                if adapter_view_cache is not None:
-                    adapter_view_cache[resolved_ref] = view
-                print(f"Loaded LoRA adapter view {resolved_ref}: {len(view)} aligned tensors")
-                return view
+    # Dense HF model refs (hub ids or local model dirs) load as full state dicts, as in
+    # io.text_checkpoints.load_aligned_tuned_from_ref; only real adapters are materialized.
+    is_dense_local_dir = Path(resolved_ref).is_dir() and not _is_adapter_reference(resolved_ref)
+    if _is_adapter_reference(resolved_ref) or is_dense_local_dir:
+        if _is_hf_dense_ref(resolved_ref):
+            print(f"Loading dense HF model ref: {resolved_ref}")
+            sd = _load_dense_hf_state_dict(resolved_ref, build_cfg)
+        else:
+            if prefer_lora_view:
+                if adapter_view_cache is not None and resolved_ref in adapter_view_cache:
+                    view = adapter_view_cache[resolved_ref]
+                    print(f"Reusing cached LoRA adapter view: {resolved_ref} ({len(view)} aligned tensors)")
+                    return view
+                try:
+                    view = _build_lora_aligned_adapter_view(adapter_ref=resolved_ref, base_sd=base_sd)
+                except Exception as exc:
+                    print(
+                        f"[warn] LoRA adapter fast-path failed for {resolved_ref}: {exc}. Falling back to full materialization."
+                    )
+                    view = None
+                if view is not None:
+                    if adapter_view_cache is not None:
+                        adapter_view_cache[resolved_ref] = view
+                    print(f"Loaded LoRA adapter view {resolved_ref}: {len(view)} aligned tensors")
+                    return view
 
-        print(f"Materializing HF/PEFT adapter into full checkpoint: {resolved_ref}")
-        sd = _materialize_adapter_state_dict(
-            adapter_ref=resolved_ref,
-            build_cfg=build_cfg,
-            model=model,
-        )
-        used_adapter = True
+            print(f"Materializing HF/PEFT adapter into full checkpoint: {resolved_ref}")
+            sd = _materialize_adapter_state_dict(
+                adapter_ref=resolved_ref,
+                build_cfg=build_cfg,
+                model=model,
+            )
+            used_adapter = True
     else:
         sd = load_ckpt(resolved_ref)
 
