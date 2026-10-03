@@ -417,6 +417,31 @@ CASES["theseus_holdout_samples_and_test_slice"] = (
 )
 FAKE_CALIBRATION = {"theseus_holdout_samples_and_test_slice"}
 
+# P7.S10b (declared): depth-mismatched THESEUS/BiCo cases pin the legacy depth rule explicitly; the per-method
+# defaults, Ariadne (both spellings) and the BiCo discrete index match get their own cases.
+_LEGACY_DEPTH_CASES = (
+    "bico_extend",
+    "eval_before_rebase_only_extend",
+    "theseus_extend_defaults_alpha_search",
+    "theseus_extend_eval_before_rebase",
+    "theseus_shrink_per_weight",
+)
+for _name in _LEGACY_DEPTH_CASES:
+    _sizes, _make = CASES[_name]
+    CASES[_name] = (_sizes, lambda r, _make=_make: {**_make(r), "depth_defaults": "legacy"})
+_ARIADNE = {"preset": "ariadne", "num_batches": 2, "seed": 0}
+CASES["theseus_extend_depth_defaults_method"] = (_EXT, lambda r: {"depth_defaults": "method"})
+CASES["bico_extend_discrete_index_match"] = (
+    _EXT,
+    lambda r: {"method": "bico", "method_params": {"num_batches": 2, "seq_align": "mean"}, "depth_defaults": "method"},
+)
+CASES["ariadne_same_depth"] = (_SAME, lambda r: {"method": "ariadne", "ariadne_params": dict(_ARIADNE)})
+CASES["ariadne_extend"] = (_EXT, lambda r: {"method": "ariadne", "ariadne_params": dict(_ARIADNE)})
+CASES["direct_residual_spelling_same_depth"] = (
+    _SAME,
+    lambda r: {"method": "direct_residual", "direct_residual_params": dict(_ARIADNE)},
+)
+
 EXPECTED: dict[str, str] = {
     "alpha_search_discrete_values:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "alpha_search_discrete_values:harness_calls": "64938befbf4cc9e0806ae1b095f264994a81216a55218dd8a622374d35ff48c2",
@@ -428,16 +453,36 @@ EXPECTED: dict[str, str] = {
     "alpha_search_sobol:resolved_config": "d122c52c84d81f38cd0a007806ff8cbb9845537dd644456e9d5db981fb1ce907",
     "alpha_search_sobol:summary": "860a96e6a03b84bbbe68536d9345b41bc112ece16af8661198a961bfdc802cfe",
     "alpha_search_sobol:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
+    "ariadne_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
+    "ariadne_extend:harness_calls": "cf893107056aceda30eda6c7e3fd20c71af2806ca74528cd821341a0095f327c",
+    "ariadne_extend:resolved_config": "2a21726f00184f9ff4966c248ddb7d53ecf5c5727dc9b03f71720cbfd11149d1",
+    "ariadne_extend:summary": "3f57d8525bd2ee7221c098123b66212b24c9b25add7a1e7176e5733e9f6f6b29",
+    "ariadne_extend:tuned_loads": "8823381edc53b384c1713eb184d37b087cb1c45c8edbde9b015d07d18f65f6ff",
+    "ariadne_same_depth:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
+    "ariadne_same_depth:harness_calls": "4c6450b4b83b1f327d8187f0a9f146ac88f29bfa6746cc43d2d42e07f7915c7c",
+    "ariadne_same_depth:resolved_config": "2a21726f00184f9ff4966c248ddb7d53ecf5c5727dc9b03f71720cbfd11149d1",
+    "ariadne_same_depth:summary": "ff819d32420df17f70620244e34c2f64e329b28f950449c89695c3478b5eb0c6",
+    "ariadne_same_depth:tuned_loads": "8823381edc53b384c1713eb184d37b087cb1c45c8edbde9b015d07d18f65f6ff",
     "bico_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "bico_extend:harness_calls": "64544190ae69c1319bd790596b9a055a3c164d25d4505e2dce7236118d02eff4",
-    "bico_extend:resolved_config": "cc7f4890139bffff964ccf6261ff7625974cdb9167ee89189823647d123ca87b",
+    "bico_extend:resolved_config": "17cb46ac0f81d1f4b78ed8f1014ec5ff6684c9f0bdf4f92e237167144ebf16c9",
     "bico_extend:summary": "66b43c9915b6cbe9d433d543b8be9aa98b1e62640bd2aa2c35a9553b65435a48",
     "bico_extend:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
+    "bico_extend_discrete_index_match:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
+    "bico_extend_discrete_index_match:harness_calls": "5c518c1dc7d10512c0e204e1fd0bacd354dc3bd978d1930d8e1c6881cfcc9a9d",
+    "bico_extend_discrete_index_match:resolved_config": "7ee8f638bb5a27aa8cfcad1a41347553cd340b100e3790fa5b9499ad80745df6",
+    "bico_extend_discrete_index_match:summary": "88e4e51f82c0f2f2f10d624ab4330c524e404cd03d5d48ab0d5c6bfe0da97de2",
+    "bico_extend_discrete_index_match:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "bico_same_depth:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "bico_same_depth:harness_calls": "5d6977c69ef9feaa598fc97f77954f3378d4e4953ff8fc209080c6b29e1490ab",
     "bico_same_depth:resolved_config": "cc7f4890139bffff964ccf6261ff7625974cdb9167ee89189823647d123ca87b",
     "bico_same_depth:summary": "d4578f90e32b0092d862511ace8c92029514e0c9074f6881f589360ddd58a78a",
     "bico_same_depth:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
+    "direct_residual_spelling_same_depth:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
+    "direct_residual_spelling_same_depth:harness_calls": "4c6450b4b83b1f327d8187f0a9f146ac88f29bfa6746cc43d2d42e07f7915c7c",
+    "direct_residual_spelling_same_depth:resolved_config": "631bee4c41a6079de1b55dbe23236dad6a76c2dd322fa5c104f41b04db628332",
+    "direct_residual_spelling_same_depth:summary": "948c5c81c2dcc9ef6612a670b41dfb06a923158eb964c1ab0cffc26641bbe98c",
+    "direct_residual_spelling_same_depth:tuned_loads": "8823381edc53b384c1713eb184d37b087cb1c45c8edbde9b015d07d18f65f6ff",
     "dnm_literal_none_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "dnm_literal_none_extend:harness_calls": "2edcff9eba89b715eae578674b8dfa071a1dd8e6f335ee773020065f86ef84de",
     "dnm_literal_none_extend:resolved_config": "234bc8e188f3aff22430d791dcea123227ae31bd4d96dccca3995a2afbb583de",
@@ -460,7 +505,7 @@ EXPECTED: dict[str, str] = {
     "dnm_uncorrected_same_depth:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "eval_before_rebase_only_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "eval_before_rebase_only_extend:harness_calls": "223046c5d23c59639535adf8f0a5e7cb32c483849943f68b7f322aefd6954bd7",
-    "eval_before_rebase_only_extend:resolved_config": "2c913ac063c3e59a09537a42a5563bba2052b250f275414f6b7c33eba897d216",
+    "eval_before_rebase_only_extend:resolved_config": "e871a5a2eb8ea494e7b13259fc7090a933687bcb32b20280cabeb7f3dd59abdb",
     "eval_before_rebase_only_extend:summary": "c159ffabb3087998b817e27a09a783689c037f963c7990d8aeeed50896a139b8",
     "eval_before_rebase_only_extend:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "eval_before_rebase_only_same_depth:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -492,12 +537,17 @@ EXPECTED: dict[str, str] = {
     "theseus_extend_brace_skip_correction_true:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_extend_defaults_alpha_search:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_extend_defaults_alpha_search:harness_calls": "8eedb83aa039f9c765b7ea9ce55f53b41b7f6e9a4b50b9939eca8cca0a933b1b",
-    "theseus_extend_defaults_alpha_search:resolved_config": "f60cd7042a1b41ab60433b147cd30dc2915c74b0dfb7bdf79690101d48c2d397",
+    "theseus_extend_defaults_alpha_search:resolved_config": "89c8491afd1bbcc81a70c8c0ec424bec7aa6d43f09eea7904dbfa14f1d93bcb6",
     "theseus_extend_defaults_alpha_search:summary": "ae4b65827bdadf515eac50b7448fbaeb5ce89838dcc5ed6e35a3bb797493a698",
     "theseus_extend_defaults_alpha_search:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
+    "theseus_extend_depth_defaults_method:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
+    "theseus_extend_depth_defaults_method:harness_calls": "f0b1d86b3c98bd8a109aaa657ec3105ec2db683153603f189cab5b5a3303a9a0",
+    "theseus_extend_depth_defaults_method:resolved_config": "b963297cb59365f7a44a32ffd3bcd07fc5921911a47e0993155fe01b0c54be00",
+    "theseus_extend_depth_defaults_method:summary": "555dad429a99c13c39f812c530a65628b78e9e6f5c8c10fdbe2ba56a41040954",
+    "theseus_extend_depth_defaults_method:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_extend_eval_before_rebase:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_extend_eval_before_rebase:harness_calls": "ba07e46f2425169faf6d2e1e8088c7f8cd4f11e60829dfd974ff29869a07f23c",
-    "theseus_extend_eval_before_rebase:resolved_config": "f2f36612b688b7c4cbe0610ce9e1f36844e512288c9feb0503a03bbc56041d56",
+    "theseus_extend_eval_before_rebase:resolved_config": "1820cb76f65eb850ffa8aa5d7b95445a87347a57d6077e82c0a78137ba8c424c",
     "theseus_extend_eval_before_rebase:summary": "f2bd3158355549ea3659d025156a1d0d73c739cf987bb4fff5820ff8a81d4e95",
     "theseus_extend_eval_before_rebase:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_gqa_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -538,26 +588,19 @@ EXPECTED: dict[str, str] = {
     "theseus_same_depth_weights_and_limit:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_shrink_per_weight:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_shrink_per_weight:harness_calls": "ebc92af2e9b8edf1e82fd77e0f4d0329139cf162d2de48ef6bf9fbe16b783542",
-    "theseus_shrink_per_weight:resolved_config": "8c720c1181bebce4d97e6caf006c5d2e667bc7cb1e4c187dc824aab37d7619c3",
+    "theseus_shrink_per_weight:resolved_config": "a9884dc5a30c103f478dca3063e11d33d63a94be56439b73c295661a3a97eb36",
     "theseus_shrink_per_weight:summary": "089790e2c77f6222aac5da19cce6a984c7fa289d0dfa78f92341c4d52f678ca5",
     "theseus_shrink_per_weight:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
 }
 EXPECTED_ERRORS: dict[str, list[Any]] = {
+    "theseus_extend_depth_defaults_guard": [
+        "ConfigMeaningChangedError",
+        'theseus: depth-mismatched pair without an explicit skip_correction. The per-method depth defaults would change this run\'s result. Either keep the previous behaviour with "block_extension_params": {"skip_correction": false} (or "depth_defaults": "legacy"), or accept the new method default with "depth_defaults": "method".',
+        2,
+        1,
+        ["failed"],
+    ],
     "alpha_step_nonpositive": ["ValueError", "alpha_step must be > 0.", 2, 1, ["failed"]],
-    "ariadne_direct_residual_spelling": [
-        "ValueError",
-        "Ariadne LLM entrypoint lands in S10; llm_rebase does not run Ariadne yet.",
-        0,
-        0,
-        [],
-    ],
-    "ariadne_not_yet": [
-        "ValueError",
-        "Ariadne LLM entrypoint lands in S10; llm_rebase does not run Ariadne yet.",
-        0,
-        0,
-        [],
-    ],
     "block_extension_bad_strategy": [
         "ValueError",
         "Unsupported extension_strategy 'bogus'. Expected: interpolate, per_weight, shrink, interpolate_per_weight, duplicate_per_weight.",
@@ -803,8 +846,6 @@ ERROR_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], bool]] = {
     # name: (world kwargs, cfg overrides, fake_calibration)
     "missing_target_model": (_SAME, {"target_model_name_or_path": None}, False),
     "unknown_method": (_SAME, {"method": "nope"}, False),
-    "ariadne_not_yet": (_SAME, {"method": "ariadne"}, False),
-    "ariadne_direct_residual_spelling": (_SAME, {"method": "direct_residual"}, False),
     "method_params_n_batches": (_SAME, {"method_params": {"n_batches": 2}}, False),
     "tuned_bodies_missing": (_SAME, {"tuned_bodies": None}, False),
     "tuned_bodies_wrong_type": (_SAME, {"tuned_bodies": "tuned_A"}, False),
@@ -823,7 +864,12 @@ ERROR_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], bool]] = {
     "transport_delta_source_bad": (_SAME, {"transport_delta_source": "foo"}, False),
     "shrink_non_per_weight": (_SHR, {"block_extension_params": {**_BE, "extension_strategy": "duplicate"}}, False),
     "depth_mismatch_block_extension_disabled": (_EXT, {"block_extension_enabled": False}, False),
-    "block_extension_bad_strategy": (_EXT, {"block_extension_params": {**_BE, "extension_strategy": "bogus"}}, False),
+    "block_extension_bad_strategy": (
+        _EXT,
+        {"block_extension_params": {**_BE, "extension_strategy": "bogus"}, "depth_defaults": "legacy"},
+        False,
+    ),
+    "theseus_extend_depth_defaults_guard": (_EXT, {}, False),
     "alpha_step_nonpositive": (_SAME, {"alpha_search": True, "alpha_step": 0.0}, False),
 }
 
@@ -850,9 +896,18 @@ def test_llm_main_error_table(name, tmp_path, monkeypatch):
     assert row == EXPECTED_ERRORS[name]
 
 
-def test_ariadne_error_is_the_explicit_s10_message(tmp_path, monkeypatch):
-    r = tmp_path / "a"
-    with pytest.raises(ValueError, match="lands in S10"):
-        _launch(_base_cfg(r, method="ariadne"), r, monkeypatch, World())
-    calls = _launch.last_calls  # type: ignore[attr-defined]
-    assert calls.builds == [] and calls.recorders == []  # fails before any model is built
+def test_ariadne_spellings_fit_the_same_vector():
+    """`direct_residual` is a pure alias of `ariadne`: identical evaluated weights and saved states."""
+    for part in ("harness_calls", "builds", "tuned_loads"):
+        a, b = EXPECTED.get(f"ariadne_same_depth:{part}"), EXPECTED.get(f"direct_residual_spelling_same_depth:{part}")
+        assert a is not None and a == b, part
+
+
+@pytest.mark.parametrize(("name", "target_layers"), [("ariadne_same_depth", 2), ("ariadne_extend", 3)])
+def test_ariadne_task_vector_is_only_the_down_proj_fit(name, target_layers, tmp_path, monkeypatch):
+    """Ariadne's LLM task vector: weight + materialized bias of every target down_proj, nothing else."""
+    _, s = _run(name, tmp_path / "a", monkeypatch)
+    assert s["merged_delta"]["key_count"] == 2 * target_layers
+    tv = s["task_vectors"]
+    assert tv["materialized_bias_keys"] == [f"model.layers.{j}.mlp.down_proj.bias" for j in range(target_layers)]
+    assert all(row["norm_match_scale"] == 1.0 for row in tv["per_task"])

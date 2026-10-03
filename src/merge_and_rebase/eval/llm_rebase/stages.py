@@ -19,7 +19,9 @@ from ...io.ckpt import load_into_model
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.decoder import run_block_extension_llm
+from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_decoder
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs, TaskModels, select_prestep_kind
+from ...rebase.run_config import MethodKind
 
 
 @dataclass
@@ -143,8 +145,13 @@ class LlmTaskContext:
 
 
 def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
-    """Per-task source base / fine-tuned copies (block-extension prestep only); the ft copy carries the tuned ckpt."""
-    if not env.plan.task_block_extension_prestep:
+    """Per-task source base / fine-tuned copies; the ft copy carries the tuned ckpt.
+
+    Built for the block-extension and discrete-index presteps and for Ariadne (which fits from the native pair).
+    """
+    plan = env.plan
+    is_ariadne = env.resolved.method_kind is MethodKind.ARIADNE
+    if not (plan.task_block_extension_prestep or plan.task_discrete_layer_match_prestep or is_ariadne):
         return None
     rt = env.runtime
     ckpt_ref = rt.task_contexts[task].ckpt_ref
@@ -242,7 +249,9 @@ class NoPrestep:
             kind=self.kind,
             source_base_sd=source_base_sd,
             task_delta=tv.delta,
-            source_base_model=source_llm.model,
+            # Ariadne gets the native per-task pair from build_task_models; transport uses the shared source model.
+            source_base_model=models.source_base if models is not None else source_llm.model,
+            source_ft_model=models.source_ft if models is not None else None,
             transport_keys=set(rt.tp_keys or ()),
         )
 
@@ -266,8 +275,50 @@ class ExtendedSourceBaseObserver:
         models.source_base.to("cpu")
 
 
-def build_prestep(plan: Any) -> BracePrestep | NoPrestep:
-    return BracePrestep() if select_prestep_kind(plan) is PrestepKind.BRACE else NoPrestep()
+class DiscreteIndexPrestep:
+    """Depth mismatch for BiCo: the BiCo-paper discrete index match ``i(j)=round(j(D_s-1)/(D_t-1))``.
+
+    The source base and fine-tuned models are reindexed to the target depth (deep copies, HF-correct layer
+    bookkeeping); the task delta and the transport statistics both come from the reindexed source stack.
+    """
+
+    kind = PrestepKind.DISCRETE_INDEX
+
+    def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
+        rt = env.runtime
+        family_adapter = rt.target_family or rt.source_family
+        if family_adapter is None:
+            raise ValueError("Discrete index match requires a family adapter but none was inferred.")
+        pairing = DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth))
+        base = build_discrete_indexed_decoder(models.source_base, pairing, family_adapter)
+        ft = build_discrete_indexed_decoder(models.source_ft, pairing, family_adapter)
+        models.source_ft = None
+        base_sd = to_cpu_fp32(base.state_dict())
+        ft_sd = to_cpu_fp32(ft.state_dict())
+        del ft
+        delta = TaskVector.from_checkpoints(base_sd, ft_sd, strict=False).delta
+        print(f"  discrete index match (source_depth={rt.source_depth} -> {rt.target_depth}): {list(pairing.pairing)}")
+        return PrestepResult(
+            kind=self.kind,
+            source_base_sd=base_sd,
+            task_delta=delta,
+            source_base_model=base,
+            layout={"pairing": list(pairing.pairing)},
+            final_depth=int(rt.target_depth),
+            transport_keys=set(family_adapter.transportable_keys(base_sd)),
+        )
+
+    def load_delta(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> PrestepResult:
+        return pre
+
+
+def build_prestep(plan: Any) -> BracePrestep | DiscreteIndexPrestep | NoPrestep:
+    kind = select_prestep_kind(plan)
+    if kind is PrestepKind.BRACE:
+        return BracePrestep()
+    if kind is PrestepKind.DISCRETE_INDEX:
+        return DiscreteIndexPrestep()
+    return NoPrestep()
 
 
 def build_prestep_observers(plan: Any) -> tuple[ExtendedSourceBaseObserver, ...]:

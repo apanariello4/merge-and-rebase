@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy  # noqa: F401
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -20,7 +21,9 @@ from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
 from ...rebase.capabilities import check_pair
+from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
+from ...rebase.run_config import MethodKind
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
 from .pipeline import LlmRuntime
 from .run_config import bind_llm_plan, resolve_llm_run_config
@@ -190,6 +193,13 @@ def build_runtime(
         device=device,
         eval_before_rebase_only=eval_before_rebase_only,
     )
+    # The per-method depth defaults may have rewritten the block-extension config (THESEUS skip_correction).
+    block_extension_cfg = resolved.block_extension_cfg
+    if resolved.method_kind is MethodKind.ARIADNE:
+        resolved = replace(
+            resolved,
+            ariadne_cfg=resolve_ariadne_decoder_config(_ariadne_params(cfg), target_family or source_family),
+        )
     plan = bind_llm_plan(
         resolved,
         source_meta=source_meta,
@@ -495,3 +505,13 @@ def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
         (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
         for i, ref in enumerate(tuned_ref_list)
     }
+
+
+def _ariadne_params(cfg) -> dict:
+    """``ariadne_params`` (or its legacy alias ``direct_residual_params``); both at once is an error."""
+    if cfg.get("ariadne_params") is not None and cfg.get("direct_residual_params") is not None:
+        raise ValueError("Set either ariadne_params or direct_residual_params, not both.")
+    raw = cfg.get("ariadne_params")
+    if raw is None:
+        raw = cfg.get("direct_residual_params")
+    return dict(raw or {})

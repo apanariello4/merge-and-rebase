@@ -12,8 +12,12 @@ from typing import Any
 import torch
 
 from ...data.llm_calibration import build_text_calibration_loader as _build_text_calibration_loader
+from ...rebase.discrete_layer_match import DiscreteLayerPairing
+from ...rebase.methods._ariadne.alignment import apply_depth_pairing_override
+from ...rebase.methods._ariadne.biases import materialize_missing_projection_biases
+from ...rebase.methods.ariadne import AriadneRebase
 from ...rebase.orchestration import MethodResult
-from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
+from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs
 from .merge import norm_match_transported, resolve_delta_source, resolve_norm_match
 from .stages import _DEFAULT_CALIB_BATCHES
 
@@ -55,7 +59,7 @@ class TransportMethodStage:
         transport_keys = pre.transport_keys
         print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) ---")
         t0 = time.time()
-        resized = env.plan.run_block_extension_prestep
+        resized = pre.kind in (PrestepKind.BRACE, PrestepKind.DISCRETE_INDEX)
         if resized:
             pre.source_base_model.to(rt.device)
 
@@ -175,6 +179,87 @@ class TransportMethodStage:
         return transported
 
 
-def build_method_stage(cfg: Any) -> TransportMethodStage:
+class AriadneStage:
+    """One task's Ariadne fit on the native source pair (no prestep, no parameter transport).
+
+    The task vector is only the fitted corrections of the target's residual-writing projections; with
+    ``copy_shape_matching_source_deltas`` (ablation, default off) shape-matching source deltas of the other keys are
+    added. Missing projection biases are materialized once on the target (``missing_bias="materialize"``).
+    """
+
+    #: Recorded in the run summary like the transport stage's; neither applies to a direct fit.
+    delta_source = "corrected"
+    norm_match = None
+
+    def __init__(self) -> None:
+        self.materialized_bias_keys: list[str] | None = None
+
+    def precompute(self, env: StageEnv) -> None:
+        """Vision's merge-in-source precompute hook; LLM Ariadne fits per task only."""
+        if env.resolved.ariadne_cfg.merge_mode != "per_task_then_merge":
+            raise ValueError("LLM Ariadne supports merge_mode='per_task_then_merge' only.")
+
+    def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult:
+        rt = env.runtime
+        config = env.resolved.ariadne_cfg
+        family_adapter = rt.family_adapter
+        print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) [ariadne] ---")
+        if config.missing_bias == "materialize" and self.materialized_bias_keys is None:
+            self.materialized_bias_keys = list(
+                materialize_missing_projection_biases(
+                    rt.target_llm.model, rt.target_base_sd, family_adapter=family_adapter, components=config.components
+                )
+            )
+        texts = rt._calibration().texts
+        source_loader = _build_text_calibration_loader(
+            tokenizer=rt.source_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
+            max_length=rt.calib_max_length,
+        )
+        target_loader = _build_text_calibration_loader(
+            tokenizer=rt.target_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
+            max_length=rt.calib_max_length,
+        )
+        pairing = apply_depth_pairing_override(
+            DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth)), config.depth_pairing
+        )
+        t0 = time.time()
+        prepared = AriadneRebase().prepare(
+            source_base_model=pre.source_base_model,
+            source_ft_model=pre.source_ft_model,
+            target_model=rt.target_llm.model,
+            target_base_sd=rt.target_base_sd,
+            source_loader=source_loader,
+            target_loader=target_loader,
+            pairing=pairing,
+            config=config,
+            device=rt.device,
+            family_adapter=family_adapter,
+        )
+        fitted = dict(prepared.task_vector)
+        if config.copy_shape_matching_source_deltas and pre.task_delta:
+            for key, value in pre.task_delta.items():
+                target = rt.target_base_sd.get(key)
+                if key not in fitted and target is not None and tuple(target.shape) == tuple(value.shape):
+                    fitted[key] = value
+        print(f"  ariadne fitted {len(fitted)} keys in {time.time() - t0:.1f}s (pairing {list(pairing.pairing)})")
+        pre.source_base_model = None
+        pre.source_ft_model = None
+        # "source_*" norms are the full source task vector's (Ariadne transports no source keys); "transported" is
+        # the fitted vector. No norm matching applies to a direct fit.
+        source_delta = pre.task_delta or {}
+        transported, norms = norm_match_transported(
+            fitted, corrected_delta=source_delta, reference_delta=source_delta, transport_keys=None, norm_match=None
+        )
+        return MethodResult(transported_delta=transported, task_vector_norms=norms)
+
+
+def build_method_stage(cfg: Any, *, ariadne: bool = False) -> TransportMethodStage | AriadneStage:
     """Resolves ``transport_delta_source`` / ``delta_norm_match`` (their config errors surface here)."""
-    return TransportMethodStage(delta_source=resolve_delta_source(cfg), norm_match=resolve_norm_match(cfg))
+    delta_source, norm_match = resolve_delta_source(cfg), resolve_norm_match(cfg)
+    if ariadne:
+        if delta_source != "corrected" or norm_match not in (None, "none"):
+            raise ValueError(
+                "Ariadne fits its task vector directly: transport_delta_source and delta_norm_match do not apply."
+            )
+        return AriadneStage()
+    return TransportMethodStage(delta_source=delta_source, norm_match=norm_match)

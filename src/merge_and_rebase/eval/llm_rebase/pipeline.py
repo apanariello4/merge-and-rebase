@@ -17,6 +17,7 @@ from ...io.ckpt import load_into_model
 from ...merge.runtime import compose_weighted_deltas
 from ...rebase.orchestration import TaskPipeline
 from ...rebase.prestep import StageEnv
+from ...rebase.run_config import MethodKind
 from .merge import _summarize_merged_delta, report_merged_delta
 from .method_stages import build_method_stage
 from .stages import build_prestep, build_prestep_observers, build_task_models
@@ -142,7 +143,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         runtime=rt,
     )
     # eval_before_rebase_only stops each task after its prestep, so its transport options are never resolved.
-    method_stage = None if eval_before_rebase_only else build_method_stage(cfg)
+    method_stage = None if eval_before_rebase_only else build_method_stage(cfg, ariadne=rt.resolved.method_kind is MethodKind.ARIADNE)
     pipeline = TaskPipeline(
         prestep=build_prestep(rt.plan),
         observers=build_prestep_observers(rt.plan),
@@ -182,5 +183,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         "delta_norm_match": method_stage.norm_match or "none",
         "per_task": loop.task_vector_norms,
     }
+    if getattr(method_stage, "materialized_bias_keys", None) is not None:
+        task_vector_report["materialized_bias_keys"] = list(method_stage.materialized_bias_keys)
     report_merged_delta(delta_stats)
     return RebaseOutputs(merged_delta=merged_delta, delta_stats=delta_stats, task_vector_report=task_vector_report)

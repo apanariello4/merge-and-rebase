@@ -15,7 +15,6 @@ from typing import Any
 from ...merge.methods._common import get_method_params
 from ...rebase import get_method
 from ...rebase.block_extension.config import BlockExtensionConfig
-from ...rebase.registry import canonical_method_name
 from ...rebase.run_config import (
     AlphaSpec,
     DepthRule,
@@ -24,6 +23,7 @@ from ...rebase.run_config import (
     ResolvedRunConfig,
     RunPlan,
     SourceLmcSpec,
+    resolve_depth_rule,
 )
 
 LLM_BLOCKEXT_METHODS = frozenset({"theseus", "theseus_gqa", "bico"})
@@ -33,9 +33,6 @@ def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Pre-model validation: method lookup, the Ariadne stop and the ``method_params.n_batches`` rename."""
     method_name = str(cfg.get("method", "theseus"))
     method = get_method(method_name)
-    if canonical_method_name(method_name) == "ariadne":
-        # Capability-supported, but llm_rebase has no Ariadne branch until S10: fail before loading any model.
-        raise ValueError("Ariadne LLM entrypoint lands in S10; llm_rebase does not run Ariadne yet.")
     method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
     if "n_batches" in method_params:
         raise ValueError(
@@ -58,8 +55,19 @@ def resolve_llm_run_config(
     device: str,
     eval_before_rebase_only: bool,
 ) -> ResolvedRunConfig:
-    """Wrap the already-resolved LLM method / block-extension settings into the shared ``ResolvedRunConfig``."""
+    """Wrap the already-resolved LLM method / block-extension settings into the shared ``ResolvedRunConfig``.
+
+    The depth rule is resolved by the shared ``resolve_depth_rule`` (per-method defaults behind ``depth_defaults``,
+    with the same meaning-changed guard as vision); ``theseus_gqa`` counts as THESEUS for the depth rule.
+    """
     blockext_like = method_name in LLM_BLOCKEXT_METHODS
+    depth_kind = MethodKind.THESEUS_LIKE if method_name == "theseus_gqa" else MethodKind.of(method_name)
+    if blockext_like:
+        depth_rule, block_extension_cfg, depth_guard = resolve_depth_rule(
+            depth_kind, method_name, cfg, block_extension_enabled, block_extension_cfg
+        )
+    else:
+        depth_rule, depth_guard = DepthRule(kind="none"), None
     return ResolvedRunConfig(
         cfg=cfg,
         method=method,
@@ -69,7 +77,8 @@ def resolve_llm_run_config(
         method_kind=MethodKind.of(method_name),
         block_extension_enabled=block_extension_enabled,
         block_extension_cfg=block_extension_cfg,
-        depth_rule=DepthRule(kind="brace" if blockext_like and block_extension_enabled else "none"),
+        depth_rule=depth_rule,
+        depth_guard=depth_guard,
         ariadne_cfg=None,
         ariadne_preset=None,
         merge=MergeSpec(
