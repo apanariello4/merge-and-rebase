@@ -48,6 +48,14 @@ unless a change below says otherwise.
   `independent_endpoint_average` without effect is rejected; unknown `merge_method` and wrong-length `weights` raise
   `ValueError`; the discrete-index protocol label; decoder `layer_types` truncated on shrink; `llm_merge` loads dense
   HF model directories as full state dicts; more tuned bodies than task names is an error.
+- LLM evaluation never scores calibration documents: harness-derived calibration always holds its docs out
+  (previously only with `calibration_split: val`), for every calibrating method including Ariadne. Calibration
+  texts are unchanged; the evaluated document set changes for configs that left the split at its default.
+- LLM Ariadne: the calibration pool counts `ariadne_params.num_batches` (a fit could silently use fewer batches)
+  and warns on any shortfall; `eval_before_rebase_only` no longer crashes; the summary records
+  `task_vectors.ariadne` (depth pairing; per task the task-vector sha256, calibration record, diagnostics, timings).
+- Dense `sequence_classification` model refs keep their classification head; the skipped-task vision summary keeps
+  a recorded epoch 0.
 
 ### Retired / removed
 - Ariadne `component_target="output_local" | "output_total"` (error: retired).

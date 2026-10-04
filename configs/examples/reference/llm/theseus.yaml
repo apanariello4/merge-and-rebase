@@ -54,7 +54,8 @@ block_extension_params:
   # extension_strategy: "interpolate_per_weight"  # [BRACE-only] [main] new-layer init: interpolate_per_weight |
   #                                 #   duplicate_per_weight (a shrink needs a per-weight strategy).
   # dampening_factor: 1.0           # [BRACE-only] scale on the inserted layer's output (biases included).
-  # calibration_split: "test"       # split of the BRACE calibration batches (task-split sources only).
+  # calibration_split: "test"       # split of a calibration_dataset; a harness source ignores it and always
+  #                                 #   holds its calibration docs out of the evaluation.
   # calibration_dataset: null       # BRACE calibration corpus; the top-level calibration_dataset wins over it.
   # calibration_task: null          # shorthand for a named task; exclusive with calibration_dataset.
   # skip_correction: true           # [BRACE-only] [default: method] skip the ridge correction of inserted layers;

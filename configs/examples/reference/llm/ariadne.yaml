@@ -40,8 +40,8 @@ method: ariadne                             # Ariadne (legacy alias: direct_resi
 depth_defaults: method                      # no effect on Ariadne (no depth rule); kept identical across examples.
 
 # ---------------------------------------------------------------- block_extension_params (calibration sizing only)
-# Ariadne runs no BRACE prestep. On LLMs n_batches_act still sizes the shared calibration pool, and
-# ariadne_params.num_batches is not counted there: keep n_batches_act >= ariadne_params.num_batches.
+# Ariadne runs no BRACE prestep. On LLMs n_batches_act still enters the shared calibration-pool size, together
+# with ariadne_params.num_batches (the larger wins); a fit that still gets fewer batches than requested warns.
 block_extension_params:
   n_batches_act: 100                        # calibration-pool sizing (see the calibration section).
 
@@ -93,7 +93,7 @@ ariadne_params:
 
 # ---------------------------------------------------------------- calibration
 # Text source, first match wins: calibration_prompts > calibration_dataset > harness_tasks (held out from the
-# evaluation docs). Pool size = n_batches_act x calibration_batch_size sequences (method_params is empty here).
+# evaluation docs). Pool size = max(n_batches_act, ariadne_params.num_batches) x calibration_batch_size sequences.
 # Padding rows never enter any statistic: each model is masked by its own attention_mask.
 seed: 0                                     # calibration partition seed (and hyperparam_search sampling).
 calibration_batch_size: 4                   # calibration loader batch; default = batch_size, else 2.
