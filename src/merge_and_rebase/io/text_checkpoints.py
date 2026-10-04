@@ -494,7 +494,12 @@ def _is_hf_dense_ref(ref: str) -> bool:
 def _load_dense_hf_state_dict(hf_ref: str, build_cfg: TextBuildConfig) -> dict[str, torch.Tensor]:
     """Load a dense HF model from a hub ref and return its CPU state dict."""
     try:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForSeq2SeqLM,
+            AutoModelForSequenceClassification,
+        )
     except Exception as e:
         raise ImportError("Loading dense HF model requires transformers.") from e
 
@@ -505,7 +510,7 @@ def _load_dense_hf_state_dict(hf_ref: str, build_cfg: TextBuildConfig) -> dict[s
         "torch_dtype": torch.float32,
     }
     if kind == "sequence_classification":
-        model = AutoModelForCausalLM.from_pretrained(**common, num_labels=int(build_cfg.num_labels))
+        model = AutoModelForSequenceClassification.from_pretrained(**common, num_labels=int(build_cfg.num_labels))
     elif kind == "causal_lm":
         hf_cfg = AutoConfig.from_pretrained(hf_ref, trust_remote_code=bool(build_cfg.trust_remote_code))
         is_encoder_decoder = bool(getattr(hf_cfg, "is_encoder_decoder", False))
