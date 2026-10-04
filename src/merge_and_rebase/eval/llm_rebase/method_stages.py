@@ -7,6 +7,7 @@ under ``passthrough_to_target``; every other method transports the whole delta d
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Any
 
 import torch
@@ -235,6 +236,15 @@ class AriadneStage:
             device=rt.device,
             family_adapter=family_adapter,
         )
+        calibration = prepared.extra.get("calibration", {})
+        if calibration.get("actual_batches", 0) < calibration.get("requested_batches", 0):
+            warnings.warn(
+                f"Ariadne fit on {calibration['actual_batches']} calibration batches, fewer than "
+                f"ariadne_params.num_batches={calibration['requested_batches']}: the calibration text pool is too "
+                "small (raise calibration_n_sequences or provide more calibration_prompts).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         fitted = dict(prepared.task_vector)
         if config.copy_shape_matching_source_deltas and pre.task_delta:
             for key, value in pre.task_delta.items():

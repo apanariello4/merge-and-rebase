@@ -371,10 +371,15 @@ def build_runtime(
     # knob: block extension consumes n_batches_act batches for its
     # activation capture, theseus/bico consume num_batches for theirs, and
     # neither is derived from the other. The max only sizes the pool, so
-    # whichever consumer asks for more still finds enough text.
+    # whichever consumer asks for more still finds enough text. Ariadne's
+    # budget is ariadne_params.num_batches: without it here, the pool held
+    # only n_batches_act batches and the fit silently ran on fewer batches
+    # than configured.
+    ariadne_n_batches = int(resolved.ariadne_cfg.num_batches) if resolved.ariadne_cfg is not None else 0
     n_calib_batches = max(
         int(block_extension_cfg.n_batches_act),
         int(calib_n_batches or 0),
+        ariadne_n_batches,
     )
     # Opt-in calibration knobs (all default to the historical behaviour):
     #   calibration_n_sequences      explicit pool size instead of max(batches) * batch_size
