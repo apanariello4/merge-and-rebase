@@ -129,7 +129,8 @@ class TaskPipeline:
         # merge_in_source_then_fit (an Ariadne config field, distinct from the top-level `merge_mode` cfg key)
         # merges every task's native delta ONCE before the per-task loop and fits one shared correction; the
         # stage caches it and the loop reuses it for every task.
-        if resolved.direct_residual_like:
+        # No method stage when the run stops after the before-rebase eval (LLM eval_before_rebase_only).
+        if resolved.direct_residual_like and self.method_stage is not None:
             self.method_stage.precompute(env)
 
         for task in tasks:
