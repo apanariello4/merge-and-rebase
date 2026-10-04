@@ -6,7 +6,7 @@ Direct Residual (Ariadne), ARIADNE direct-target, THESEUS / theseus_gqa / BiCo a
 fixtures. A refactor that moves code but keeps behaviour must leave every hash unchanged;
 a changed hash means a changed number and invalidates published results until explained.
 
-- **Generated at**: commit `7a7ee9a` (release/ariadne-main), behaviour-identical to `b6128d3`.
+- **Generated at**: commit `7a7ee9a` (release/2026-10-rebase-refactor), behaviour-identical to `b6128d3`.
   Cross-checked: the same 71 tests pass unchanged against a clean `b6128d3` worktree.
 - **Platform caveat**: hashes are bit-level and therefore specific to this CPU family, torch
   build (torch + the pinned `pytorch-cu128` wheel), `torch.set_num_threads(1)` and
@@ -297,7 +297,7 @@ the Hasher bullet above is historical).
 end to end on a tiny offline world and pins everything it produces, so each Phase 5 move out of
 `vision_rebase.py` is checked at hash level. Tests only: no source file was touched.
 
-- **Generating commit**: values captured on the code of `8028734` (release/ariadne-main) plus the
+- **Generating commit**: values captured on the code of `8028734` (release/2026-10-rebase-refactor) plus the
   docstring-only edits that were committed as `e262b7c` (AST-identical, no behaviour change); the file
   passes unchanged on `e262b7c`. Python 3.14.4, torch 2.11.0+cu128, single thread, deterministic
   algorithms (same platform caveat as above: bit-level hashes are CPU/BLAS/torch specific).

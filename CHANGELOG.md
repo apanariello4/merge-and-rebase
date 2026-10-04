@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — `release/ariadne-main`
+## Unreleased — `release/2026-10-rebase-refactor`
 
 Published numbers: every refactor step was gated by golden SHA-256 pins (`tests/golden/`); intended changes are
 listed under "Declared changes" in `tests/golden/HASHES.md`. Results of default configurations are byte-identical
