@@ -112,9 +112,10 @@ def resolve_calibration_texts(
     prompts : Explicit prompt bank from `config['calibration_prompts']`.
     calibration_dataset : HF dataset path, or a spec mapping with `path` and
         optional `name`/`split`/`text_column`.
-    calibration_split : Split to calibrate on. For an lm-harness source this
-        selects the held-out slice ("val"/"validation") rather than a split
-        that has to exist upstream, so it also works for single-split tasks.
+    calibration_split : Split of a ``calibration_dataset`` to calibrate on. An
+        lm-harness source ignores it: its calibration docs are always held out
+        of the evaluation (``eval_samples``), since the harness scores the same
+        task the text is drawn from.
     harness_tasks : Evaluated lm-harness tasks, used as the default source.
     n_sequences : How many sequences the run will actually consume
         (`n_batches * batch_size`). The calibration slice is sized to cover
@@ -242,7 +243,9 @@ def _from_harness_tasks(
     from lm_eval.tasks import TaskManager
 
     manager = TaskManager()
-    wants_holdout = str(calibration_split).lower() in {"val", "validation", "dev"}
+    # Always hold out: the calibration docs come from the very task the harness then scores, so they never reach
+    # the evaluation (``calibration_split`` used to switch this off for any split but "val"/"validation"/"dev").
+    del calibration_split
 
     texts: list[str] = []
     notes: list[str] = []
@@ -264,13 +267,9 @@ def _from_harness_tasks(
         order = list(range(len(docs)))
         random.Random(seed).shuffle(order)
 
-        if wants_holdout:
-            n_calib = min(per_task, max(1, len(order) - 1))
-            calib_idx = sorted(order[:n_calib])
-            eval_idx = sorted(order[n_calib:])
-            eval_samples[task_name] = eval_idx
-        else:
-            calib_idx = sorted(order[:per_task])
+        n_calib = min(per_task, max(1, len(order) - 1))
+        calib_idx = sorted(order[:n_calib])
+        eval_samples[task_name] = sorted(order[n_calib:])
 
         n_without_target = 0
         for i in calib_idx:
@@ -295,10 +294,9 @@ def _from_harness_tasks(
             "Point block_extension_params.calibration_dataset at a dataset instead."
         )
 
-    split_label = "holdout" if wants_holdout else str(calibration_split)
     return CalibrationTexts(
         texts,
-        source=f"lm-harness {'+'.join(tasks)}[{split_label}]",
+        source=f"lm-harness {'+'.join(tasks)}[holdout]",
         eval_samples=eval_samples,
         notes=notes,
     )

@@ -203,12 +203,15 @@ def test_harness_holdout_splits(stub_tasks, split):
     assert resolve_calibration_texts(harness_tasks=["t"], calibration_split=split, n_sequences=5).eval_samples
 
 
-def test_harness_other_split_calibrates_without_holdout(stub_tasks):
+def test_harness_any_split_holds_calibration_docs_out(stub_tasks):
+    # Release review fix (2026-10-04): a non-"val" split used to calibrate on docs that the harness then also
+    # scored (eval_samples == {}); the calibration texts are the same, only the evaluation now excludes them.
     stub_tasks["t"] = _StubTask(20)
     out = resolve_calibration_texts(harness_tasks=["t"], calibration_split="test", n_sequences=5)
-    assert len(out) == 5
-    assert out.eval_samples == {}
-    assert out.source == "lm-harness t[test]"
+    val = resolve_calibration_texts(harness_tasks=["t"], calibration_split="val", n_sequences=5)
+    assert len(out) == 5 and out.texts == val.texts
+    assert out.eval_samples == val.eval_samples and len(out.eval_samples["t"]) == 15
+    assert out.source == "lm-harness t[holdout]"
 
 
 def test_harness_skips_groups_and_empty_tasks_and_errors_when_nothing_left(stub_tasks):

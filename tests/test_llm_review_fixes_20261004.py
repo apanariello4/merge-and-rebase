@@ -70,3 +70,34 @@ def test_summary_records_ariadne_fit(tmp_path, monkeypatch):
             assert record["timing"]["correction_fit"] and record["diagnostics"]
         digests.append({t: r["task_vector_sha256"] for t, r in report["per_task"].items()})
     assert digests[0] == digests[1]
+
+
+class _StubHarnessTask:
+    def __init__(self, n_docs: int):
+        self.eval_docs = [{"i": i} for i in range(n_docs)]
+
+    def doc_to_text(self, doc):
+        return f"the quick brown fox {doc['i']}"
+
+
+def test_harness_calibration_is_held_out_with_the_default_split(tmp_path, monkeypatch):
+    """Real resolver, default block_extension_params.calibration_split ("test"): the harness must not score the
+    calibration docs (it used to score all of them: samples=None)."""
+    import lm_eval.tasks as lm_tasks
+
+    class _Manager:
+        def load_task_or_group(self, names):
+            return {n: _StubHarnessTask(20) for n in names}
+
+    monkeypatch.setattr(lm_tasks, "TaskManager", _Manager)
+    for method, extra in (("theseus", {}), ("ariadne", {"ariadne_params": {"preset": "ariadne", "num_batches": 2}})):
+        root = tmp_path / method
+        cfg = _base_cfg(root, method=method, **extra, depth_defaults="method")
+        cfg.pop("calibration_prompts")
+        assert "calibration_split" not in cfg["block_extension_params"]
+        calls = _launch(cfg, root, monkeypatch, World())
+        assert calls.harness, method
+        for call in calls.harness:
+            samples = call["samples"]
+            assert samples is not None and set(samples) == {"arc_easy", "piqa"}, method
+            assert all(len(v) == 18 for v in samples.values()), method  # 20 docs, 2 per task held out
