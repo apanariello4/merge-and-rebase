@@ -51,3 +51,22 @@ def test_ariadne_calibration_shortfall_warns(tmp_path, monkeypatch):
     cfg = _base_cfg(tmp_path, method="ariadne", ariadne_params=params, depth_defaults="method")
     with pytest.warns(RuntimeWarning, match="fewer than ariadne_params.num_batches=5"):
         _launch(cfg, tmp_path, monkeypatch, World())
+
+
+def test_summary_records_ariadne_fit(tmp_path, monkeypatch):
+    digests = []
+    for run in ("a", "b"):
+        root = tmp_path / run
+        calls = _launch(_base_cfg(root, **_ARIADNE, depth_defaults="method"), root, monkeypatch, World())
+        summary = calls.recorders[0].summary
+        report = summary["task_vectors"]["ariadne"]
+        assert report["pairing"]["depth_pairing"] == "relative"
+        assert len(report["pairing"]["pairing"]) == report["pairing"]["target_depth"]
+        assert set(report["per_task"]) == {"task_0", "task_1"}
+        for record in report["per_task"].values():
+            assert len(record["task_vector_sha256"]) == 64
+            assert record["calibration"]["actual_batches"] == record["calibration"]["requested_batches"] == 3
+            assert record["calibration_indices_sha256"] is not None
+            assert record["timing"]["correction_fit"] and record["diagnostics"]
+        digests.append({t: r["task_vector_sha256"] for t, r in report["per_task"].items()})
+    assert digests[0] == digests[1]

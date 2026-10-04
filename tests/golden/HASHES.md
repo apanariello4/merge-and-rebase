@@ -505,3 +505,9 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
 - New cases: ariadne_same_depth, ariadne_extend, direct_residual_spelling_same_depth (same evaluated weights as
   ariadne_same_depth), theseus_extend_depth_defaults_method, bico_extend_discrete_index_match; new error row
   theseus_extend_depth_defaults_guard (ConfigMeaningChangedError).
+
+### Declared changes — 2026-10-04, release review fix #6, tests/golden/test_llm_main_golden.py
+- `summary` only for ariadne_same_depth, ariadne_extend, direct_residual_spelling_same_depth: the LLM summary gains
+  `task_vectors.ariadne` (depth pairing; per task the task-vector sha256, calibration record, fit diagnostics and
+  timings). Additive: with that one key removed, each summary hashes to its previous value (verified case by case).
+  Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.

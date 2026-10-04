@@ -185,5 +185,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
     }
     if getattr(method_stage, "materialized_bias_keys", None) is not None:
         task_vector_report["materialized_bias_keys"] = list(method_stage.materialized_bias_keys)
+    if hasattr(method_stage, "report"):
+        task_vector_report["ariadne"] = method_stage.report()
     report_merged_delta(delta_stats)
     return RebaseOutputs(merged_delta=merged_delta, delta_stats=delta_stats, task_vector_report=task_vector_report)

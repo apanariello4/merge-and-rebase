@@ -6,6 +6,7 @@ under ``passthrough_to_target``; every other method transports the whole delta d
 
 from __future__ import annotations
 
+import hashlib
 import time
 import warnings
 from typing import Any
@@ -16,6 +17,7 @@ from ...data.llm_calibration import build_text_calibration_loader as _build_text
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods._ariadne.alignment import apply_depth_pairing_override
 from ...rebase.methods._ariadne.biases import materialize_missing_projection_biases
+from ...rebase.methods._ariadne.fit import _task_vector_sha256
 from ...rebase.methods.ariadne import AriadneRebase
 from ...rebase.orchestration import MethodResult
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs
@@ -194,6 +196,13 @@ class AriadneStage:
 
     def __init__(self) -> None:
         self.materialized_bias_keys: list[str] | None = None
+        #: Depth pairing used (one per run) and one record per task, reported in the summary (``report``).
+        self.pairing_record: dict[str, Any] | None = None
+        self.task_records: dict[str, dict[str, Any]] = {}
+
+    def report(self) -> dict[str, Any]:
+        """Summary record: depth pairing, and per task the calibration, fit diagnostics, timings and TV hash."""
+        return {"pairing": self.pairing_record, "per_task": dict(self.task_records)}
 
     def precompute(self, env: StageEnv) -> None:
         """Vision's merge-in-source precompute hook; LLM Ariadne fits per task only."""
@@ -252,6 +261,22 @@ class AriadneStage:
                 if key not in fitted and target is not None and tuple(target.shape) == tuple(value.shape):
                     fitted[key] = value
         print(f"  ariadne fitted {len(fitted)} keys in {time.time() - t0:.1f}s (pairing {list(pairing.pairing)})")
+        if self.pairing_record is None:
+            self.pairing_record = {
+                "source_depth": pairing.source_depth,
+                "target_depth": pairing.target_depth,
+                "depth_pairing": config.depth_pairing,
+                "pairing": list(pairing.pairing),
+            }
+        self.task_records[task.task] = {
+            "task_vector_sha256": _task_vector_sha256(fitted),
+            "task_vector_stats": prepared.extra.get("task_vector_stats"),
+            "calibration": {k: v for k, v in calibration.items() if k != "indices"},
+            "calibration_indices_sha256": _indices_sha256(calibration.get("indices")),
+            "alignment_diagnostics": prepared.extra.get("alignment_diagnostics"),
+            "diagnostics": prepared.diagnostics,
+            "timing": {k: prepared.timing.get(k) for k in ("alignment_calibration", "correction_fit")},
+        }
         pre.source_base_model = None
         pre.source_ft_model = None
         # "source_*" norms are the full source task vector's (Ariadne transports no source keys); "transported" is
@@ -260,7 +285,19 @@ class AriadneStage:
         transported, norms = norm_match_transported(
             fitted, corrected_delta=source_delta, reference_delta=source_delta, transport_keys=None, norm_match=None
         )
-        return MethodResult(transported_delta=transported, task_vector_norms=norms)
+        return MethodResult(
+            transported_delta=transported,
+            task_vector_norms=norms,
+            alignment_calibration=prepared.timing.get("alignment_calibration"),
+            correction_fit=prepared.timing.get("correction_fit"),
+            cost_phases=prepared.timing.get("cost_phases"),
+        )
+
+
+def _indices_sha256(indices: Any) -> str | None:
+    if indices is None:
+        return None
+    return hashlib.sha256(repr([int(i) for i in indices]).encode()).hexdigest()
 
 
 def build_method_stage(cfg: Any, *, ariadne: bool = False) -> TransportMethodStage | AriadneStage:
