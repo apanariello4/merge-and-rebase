@@ -1689,8 +1689,9 @@ def _build_skipped_existing_task_summary(
             "name": regularization_name,
             "info": regularization_info,
         },
-        "best_epoch": int(summary.get("best_epoch", -1) or -1),
-        "last_epoch": int(summary.get("last_epoch", -1) or -1),
+        # Epoch 0 is a real epoch: only a missing value maps to -1 (``or -1`` turned 0 into -1).
+        "best_epoch": -1 if summary.get("best_epoch") is None else int(summary["best_epoch"]),
+        "last_epoch": -1 if summary.get("last_epoch") is None else int(summary["last_epoch"]),
         "vision_training_skipped": True,
         "skip_reason": "existing_task_vector_checkpoint",
         "existing_summary_path": (
