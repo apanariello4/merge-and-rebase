@@ -131,9 +131,14 @@ Fine-tuning configurations contain a `common` section and optional per-dataset o
 | `common.backbone` | `name`, `clip_model`, `clip_pretrained`. |
 | `common.data` | `batch_size`, `num_workers`, `val_fraction`, `pin_memory`. |
 | `common.train` | `epochs`, optimizer, `lr`, `weight_decay`, accumulation, scheduler, clipping, early stopping. |
-| `common.strategy` | strategy `name`, `forward_mode`, `forward_mode_params`, and strategy `params`. |
+| `common.strategy` | strategy `name`, `forward_mode`, `forward_mode_params`, and strategy `params` (`parameterization: weights\|delta`, `trainable_params: all_trainable\|regularized_only`). |
+| `common.regularization` | optional; one regularizer `name` (`distillation`, `kfac_ggn`, `ekfac_ggn`, `composite`) plus its parameters. See [fine-tuning.md](fine-tuning.md#regularization). |
 | `common.output` | output directory, save format, and last-epoch checkpoint behavior. |
 | `common.logging` | local log path and optional Weights & Biases configuration. |
 | `datasets` | per-task overrides for any `common` field. |
 
-Use `--suite`, `--datasets`, `--device`, and logging flags to override a fine-tuning configuration at runtime.
+Use `--suite`, `--datasets`, `--device`, and logging flags to override a fine-tuning configuration at runtime. For regularized runs, `--reference-suite`, `--reference-datasets`, and `--force-recompute` override the reference tasks and the curvature cache.
+
+Ready-made method presets live in `finetune/configs/TAK/` (linearized + `kfac_ggn`) and `finetune/configs/DELTA/{Full FT,LoRA}/` (`composite` of distillation and `ekfac_ggn`). There is one file per backbone (ViT-B/32, B/16, L/14) and suite (`vision8`, `vision14`, `vision20`). See [fine-tuning methods](fine-tuning.md#fine-tuning-methods).
+
+The merge configuration also accepts `forward_mode` (`auto` by default, `standard`, or `linearized_ntk`). `auto` chooses `linearized_ntk` only when every input checkpoint was trained linearized, as TAK checkpoints are.
