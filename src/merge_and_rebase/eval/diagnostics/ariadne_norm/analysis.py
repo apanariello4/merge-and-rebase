@@ -293,7 +293,10 @@ def procrustes_split_half(q_a: Tensor, q_b: Tensor, q_full: Tensor) -> dict[str,
     d_min = min(q_full.shape)
     return {
         "q_rel_diff": _frob(q_a - q_b) / _frob(q_full),
-        "q_overlap": float(((q_a.T @ q_b).norm() ** 2).item()) / d_min,
+        # Overlap of the d_min-dimensional subspaces the two partial isometries actually use (rows of Q when
+        # d_source <= d_target, columns otherwise); the other product is identically d_min and carries no information.
+        "q_overlap": float(((q_a @ q_b.T if q_full.shape[0] <= q_full.shape[1] else q_a.T @ q_b).norm() ** 2).item())
+        / d_min,
         "q_half_a_vs_full_rel_diff": _frob(q_a - q_full) / _frob(q_full),
     }
 

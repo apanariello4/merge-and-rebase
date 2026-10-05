@@ -346,3 +346,16 @@ def test_state_sha_handles_zero_dim_and_bf16_parameters():
     with torch.no_grad():
         model.logit_scale.add_(1e-3)
     assert _state_sha(model) != first
+
+
+@pytest.mark.parametrize("shape", [(3, 6), (6, 3)])
+def test_procrustes_overlap_is_informative_for_rectangular_maps(shape):
+    from merge_and_rebase.eval.diagnostics.ariadne_norm.analysis import procrustes_split_half
+
+    torch.manual_seed(0)
+    small, big = min(shape), max(shape)
+    a = torch.linalg.qr(torch.randn(big, big))[0][:, :small]
+    b = torch.linalg.qr(torch.randn(big, big))[0][:, :small]
+    qa, qb = (a.T, b.T) if shape[0] < shape[1] else (a, b)
+    assert procrustes_split_half(qa, qa, qa)["q_overlap"] == pytest.approx(1.0)
+    assert procrustes_split_half(qa, qb, qa)["q_overlap"] < 0.99
