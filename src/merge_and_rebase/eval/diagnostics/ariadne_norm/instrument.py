@@ -29,12 +29,16 @@ class FitRecorder:
         exact_form: bool,
         row_positions: Collection[int],
         token_index_fn: Callable[[int, int], Tensor],
+        token_split: bool = False,
     ) -> None:
         self.ridge_estimator = ridge_estimator
         self.ridge_relative = ridge_relative
         self.exact_form = exact_form
         self.row_positions = set(row_positions)
         self.token_index_fn = token_index_fn
+        # Second split (analysis only): halves by token-index parity within the SAME batches/images, next to the
+        # odd/even-batch split, to compare between-image and within-image variability of the fit.
+        self.token_split = token_split
         self.records: dict[int, dict[str, Any]] = {}
         self.arrays: dict[str, Tensor] = {}
 
@@ -51,6 +55,11 @@ class InstrumentedStatistics(ResidualSufficientStatistics):
         self.component = component
         self.recorder = recorder
         self.halves = [ResidualSufficientStatistics(device=device), ResidualSufficientStatistics(device=device)]
+        self.token_halves = (
+            [ResidualSufficientStatistics(device=device), ResidualSufficientStatistics(device=device)]
+            if recorder.token_split
+            else []
+        )
         self.n_updates = 0
         self.keep_rows = position in recorder.row_positions
         self.h_rows: list[Tensor] = []
@@ -63,6 +72,10 @@ class InstrumentedStatistics(ResidualSufficientStatistics):
             raise ValueError("instrumented statistics expect pre-masked rows (row_mask=None), as Pass B passes them")
         k = self.n_updates
         self.halves[k % 2].update(h, e, t_in, t_out)
+        if self.token_halves:
+            parity = (self.recorder.token_index_fn(k, int(h.shape[0])) % 2).to(torch.bool)
+            self.token_halves[0].update(h, e, t_in, t_out, row_mask=~parity)
+            self.token_halves[1].update(h, e, t_in, t_out, row_mask=parity)
         if self.keep_rows:
             self.h_rows.append(h.detach().float().cpu())
             self.e_rows.append(e.detach().float().cpu())
@@ -87,6 +100,10 @@ class InstrumentedStatistics(ResidualSufficientStatistics):
         record["n7_regression"] = split_half_stability(
             self, self.halves, ridge_estimator=rec.ridge_estimator, ridge_relative=rec.ridge_relative
         )
+        if self.token_halves:
+            record["n7_regression_token_split"] = split_half_stability(
+                self, self.token_halves, ridge_estimator=rec.ridge_estimator, ridge_relative=rec.ridge_relative
+            )
         if self.keep_rows:
             record["n5"] = row_concentration(
                 torch.cat(self.h_rows),
@@ -103,4 +120,5 @@ class InstrumentedStatistics(ResidualSufficientStatistics):
             rec.arrays[f"pos{self.position}.{self.component}.{name}"] = value
         rec.records[self.position] = record
         self.halves = []
+        self.token_halves = []
         return x, diag

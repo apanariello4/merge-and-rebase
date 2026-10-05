@@ -359,3 +359,65 @@ def test_procrustes_overlap_is_informative_for_rectangular_maps(shape):
     qa, qb = (a.T, b.T) if shape[0] < shape[1] else (a, b)
     assert procrustes_split_half(qa, qa, qa)["q_overlap"] == pytest.approx(1.0)
     assert procrustes_split_half(qa, qb, qa)["q_overlap"] < 0.99
+
+
+def test_token_split_partitions_statistics():
+    config = _config()
+    captured = {}
+
+    class _Spy(FitRecorder):
+        def factory(self, position, component, device):
+            stats = super().factory(position, component, device)
+            captured[position] = stats
+            return stats
+
+    recorder = _Spy(
+        ridge_estimator=config.ridge_estimator,
+        ridge_relative=config.ridge_relative,
+        exact_form=True,
+        row_positions=(),
+        token_index_fn=lambda k, n: torch.arange(5).repeat(n // 5),
+        token_split=True,
+    )
+    import merge_and_rebase.eval.diagnostics.ariadne_norm.instrument as inst
+
+    seen = {}
+    old = inst.InstrumentedStatistics.solve
+
+    def solve_spy(self, **kwargs):
+        seen[self.position] = list(self.token_halves)
+        return old(self, **kwargs)
+
+    inst.InstrumentedStatistics.solve = solve_spy
+    try:
+        _fit(_setup(2, 4), config, stats_factory=recorder.factory)
+    finally:
+        inst.InstrumentedStatistics.solve = old
+    for j, stats in captured.items():
+        a, b = seen[j]
+        assert a.n_rows + b.n_rows == stats.n_rows
+        assert torch.allclose(a.s + b.s, stats.s, rtol=1e-12, atol=1e-12)
+        assert torch.allclose(a.b + b.b, stats.b, rtol=1e-12, atol=1e-12)
+        assert "n7_regression_token_split" in recorder.records[j]
+
+
+@pytest.mark.parametrize(("sd", "td"), REGIMES)
+def test_run_task_token_split_without_realization(sd, td):
+    config = _config()
+    plain, _ = _fit(_setup(sd, td), config)
+    inp = _inputs(sd, td, config)
+    inp.reference_task_vector = plain
+    record, _, tv = run_task(inp, alpha_grid=[1.0], row_positions=[], measure_realization=False, token_split=True)
+    assert record["n0"]["task_vector"]["reference"]["sha256_equal"]
+    assert "n2" not in record and "n6" not in record and record["n5"] == {}
+    for j in range(td):
+        assert "procrustes_token_split" in record["n7"][j]
+        assert "regression_token_split" in record["n7"][j]
+        assert 0.0 <= record["n7"][j]["procrustes_token_split"]["desired_rel_diff"]
+
+
+def test_run_task_defaults_have_no_token_split_fields():
+    config = _config()
+    record, _, _ = run_task(_inputs(2, 4, config), alpha_grid=[1.0], row_positions=[])
+    assert "n2" in record and "n6" in record
+    assert all("procrustes_token_split" not in v and "regression_token_split" not in v for v in record["n7"].values())

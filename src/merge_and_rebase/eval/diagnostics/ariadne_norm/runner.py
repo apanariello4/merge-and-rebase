@@ -181,13 +181,24 @@ def norm_profile(inp: DiagnosticInputs, corrections: Mapping[str, Tensor], rows:
     }
 
 
-def _cache_sweep(inp: DiagnosticInputs, prepared: Mapping[str, Any]) -> tuple[list[dict[int, Tensor]], dict]:
-    """Aligned source displacements per batch and odd/even Procrustes maps (N7-Procrustes)."""
+def _cache_sweep(
+    inp: DiagnosticInputs, prepared: Mapping[str, Any], *, token_split: bool = False
+) -> tuple[list[dict[int, Tensor]], dict]:
+    """Aligned source displacements per batch and odd/even Procrustes maps (N7-Procrustes).
+
+    ``token_split`` adds a second pair of maps from token-index-parity halves of the SAME batches (every image in
+    both halves), keyed ``_qa_token`` / ``_qb_token``.
+    """
     pairing = inp.pairing
     distinct = sorted(set(pairing.pairing))
     src_req = {str(i): (i, "boundary") for i in distinct}
     tgt_req = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
     halves = [{j: _StreamingCrossCovariance(device=inp.device) for j in range(pairing.target_depth)} for _ in range(2)]
+    token_halves = (
+        [{j: _StreamingCrossCovariance(device=inp.device) for j in range(pairing.target_depth)} for _ in range(2)]
+        if token_split
+        else []
+    )
     gens = [
         iter_capture_tokens(
             inp.source_base_model,
@@ -230,13 +241,23 @@ def _cache_sweep(inp: DiagnosticInputs, prepared: Mapping[str, Any]) -> tuple[li
                 i = pairing.pairing[j]
                 t = tgt[str(j)]
                 x = _aligned([sb[str(i)]], [t])[0]
-                halves[k % 2][j].update(x.reshape(-1, x.shape[-1]).double(), t.reshape(-1, t.shape[-1]).double())
+                x_rows, y_rows = x.reshape(-1, x.shape[-1]).double(), t.reshape(-1, t.shape[-1]).double()
+                halves[k % 2][j].update(x_rows, y_rows)
+                if token_halves:
+                    odd = (inp.token_index(prepared["target_batches"][k], int(y_rows.shape[0])) % 2).to(torch.bool)
+                    token_halves[0][j].update(x_rows, y_rows, row_mask=~odd.to(x_rows.device))
+                    token_halves[1][j].update(x_rows, y_rows, row_mask=odd.to(x_rows.device))
     q_full = prepared["activation_q64_by_position"]
     stability = {}
     for j in range(pairing.target_depth):
         qa = _procrustes_from_cross(halves[0][j].cross()).cpu()
         qb = _procrustes_from_cross(halves[1][j].cross()).cpu()
         stability[j] = {"q": procrustes_split_half(qa, qb, q_full[j]), "_qa": qa.float(), "_qb": qb.float()}
+        if token_halves:
+            qa_t = _procrustes_from_cross(token_halves[0][j].cross()).cpu()
+            qb_t = _procrustes_from_cross(token_halves[1][j].cross()).cpu()
+            stability[j]["q_token_split"] = procrustes_split_half(qa_t, qb_t, q_full[j])
+            stability[j]["_qa_token"], stability[j]["_qb_token"] = qa_t.float(), qb_t.float()
     return cache, stability
 
 
@@ -293,8 +314,14 @@ def run_task(
     alpha_grid: Sequence[float],
     row_positions: Sequence[int],
     generic_alphas: Sequence[float] | None = None,
+    measure_realization: bool = True,
+    token_split: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Tensor], dict[str, Tensor]]:
-    """Returns ``(record, arrays, task_vector)`` for one task."""
+    """Returns ``(record, arrays, task_vector)`` for one task.
+
+    ``measure_realization=False`` skips the mount sweeps (N2, N6); ``token_split`` adds token-parity split halves to
+    N7 (regression and Procrustes) next to the odd/even-batch split.
+    """
     cfg = inp.config
     check_supported_config(cfg)
     entry_sha = _state_sha(inp.target_model)
@@ -322,6 +349,7 @@ def run_task(
         exact_form=cfg.exact_form,
         row_positions=row_positions,
         token_index_fn=lambda k, n: inp.token_index(target_batches[k], n),
+        token_split=token_split,
     )
     corrections, rows = fit_direct_residual_streaming(
         inp.target_model,
@@ -375,7 +403,7 @@ def run_task(
     record["n5"] = {j: r["n5"] for j, r in sorted(recorder.records.items()) if "n5" in r}
     record["n7"] = {j: {"regression": r["n7_regression"]} for j, r in sorted(recorder.records.items())}
 
-    cache, q_stability = _cache_sweep(inp, prepared)
+    cache, q_stability = _cache_sweep(inp, prepared, token_split=token_split)
     q_by_position = prepared["q_by_position"]
     for j, value in q_stability.items():
         # Desired-effect stability under the half maps, measured on all calibration batches.
@@ -386,61 +414,75 @@ def run_task(
             num += float(((da - db).double() ** 2).sum())
             den += float((df.double() ** 2).sum())
         record["n7"][j]["procrustes"] = {**value["q"], "desired_rel_diff": (num / den) ** 0.5 if den > 0 else 0.0}
+        if "_qa_token" in value:
+            num_t = 0.0
+            for cache_k in cache:
+                ds = cache_k[inp.pairing.pairing[j]]
+                num_t += float(((ds @ value["_qa_token"] - ds @ value["_qb_token"]).double() ** 2).sum())
+            record["n7"][j]["procrustes_token_split"] = {
+                **value["q_token_split"],
+                "desired_rel_diff": (num_t / den) ** 0.5 if den > 0 else 0.0,
+            }
+        if "n7_regression_token_split" in recorder.records.get(j, {}):
+            record["n7"][j]["regression_token_split"] = recorder.records[j]["n7_regression_token_split"]
 
-    positions = list(range(inp.pairing.target_depth))
+    if measure_realization:
+        positions = list(range(inp.pairing.target_depth))
 
-    def desired_fn(k, j):
-        return _desired(cache[k], inp.pairing, q_by_position, j)
+        def desired_fn(k, j):
+            return _desired(cache[k], inp.pairing, q_by_position, j)
 
-    mounted = copy.deepcopy(inp.target_model)
-    try:
-        joint = {}
-        for alpha in alpha_grid:
-            joint[float(alpha)] = _measure(
-                inp, mounted, corrections, float(alpha), target_batches, positions, desired_fn
+        mounted = copy.deepcopy(inp.target_model)
+        try:
+            joint = {}
+            for alpha in alpha_grid:
+                joint[float(alpha)] = _measure(
+                    inp, mounted, corrections, float(alpha), target_batches, positions, desired_fn
+                )
+            own = {}
+            for j in positions:
+                wk = inp.component_key(j)
+                delta_j = {k: v for k, v in corrections.items() if k in (wk, _bias_key(wk))}
+                own[j] = _measure(inp, mounted, delta_j, 1.0, target_batches, positions[j:], desired_fn)
+            generic = {}
+            alphas_generic = sorted(
+                {1.0, *([inp.alpha_star] if inp.alpha_star is not None else []), *(generic_alphas or [])}
             )
-        own = {}
-        for j in positions:
-            wk = inp.component_key(j)
-            delta_j = {k: v for k, v in corrections.items() if k in (wk, _bias_key(wk))}
-            own[j] = _measure(inp, mounted, delta_j, 1.0, target_batches, positions[j:], desired_fn)
-        generic = {}
-        alphas_generic = sorted(
-            {1.0, *([inp.alpha_star] if inp.alpha_star is not None else []), *(generic_alphas or [])}
-        )
-        for alpha in alphas_generic:
-            generic[float(alpha)] = {
-                "generic": _measure(inp, mounted, corrections, alpha, inp.generic_target_batches, positions),
-                "calibration": joint.get(float(alpha))
-                or _measure(inp, mounted, corrections, alpha, target_batches, positions, desired_fn),
-            }
-    finally:
-        del mounted
-    record["n2"] = {
-        "alpha_star": inp.alpha_star,
-        "joint_by_alpha": {a: rows_a for a, rows_a in joint.items()},
-        "label_free_alpha": label_free_alpha(joint),
-        "single_block": {
-            j: {
-                "own_r": own[j][j]["r"],
-                "own_cos": own[j][j]["cos"],
-                "own_relative_error": own[j][j]["relative_error"],
-                "projection_by_position": {jj: own[j][jj]["projection_coefficient"] for jj in own[j]},
-                "r_by_position": {jj: own[j][jj]["r"] for jj in own[j]},
-            }
-            for j in positions
-        },
-    }
-    # Superposition check: sum over k<=j of block k's projection onto D_j against the joint projection at alpha=1.
-    if 1.0 in joint:
-        record["n2"]["superposition"] = {
-            j: {
-                "sum_single_projection": sum(own[k][j]["projection_coefficient"] or 0.0 for k in positions if k <= j),
-                "joint_projection": joint[1.0][j]["projection_coefficient"],
-            }
-            for j in positions
+            for alpha in alphas_generic:
+                generic[float(alpha)] = {
+                    "generic": _measure(inp, mounted, corrections, alpha, inp.generic_target_batches, positions),
+                    "calibration": joint.get(float(alpha))
+                    or _measure(inp, mounted, corrections, alpha, target_batches, positions, desired_fn),
+                }
+        finally:
+            del mounted
+        record["n2"] = {
+            "alpha_star": inp.alpha_star,
+            "joint_by_alpha": {a: rows_a for a, rows_a in joint.items()},
+            "label_free_alpha": label_free_alpha(joint),
+            "single_block": {
+                j: {
+                    "own_r": own[j][j]["r"],
+                    "own_cos": own[j][j]["cos"],
+                    "own_relative_error": own[j][j]["relative_error"],
+                    "projection_by_position": {jj: own[j][jj]["projection_coefficient"] for jj in own[j]},
+                    "r_by_position": {jj: own[j][jj]["r"] for jj in own[j]},
+                }
+                for j in positions
+            },
         }
-    record["n6"] = generic
+        # Superposition check: sum over k<=j of block k's projection onto D_j against the joint projection at alpha=1.
+        if 1.0 in joint:
+            record["n2"]["superposition"] = {
+                j: {
+                    "sum_single_projection": sum(
+                        own[k][j]["projection_coefficient"] or 0.0 for k in positions if k <= j
+                    ),
+                    "joint_projection": joint[1.0][j]["projection_coefficient"],
+                }
+                for j in positions
+            }
+        record["n6"] = generic
     exit_sha = _state_sha(inp.target_model)
     if exit_sha != entry_sha:
         raise RuntimeError("target model state changed during the diagnostics")

@@ -9,6 +9,8 @@ Config keys:
 - ``alpha_grid``: alphas for the joint realization curve (N2).
 - ``row_positions``: target positions whose row banks are kept for N5, or ``"auto"`` (4 positions spread over depth).
 - ``generic_num_batches``: off-task batches for N6. Family-specific keys are documented in the adapter modules.
+- ``measure_realization`` (default true): false skips the mount sweeps (N2, N6).
+- ``token_split`` (default false): also split N7 by token-index parity within the same batches.
 
 Per task: ``<out_dir>/<task>/record.json``, ``arrays.pt`` (spectra) and the reproduced unit task vector under
 ``<out_dir>/transported_tvs``. ``<out_dir>/run.json`` records config hash, code fingerprint and timings.
@@ -94,7 +96,11 @@ def main(argv: list[str] | None = None) -> None:
         rows = cfg.get("row_positions", "auto")
         row_positions = auto_row_positions(inp.pairing.target_depth) if rows == "auto" else [int(r) for r in rows]
         record, arrays, tv = run_task(
-            inp, alpha_grid=[float(a) for a in cfg["alpha_grid"]], row_positions=row_positions
+            inp,
+            alpha_grid=[float(a) for a in cfg["alpha_grid"]],
+            row_positions=row_positions,
+            measure_realization=bool(cfg.get("measure_realization", True)),
+            token_split=bool(cfg.get("token_split", False)),
         )
         task_dir = out_dir / inp.task
         task_dir.mkdir()
