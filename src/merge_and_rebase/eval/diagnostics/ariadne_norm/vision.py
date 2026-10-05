@@ -170,8 +170,16 @@ def _build_clf(
     return OpenClipClassifier.build(build), build
 
 
-def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
-    """Yield one `DiagnosticInputs` per requested task, reproducing the reference run's Ariadne fit inputs."""
+def build_vision_inputs(
+    cfg: dict, device: str, *, context_sink: dict[str, Any] | None = None
+) -> Iterator[DiagnosticInputs]:
+    """Yield one `DiagnosticInputs` per requested task, reproducing the reference run's Ariadne fit inputs.
+
+    ``context_sink`` (optional, for evaluation diagnostics such as ``readout``): when a dict is given it is cleared and
+    refilled right before each yield with ``task``, ``eval_context`` (the task's own `_TaskContext`: target/source
+    val and test loaders, class names, build configs), ``target_clf`` / ``source_clf``, ``resolved`` and ``summary``
+    (the parsed reference summary). Nothing else changes; ``None`` (default) reproduces the previous behaviour.
+    """
     if cfg.get("num_batches_override") is not None:
         raise NotImplementedError("num_batches_override: the diagnostics only reproduce the reference run's fit")
     summary_path = Path(cfg["reference_summary"]).resolve()
@@ -331,13 +339,17 @@ def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
         )
         del per_task
 
-    generic_batches, generic_provenance = _generic_target_batches(
-        suite=resolved.suite,
-        clf_target=target_clf,
-        ref_cfg=ref_cfg,
-        num_batches=int(cfg.get("generic_num_batches", 10)),
-        seed=int(cfg.get("generic_seed", 0)),
-    )
+    # ``generic_num_batches: 0`` skips the N6 off-task batches (the readout diagnostic does not use them).
+    if int(cfg.get("generic_num_batches", 10)) > 0:
+        generic_batches, generic_provenance = _generic_target_batches(
+            suite=resolved.suite,
+            clf_target=target_clf,
+            ref_cfg=ref_cfg,
+            num_batches=int(cfg.get("generic_num_batches", 10)),
+            seed=int(cfg.get("generic_seed", 0)),
+        )
+    else:
+        generic_batches, generic_provenance = [], {"skipped": True}
 
     component_key = lambda j: _layout_for(None).component_key(int(j), _COMPONENT, prefixed=True)  # noqa: E731
     unit_vector_ok = float(config.strength) == 1.0 and config.tv_scaling == "none"
@@ -361,7 +373,10 @@ def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
         load_into_model(source_ft_model, raw_sd, strict=False)
         del raw_sd
 
+        eval_ctx: _TaskContext | None = None
         if shared_ctx is not None:
+            if context_sink is not None:
+                eval_ctx = task_context(task)
             source_loader = shared_ctx.source_loaders.train
             target_loader = shared_ctx.loaders.train
             calibration_source = {"kind": shared_meta.get("calibration_data"), "meta": shared_meta}
@@ -380,6 +395,7 @@ def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
                 val_loader=ctx.loaders.val,
             )
             calibration_source = {"kind": "task_local", "split": "train"}
+            eval_ctx = ctx if context_sink is not None else None
             del ctx
 
         vector_path = reference_vector_path(run_dir, task)
@@ -432,6 +448,16 @@ def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
                 "target_depth": target_depth,
             },
         }
+        if context_sink is not None:
+            context_sink.clear()
+            context_sink.update(
+                task=task,
+                eval_context=eval_ctx,
+                target_clf=target_clf,
+                source_clf=source_clf,
+                resolved=resolved,
+                summary=summary,
+            )
         yield DiagnosticInputs(
             family="vision",
             task=task,
@@ -455,4 +481,4 @@ def build_vision_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
             provenance=provenance,
         )
         # Drop this task's references before the next ones are built (peak memory).
-        del source_base_model, source_ft_model, source_loader, target_loader, reference_tv
+        del source_base_model, source_ft_model, source_loader, target_loader, reference_tv, eval_ctx
