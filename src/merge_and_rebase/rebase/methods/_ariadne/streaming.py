@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import math
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -342,6 +343,28 @@ def prepare_direct_residual_streaming(
     }
 
 
+def _check_boundary_fingerprint(out, expected, config, pos, k) -> None:
+    """Raise if the captured target boundary ``out`` does not match Pass A's ``(sum, sumsq)`` fingerprint."""
+    out64 = out.double()
+    fp_sum = float(out64.sum().item())
+    fp_sumsq = float((out64**2).sum().item())
+    exp_sum, exp_sumsq = expected
+    scale = math.sqrt(exp_sumsq) if exp_sumsq > 0 else 1.0
+    tol = float(config.streaming_fingerprint_tol)
+    sumsq_ok = math.isclose(fp_sumsq, exp_sumsq, rel_tol=tol, abs_tol=tol)
+    sum_ok = abs(fp_sum - exp_sum) <= tol * max(scale, 1.0)
+    if not (sumsq_ok and sum_ok):
+        drift_sumsq = abs(fp_sumsq - exp_sumsq) / max(abs(exp_sumsq), 1e-300)
+        drift_sum = abs(fp_sum - exp_sum) / max(scale, 1.0)
+        raise RuntimeError(
+            "Direct completion started from a target model that is not the "
+            f"native base: target boundary fingerprint mismatch between "
+            f"pass A and pass B at position {pos} (batch {k}); relative drift "
+            f"sumsq={drift_sumsq:.3e}, sum={drift_sum:.3e} vs "
+            f"streaming_fingerprint_tol={tol:.3e}"
+        )
+
+
 @torch.no_grad()
 def fit_direct_residual_streaming(
     target_model,
@@ -463,24 +486,7 @@ def fit_direct_residual_streaming(
                     for pos in chunk:
                         i = pairing.pairing[pos]
                         out = tgt[f"{pos}.out"]
-                        out64 = out.double()
-                        fp_sum = float(out64.sum().item())
-                        fp_sumsq = float((out64**2).sum().item())
-                        exp_sum, exp_sumsq = fingerprints[(k, pos)]
-                        scale = math.sqrt(exp_sumsq) if exp_sumsq > 0 else 1.0
-                        tol = float(config.streaming_fingerprint_tol)
-                        sumsq_ok = math.isclose(fp_sumsq, exp_sumsq, rel_tol=tol, abs_tol=tol)
-                        sum_ok = abs(fp_sum - exp_sum) <= tol * max(scale, 1.0)
-                        if not (sumsq_ok and sum_ok):
-                            drift_sumsq = abs(fp_sumsq - exp_sumsq) / max(abs(exp_sumsq), 1e-300)
-                            drift_sum = abs(fp_sum - exp_sum) / max(scale, 1.0)
-                            raise RuntimeError(
-                                "Direct completion started from a target model that is not the "
-                                f"native base: target boundary fingerprint mismatch between "
-                                f"pass A and pass B at position {pos} (batch {k}); relative drift "
-                                f"sumsq={drift_sumsq:.3e}, sum={drift_sum:.3e} vs "
-                                f"streaming_fingerprint_tol={tol:.3e}"
-                            )
+                        _check_boundary_fingerprint(out, fingerprints[(k, pos)], config, pos, k)
                         # Align on CPU, as the resident path does on its CPU banks, so D_j stays bit-comparable.
                         out_cpu = out.cpu()
                         b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
@@ -539,6 +545,157 @@ def fit_direct_residual_streaming(
         for mid, m in unique_models.items():
             orig_device, orig_training = originals[mid]
             m.to(orig_device).train(orig_training)
+    return target_corrections, diagnostics
+
+
+@torch.no_grad()
+def fit_direct_residual_sequential_streaming(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    source_base_model,
+    source_ft_model,
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
+    """Sequential-across-depth variant of `fit_direct_residual_streaming` (``depth_fit="sequential"``).
+
+    Pass A (`prepare_direct_residual_streaming`) is unchanged. Blocks are then fitted in order ``j = 0..N-1``; before
+    block ``j`` the target holds the base plus the already-fitted unit-strength updates of blocks ``0..j-1``. Per
+    calibration batch (source base, source FT, current target and a pristine target copy swept in lockstep) it
+    forms ``D_j`` exactly as Pass B does, the upstream effect ``U_j = out_current_j - out_pristine_j`` at boundary
+    ``j`` and the residual target ``E_j = D_j - U_j``, accumulates ``ResidualSufficientStatistics(h_current, E_j)``
+    and solves with the same ridge configuration. Block ``j``'s own update moves boundary ``j`` by exactly
+    ``H_j dW_j + 1 beta_j^T`` (its projection input does not depend on that projection) and later blocks do not
+    affect boundary ``j``, so after the full fit the mounted realized error at boundary ``j`` equals block ``j``'s
+    fit residual. Block 0 (no upstream) is bit-identical to the independent fit.
+
+    Rows follow the independent schema plus ``depth_fit="sequential"`` and ``upstream_effect_norm``
+    (``sqrt(sum ||U_j||^2)``; ``effect_before_norm`` stays 0 because the solver is called with a zero pre-fit
+    effect). Returns ``(corrections, rows)``. The target model's entry state and placement are restored in a
+    ``finally``. A pristine deep copy of the target model is held for the duration (extra model memory).
+    """
+    if pairing.target_depth < 1:
+        raise ValueError("pairing.target_depth must be positive")
+    if config.depth_fit != "sequential":
+        raise ValueError("fit_direct_residual_sequential_streaming requires depth_fit='sequential'")
+    components = order_components(config.components)
+    if len(components) != 1:
+        raise ValueError("depth_fit='sequential' requires exactly one component")
+    component = components[0]
+    batches = prepared["target_batches"]
+    source_batches = prepared["source_batches"]
+    q_by_position = prepared["q_by_position"]
+    fingerprints = prepared["fingerprints"]
+    positions = list(range(pairing.target_depth))
+    for j in positions:
+        if j not in q_by_position:
+            raise ValueError(f"Missing prepared Procrustes map for position {j}")
+    source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
+    shim = _layout_for(family_adapter)
+
+    unique_models: dict[int, Any] = {}
+    for m in (target_model, source_base_model, source_ft_model):
+        unique_models.setdefault(id(m), m)
+    originals = {mid: (next(m.parameters()).device, m.training) for mid, m in unique_models.items()}
+
+    original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    target_corrections: dict[str, Tensor] = {}
+    diagnostics: list[dict[str, Any]] = []
+    pristine_model = None
+    try:
+        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        target_model.load_state_dict(current_state, strict=True)
+        # Frozen copy holding exactly the base state: the reference for U_j, and (when a source model is the same
+        # object as the target) the source model, which must not see the mounted updates.
+        pristine_model = deepcopy(target_model)
+        pristine_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
+        sb_model = pristine_model if source_base_model is target_model else source_base_model
+        sf_model = pristine_model if source_ft_model is target_model else source_ft_model
+        for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
+            m.to(device).eval()
+
+        for pos in positions:
+            i = pairing.pairing[pos]
+            q = q_by_position[pos]
+            key = shim.component_key(pos, component, prefixed=True)
+            width = int(current_state[key].shape[0])
+            effective_out = _component_effective_out(shim, target_model, pos, component, width)
+            stats = ResidualSufficientStatistics(device=device)
+            desired_sq = 0.0
+            upstream_sq = 0.0
+            src_requests = {str(i): (i, "boundary")}
+            out_key, h_key = f"{pos}.out", f"{pos}.{component}.h"
+            tgt_requests = {out_key: (pos, "boundary"), h_key: (pos, COMPONENT_INPUT_KIND[component])}
+            ref_requests = {out_key: (pos, "boundary")}
+            gens = (
+                iter_capture_tokens(
+                    sb_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    sf_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    pristine_model, batches, ref_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+            )
+            with contextlib.ExitStack() as stack:
+                for gen in gens:
+                    stack.enter_context(contextlib.closing(gen))
+                for k, (sb, sf, tgt, ref) in enumerate(zip(*gens, strict=True)):
+                    # The pristine copy's boundary must match Pass A's fingerprint (detects a mutated base).
+                    _check_boundary_fingerprint(ref[out_key], fingerprints[(k, pos)], config, pos, k)
+                    out_cpu = tgt[out_key].cpu()
+                    b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
+                    f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
+                    desired = (f - b) @ q
+                    upstream = out_cpu - ref[out_key].cpu()
+                    error = desired - upstream
+                    desired_sq += float((desired.double() ** 2).sum().item())
+                    upstream_sq += float((upstream.double() ** 2).sum().item())
+                    h = tgt[h_key].cpu()
+                    stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+
+            position_corrections: dict[str, Tensor] = {}
+            block_rows: list[dict[str, Any]] = []
+            # effect_sq=0.0: the upstream effect is intentional here (it is part of the residual target), so the
+            # pristine-effect check does not apply; the true value is recorded as ``upstream_effect_norm``.
+            _finalize_independent_component(
+                stats,
+                desired_sq,
+                0.0,
+                pos,
+                component,
+                key,
+                current_state,
+                effective_out,
+                config,
+                source_coordinates,
+                position_corrections,
+                block_rows,
+                h_batches=None,
+            )
+            target_corrections.update(position_corrections)
+            for row in block_rows:
+                row["source_position"] = row.pop("source_coordinate")
+                row["procrustes_source"] = prepared.get("procrustes_source", "activation")
+                row["depth_fit"] = "sequential"
+                row["upstream_effect_norm"] = upstream_sq**0.5
+                diagnostics.append(row)
+            # Mount this block's update (weight and bias, as updated in current_state) before the next block.
+            target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+        for mid, m in unique_models.items():
+            orig_device, orig_training = originals[mid]
+            m.to(orig_device).train(orig_training)
+        del pristine_model
     return target_corrections, diagnostics
 
 

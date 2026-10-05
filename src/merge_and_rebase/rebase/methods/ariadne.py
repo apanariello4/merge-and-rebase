@@ -62,6 +62,7 @@ from ._ariadne.fit import (
 from ._ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
     compute_gradient_delta_disagreement_streaming,
+    fit_direct_residual_sequential_streaming,
     fit_direct_residual_streaming,
     measure_streaming_realization_for,
     prepare_direct_residual_streaming,
@@ -294,7 +295,12 @@ def _fit_body(
             family_adapter=family_adapter,
         )
     elif streaming:
-        target_corrections, diagnostics = fit_direct_residual_streaming(
+        fit_streaming = (
+            fit_direct_residual_sequential_streaming
+            if config.depth_fit == "sequential"
+            else fit_direct_residual_streaming
+        )
+        target_corrections, diagnostics = fit_streaming(
             target_model,
             target_base_sd,
             source_base_model,
@@ -588,6 +594,7 @@ __all__ = [
     "compute_fidelity_holdout_diagnostics",
     "draw_fidelity_holdout_calibration",
     "fit_direct_residual",
+    "fit_direct_residual_sequential_streaming",
     "fit_direct_residual_streaming",
     "fit_sequential_source_endpoints",
     "iter_capture_block_gradients",

@@ -166,6 +166,7 @@ method; **retired** = rejected with an error; **kept** = supported but not used 
 | `depth_pairing` | `"relative"` | `relative`, `spread_duplicate`, `reversed`, `shift_plus1`, `shift_minus1` | main: `relative`; the others are ablations that change both `D_j` and `Q_j` |
 | `streaming_fingerprint_tol` | `1e-9` | positive float | streaming check that the target model was not mutated between capture passes; serialized only when non-default |
 | `copy_shape_matching_source_deltas` | `false` | bool | ablation: add shape-matching source deltas of non-fitted parameters to the task vector; serialized only when true |
+| `depth_fit` | `"independent"` | `independent`, `sequential` | ablation: `sequential` fits blocks in order, block `j` on the target already carrying the fitted updates of blocks `< j` (residual target `D_j - U_j`, `U_j` the upstream effect at boundary `j`); streaming, one component, `transported_delta`, no `tv_scaling`; serialized only when non-default |
 | `activation_storage` | `"resident"` | `resident`, `streaming` | main: `streaming` (preset). See [storage paths](#storage-paths) |
 | `streaming_position_chunk` | `null` | `null` or positive integer | streaming only: fit target positions in chunks (one capture sweep each) to bound host memory |
 | `block_split` | `"none"` | `none`, `backfit`, `joint` | main: `none`. `joint` is an ablation (closed-form joint ridge over attention and MLP projections; equals `none` for one component). `backfit` is kept but not used in current experiments |

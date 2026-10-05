@@ -121,11 +121,20 @@ class DirectResidualConfig:
     # Ablation (default off): besides the fit, also copy source task-vector deltas whose shapes match the target's
     # (decoder/LLM runs; by default the Ariadne task vector is only its own fit). Serialized only when True.
     copy_shape_matching_source_deltas: bool = False
+    # Ablation: how blocks are fitted across depth. 'independent' (default): every block fitted against the pristine
+    # target base (golden-hash pinned). 'sequential': blocks fitted in order, block j against the target already
+    # carrying the fitted updates of blocks < j (residual target D_j - U_j); streaming path only (see
+    # streaming.fit_direct_residual_sequential_streaming). Serialized only when non-default.
+    depth_fit: str = "independent"
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
 # artifact and golden hash of a default run stays byte-identical.
-_SERIALIZED_WHEN_NON_DEFAULT = {"streaming_fingerprint_tol": 1e-9, "copy_shape_matching_source_deltas": False}
+_SERIALIZED_WHEN_NON_DEFAULT = {
+    "streaming_fingerprint_tol": 1e-9,
+    "copy_shape_matching_source_deltas": False,
+    "depth_fit": "independent",
+}
 
 
 def direct_residual_config_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
@@ -215,6 +224,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "fidelity_holdout_batches",
         "streaming_fingerprint_tol",
         "copy_shape_matching_source_deltas",
+        "depth_fit",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -408,6 +418,27 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     tol = cfg.streaming_fingerprint_tol
     if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
         raise ValueError("streaming_fingerprint_tol must be a positive finite number")
+    if cfg.depth_fit not in {"independent", "sequential"}:
+        raise ValueError("depth_fit must be 'independent' or 'sequential'")
+    if cfg.depth_fit == "sequential":
+        required = {
+            "activation_storage": "streaming",
+            "block_split": "none",
+            "tv_scaling": "none",
+            "endpoint_construction": "native_delta",
+            "merge_mode": "per_task_then_merge",
+            "procrustes_source": "activation",
+            "residual_target": "transported_delta",
+            "fidelity_holdout": False,
+            "realization_diagnostics": False,
+        }
+        bad = {name: getattr(cfg, name) for name, want in required.items() if getattr(cfg, name) != want}
+        if len(components) != 1:
+            bad["components"] = components
+        if bad:
+            raise ValueError(
+                f"depth_fit='sequential' requires {required} and exactly one component; got incompatible {bad}"
+            )
     return cfg
 
 
