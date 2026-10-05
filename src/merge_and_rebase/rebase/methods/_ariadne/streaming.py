@@ -354,6 +354,7 @@ def fit_direct_residual_streaming(
     config: DirectResidualConfig,
     device,
     family_adapter=None,
+    stats_factory=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Streaming (Pass B) equivalent of ``fit_direct_residual``.
 
@@ -368,6 +369,10 @@ def fit_direct_residual_streaming(
     a lockstep sweep over source_base / source_ft / target `iter_capture_tokens` generators, re-deriving
     ``desired = (f - b) @ q_j`` per batch from `prepared`'s maps and checking the captured target boundary against
     `prepared`'s fingerprint before using it as ``base_out`` (no resident base-output bank to diff against).
+
+    ``stats_factory(position, component, device)`` (analysis only, default ``None``) builds the per-(position,
+    component) accumulator in place of ``ResidualSufficientStatistics(device=device)``; it must return a subclass
+    that leaves ``update``/``solve`` numerically unchanged, so the fit and its hash do not depend on it.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
@@ -426,7 +431,11 @@ def fit_direct_residual_streaming(
                     width = int(current_state[key].shape[0])
                     pair = (pos, component)
                     effective_out[pair] = _component_effective_out(shim, target_model, pos, component, width)
-                    stats_by[pair] = ResidualSufficientStatistics(device=device)
+                    stats_by[pair] = (
+                        ResidualSufficientStatistics(device=device)
+                        if stats_factory is None
+                        else stats_factory(pos, component, device)
+                    )
                     desired_sq[pair] = 0.0
                     effect_sq[pair] = 0.0
 
