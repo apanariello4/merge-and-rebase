@@ -281,7 +281,8 @@ def _state_sha(model: torch.nn.Module) -> str:
     h = hashlib.sha256()
     for key, value in sorted(model.state_dict().items()):
         h.update(key.encode())
-        h.update(value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+        h.update(str(value.dtype).encode())
+        h.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 

@@ -93,7 +93,9 @@ def main(argv: list[str] | None = None) -> None:
             torch.cuda.reset_peak_memory_stats()
         rows = cfg.get("row_positions", "auto")
         row_positions = auto_row_positions(inp.pairing.target_depth) if rows == "auto" else [int(r) for r in rows]
-        record, arrays, tv = run_task(inp, alpha_grid=[float(a) for a in cfg["alpha_grid"]], row_positions=row_positions)
+        record, arrays, tv = run_task(
+            inp, alpha_grid=[float(a) for a in cfg["alpha_grid"]], row_positions=row_positions
+        )
         task_dir = out_dir / inp.task
         task_dir.mkdir()
         (task_dir / "record.json").write_text(json.dumps(_jsonable(record), indent=1, sort_keys=True))

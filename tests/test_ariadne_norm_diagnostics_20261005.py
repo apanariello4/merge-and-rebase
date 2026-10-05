@@ -333,3 +333,16 @@ def test_run_task_end_to_end(sd, td):
 def test_label_free_alpha_picks_minimum():
     curve = {0.5: {0: {"relative_error": 0.2}}, 1.0: {0: {"relative_error": 0.9}}}
     assert label_free_alpha(curve)["alpha_hat"] == 0.5
+
+
+def test_state_sha_handles_zero_dim_and_bf16_parameters():
+    from merge_and_rebase.eval.diagnostics.ariadne_norm.runner import _state_sha
+
+    model = torch.nn.Module()
+    model.logit_scale = torch.nn.Parameter(torch.tensor(4.6))  # 0-dim, as in OpenCLIP
+    model.w = torch.nn.Parameter(torch.randn(3, 2).to(torch.bfloat16))
+    first = _state_sha(model)
+    assert first == _state_sha(model)
+    with torch.no_grad():
+        model.logit_scale.add_(1e-3)
+    assert _state_sha(model) != first
