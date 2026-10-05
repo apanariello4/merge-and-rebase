@@ -421,3 +421,26 @@ def test_run_task_defaults_have_no_token_split_fields():
     record, _, _ = run_task(_inputs(2, 4, config), alpha_grid=[1.0], row_positions=[])
     assert "n2" in record and "n6" in record
     assert all("procrustes_token_split" not in v and "regression_token_split" not in v for v in record["n7"].values())
+
+
+def test_first_token_realization_matches_direct_computation():
+    from merge_and_rebase.eval.diagnostics.ariadne_norm.runner import _measure, _mounted_state
+    from merge_and_rebase.rebase.methods._ariadne.capture import iter_capture_tokens
+
+    config = _config()
+    plain, _ = _fit(_setup(2, 4), config)
+    inp = _inputs(2, 4, config)
+    batches = list(inp.target_loader)
+    mounted = deepcopy(inp.target_model)
+    rows = _measure(inp, mounted, plain, 0.7, batches, [0, 3], None, first_token=True)
+    mounted.load_state_dict(_mounted_state(inp.target_base_state, plain, 0.7), strict=True)
+    req = {"0": (0, "boundary"), "3": (3, "boundary")}
+    sq = {0: 0.0, 3: 0.0}
+    for t0, t1 in zip(
+        iter_capture_tokens(inp.target_model, batches, req, "cpu"), iter_capture_tokens(mounted, batches, req, "cpu")
+    ):
+        for j in (0, 3):
+            sq[j] += float(((t1[str(j)][:, 0, :] - t0[str(j)][:, 0, :]).double() ** 2).sum())
+    for j in (0, 3):
+        assert rows[j]["first_token"]["delta_norm"] == pytest.approx(sq[j] ** 0.5, rel=1e-6)
+        assert rows[j]["first_token"]["delta_norm"] < rows[j]["delta_norm"]

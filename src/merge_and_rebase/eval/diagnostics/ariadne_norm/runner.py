@@ -280,10 +280,14 @@ def _measure(
     batches: Sequence[Any],
     positions: Sequence[int],
     desired_fn=None,
+    first_token: bool = False,
 ) -> dict[int, dict[str, float]]:
+    """Realization sums for one mounted delta. ``first_token`` adds, per position, the same sums restricted to the
+    rows with token index 0 (vision: CLS; decoders: first content token) under ``rows[j]["first_token"]``."""
     mounted_model.load_state_dict(_mounted_state(inp.target_base_state, delta, alpha), strict=True)
     req = {str(j): (j, "boundary") for j in positions}
     acc = RealizationAccumulator(positions)
+    acc_first = RealizationAccumulator(positions) if first_token else None
     g0 = iter_capture_tokens(
         inp.target_model, batches, req, inp.device, family_adapter=inp.family_adapter, store_device=inp.device
     )
@@ -292,10 +296,26 @@ def _measure(
     )
     with contextlib.closing(g0), contextlib.closing(g1):
         for k, (t0, t1) in enumerate(zip(g0, g1, strict=True)):
+            first = None
             for j in positions:
                 d = desired_fn(k, j) if desired_fn is not None else None
-                acc.add(j, t1[str(j)] - t0[str(j)], d, t0[str(j)])
-    return acc.rows()
+                dt = t1[str(j)] - t0[str(j)]
+                acc.add(j, dt, d, t0[str(j)])
+                if acc_first is not None:
+                    width = dt.shape[-1]
+                    if first is None:
+                        first = inp.token_index(batches[k], dt.numel() // width).to(dt.device) == 0
+                    acc_first.add(
+                        j,
+                        dt.reshape(-1, width)[first],
+                        None if d is None else d.reshape(-1, width).to(dt.device)[first],
+                        t0[str(j)].reshape(-1, width)[first],
+                    )
+    rows = acc.rows()
+    if acc_first is not None:
+        for j, row in acc_first.rows().items():
+            rows[j]["first_token"] = row
+    return rows
 
 
 def _state_sha(model: torch.nn.Module) -> str:
@@ -316,6 +336,7 @@ def run_task(
     generic_alphas: Sequence[float] | None = None,
     measure_realization: bool = True,
     token_split: bool = False,
+    first_token_realization: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Tensor], dict[str, Tensor]]:
     """Returns ``(record, arrays, task_vector)`` for one task.
 
@@ -437,22 +458,56 @@ def run_task(
             joint = {}
             for alpha in alpha_grid:
                 joint[float(alpha)] = _measure(
-                    inp, mounted, corrections, float(alpha), target_batches, positions, desired_fn
+                    inp,
+                    mounted,
+                    corrections,
+                    float(alpha),
+                    target_batches,
+                    positions,
+                    desired_fn,
+                    first_token=first_token_realization,
                 )
             own = {}
             for j in positions:
                 wk = inp.component_key(j)
                 delta_j = {k: v for k, v in corrections.items() if k in (wk, _bias_key(wk))}
-                own[j] = _measure(inp, mounted, delta_j, 1.0, target_batches, positions[j:], desired_fn)
+                own[j] = _measure(
+                    inp,
+                    mounted,
+                    delta_j,
+                    1.0,
+                    target_batches,
+                    positions[j:],
+                    desired_fn,
+                    first_token=first_token_realization,
+                )
             generic = {}
             alphas_generic = sorted(
                 {1.0, *([inp.alpha_star] if inp.alpha_star is not None else []), *(generic_alphas or [])}
             )
             for alpha in alphas_generic:
                 generic[float(alpha)] = {
-                    "generic": _measure(inp, mounted, corrections, alpha, inp.generic_target_batches, positions),
+                    "generic": _measure(
+                        inp,
+                        mounted,
+                        corrections,
+                        alpha,
+                        inp.generic_target_batches,
+                        positions,
+                        None,
+                        first_token=first_token_realization,
+                    ),
                     "calibration": joint.get(float(alpha))
-                    or _measure(inp, mounted, corrections, alpha, target_batches, positions, desired_fn),
+                    or _measure(
+                        inp,
+                        mounted,
+                        corrections,
+                        alpha,
+                        target_batches,
+                        positions,
+                        desired_fn,
+                        first_token=first_token_realization,
+                    ),
                 }
         finally:
             del mounted

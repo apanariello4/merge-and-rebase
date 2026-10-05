@@ -11,6 +11,7 @@ Config keys:
 - ``generic_num_batches``: off-task batches for N6. Family-specific keys are documented in the adapter modules.
 - ``measure_realization`` (default true): false skips the mount sweeps (N2, N6).
 - ``token_split`` (default false): also split N7 by token-index parity within the same batches.
+- ``first_token_realization`` (default false): N2/N6 sums also restricted to token index 0 (CLS / first token).
 
 Per task: ``<out_dir>/<task>/record.json``, ``arrays.pt`` (spectra) and the reproduced unit task vector under
 ``<out_dir>/transported_tvs``. ``<out_dir>/run.json`` records config hash, code fingerprint and timings.
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
             row_positions=row_positions,
             measure_realization=bool(cfg.get("measure_realization", True)),
             token_split=bool(cfg.get("token_split", False)),
+            first_token_realization=bool(cfg.get("first_token_realization", False)),
         )
         task_dir = out_dir / inp.task
         task_dir.mkdir()
