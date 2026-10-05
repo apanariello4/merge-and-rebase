@@ -255,6 +255,10 @@ changed):
 - **Bias:** `exact_form=true` with `missing_bias="materialize"`: a zero `down_proj.bias` is added once to the
   target model and base state, and the task vector carries its fitted value. To keep the stock architecture use
   `missing_bias="skip"` with `exact_form=false` (first-order, intercept-free fit).
+  **Deviation from the paper:** the paper states that a bias-free component is fitted with `beta = 0` on
+  uncentered `H` and `D`, which is the `missing_bias="skip"`, `exact_form=false` configuration. The decoder
+  default deliberately materializes and fits the bias instead; select the paper's formulation explicitly when
+  reproducing it.
 - **Calibration:** text from the LLM calibration loader; padding rows are removed with each model's attention
   mask before any statistic is accumulated; an unpairable mask (e.g. tokenizer mismatch) is an error.
 - **Task vector:** only the fit. `copy_shape_matching_source_deltas` (default off) is an ablation that adds

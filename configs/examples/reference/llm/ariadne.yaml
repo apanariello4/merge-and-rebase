@@ -63,7 +63,8 @@ ariadne_params:
   # ridge_estimator: "empirical_bayes"  # [main] [default: preset] empirical_bayes | fixed_relative | none.
   # missing_bias: "materialize"     # [main] [default: decoder] Qwen down_proj has no bias: materialize adds a
   #                                 #   zero-initialised down_proj.bias that the fit fills; skip (needs
-  #                                 #   exact_form=false) keeps the stock architecture; error refuses.
+  #                                 #   exact_form=false) keeps the stock architecture and is the paper's
+  #                                 #   bias-free formulation (beta = 0, uncentered); error refuses.
   # exact_form: true                # [main] [default: decoder] exact form with intercept (bias) term.
   # ridge_relative: 0.01            # ridge strength for fixed_relative (finite, > 0).
   # strength: 1.0                   # scale of the fitted task vector (finite, >= 0).
