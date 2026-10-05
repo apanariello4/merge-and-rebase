@@ -10,8 +10,8 @@ from merge_and_rebase.finetune._vision_runtime import (
     build_image_encoder,
     initialize_task_text_features,
     load_model_init_checkpoint,
-    snapshot_parameter_map,
 )
+from merge_and_rebase.finetune._vision_scaled_forward import snapshot_parameter_map
 from merge_and_rebase.finetune.regularizers._distill_capture import (
     CaptureStore as _CaptureStore,
 )

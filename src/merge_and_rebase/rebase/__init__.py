@@ -9,7 +9,6 @@ __all__ = [
     'GradRecipe',
     'BiCoGradInRebase',
     'BiCoRebase',
-    'GitRebasinRebase',
     'TheseusRebase',
     'apply_gradfix_mask',
     'compute_gradient_signs',

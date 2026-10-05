@@ -10,7 +10,7 @@
     "blocks_to_add": null,
     "insertion_order": "bottom-top",
     "extension_density": "spread",
-    "extension_strategy": "interpolate",
+    "extension_strategy": "interpolate_per_weight",
     "dampening_factor": 1.0,
     "n_batches_act": 2,
     "calibration_split": "test",
@@ -19,7 +19,8 @@
     "eval_before_extension": true,
     "first_n_eval_batches": null,
     "verbose": false,
-    "show_progress": false
+    "show_progress": false,
+    "lmc_mode": "independent"
   },
   "eval_split": "test",
   "batch_size": 32,

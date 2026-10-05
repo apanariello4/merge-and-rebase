@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -42,6 +43,145 @@ def test_theseus_registered() -> None:
     assert get_method("theseus").name == "theseus"
 
 
+def test_theseus_strict_apply_rejects_missing_transform() -> None:
+    with pytest.raises(RuntimeError, match="missing_transform_zero=1"):
+        theseus_mod._apply_transforms_to_visual_delta(
+            target_visual_base={"weight": torch.zeros(2, 2)},
+            visual_delta={"weight": torch.ones(2, 2)},
+            transforms_by_key={},
+            show_progress=False,
+            method_name="theseus",
+            device="cpu",
+            strict=True,
+        )
+
+
+def test_transport_diagnostics_partition_zero_and_active_paths(caplog, capsys) -> None:
+    identity = torch.eye(2)
+    target = {
+        "active": torch.zeros(2, 2),
+        "class_embedding": torch.zeros(2),
+        "missing": torch.zeros(2, 2),
+        "unsupported": torch.zeros(1, 1, 1),
+        "failure": torch.zeros(2, 2),
+        "wrong_shape": torch.zeros(3, 3),
+    }
+    delta = {key: torch.ones_like(value) for key, value in target.items()}
+    delta["wrong_shape"] = torch.ones(2, 2)
+    transforms = {
+        "active": theseus_mod._LayerTransform(kind="weight", t_in=identity, t_out=identity),
+        "class_embedding": theseus_mod._LayerTransform(kind="zero"),
+        "unsupported": theseus_mod._LayerTransform(kind="unsupported"),
+        "failure": theseus_mod._LayerTransform(kind="weight", t_in=torch.eye(3), t_out=identity),
+        "wrong_shape": theseus_mod._LayerTransform(kind="weight", t_in=identity, t_out=identity),
+    }
+
+    with caplog.at_level("WARNING"):
+        aligned, diagnostics = theseus_mod._apply_transforms_to_visual_delta(
+            target_visual_base=target,
+            visual_delta=delta,
+            transforms_by_key=transforms,
+            show_progress=False,
+            method_name="theseus",
+            device="cpu",
+            out_of_scope_keys=("out_scope",),
+            skipped_not_in_target_keys=("not_in_target",),
+        )
+
+    assert diagnostics.actively_transported == 1
+    assert diagnostics.intentional_zero == 1
+    assert diagnostics.missing_transform_zero == 1
+    assert diagnostics.unsupported_zero == 1
+    assert diagnostics.transport_failure_zero == 1
+    assert diagnostics.wrong_shape_zero == 1
+    assert diagnostics.out_of_scope_zero == 1
+    assert diagnostics.skipped_not_in_target == 1
+    assert set(aligned) == set(target)
+    assert any("theseus transport diagnostics" in record.message for record in caplog.records)
+
+    theseus_mod._report_apply_diagnostics(
+        method_name="theseus", diagnostics=diagnostics, verbose=True
+    )
+    report = capsys.readouterr().out
+    assert "active=1 matrices=1 vectors=0" in report
+    assert "missing_transform_zero=1" in report
+    assert "intentional_zero=1" in report
+
+
+def test_strict_allows_intentional_and_out_of_scope_zero() -> None:
+    _, diagnostics = theseus_mod._apply_transforms_to_visual_delta(
+        target_visual_base={"class_embedding": torch.zeros(2)},
+        visual_delta={"class_embedding": torch.ones(2)},
+        transforms_by_key={"class_embedding": theseus_mod._LayerTransform(kind="zero")},
+        show_progress=False,
+        method_name="theseus",
+        device="cpu",
+        strict=True,
+        out_of_scope_keys=("text_projection",),
+    )
+    assert diagnostics.intentional_zero == 1
+    assert diagnostics.out_of_scope_zero == 1
+
+
+def test_data_free_precompute_marks_every_structural_exclusion_as_intentional_zero() -> None:
+    tensors = {
+        "class_embedding": torch.ones(2),
+        "positional_embedding": torch.ones(3, 2),
+        "conv1.weight": torch.ones(2, 2, 1, 1),
+    }
+    transforms = theseus_mod._precompute_transforms_data_free(
+        source_visual_base=tensors,
+        target_visual_base=tensors,
+        visual_delta=tensors,
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+        show_progress=False,
+        method_name="theseus",
+    )
+    assert set(transforms) == set(tensors)
+    assert all(transform.kind == "zero" for transform in transforms.values())
+
+
+def test_theseus_rejects_misaligned_calibration_labels() -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    x = torch.randn(4, 6)
+    source_loader = DataLoader(TensorDataset(x, torch.zeros(4, dtype=torch.long)), batch_size=4)
+    target_loader = DataLoader(TensorDataset(x, torch.ones(4, dtype=torch.long)), batch_size=4)
+
+    with pytest.raises(ValueError, match="not label-aligned"):
+        theseus_mod.collect_activations(
+            source_model,
+            target_model,
+            source_loader,
+            target_loader,
+            device="cpu",
+            seq_align="mean",
+            n_batches=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("whiten_power", "whiten_eps"),
+    [(-0.01, 1e-5), (0.51, 1e-5), (0.0, 0.0)],
+)
+def test_theseus_rejects_invalid_whitening_parameters(whiten_power, whiten_eps):
+    method = theseus_mod.TheseusRebase()
+    with pytest.raises(ValueError):
+        method.prepare(
+            source_model=nn.Linear(2, 2),
+            target_model=nn.Linear(2, 2),
+            source_dataloader=[],
+            target_dataloader=[],
+            device="cpu",
+            patch_qkv=False,
+            whiten_power=whiten_power,
+            whiten_eps=whiten_eps,
+            show_progress=False,
+            verbose=False,
+        )
+
+
 def test_theseus_transport_smoke() -> None:
     source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
     target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
@@ -77,6 +217,9 @@ def test_theseus_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_partial_whitening_changes_alignment_map() -> None:
@@ -140,6 +283,9 @@ def test_theseus_transport_with_partial_whitening_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
@@ -173,6 +319,70 @@ def test_theseus_data_free_transport_smoke_without_dataloaders() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
+
+
+def test_data_free_transforms_handle_biases_and_zero_keys() -> None:
+    source_weight = torch.eye(4)
+    target_weight = torch.eye(6)
+    transforms = theseus_mod._precompute_transforms_data_free(
+        source_visual_base={
+            "class_embedding": torch.ones(4),
+            "transformer.resblocks.0.mlp.c_fc.weight": source_weight,
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(4),
+        },
+        target_visual_base={
+            "class_embedding": torch.ones(6),
+            "transformer.resblocks.0.mlp.c_fc.weight": target_weight,
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(6),
+        },
+        visual_delta={
+            "class_embedding": torch.ones(4),
+            "transformer.resblocks.0.mlp.c_fc.weight": torch.ones_like(source_weight),
+            "transformer.resblocks.0.mlp.c_fc.bias": torch.ones(4),
+        },
+        whiten_power=0.0,
+        whiten_eps=1e-6,
+        show_progress=False,
+        method_name="theseus",
+    )
+
+    assert transforms["class_embedding"].kind == "zero"
+    bias_transform = transforms["transformer.resblocks.0.mlp.c_fc.bias"]
+    assert bias_transform.kind == "bias"
+    assert bias_transform.t_out is not None
+
+
+def test_prepare_collects_grams_when_whitening_is_enabled(monkeypatch) -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    source_base = {k: v.detach().clone() for k, v in source_model.state_dict().items()}
+    delta = {"visual.fc1.weight": torch.ones_like(source_base["visual.fc1.weight"])}
+    seen: dict[str, object] = {}
+
+    def fake_collect(*args, **kwargs):
+        seen["store_a_gram"] = kwargs["store_a_gram"]
+        seen["store_b_gram"] = kwargs["store_b_gram"]
+        return {}
+
+    monkeypatch.setattr(theseus_mod, "collect_activations", fake_collect)
+    theseus_mod.TheseusRebase().prepare(
+        source_model=source_model,
+        target_model=target_model,
+        source_dataloader=[],
+        target_dataloader=[],
+        target_base={k: v.detach().clone() for k, v in target_model.state_dict().items()},
+        delta=delta,
+        device="cpu",
+        patch_qkv=False,
+        whiten_power=0.25,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert seen == {"store_a_gram": True, "store_b_gram": True}
 
 
 def test_data_free_covariance_map_uses_weight_proxies() -> None:
@@ -274,3 +484,49 @@ def test_random_dataset_subsampling_uses_randperm_seed() -> None:
     g2.manual_seed(124)
     expected_other_seed = torch.randperm(20, generator=g2)[:12].tolist()
     assert seen != expected_other_seed
+
+
+def test_content_row_mask_and_padding_drop():
+    """Padded calibration positions must not reach the cross-covariance.
+
+    Text calibration batches are padded to a fixed length, so on short prompts
+    most positions are pad tokens. Folding them into the Procrustes covariance
+    lets padding dominate the fitted alignment.
+    """
+    import torch
+
+    from merge_and_rebase.rebase.methods.theseus import _content_row_mask, _drop_padding_rows
+
+    # batch=2, tokens=4, with 3 real tokens then 1 pad in each row.
+    attn = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 0]])
+    mask = _content_row_mask(attn, attn)
+    assert mask is not None
+    assert mask.tolist() == [True, True, True, False, True, True, True, False]
+
+    src = torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
+    tgt = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
+    src_kept, tgt_kept = _drop_padding_rows(src, tgt, mask)
+    assert src_kept.shape == (6, 3)
+    assert tgt_kept.shape == (6, 5)
+    assert torch.equal(src_kept, src[mask])
+    assert torch.equal(tgt_kept, tgt[mask])
+
+    # No mask and an all-real mask leave rows untouched; an all-pad batch contributes no rows
+    # (all-False mask, never a pad-keeping None).
+    assert _content_row_mask(None, None) is None
+    assert _content_row_mask(torch.ones(2, 4, dtype=torch.long), None) is None
+    all_pad = _content_row_mask(torch.zeros(2, 4, dtype=torch.long), None)
+    assert all_pad is not None and not bool(all_pad.any())
+
+    # Source and target tokenized to different lengths -> rows cannot be paired: error, never a
+    # pad-keeping fallback.
+    with pytest.raises(ValueError, match="cannot be paired"):
+        _content_row_mask(attn, torch.ones(2, 6, dtype=torch.long))
+
+    # Activations that aren't one row per input token (pooled/head-split) are
+    # passed through rather than mis-sliced.
+    pooled_src = torch.zeros(2, 3)
+    pooled_tgt = torch.zeros(2, 5)
+    out_src, out_tgt = _drop_padding_rows(pooled_src, pooled_tgt, mask)
+    assert out_src.shape == (2, 3)
+    assert out_tgt.shape == (2, 5)

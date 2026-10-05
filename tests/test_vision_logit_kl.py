@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from merge_and_rebase.eval import vision_logit_kl
+from merge_and_rebase.eval.diagnostics import vision_logit_kl
 
 
 def test_batch_kl_sum_matches_torch_reference() -> None:

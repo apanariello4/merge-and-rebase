@@ -17,7 +17,7 @@ Usage
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -155,8 +155,9 @@ def causal_lm_recipe(
         (``output.loss``) is used.
     """
     def _recipe(model: nn.Module, batch: Any) -> tuple[torch.Tensor, NamedParams]:
-        # HF-style batch dict
-        if isinstance(batch, dict):
+        # HF-style batch dict (also accepts transformers.BatchEncoding, a
+        # Mapping but not a dict subclass, as produced by tokenizer calls)
+        if isinstance(batch, Mapping):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch.get("attention_mask", None)
             if attention_mask is not None:
@@ -164,7 +165,7 @@ def causal_lm_recipe(
             labels = batch["labels"].to(device).long()
         else:
             raise TypeError(
-                f"causal_lm_recipe expects a dict batch with 'input_ids' and "
+                f"causal_lm_recipe expects a dict/Mapping batch with 'input_ids' and "
                 f"'labels' keys, got {type(batch)}"
             )
 
@@ -214,8 +215,8 @@ def seq_classification_recipe(
         loss_fn = nn.CrossEntropyLoss(reduction=reduction)
 
     def _recipe(model: nn.Module, batch: Any) -> tuple[torch.Tensor, NamedParams]:
-        if not isinstance(batch, dict):
-            raise TypeError(f"seq_classification_recipe expects dict batch, got {type(batch)}")
+        if not isinstance(batch, Mapping):
+            raise TypeError(f"seq_classification_recipe expects dict/Mapping batch, got {type(batch)}")
 
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch.get("attention_mask", None)

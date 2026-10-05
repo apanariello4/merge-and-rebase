@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
 @dataclass(frozen=True)
 class TextBuildConfig:
     model_name_or_path: str
-    model_arch: str = "auto"  # "llama" | "t5" | "auto"
+    model_arch: str = "auto"  # "llama" | "qwen" | "t5" | "auto"
     device: str = "cuda"
     dtype: str | None = None  # "fp16" | "bf16" | "fp32" | None
     model_kind: str = "causal_lm"  # "causal_lm" | "sequence_classification"
@@ -58,8 +58,8 @@ class TextLM(nn.Module):
         torch_dtype = dtype_map.get(cfg.dtype, None)
 
         arch = str(cfg.model_arch).strip().lower()
-        if arch not in {"llama", "t5", "auto"}:
-            raise ValueError("model_arch must be one of: llama, t5, auto")
+        if arch not in {"llama", "qwen", "t5", "auto"}:
+            raise ValueError("model_arch must be one of: llama, qwen, t5, auto")
 
         try:
             tokenizer = AutoTokenizer.from_pretrained(

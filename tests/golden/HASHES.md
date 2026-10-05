@@ -1,0 +1,513 @@
+# Release golden hashes (Phase 0 safety net)
+
+`test_release_golden_hashes.py` pins the SHA-256 of the numerical outputs of the current
+Direct Residual (Ariadne), ARIADNE direct-target, THESEUS / theseus_gqa / BiCo and BRACE
+(vision `BlockExtender`, decoder `DecoderBlockExtender`) code paths, on tiny seeded CPU
+fixtures. A refactor that moves code but keeps behaviour must leave every hash unchanged;
+a changed hash means a changed number and invalidates published results until explained.
+
+- **Generated at**: commit `7a7ee9a` (release/2026-10-rebase-refactor), behaviour-identical to `b6128d3`.
+  Cross-checked: the same 71 tests pass unchanged against a clean `b6128d3` worktree.
+- **Platform caveat**: hashes are bit-level and therefore specific to this CPU family, torch
+  build (torch + the pinned `pytorch-cu128` wheel), `torch.set_num_threads(1)` and
+  `torch.use_deterministic_algorithms(True)` (applied by an autouse fixture, restored after each
+  test). Another CPU/BLAS/torch version may legitimately produce different bits; in that case
+  re-derive the table on the *pre-refactor* commit first, then compare against the refactor.
+- **Hasher**: `_hashing.py`, self-contained (does not import `merge_and_rebase`): sorted keys; per
+  tensor the key, dtype, shape and raw bytes (bf16 viewed as int16), all length-prefixed.
+  JSON summaries: `hash_json` = sha256 of `json.dumps(sort_keys=True)` after dropping timing /
+  memory / path / git keys (token-based, see `VOLATILE_KEY_TOKENS`) and `dataset_identity`
+  (embeds `id()`), with floats serialized via `repr` and tensors replaced by their hash.
+- **Regenerating** (only after establishing the change is intended):
+  `GOLDEN_CAPTURE=/path/out.txt pytest tests/golden -q -p no:cacheprovider` appends `key hash`
+  lines and skips the asserts; paste into `EXPECTED`.
+- Run: `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 pytest tests/golden -q -p no:cacheprovider`
+  (about 5 s of test time on top of ~16 s of imports, peak RSS about 0.67 GB).
+- Stability: file run 3x in separate processes, once in reverse order, once shuffled, and every
+  parametrized case twice in one process: identical hashes throughout. The `default` Direct Residual
+  case reproduces the pre-existing `test_direct_residual_ablation_v2_golden_hashes_20260925` pins
+  (`485999a6...`, `48a74919...`) when hashed with that file's `_task_vector_sha256`.
+
+Public paths used by the tests (the back-compat shims must keep them importable):
+`merge_and_rebase.rebase.methods.ariadne` (+ `_ariadne.*`), `rebase.block_extension.{config,vision,decoder,core,schedules}` (the `eval.direct_residual` / `eval.block_extension*` shims were removed in P5.16, hashes unchanged), `eval.vision_rebase` (`_run_direct_residual_fit`,
+`_build_rebase_prepared`), `eval.llm_rebase` (`_prepare_resized_task_delta`,
+`_build_text_calibration_loader`), `rebase.registry.get_method`, `rebase.methods`,
+`rebase.model_families.infer_family`, `rebase.discrete_layer_match`, `models.grad_recipes`,
+`merge.runtime.to_cpu_fp32`.
+
+## What is NOT pinned (explicit gaps)
+
+- `vision_rebase.main()` and `llm_rebase.main()` cannot run offline (real OpenCLIP / HF
+  checkpoints, datasets, tokenizers, evaluation). The deepest cheap entries are pinned instead:
+  `_run_direct_residual_fit`, `_build_rebase_prepared` + `method.transport` (with a real BRACE
+  prestep), and for LLMs `_prepare_resized_task_delta` + `method.transport`. Not covered: argument
+  and config resolution in `main()`, alpha search, merge modes (`merge_in_source_then_fit`,
+  merge-then-rebase), checkpoint loading / key alignment, saved task-vector files, `summary.json`
+  assembly and the git-fingerprint field, `_maybe_complete_*` residual-completion wiring inside
+  both `main()`s, and every evaluation metric.
+- Direct Residual on a *decoder* (`family_adapter` path) is not pinned; DR is pinned on the
+  vision-style block fixture and (gradient mode) on real open_clip ViT blocks only.
+- Not pinned: `component_target` in {`output_local`, `output_total`} (retired dead end),
+  `residual_target=transported_endpoint`, `tv_scaling`, `endpoint_construction` other than
+  `native_delta`, `calibration_data` modes, `fidelity_holdout`, `depth_pairing` shift modes,
+  `merge_mode=merge_in_source_then_fit`.
+- `random_isometry` and `reversed` are pinned on both storages; `block_split=joint/backfit` only
+  resident (streaming rejects them by design).
+- THESEUS/BiCo/BRACE are pinned on tiny fc / attention models and real tiny Qwen2 only (no
+  Llama/Qwen3 adapters, no fused-QKV CLIP-patched attention, no bf16/fp16 paths, no GPU).
+- Streaming vs resident Direct Residual task vectors are byte-identical on the activation
+  fixtures (equal hashes below) but differ on the gradient fixture (different float accumulation
+  order); both are pinned separately. Resident alignment is hashed as `desired` effects + fitted
+  `q`; streaming alignment as `q_by_position`, so those two hashes are not comparable.
+
+## Cases
+
+Key format: `case:direction:part` (direction extend = 2->4, shrink = 4->2 for Direct Residual and
+decoders; see the config column for the others). Parts: `task_vector` (fitted/transported
+tensors), `alignment` (maps), `summary`/`diagnostics`/`brace_and_delta`/`layout` (json hash).
+
+| Case key | Pins | Config | SHA-256 |
+|---|---|---|---|
+| `bico_gradin_vision_fc` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | bico_gradin, seq_align=mean; num_batches=2, seed=123 | `4b121cac8c44864123a0f13437199be901082960669c91f705d965e25701d896` |
+| `bico_vision_fc` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | bico, seq_align=mean; num_batches=2, seed=123 | `c2ce523b8acc67770595cee94c0743591546615452bb058017495d2b886e173d` |
+| `brace_decoder_class_api:extend:base_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `6d084485a368c80528d0778abc623900edb8883201f6e8fdd98de25fa5a8484b` |
+| `brace_decoder_class_api:extend:ft_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `5c305892c9f78461a681ea761c543b890075617824e879ba462e4019aa18d637` |
+| `brace_decoder_class_api:extend:task_vector` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `4a82cc58a4f6abcf8f806e7b703e06930dca8c1e2180a670494cdbbcb3bfd065` |
+| `brace_decoder_class_api:shrink:base_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `270b1e5c059061a4a70fa3ef79a7444e67b2529b0dd7a2eed9fbafca71af426b` |
+| `brace_decoder_class_api:shrink:ft_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `7866d15877f22d649bc3fb41b549e641a3f38e6d72cdf42af0edda1adec3da8a` |
+| `brace_decoder_class_api:shrink:task_vector` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `14ed6c47dee728ee75498c593b5cadb7901a14d342fa961183679e932076aa6d` |
+| `brace_decoder_independent:extend:base_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `6d084485a368c80528d0778abc623900edb8883201f6e8fdd98de25fa5a8484b` |
+| `brace_decoder_independent:extend:ft_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `5c305892c9f78461a681ea761c543b890075617824e879ba462e4019aa18d637` |
+| `brace_decoder_independent:extend:layout` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `9e1555f3dbafa6ffd033b3124da7e76dd677700de308e1ab939be6795d4ac3f8` |
+| `brace_decoder_independent:extend:task_vector` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `4a82cc58a4f6abcf8f806e7b703e06930dca8c1e2180a670494cdbbcb3bfd065` |
+| `brace_decoder_independent:shrink:base_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `270b1e5c059061a4a70fa3ef79a7444e67b2529b0dd7a2eed9fbafca71af426b` |
+| `brace_decoder_independent:shrink:ft_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `7866d15877f22d649bc3fb41b549e641a3f38e6d72cdf42af0edda1adec3da8a` |
+| `brace_decoder_independent:shrink:layout` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `9756faed9b78a9078e554f9762b3759ad5cc1057d1a41b030acc72653e5fc028` |
+| `brace_decoder_independent:shrink:task_vector` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=independent; depth 2 -> 4 / 4 -> 2 | `14ed6c47dee728ee75498c593b5cadb7901a14d342fa961183679e932076aa6d` |
+| `brace_decoder_shared:extend:base_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `6d084485a368c80528d0778abc623900edb8883201f6e8fdd98de25fa5a8484b` |
+| `brace_decoder_shared:extend:ft_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `a97023b76e3a7253aaa6c55a328254e5d4d13fb09a1ce26c6822b31e203c4f9d` |
+| `brace_decoder_shared:extend:layout` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `9e1555f3dbafa6ffd033b3124da7e76dd677700de308e1ab939be6795d4ac3f8` |
+| `brace_decoder_shared:extend:task_vector` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `bd67b0f65f31ad75742bc02f626942cbef47d50a69c2b13ce29c93aac736b67a` |
+| `brace_decoder_shared:shrink:base_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `270b1e5c059061a4a70fa3ef79a7444e67b2529b0dd7a2eed9fbafca71af426b` |
+| `brace_decoder_shared:shrink:ft_state` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `59f4089a766cbb3a8b3321ca404bc7804b60578160cfa0db4f71539ef60204d8` |
+| `brace_decoder_shared:shrink:layout` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `9756faed9b78a9078e554f9762b3759ad5cc1057d1a41b030acc72653e5fc028` |
+| `brace_decoder_shared:shrink:task_vector` | `block_extension_llm.run_block_extension_llm` -> `DecoderBlockExtender`, real tiny Qwen2 | interpolate_per_weight, lmc_mode=shared; depth 2 -> 4 / 4 -> 2 | `4ebe41249e43952a1ab4811c0db64c2c791924f7c70ea78d8a864558861d85fa` |
+| `brace_vision_class_api:extend:base_state` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 5; parts = base/ft state, task vector, layout | `6c222cf231d2d5f75fd49e3dc91a3b97fc678e98ec1b10291a2f803cc8bd0fc6` |
+| `brace_vision_class_api:extend:ft_state` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 5; parts = base/ft state, task vector, layout | `3ad36b00d2f76bf4e2d90b451ab9ec536567be196be9915bde45e33483f202a4` |
+| `brace_vision_class_api:extend:layout` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 5; parts = base/ft state, task vector, layout | `c2b0cbd3867b8f23accb5c96b5ae2f915cc3816a0aa0dc54cb56c0c4f070cf51` |
+| `brace_vision_class_api:extend:task_vector` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 5; parts = base/ft state, task vector, layout | `3459b8aedcd04af883280b353b25dece88a9cc9e8e8c3c6a4b488c8f1e9000bd` |
+| `brace_vision_class_api:shrink:base_state` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 2; parts = base/ft state, task vector, layout | `0d521ec5d4c307fe2fbcd9648712f6eeb63dcac5906bdd2a9e0c3c5eab05ad4b` |
+| `brace_vision_class_api:shrink:ft_state` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 2; parts = base/ft state, task vector, layout | `2ee6262cc64ef4da09851ac7ebc7e90e2e9db8d3b28e3fd9dd00f31f546b063a` |
+| `brace_vision_class_api:shrink:layout` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 2; parts = base/ft state, task vector, layout | `d5ce7bc70e71528c76d7b144a56b5f1c05bb0c59063b81f62f0cb59bac7c2a59` |
+| `brace_vision_class_api:shrink:task_vector` | `BlockExtender.extend_and_calibrate` (class API) | interpolate_per_weight, independent, ridge_identity=100; depth 3 -> 2; parts = base/ft state, task vector, layout | `600fadb5341c4b9dd9ff50d0acfd73ecfd6753a39f1e11775ef98b7b3249d31a` |
+| `brace_vision_extend_duplicate_independent:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `4a3edd070afa6742fea1da2c07cc5bc5d1cb2756990b3416973a0a027b1a4e88` |
+| `brace_vision_extend_duplicate_independent:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `54c7348ece68a3e95d663e29cde1097925cee15881ee0c4b70847357d5cfb1fa` |
+| `brace_vision_extend_duplicate_independent:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `c2b0cbd3867b8f23accb5c96b5ae2f915cc3816a0aa0dc54cb56c0c4f070cf51` |
+| `brace_vision_extend_duplicate_independent:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `e4c6e223f68f77bbbc42d841194b7cd676104a1ec77c3fc562c4a7cf369c3e93` |
+| `brace_vision_extend_duplicate_shared:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `4a3edd070afa6742fea1da2c07cc5bc5d1cb2756990b3416973a0a027b1a4e88` |
+| `brace_vision_extend_duplicate_shared:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `cefaf964a7baffecbd42f63875095520fae593a075ca373a632211d1d731a124` |
+| `brace_vision_extend_duplicate_shared:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `c2b0cbd3867b8f23accb5c96b5ae2f915cc3816a0aa0dc54cb56c0c4f070cf51` |
+| `brace_vision_extend_duplicate_shared:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `34becee22c617335cd051b04662b9dd4f9de8cfcfcec2a96b2470ebc15d2353f` |
+| `brace_vision_extend_duplicate_shared_ft:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `0e0e38d4775198988cd9ece1002cffafe77a2619e564cf3962dff8eb42568369` |
+| `brace_vision_extend_duplicate_shared_ft:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `54c7348ece68a3e95d663e29cde1097925cee15881ee0c4b70847357d5cfb1fa` |
+| `brace_vision_extend_duplicate_shared_ft:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `c2b0cbd3867b8f23accb5c96b5ae2f915cc3816a0aa0dc54cb56c0c4f070cf51` |
+| `brace_vision_extend_duplicate_shared_ft:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_duplicate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `ea4cf1c18a24400fae3a186195eefefbc4db649d4d08b6e65fbdb369ca951346` |
+| `brace_vision_extend_interpolate_independent:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `d2927777ed73705995f8662f0285bb21da478e8d582455a784e1d33ee5a5a7f3` |
+| `brace_vision_extend_interpolate_independent:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `6ae5584333dc8265eec8ad14d47710c784f8e5edfdd7162c3dfa67a08482a42f` |
+| `brace_vision_extend_interpolate_independent:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `c2b0cbd3867b8f23accb5c96b5ae2f915cc3816a0aa0dc54cb56c0c4f070cf51` |
+| `brace_vision_extend_interpolate_independent:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case extend_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `18b42ed4476040e02df930f6ce29d36fadf40a6317523fba2cdc8c7206b540f8` |
+| `brace_vision_shrink_interpolate_independent:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `cf08855089d2dbe24b16c73343adc6f3bc983e9744d0b957e9ea647f84205334` |
+| `brace_vision_shrink_interpolate_independent:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `31abfad7eea8cc938eb7200fa24ad8fde587f0c2614d235adcd3264ebca255b0` |
+| `brace_vision_shrink_interpolate_independent:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `d5ce7bc70e71528c76d7b144a56b5f1c05bb0c59063b81f62f0cb59bac7c2a59` |
+| `brace_vision_shrink_interpolate_independent:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_independent (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `1afc337731bd4e81e4ca6c11a4499fa916a4fdfebd26ba2f8e8d79cd8303fa93` |
+| `brace_vision_shrink_interpolate_shared:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `cf08855089d2dbe24b16c73343adc6f3bc983e9744d0b957e9ea647f84205334` |
+| `brace_vision_shrink_interpolate_shared:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `19ec6af8c7cd4de95a2d2a9b683c43bbc09290e162780eaed618870ce4c051d5` |
+| `brace_vision_shrink_interpolate_shared:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `d5ce7bc70e71528c76d7b144a56b5f1c05bb0c59063b81f62f0cb59bac7c2a59` |
+| `brace_vision_shrink_interpolate_shared:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `3b8f2d5e6301f26e92116a4ec174a702122cc710d68042093f973d570af8894f` |
+| `brace_vision_shrink_interpolate_shared_ft:base_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `56169469a92385efd720e719880d8da79b2220f92cd2b34981b5bc58db0f2e4d` |
+| `brace_vision_shrink_interpolate_shared_ft:ft_state` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `31abfad7eea8cc938eb7200fa24ad8fde587f0c2614d235adcd3264ebca255b0` |
+| `brace_vision_shrink_interpolate_shared_ft:layout` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `d5ce7bc70e71528c76d7b144a56b5f1c05bb0c59063b81f62f0cb59bac7c2a59` |
+| `brace_vision_shrink_interpolate_shared_ft:task_vector` | `block_extension.run_block_extension` -> `BlockExtender` | case shrink_interpolate_shared_ft (strategy, lmc_mode, depth 3 -> 5/2); ridge_identity=1; parts = base/ft state, task vector, layout | `60ced8b4cb1274fb82a04fff3ca090e38a3ac23444badb371da365f60590968c` |
+| `complete_residuals_direct_empirical_bayes:extend:diagnostics` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=empirical_bayes; layout forced to the discrete pairing | `93e25baa3788787a7bd6186c1e9aaa57238fa6881a5fe1afbadcf9a787661081` |
+| `complete_residuals_direct_empirical_bayes:extend:task_vector` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=empirical_bayes; layout forced to the discrete pairing | `3057b0aabc072225af942ee939ef0136da0fa8655a1e03c6d640566d8f7014db` |
+| `complete_residuals_direct_empirical_bayes:shrink:diagnostics` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=empirical_bayes; layout forced to the discrete pairing | `6c46da515be30573b3e28c67919d3f8fe3dd4c8a71edf40c61c253bd9b2df7ea` |
+| `complete_residuals_direct_empirical_bayes:shrink:task_vector` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=empirical_bayes; layout forced to the discrete pairing | `6475039c4d88975af6fd76696082cb7cdc600e8d7efa56c588befc7fa551bb33` |
+| `complete_residuals_direct_fixed_relative:extend:diagnostics` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=fixed_relative; layout forced to the discrete pairing | `0b6691566fde49ae484a33b3f55f1aae1e035cb06eea4df7c9dcd041abfa2433` |
+| `complete_residuals_direct_fixed_relative:extend:task_vector` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=fixed_relative; layout forced to the discrete pairing | `db4cebbaeec743066976d0f363a02f1e6440778ef8c801bc17a712c09c5819b0` |
+| `complete_residuals_direct_fixed_relative:shrink:diagnostics` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=fixed_relative; layout forced to the discrete pairing | `4b23327f34ac654094cc96fa7cb8145be144963151600bbe45773ec87ba864f5` |
+| `complete_residuals_direct_fixed_relative:shrink:task_vector` | `target_informed_runtime.complete_residuals_direct` (shared `_fit_all_positions_independent` kernel) | ResidualCompletionConfig direct_target/all/step/independent, components O+D, ridge_estimator=fixed_relative; layout forced to the discrete pairing | `f2c3817d4e9de77e5fa72b95469c5b881c5d6932148dadd3516a689635ab388d` |
+| `dr_alignment_ridge_streaming:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=ridge; num_batches=3, ridge_relative=0.05 | `2c1b900133f2832ad56a510ea0a8bc51c8891f3c1e68131199eab426dcd594d1` |
+| `dr_alignment_ridge_streaming:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=ridge; num_batches=3, ridge_relative=0.05 | `0b9d5a3ca8bf2470d00daf3a27954a738e70c7adc2587cde0cdd566e3ffe1762` |
+| `dr_alignment_ridge_streaming:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=ridge; num_batches=3, ridge_relative=0.05 | `d68ec69ff895eda8cce861710365359b8d58fecddda0d52931d8b6e669154b23` |
+| `dr_alignment_ridge_streaming:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=ridge; num_batches=3, ridge_relative=0.05 | `91e4e20a3e5a92f19b280bf8a4611bc407073ec4e91b81be3616ea6df204011d` |
+| `dr_block_split_backfit:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=backfit, backfit_max_iters=2; num_batches=3, ridge_relative=0.05 | `e6ee902c3d40e0511bf7ad27c63e71532b2f922f52e50faea5cb1c149fe7ef6c` |
+| `dr_block_split_backfit:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=backfit, backfit_max_iters=2; num_batches=3, ridge_relative=0.05 | `0db607aa29e80100c7096457b3596f53f4d67a54c7335d2d9610a287213a03db` |
+| `dr_block_split_backfit:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=backfit, backfit_max_iters=2; num_batches=3, ridge_relative=0.05 | `1f687e3e452feaefbab1a7bc89de3886c8d14f2d6a6c5cf5d4cba0f5a2a121e7` |
+| `dr_block_split_backfit:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=backfit, backfit_max_iters=2; num_batches=3, ridge_relative=0.05 | `39818ce857714640737e9805be874ce2cf301a1afce2b93be66288254e9581f4` |
+| `dr_block_split_joint:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=joint; num_batches=3, ridge_relative=0.05 | `e6ee902c3d40e0511bf7ad27c63e71532b2f922f52e50faea5cb1c149fe7ef6c` |
+| `dr_block_split_joint:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=joint; num_batches=3, ridge_relative=0.05 | `fc02aac2fcbbc611c284d7e9840ee06490769e2e7648566836af4f6a44949688` |
+| `dr_block_split_joint:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=joint; num_batches=3, ridge_relative=0.05 | `1f687e3e452feaefbab1a7bc89de3886c8d14f2d6a6c5cf5d4cba0f5a2a121e7` |
+| `dr_block_split_joint:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults (O+D, resident) + block_split=joint; num_batches=3, ridge_relative=0.05 | `91416a6fe342a1c0724b12a39fa76b4ca1a44137459fa86f35cbc0046b6fc721` |
+| `dr_default_resident_fixed_relative:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); reproduces the hashes of test_direct_residual_ablation_v2_golden_hashes_20260925 under that file's hasher; num_batches=3, ridge_relative=0.05 | `e6ee902c3d40e0511bf7ad27c63e71532b2f922f52e50faea5cb1c149fe7ef6c` |
+| `dr_default_resident_fixed_relative:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); reproduces the hashes of test_direct_residual_ablation_v2_golden_hashes_20260925 under that file's hasher; num_batches=3, ridge_relative=0.05 | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
+| `dr_default_resident_fixed_relative:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); reproduces the hashes of test_direct_residual_ablation_v2_golden_hashes_20260925 under that file's hasher; num_batches=3, ridge_relative=0.05 | `1f687e3e452feaefbab1a7bc89de3886c8d14f2d6a6c5cf5d4cba0f5a2a121e7` |
+| `dr_default_resident_fixed_relative:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); reproduces the hashes of test_direct_residual_ablation_v2_golden_hashes_20260925 under that file's hasher; num_batches=3, ridge_relative=0.05 | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
+| `dr_default_streaming_fixed_relative:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults + activation_storage=streaming; num_batches=3, ridge_relative=0.05 | `8255b82b82472d08ce56fb36caf5d087205d76ccfcf007217c09926dd7eab433` |
+| `dr_default_streaming_fixed_relative:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults + activation_storage=streaming; num_batches=3, ridge_relative=0.05 | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
+| `dr_default_streaming_fixed_relative:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults + activation_storage=streaming; num_batches=3, ridge_relative=0.05 | `552f60a1ce474bb04de0283f4f97310c03886d8b19692af0996ea31303b77966` |
+| `dr_default_streaming_fixed_relative:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | defaults + activation_storage=streaming; num_batches=3, ridge_relative=0.05 | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
+| `dr_depth_pairing_reversed:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, resident, depth_pairing=reversed (`apply_depth_pairing_override`); num_batches=3, ridge_relative=0.05 | `e4be8b037eddd579270b94435b0e4e902a79366b12f9221177f98a2dd3b05013` |
+| `dr_depth_pairing_reversed:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, resident, depth_pairing=reversed (`apply_depth_pairing_override`); num_batches=3, ridge_relative=0.05 | `51dc6aeffd968768a576e5d66454b06bf40f9f972f7c7f16e31a31178704f43f` |
+| `dr_depth_pairing_reversed:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, resident, depth_pairing=reversed (`apply_depth_pairing_override`); num_batches=3, ridge_relative=0.05 | `a1d7f0b197b7a3d7c21c2a5e20a04b3225fa3151f7419890c2db229ba157af7c` |
+| `dr_depth_pairing_reversed:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, resident, depth_pairing=reversed (`apply_depth_pairing_override`); num_batches=3, ridge_relative=0.05 | `7c9eabb3a13918253fb2d223e658e17e8280f9364cd4360c06e58f9cfc080b74` |
+| `dr_depth_pairing_reversed_streaming:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, streaming, depth_pairing=reversed; num_batches=3, ridge_relative=0.05 | `c4b0787bbc478e5e0e24ca34e05318538289b9990993a13b1999424177c259b9` |
+| `dr_depth_pairing_reversed_streaming:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, streaming, depth_pairing=reversed; num_batches=3, ridge_relative=0.05 | `51dc6aeffd968768a576e5d66454b06bf40f9f972f7c7f16e31a31178704f43f` |
+| `dr_depth_pairing_reversed_streaming:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, streaming, depth_pairing=reversed; num_batches=3, ridge_relative=0.05 | `9358fcceb6ee6eee77e45365cacfb103f7271f2ede3ede96cc780a4c6b11e83f` |
+| `dr_depth_pairing_reversed_streaming:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN, streaming, depth_pairing=reversed; num_batches=3, ridge_relative=0.05 | `7c9eabb3a13918253fb2d223e658e17e8280f9364cd4360c06e58f9cfc080b74` |
+| `dr_gradient_procrustes_resident:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, resident storage; open_clip ViT (w8/L2 <-> w12/L4) | `9d7a320d88482f84572160051b6ac6b2e48823eadf2493c5ee0dd0d4e628172b` |
+| `dr_gradient_procrustes_resident:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, resident storage; open_clip ViT (w8/L2 <-> w12/L4) | `bcab85765349a48c887cd9785ec4c5411f8115165d57058f31a5d47e9023c7cc` |
+| `dr_gradient_procrustes_resident:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, resident storage; open_clip ViT (w8/L2 <-> w12/L4) | `ce8025cec6f316fac2888f38f1d53211056a55ec1b076f28448e57f9a5827412` |
+| `dr_gradient_procrustes_resident:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, resident storage; open_clip ViT (w8/L2 <-> w12/L4) | `5d8821a33528782fdc6458f347583c8f60d093325dcae4cace0df246252419ad` |
+| `dr_gradient_procrustes_streaming:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, streaming storage; open_clip ViT (w8/L2 <-> w12/L4) | `2730f8a9ef810d35bb5678a3d64a3829613d7a11fd9bb8df57ec1ca0272880ff` |
+| `dr_gradient_procrustes_streaming:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, streaming storage; open_clip ViT (w8/L2 <-> w12/L4) | `214018ae5b0e75e051c8c2956dde958d35db418bc80c53849a0911c7740a6c58` |
+| `dr_gradient_procrustes_streaming:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, streaming storage; open_clip ViT (w8/L2 <-> w12/L4) | `2771b082b1e2de769090edbc72127f895a406f63dee9bc7f18f63f976b88e857` |
+| `dr_gradient_procrustes_streaming:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm with procrustes_source=gradient, streaming storage; open_clip ViT (w8/L2 <-> w12/L4) | `db74ab5b9307b9c548822aad5f67bd6b6e320f5c8da76b13c01d3021230cf979` |
+| `dr_main_cproj_resident_eb:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with activation_storage=resident; num_batches=3, ridge_relative=0.05 | `e6ee902c3d40e0511bf7ad27c63e71532b2f922f52e50faea5cb1c149fe7ef6c` |
+| `dr_main_cproj_resident_eb:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with activation_storage=resident; num_batches=3, ridge_relative=0.05 | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
+| `dr_main_cproj_resident_eb:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with activation_storage=resident; num_batches=3, ridge_relative=0.05 | `1f687e3e452feaefbab1a7bc89de3886c8d14f2d6a6c5cf5d4cba0f5a2a121e7` |
+| `dr_main_cproj_resident_eb:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with activation_storage=resident; num_batches=3, ridge_relative=0.05 | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
+| `dr_main_cproj_streaming_eb:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm: components=(mlp.c_proj,), block_boundary, streaming, empirical_bayes, polar, activation; num_batches=3, ridge_relative=0.05 | `8255b82b82472d08ce56fb36caf5d087205d76ccfcf007217c09926dd7eab433` |
+| `dr_main_cproj_streaming_eb:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm: components=(mlp.c_proj,), block_boundary, streaming, empirical_bayes, polar, activation; num_batches=3, ridge_relative=0.05 | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
+| `dr_main_cproj_streaming_eb:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm: components=(mlp.c_proj,), block_boundary, streaming, empirical_bayes, polar, activation; num_batches=3, ridge_relative=0.05 | `552f60a1ce474bb04de0283f4f97310c03886d8b19692af0996ea31303b77966` |
+| `dr_main_cproj_streaming_eb:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN arm: components=(mlp.c_proj,), block_boundary, streaming, empirical_bayes, polar, activation; num_batches=3, ridge_relative=0.05 | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
+| `dr_main_cproj_streaming_fixed_relative:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with ridge_estimator=fixed_relative; num_batches=3, ridge_relative=0.05 | `8255b82b82472d08ce56fb36caf5d087205d76ccfcf007217c09926dd7eab433` |
+| `dr_main_cproj_streaming_fixed_relative:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with ridge_estimator=fixed_relative; num_batches=3, ridge_relative=0.05 | `06f9ab188bd7a680abb045a43b0dba6d069fa1bf31cd3c5f9fbd20e449006202` |
+| `dr_main_cproj_streaming_fixed_relative:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with ridge_estimator=fixed_relative; num_batches=3, ridge_relative=0.05 | `552f60a1ce474bb04de0283f4f97310c03886d8b19692af0996ea31303b77966` |
+| `dr_main_cproj_streaming_fixed_relative:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with ridge_estimator=fixed_relative; num_batches=3, ridge_relative=0.05 | `ddb76c6e2e142f0e0d514c5f5fe58111ed131d808fdf3d6347301e28136e1e4c` |
+| `dr_od_streaming_eb:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `8255b82b82472d08ce56fb36caf5d087205d76ccfcf007217c09926dd7eab433` |
+| `dr_od_streaming_eb:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `c472d2b55cd53b7230bc37ab872e7cdddb6e49f1cc5f1dd9c02229b806e58b0b` |
+| `dr_od_streaming_eb:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `552f60a1ce474bb04de0283f4f97310c03886d8b19692af0996ea31303b77966` |
+| `dr_od_streaming_eb:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | O+D: components=(attn.out_proj, mlp.c_proj), otherwise MAIN; num_batches=3, ridge_relative=0.05 | `9f759855432ed43cd619b11eb35d487f696f2dcba5848520d922f2918376c342` |
+| `dr_orchestration_main_streaming_eb:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `1686a7afde96ab90d0ca062e69f28d0a75a3f51f09f79db7b275e2573aa6c7ec` |
+| `dr_orchestration_main_streaming_eb:extend:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
+| `dr_orchestration_main_streaming_eb:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `0a4c6c11ff8ac3619b7f11bb0d835de0fd8006c8329e9727f4d1ad28673b8984` |
+| `dr_orchestration_main_streaming_eb:shrink:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | MAIN arm config (streaming, c_proj only, EB ridge, polar); num_batches=3, ridge_relative=0.05 | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
+| `dr_orchestration_od_resident_fixed_relative:extend:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `ba8c4447a4f3aba99a2640c8728eb5aaa8c055441ba8dafffcb6ef7efbcb7d6a` |
+| `dr_orchestration_od_resident_fixed_relative:extend:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `82656c63449b965c653663f63107e1a47ea0dfc86c8e76179b3dfecafa9be8ee` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:task_vector` | `vision_rebase._run_direct_residual_fit` (pairing, capture, alignment, fit, strength scaling) | `DirectResidualConfig` defaults (O+D, resident, fixed_relative); num_batches=3, ridge_relative=0.05 | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
+| `dr_random_isometry_resident:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `9d77ebb184f6ac41583b52fea44d1ab9b12f9ba5c9fb4668a57d619b2af3e8da` |
+| `dr_random_isometry_resident:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `67cf0ee866c51175f41ba8838b85b19be6b6f097857b33de4182c9cf7df07067` |
+| `dr_random_isometry_resident:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `5f4a4c43c168f6fd2307862425a94a60e7a0bd61d562b0c09c8ff1e67dc7edab` |
+| `dr_random_isometry_resident:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | same, resident; num_batches=3, ridge_relative=0.05 | `d5839f8624b04da2713fa2b2cb77001551610137fac7759f23082d2c94486922` |
+| `dr_random_isometry_streaming:extend:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=random_isometry, alignment_seed=3, streaming; num_batches=3, ridge_relative=0.05 | `2e894bd50a1f4a1d3f04d2e6c81dd1fd347901a454fc0d0588bdb21b7cfa40b8` |
+| `dr_random_isometry_streaming:extend:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=random_isometry, alignment_seed=3, streaming; num_batches=3, ridge_relative=0.05 | `67cf0ee866c51175f41ba8838b85b19be6b6f097857b33de4182c9cf7df07067` |
+| `dr_random_isometry_streaming:shrink:alignment` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=random_isometry, alignment_seed=3, streaming; num_batches=3, ridge_relative=0.05 | `f537d10f91a1936d735ced2dfc92f0ec7b423a7a6e702285a2d10199bc9ba4f2` |
+| `dr_random_isometry_streaming:shrink:task_vector` | `capture_paired_boundary_activations`/`prepare_direct_residual_streaming` + `compute_desired_effects` + `fit_direct_residual[_streaming]` | MAIN with alignment_map=random_isometry, alignment_seed=3, streaming; num_batches=3, ridge_relative=0.05 | `d5839f8624b04da2713fa2b2cb77001551610137fac7759f23082d2c94486922` |
+| `llm_rebase_bico:extend:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | bico; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `f51a5f74830a68ab6e3b759b5ecbf2645b104338f8048ed4f90c4171c3c64f3a` |
+| `llm_rebase_bico:extend:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | bico; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `c2db0ef90e07a6e316cff3b2b03e4a26d0669ec2118df62d4587aa805b3e6ac0` |
+| `llm_rebase_bico:shrink:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | bico; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `d5d93a32aa1ea5fca9c1311e0f5e20b49ff1f9309023c5fdad9f622bdcb385a6` |
+| `llm_rebase_bico:shrink:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | bico; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `ad84126f2cb746192a97abae8fae8da6b5c1f8fa3559af5c560a60a8b6c98ee4` |
+| `llm_rebase_theseus:extend:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `f51a5f74830a68ab6e3b759b5ecbf2645b104338f8048ed4f90c4171c3c64f3a` |
+| `llm_rebase_theseus:extend:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `f395a303ad1973226636f39b49ed7ffebaf1651ecb33a9996e1861d36d160a3b` |
+| `llm_rebase_theseus:shrink:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `d5d93a32aa1ea5fca9c1311e0f5e20b49ff1f9309023c5fdad9f622bdcb385a6` |
+| `llm_rebase_theseus:shrink:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `56011dfa9bf8a323c374c6c45f03437c7b93149f42fe958eadb7ac9454cb25ec` |
+| `llm_rebase_theseus_gqa:extend:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus_gqa; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `f51a5f74830a68ab6e3b759b5ecbf2645b104338f8048ed4f90c4171c3c64f3a` |
+| `llm_rebase_theseus_gqa:extend:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus_gqa; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `a4670d67d22b70a87bb98579c0b4fd37a690b9e4d5b8fa18216953e64cb1b870` |
+| `llm_rebase_theseus_gqa:shrink:brace_and_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus_gqa; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `d5d93a32aa1ea5fca9c1311e0f5e20b49ff1f9309023c5fdad9f622bdcb385a6` |
+| `llm_rebase_theseus_gqa:shrink:transported_delta` | `llm_rebase._prepare_resized_task_delta` (BRACE, corrected + uncorrected) -> `method.transport` exactly as `llm_rebase.main` calls it | theseus_gqa; Qwen2 hidden 32/4 heads/2 kv -> 48/6/2; seq_align=interpolate, n_batches=2 | `a2ad60584ec835e7ded402cab8a045767a12a69ef66ae352584de3daadc0e6a6` |
+| `theseus_vision_fc` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | theseus, activations, seq_align=mean; num_batches=2, seed=123 | `5ad4876a13fa9c48d39a1d97d781b47145d462b5e03ac863072e5a069d90b8f1` |
+| `theseus_vision_fc_centered` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | theseus, center_acts=True; num_batches=2, seed=123 | `a2a94edf84da6a463282fc85c6ce25c64d375c08b7bf8375aa22157a8ffbc958` |
+| `theseus_vision_fc_data_free` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | theseus, covariance_mode=data_free, whiten_power=0.25; num_batches=2, seed=123 | `23e9a0a6b41ad9c5ee11f5779e77e7104971bba27be4159c84651afe16b0e28b` |
+| `theseus_vision_fc_whiten025` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | theseus, whiten_power=0.25; num_batches=2, seed=123 | `aee27268f56e8fce14d2c1b22e891f2b7fd91302a6d2d162a6f9687fce8ea1a5` |
+| `vision_rebase_bico_brace_prestep:extend:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `9d54bc803bd6881986f46e8d87d9e81f762ac631c09ee9b1d922c2eb8a6b8b71` |
+| `vision_rebase_bico_brace_prestep:extend:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `a6c3e079cc287a58aa4778b792cce308d54cf1b23c991e66c133968c3b9dba38` |
+| `vision_rebase_bico_brace_prestep:shrink:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `12abe7a8ede5340e42316adea34ed00da12e2c3fe1ebaab75fd6e5d2af676b0a` |
+| `vision_rebase_bico_brace_prestep:shrink:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `6bcebcedeb4398b4251547927e29dc0c9abb8684cfe917bf93b17e1f2f5f7b8a` |
+| `vision_rebase_bico_no_prestep:samedepth:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `1fe61eed751c59c39920bfe4e530af9bbae8cc00ab3132bd1c4e54f0dcb14647` |
+| `vision_rebase_bico_no_prestep:samedepth:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | bico, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `f1aeaf7045945a63e8cda60ab9a1d6cc730932e95d3a82e0229fd71446a76e01` |
+| `vision_rebase_theseus_brace_prestep:extend:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `9d54bc803bd6881986f46e8d87d9e81f762ac631c09ee9b1d922c2eb8a6b8b71` |
+| `vision_rebase_theseus_brace_prestep:extend:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `205a2d3a5cd14f036c3f125a8db16161cd69f546e24f5c828027d45519fb57ba` |
+| `vision_rebase_theseus_brace_prestep:shrink:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `12abe7a8ede5340e42316adea34ed00da12e2c3fe1ebaab75fd6e5d2af676b0a` |
+| `vision_rebase_theseus_brace_prestep:shrink:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, BRACE prestep (interpolate_per_weight, correction on); parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `d5db7ff6e25218727f88a85543dca479c172ea4afc7589fc25249c675f964b7d` |
+| `vision_rebase_theseus_no_prestep:samedepth:brace_and_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `1fe61eed751c59c39920bfe4e530af9bbae8cc00ab3132bd1c4e54f0dcb14647` |
+| `vision_rebase_theseus_no_prestep:samedepth:transported_delta` | `run_block_extension` -> `vision_rebase._build_rebase_prepared` -> `method.transport` (tiny attention ViT, width 4 -> 6) | theseus, no prestep, depth 2 -> 2; parts: `brace_and_delta` = json hash of {resized source base, ft, task delta} | `9a71d4f4531618193315ae6547580fa29076f057285c3beaed20da39ef6771e4` |
+
+## Declared changes
+
+### 2026-10-03 -- S10d: LLM rebase on the shared per-task contracts (ordering-only, 0 hashes changed)
+
+`llm_rebase` now runs `rebase.orchestration.TaskPipeline` (prepare -> transport -> free, one task at a time) instead
+of a two-phase loop (prepare all, then transport all). Declared change: only the ORDER of log lines / model-build
+side effects (each task's resized model is built, scored, transported and freed before the next one is built; the
+"Transporting N task vectors" banner prints before the per-task loop). All 53 `test_llm_main_golden.py` cases
+(summary, resolved_config, harness_calls, builds, tuned_loads, every `file:*.pt`) and the 24 error rows are
+byte-identical to the pre-change commit: **no hash changed**, which is the proof that no number moved and that the
+harness-call sequence (before-rebase evals happen in the per-task prestep, alpha-search evals after the loop) is
+unchanged. `transport_delta_source` / `delta_norm_match` are now resolved before the loop (not after it); their error
+messages and the 2-builds row are unchanged, and `eval_before_rebase_only` still never resolves them.
+`tests/test_llm_rebase_task_pipeline.py` pins the per-task event order and that the resized model is released.
+
+### 2026-10-01 -- Ariadne diagnostics/schema fixes (task vectors, alignment maps and q unchanged)
+
+Only the four `summary` hashes below changed; every `task_vector`, `alignment`, `diagnostics`
+and `brace_and_delta` hash is byte-identical to the previous table. The `summary` part is
+`hash_json({"diagnostics": rows, "extra": extra})` of `vision_rebase._run_direct_residual_fit`,
+so it moves whenever the diagnostics-row schema gains keys, even though no number moved.
+
+Reason (all four cases): the per-position diagnostics rows gained the rank diagnostics of the
+cross-covariance the Procrustes map was solved from -- `procrustes_rank`, `procrustes_min_dim`,
+`procrustes_q_non_unique` -- in both storage paths (fix: flag non-unique polar factors, no
+numeric change). The streaming case (`dr_orchestration_main_streaming_eb`) additionally gained
+the row key `procrustes_source` (row-key parity with the resident path). No existing value in
+any row or in `extra` changed (default polar / uniform alignment diagnostics are bit-identical;
+verified key by key against the pre-change code). `extra["calibration"]["dataset_identity"]` now
+holds a process-independent identity instead of a Python object id; it is dropped by `hash_json`
+(`VOLATILE_KEYS`), so it does not affect any hash (and the `id()` remark in `_hashing.py` /
+the Hasher bullet above is historical).
+
+| Case | Old hash | New hash |
+|---|---|---|
+| `dr_orchestration_main_streaming_eb:extend:task_vector` | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` | `98ef3bc1592b30e952712731bece8536da3f9cdd7841f908109c70e8603781cb` |
+| `dr_orchestration_main_streaming_eb:extend:summary` | `18c46657227748a8d853c478e4206144da4b776ffb38873098905a486c27dba8` | `1686a7afde96ab90d0ca062e69f28d0a75a3f51f09f79db7b275e2573aa6c7ec` |
+| `dr_orchestration_main_streaming_eb:shrink:task_vector` | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` | `39e63783763f302dc635be0eec9f744bd3e8798970168aa5b355e9338ca02f6f` |
+| `dr_orchestration_main_streaming_eb:shrink:summary` | `47c560421cc09c7e87a15004a59eda638f8a2e2d80aae879df2144eac2c32fb0` | `0a4c6c11ff8ac3619b7f11bb0d835de0fd8006c8329e9727f4d1ad28673b8984` |
+| `dr_orchestration_od_resident_fixed_relative:extend:task_vector` | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` | `113c485c5be7790e5b7cd0e57a11ed66392eabc5c9376dd8a58bb7053f77b399` |
+| `dr_orchestration_od_resident_fixed_relative:extend:summary` | `ee55a24e6b76151127d944a674c34e7cd65309a0c44d6bbc9bcd7474eca59159` | `ba8c4447a4f3aba99a2640c8728eb5aaa8c055441ba8dafffcb6ef7efbcb7d6a` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:task_vector` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` | `208eaae4c7fac3efbcad60c734e05894e575b08d5751e2be52ff02a1935d8ad9` |
+| `dr_orchestration_od_resident_fixed_relative:shrink:summary` | `35fee9670ff99777a7be08a3a8f8ad14c012d2d7de6261f6514a21270a5d8066` | `82656c63449b965c653663f63107e1a47ea0dfc86c8e76179b3dfecafa9be8ee` |
+
+## `vision_rebase.main()` characterization (Phase 5.0)
+
+**Declared changes (this section).**
+- 2026-10-01, P5.1b: `_load_saved_sequential_tv` now resolves `{task}_{ariadne|direct_residual}_transported_native.{pt,json}` (canonical name and legacy alias; `ValueError` if both exist, `FileNotFoundError` naming both if neither). Quirk 4 below is fixed: vectors saved under `method='ariadne'` reload. No pinned hash changed (the old failure was an asserted exception in `test_main_sequential_load_misses_vectors_saved_under_the_ariadne_spelling`, now `..._reads_vectors_saved_under_the_ariadne_spelling`); the `direct_residual` spelling is byte-identical.
+- 2026-10-02, P5.12: per-method depth defaults (`depth_defaults: legacy|method`; THESEUS-like -> BRACE + `skip_correction=True`, BiCo-like -> `discrete_index_match`; absent key + changed outcome -> `ConfigMeaningChangedError`). `test_main_golden.py`: (a) 35 `summary` hashes changed only by the additive `depth_rule_resolved` key (verified: identical with that key masked; no `events` or `file:` hash changed, so no number moved); (b) 11 `resolved_config` hashes changed because those cases (depth-mismatched THESEUS without `skip_correction`, joint/direct-P1 THESEUS, BiCo without `depth_alignment`: `bico_extend_depth_alignment_absent`, `theseus_brace_merge_then_transport`, `theseus_double_{target_residual_completion,joint_blockwise_correction,direct_p1_correction}`, `theseus_extend_eval_before_and_source_lmc`, `theseus_independent_endpoint_average`, `theseus_merge_then_brace_then_transport_correction`, `theseus_native_target_{auto_detected_per_task,explicit}`, `theseus_shrink_brace`) now carry `"depth_defaults": "legacy"`; the error cases `merge_then_rebase_with_block_extension_prestep` and `joint_correction_needs_depth_mismatch` carry it too; (c) 3 new pinned cases `{theseus_extend,theseus_shrink,bico_extend}_depth_defaults_method`. `main_golden_structure.json` gains the `depth_rule_resolved.*` key paths.
+- 2026-10-02, P5.14/B2: `source_only=true` no longer crashes on a `zip()` length mismatch after the task loop; `pipeline.run` returns a source-only summary (source-side observer rows, target hashes, `source_only: true`). The pinned crash `source_only_always_crashes_in_merge_mode_none` (ERRORS table) is replaced by `test_main_source_only_completes_without_transport`. No hash changed (error cases are not hash-pinned).
+- 2026-10-02, P5.14/B3: `auto_detect_ckpt_base=false` without `native_target_tasks` now still refuses a target-architecture checkpoint (`ValueError`, same message as the explicit-list case) instead of completing with an empty task vector. New ERRORS pin `target_architecture_checkpoint_without_auto_detect_or_native_list`; no hash changed (quirk 3 of the quirk list is fixed).
+- 2026-10-02, P5.14/B4: `native` source/target base snapshots (`pipeline._owned_cpu_fp32`) no longer alias a CPU fp32 model, so `load_into_model` cannot mutate `target_base_sd` (quirk 2 fixed; CUDA runs unchanged, their CPU copy was already real). The golden fake `_AttnModel.state_dict` clone workaround is KEPT: it also copies raw `model.state_dict()` views that real CUDA runs share, and removing it changed `theseus_extend_eval_before_and_source_lmc` (events + summary) -- a harness artefact, not part of this fix; the fix is pinned by `tests/test_owned_cpu_fp32_20261002.py`. No hash changed.
+- 2026-10-02, P5.14/B6: `base_construction='independent_endpoint_average'` with a valid merge mode now raises `ValueError` (it was a verified no-op identical to `per_task`; the independent base is consumed only by `brace_merge_then_transport`, which rejects it). RETIRED golden case `theseus_independent_endpoint_average` (3 hashes: events, resolved_config, summary, plus its structure entry), replaced by ERRORS pin `independent_endpoint_average_has_no_effect`. Local `configs/final/independent_merge/*.json` using the option must switch to `per_task` (identical numbers).
+- 2026-10-02, P5.14/B7: `block_extension_protocol.label` is `discrete_index_match` (was `ariadne`) when the resolved depth rule is `discrete_index_match`. `test_main_golden.py` `summary` hashes changed: `bico_extend_discrete_index_match`, `bico_extend_depth_defaults_method` (2). No events/file hash moved.
+- 2026-10-02, P5.14/B10: an unknown `merge_method` in a run config is a `ValueError` (same text, no KeyError quoting) instead of the registry's `KeyError`; the registry itself is unchanged. ERRORS pin `merge_method_unknown` updated. No hash changed.
+- 2026-10-02, P5.14/B9: a `weights` list whose length differs from the tuned checkpoints is rejected up front (before any model is built) with `weights length must match tuned checkpoints` in every merge mode; merge_mode `none` used to fail late with a bare `zip()` error. ERRORS pins `weights_length_mismatch_merge_mode_none` and `weights_length_mismatch_merge` updated (both now `before_build`). No hash changed.
+- 2026-10-02, P5.14/B5 (D-P5c): `cross_task_lmc_pairs` / `all_task_lmc_tasks` are deprecated (`DeprecationWarning` when non-empty; keys kept, outputs stay `[]`); the per-task `corrected_ft_states` / `corrected_ft_templates` bookkeeping (a CPU `deepcopy` of a model per task, never read) is no longer filled. No hash changed.
+- 2026-10-02, item 5 (user decision): target-informed completion RETIRED and archived to `.repo-archive/2026-10-02-target-informed/` (`eval/target_informed_runtime.py`, `eval/target_residual_completion.py`, `rebase/block_extension/completion_config.py`, `eval/vision_rebase/completion.py`, the same-depth direct-target prestep, the LLM `transport_residual`/`direct_target` modes, 11 test files). Config keys `target_residual_completion`, `joint_blockwise_correction`, `direct_p1_correction` (top level or under `block_extension_params`) raise `ValueError ... retired`; BRACE `target_shared_correction` and Ariadne are kept. `test_main_golden.py`: RETIRED cases `theseus_same_depth_direct_target`, `theseus_double_target_residual_completion`, `theseus_double_target_residual_completion_direct_target`, `theseus_double_joint_blockwise_correction`, `theseus_double_direct_p1_correction` (15 hashes + structure entries); 34 remaining `summary` hashes changed only by the removed always-present keys `target_residual_completion` / `joint_blockwise_correction` / `direct_p1_correction` (no events/resolved_config/file hash moved); 6 ERRORS pins retired, 3 `retired_completion_key_*` pins added. `test_release_golden_hashes.py`: RETIRED 8 hashes `complete_residuals_direct_{fixed_relative,empirical_bayes}:{extend,shrink}:{task_vector,diagnostics}` (the frozen oracle went with the archive).
+- 2026-10-02, P7.S4b (D-P7b, correctness fix, unconditional): the BRACE DECODER correction no longer fits on padding rows (reference inputs / component references and the per-step block-input and component captures keep only `attention_mask == 1` rows, via `family_adapter.content_mask`; a mask/row-count mismatch raises). Changed hashes (the golden fixture has pads): `test_brace_extra_golden.py` 129 `brace_x_decoder_*` entries; `test_release_golden_hashes.py` 30 entries (`brace_decoder_{independent,shared}:{extend,shrink}`, `brace_decoder_class_api:*`, `llm_rebase_{theseus,theseus_gqa,bico}:*`, whose BRACE prestep runs the decoder correction). Vision BRACE (`brace_vision*`, `brace_x_vision*`: 246 pins) unchanged, enforced by a digest test in `tests/test_brace_decoder_padding_p7s4.py`, which also pins max_length invariance of the correction (extend + shrink, left and right padding).
+
+`test_main_golden.py` (+ `main_golden_structure.json`) drives the REAL `eval/vision_rebase.py::main()`
+end to end on a tiny offline world and pins everything it produces, so each Phase 5 move out of
+`vision_rebase.py` is checked at hash level. Tests only: no source file was touched.
+
+- **Generating commit**: values captured on the code of `8028734` (release/2026-10-rebase-refactor) plus the
+  docstring-only edits that were committed as `e262b7c` (AST-identical, no behaviour change); the file
+  passes unchanged on `e262b7c`. Python 3.14.4, torch 2.11.0+cu128, single thread, deterministic
+  algorithms (same platform caveat as above: bit-level hashes are CPU/BLAS/torch specific).
+- **Run**: `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 pytest tests/golden/test_main_golden.py -q -p no:cacheprovider`
+  (109 tests, about 30 s test time on top of the import time; the whole `tests/golden` directory is 180 tests,
+  about 36 s, peak RSS 0.67 GB).
+- **Regenerating** (only after establishing the change is intended; never to "make it green"):
+  `GOLDEN_CAPTURE=/path/out.txt GOLDEN_CAPTURE_STRUCTURE=tests/golden/main_golden_structure.json pytest tests/golden/test_main_golden.py -q -p no:cacheprovider -k test_main_golden`
+  appends `key hash` lines (paste into `EXPECTED`) and rewrites the per-case structure entries. Capture was run in
+  3 separate processes (plus forward/reverse/shuffled test order) and gave identical output.
+
+**Harness.** `run_main(cfg, root, monkeypatch, world=...)` writes `cfg` to JSON, sets `sys.argv` and calls
+`vision_rebase.main()`. The fakes are installed BY NAME into every module of `PATCH_MODULES`
+(`vision_rebase` now; `vision_rebase_context`, `vision_alpha_search`, `rebase.orchestration` are already listed and
+skipped while they do not exist; use `monkeypatch.setattr(mod, name, fake, raising=False)`, so a name that has moved
+is patched wherever it now lives -- add new module names to the list in the same commit as the move).
+Patched names: `OpenClipClassifier` (a fake class around the real tiny attention ViT-like `_AttnModel`, copied from
+the release golden fixtures; `.build`, constructor, `_compute_zeroshot_text_features`, `build_zeroshot_text_features`,
+`top1`, `top1_with_text_features`, `__call__`, `.preprocess.tag` marks the source/target view), `load_ckpt`,
+`resolve_ckpt_path` (in-memory seeded perturbations of the base state dict; native-target checkpoints are
+perturbations of the target base), `SUITES` (fake 2-task suite `fake2` over the real task names MNIST and DTD, because
+`get_templates` is real), `load_hf_splits`, `extract_classnames`, `build_vision_loaders`,
+`build_vision_calibration_loader` (seeded class-labelled tensor datasets with `sample_ids`; the two views differ by a
+seeded perturbation but share labels and ids), `eval_task_top1` (real, weight-sensitive: 0.999 * top-1 accuracy +
+0.001 * mean true-class probability of a zero-shot head on fixed tensors, so a change that flips no prediction still
+changes the bits), `start_run` (a recorder keeping the metadata `resolved_config`, every `log_event`, the summary and the
+final status). Everything else is real: config/CLI resolution, alpha search, BRACE, THESEUS/BiCo/Ariadne, merge
+registry, task vectors, `torch.save`, `default_summary_path`, `finish_with_error`.
+The model's `state_dict()` returns clones: on a CPU model `to_cpu_fp32(model.state_dict())` aliases the live
+parameters and `main()`'s "target base mutated" guard fires (see quirks); a GPU run copies, which is what is mimicked.
+
+**Pinned per case** (`EXPECTED[case:part]`): `summary` (`hash_json` of the `log_summary` payload; timing / memory / path /
+git / `dataset_identity` keys masked, run-dir prefixes normalised), `resolved_config` (`hash_json` of the dict handed
+to `start_run`), `events` (`hash_json` of all `log_event` calls), `file:<relpath>` (`hash_tensor_dict` of every saved
+`.pt`, `hash_json` of every JSON sidecar). `main_golden_structure.json` pins per case the sorted summary key paths
+(`a.b`, `a[]`; the "keys byte-for-byte" gate, timing keys included), the ordered `log_event` names and the
+saved file names, with an added/removed diff in the failure message. Every case is run twice in one process and the
+two digests must be equal. `test_pins_change_when_*` perturb one tuned checkpoint / one transported task vector and
+assert the summary and the saved vector hashes move (the pins are not vacuous). Extra tests: sequential Ariadne
+vectors save -> load round trip (`..._load`), the write-once `FileExistsError`, and the loader/saver file-name quirk.
+
+**Error surface** (`test_main_error_surface`, 67 invalid configs): for each, the exact exception type and message,
+whether it is raised before `OpenClipClassifier.build` (sentinel build raising `_ReachedModelBuild`; for the
+post-build ones the sentinel must be reached and the real run then fails with the pinned message), and whether the run
+record (`start_run`) was already opened (then it is finished `failed`). 41 fail before the build with no run record,
+1 (`tuned_ckpts_missing`) after `start_run` but before the build, 25 after the build.
+
+### Cases (summary hashes; the other parts are in `EXPECTED`)
+
+| Case key | Source -> target (depth, width) | Config (non-default) | Saved files | summary SHA-256 |
+|---|---|---|---|---|
+| `ariadne_calibration_tiny_imagenet` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"calibration_data":"tiny_imagenet"}}` | 0 | `ffbeccb43e42506f59bd0d522eb412b116b945b4d05822ccf67fe79d45892624` |
+| `ariadne_calibration_vision8_mix` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"calibration_data":"vision8_mix"}}` | 0 | `8ccfca91a9130ef3aa1847969b397966d18ecb441db28f085456260cfd894e54` |
+| `ariadne_merge_in_source_then_fit` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":{"merge_mode":"merge_in_source_then_fit"}}` | 0 | `4227a4252d1237584e71693fde46657161e0fb4bd88e743149f0394bab3c2cb1` |
+| `ariadne_spelling_ariadne` | (2, 4)->(3, 6) | `{"method":"ariadne","method_params":{},"ariadne_params":"main"}` | 2 | `bd5218e25356daf94570cc5a9a1284bd70f6034e9dc40433201ceb6ae898f412` |
+| `ariadne_spelling_direct_residual` | (2, 4)->(3, 6) | `{"method":"direct_residual","method_params":{},"direct_residual_params":"main"}` | 0 | `ec6ea6f5017cc599862f11e13a7be842c76d2cc529b99ff86ac2fd8a317b5051` |
+| `bico_extend_depth_alignment_absent` | (2, 4)->(3, 6) | `{"method":"bico"}` | 0 | `c3405baf8c644b06eca4029faa223418017724a05ba9e73b0eab0abd78cdfa74` |
+| `bico_extend_discrete_index_match` | (2, 4)->(3, 6) | `{"method":"bico","depth_alignment":"discrete_index_match"}` | 0 | `28d72a90c89a5a0d98c14a08fb56feae0f6d347c52b2619d5ca0dcf0db0150f9` |
+| `direct_residual_sequential_endpoints_save` | (2, 4)->(3, 6) | `{"method":"direct_residual","method_params":{},"direct_residual_params":{"endpoint_construction":"sequential_source_endpoints"}}` | 4 | `4beecdb3b5e70ff98b500e5f5c090acf76b37ed602d78e662cef7107b176c170` |
+| `gradfix_same_architecture` | (2, 4)->(2, 4) | `{"method":"gradfix","method_params":{},"grad_batch_size":4,"grad_imgs_per_class":2,"grad_num_batches":2}` | 0 | `3f43269679dae616de9395dba3ef72f9e49534be04429a19c9f1426253fbaaeb` |
+| `theseus_alpha_patience_per_task` | (2, 4)->(2, 6) | `{"alpha_selection":"per_task","alpha_patience":1,"alpha_min":0.0,"alpha_max":2.0,"alpha_step":0.25,"alpha_search":true}` | 0 | `1c72d19369564dfa41baf37a79c43ab10a9abd671ff5d98d11a11ab5ac415d21` |
+| `theseus_alpha_patience_shared` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_patience":0,"alpha_min":0.0,"alpha_max":2.0,"alpha_step":0.25,"alpha_search":true}` | 0 | `460a1de68c82e7c1501eb2beacecd0353ffc75921de69cdf8d222ee9d3d1cd91` |
+| `theseus_brace_merge_then_transport` | (2, 4)->(3, 6) | `{"merge_mode":"brace_merge_then_transport","transport_calibration_batches":2,"alpha_search":"0..1 step .5"}` | 0 | `10f3f007a2f73c06e8581ccd0921eeb71feb79a1c4d602ebe24a71ff66c16c48` |
+| `theseus_double_direct_p1_correction` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","extension_strategy":"duplicate_per_weight","calibration_split":"val","direct_p1_correction":{"enabled":true}}}` | 0 | `0b2424214be65e13b01c6ecc8902033ee2a638546e1b89b72492421547e53fbb` |
+| `theseus_double_joint_blockwise_correction` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","extension_strategy":"duplicate_per_weight","calibration_split":"val","joint_blockwise_correction":{"enabled":true}}}` | 0 | `804673c14647641ae0488d6064f294d27bf78615498dee985cb02e35b0c279e1` |
+| `theseus_double_target_residual_completion` | (2, 4)->(4, 6) | `{"block_extension_params":{"lmc_mode":"shared","target_residual_completion":{"enabled":true,"num_batches":2}}}` | 0 | `b54d0bf520fa7a0855cad09ad5efa934c79d26dafde193549c5b36c14cff2986` |
+| `theseus_double_target_residual_completion_direct_target` | (2, 4)->(4, 6) | `{"block_extension_params":{"skip_correction":true,"target_residual_completion":{"enabled":true,"mode":"direct_target","num_batches":2}}}` | 0 | `20ecc7afbe1bc36a8fa61b9bea9ea5c82d09db51c40255cf205554603f117a71` |
+| `theseus_equal_depth_none_fixed_alpha_save_tvs` | (2, 4)->(2, 6) | `{"merge_mode":"none","save_transported_tvs_legacy":true}` | 6 | `5b351126ddadffd1fc25dab1752c5431b5c17034a5cfc6c06121126dd2b1213d` |
+| `theseus_extend_brace_correction_search_shared` | (2, 4)->(3, 6) | `{"alpha_selection":"shared","block_extension_params":{"skip_correction":false},"alpha_search":"0..1 step .5"}` | 0 | `6032fd660bbe0b6e85c6c6ec68bb15933dff5e4c9c5c883232895201c539992d` |
+| `theseus_extend_brace_skip_correction` | (2, 4)->(3, 6) | `{"alpha":1.0,"block_extension_params":{"skip_correction":true}}` | 0 | `2d3a70538cfd30bf3ec58259a5193d9390da433bc115d0940ed9f32ce5d35476` |
+| `theseus_extend_eval_before_and_source_lmc` | (2, 4)->(3, 6) | `{"eval_before_rebase":true,"source_lmc_eval":true,"source_lmc_alpha_step":0.5,"cross_task_lmc_pairs":[["MNIST","DTD"]],"all_task_lmc_tasks":["MNIST","DTD"]}` | 0 | `b95d0578abcc84b284d8cf70fbe7e303901a2c241e9856bca753ca855afefc7f` |
+| `theseus_independent_endpoint_average` | (2, 4)->(3, 6) | `{"merge_mode":"brace_transport_then_merge","base_construction":"independent_endpoint_average","alpha_search":"0..1 step .5"}` | 0 | `1d2505f133562abbaf4818fd5399ebea4b1bbec6f1cfad362b73434fa123a77f` |
+| `theseus_merge_then_brace_then_transport_correction` | (2, 4)->(3, 6) | `{"merge_mode":"merge_then_brace_then_transport","transport_calibration_batches":2,"block_extension_params":{"calibration_dataset":{"path":"zh-plus/tiny-imagenet","split":"valid"}},"alpha_search":"0..1 step .5"}` | 0 | `e976a806fed73d1338952b7b0cdda372360dd55781a3566072574ddb4c0c2bc3` |
+| `theseus_merge_then_brace_then_transport_skip_correction` | (2, 4)->(3, 6) | `{"merge_mode":"merge_then_brace_then_transport","transport_calibration_batches":2,"block_extension_params":{"skip_correction":true},"alpha_search":"0..1 step .5"}` | 0 | `f58063754bd30bec80d15b436117a6e5210dc1d1a07d42431cc10c69991f2ab4` |
+| `theseus_merge_then_rebase` | (2, 4)->(2, 6) | `{"merge_mode":"merge_then_rebase","transport_calibration_batches":2,"alpha_search":"0..1 step .5"}` | 0 | `3c19d3932a11ac5561bf5f1afbb06e51b8fd370ed42f77b9f69b2e7bf12206af` |
+| `theseus_merge_then_rebase_tiny_protocol` | (2, 4)->(2, 6) | `{"merge_mode":"merge_then_rebase","transport_calibration_protocol":"tiny","alpha_search":"0..1 step .5"}` | 0 | `7559c8047e0c37ed5561961a76361e8494e257c268bc0ce6caf1a3bfe8141926` |
+| `theseus_native_target_auto_detected_per_task` | (2, 4)->(3, 6) native=DTD | `{"merge_mode":"brace_transport_then_merge","alpha_selection":"per_task","alpha_search":"0..1 step .5"}` | 0 | `e3cb36f02a0d9d6c9fc72944e0b4b72043efcf5e2016ed55fd9ec3e951434da5` |
+| `theseus_native_target_explicit` | (2, 4)->(3, 6) native=DTD | `{"merge_mode":"rebase_then_merge","native_target_tasks":["DTD"],"alpha_search":"0..1 step .5"}` | 0 | `d768a510ca4ce10baa57c9fdc27a9e8610f588484e20903f48b22c4517c9072f` |
+| `theseus_rebase_then_merge_per_task_hierarchical` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_selection":"per_task","alpha_search":"0..1 step .5"}` | 0 | `5be1f078cba33c4592c75813109c5c4aa5c90060cad1d4f2d5fd6070afbc3476` |
+| `theseus_rebase_then_merge_per_task_no_global_search` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_selection":"per_task","global_alpha_search":false,"alpha_search":"0..1 step .5"}` | 0 | `eeb854b733223aa4a20b0c81b112a12fed6f16164f88046c6dc7ccc985fea379` |
+| `theseus_rebase_then_merge_save_merged` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_search":"0..1 step .5"}` | 1 | `448c76a73395bae503501e939e95162595b0264f3fa3f70c2031765618324561` |
+| `theseus_rebase_then_merge_shared` | (2, 4)->(2, 6) | `{"merge_mode":"rebase_then_merge","alpha_search":"0..1 step .5"}` | 0 | `448c76a73395bae503501e939e95162595b0264f3fa3f70c2031765618324561` |
+| `theseus_same_depth_direct_target` | (2, 4)->(2, 6) | `{"block_extension_params":{"skip_correction":true,"target_residual_completion":{"enabled":true,"mode":"direct_target","target_scope":"all","num_batches":2}}}` | 0 | `c253b413f734a3e979c78b9e0da2badd55a73eff36a131667ddf12805526cc4b` |
+| `theseus_samearch_none_alpha_search_untransported` | (2, 4)->(2, 4) | `{"merge_mode":"none","alpha_search":"0..1 step .5"}` | 0 | `afff8207eb788cb3c7ccfda1329139fb12addde7f35542423f3308c5af24ec33` |
+| `theseus_samedepth_eval_before_rebase` | (2, 4)->(2, 6) | `{"eval_before_rebase":true}` | 0 | `ef2b2bc7728b5fbce957db1d559ac214dfef754bf4a4ff4178676fc4bfcae46a` |
+| `theseus_shrink_brace` | (3, 4)->(2, 6) | `{}` | 0 | `b15318e722066886a35a421c00e322ca6fea5ae8e0638af2e604098fc6a0fae6` |
+| `theseus_transport_calibration_tiny_imagenet` | (2, 4)->(2, 6) | `{"transport_calibration_data":"tiny_imagenet"}` | 0 | `09fe816444760519b2823ce6d2280ddcedbd12c76ecba267c051ca8d63cef451` |
+| `direct_residual_sequential_endpoints_load` | (2, 4)->(3, 6) | `load_direct_residual_tvs_dir` = the vectors of the save case above | 0 | `48321f0c8cdae5bed64c8f728a4f48f5c3605ec507311d4bef5fc82e61e5d742` |
+
+All cases except the load leg also pin `resolved_config`, `events` and every saved file (the "Saved files" column counts
+them). Worlds are `_AttnModel` pairs, e.g. `(2, 4)->(3, 6)` = depth 2 width 4 source, depth 3 width 6 target; BRACE
+cases use odd 2->3 extension or a 3->2 shrink, target-informed protocols need the doubled 2->4 layout.
+
+### Not pinned (and why)
+
+- `method=transfusion`: `_load_or_compute_permutations` raises "requires CUDA" on CPU. Only its native-target guard is in the error table.
+- Attention patching (`attn_patch_cfg`, `patched_attn`), `dtype` other than fp32, every CUDA branch (peak-memory brackets, `torch.cuda.synchronize`).
+- `bico_gradin`, `theseus_reference`, `theseus_gqa`, `orthogonal_shift`, `identity` through `main()`; merge methods other than `task_arithmetic`; non-uniform `weights`.
+- `source_only` (always crashes, see quirks), `transport_calibration_protocol` values `vision8_mix*` (the default `task_local` goes through the same balanced builder), `procrustes_source=gradient` and the gradient-recipe paths through `main()` (need a real open_clip ViT).
+- The real data / checkpoint layer (`load_hf_splits`, `build_vision_loaders`, `load_ckpt` key renaming), real summary-JSON serialisation and the `code_fingerprint`, W&B logging: all faked or bypassed.
+- Numbers come from a chance-level toy head on 8 samples per split: they pin bits, not scientific behaviour.
+
+### Observed quirks of `main()` (pinned as-is; nothing was fixed)
+
+1. **`source_only: true` cannot run** (merge_mode `none`): the per-task `continue` skips transport, then
+   `zip(transported_deltas, merge_weights, strict=True)` raises `ValueError: zip() argument 2 is longer than argument 1`.
+2. **(Fixed in P5.14/B4, see Declared changes.)** `target_hash_before == target_hash_after` guard failed on CPU models: `to_cpu_fp32` does `.detach().cpu().to(float32)`, which is a view for a
+   CPU fp32 model, so `load_into_model(clf_target.model, ...)` mutates `target_base_sd` in place and the guard raises
+   `RuntimeError: Native target base was mutated ...`. Invisible on CUDA (the CPU copy is real). `main()` with `device=cpu` and real classifiers would hit it.
+3. **(Fixed in P5.14/B3, see Declared changes.)** Silent empty task vector: with `auto_detect_ckpt_base=false` and no `native_target_tasks` the checkpoint classification block is skipped entirely, so a
+   target-architecture checkpoint is treated as a source one; `align_to_base_keys` keeps only shape-compatible keys (here just `logit_scale`), the run
+   prints "Loaded tuned checkpoint ... (1 keys)", "transported delta computed for 0 params" and completes. The error "matches the target architecture; add it to
+   native_target_tasks or set auto_detect_ckpt_base=true" is only reachable when `native_target_tasks` is non-empty (error case `target_architecture_checkpoint_without_auto_detect`).
+4. **(Fixed in P5.1b, see Declared changes.)** Ariadne sequential vectors could not be reloaded when saved under `method='ariadne'`: the saver names files `{task}_{method.name}_transported_native.pt`, `_load_saved_sequential_tv` hardcodes `{task}_direct_residual_...` (FileNotFoundError). Works with the `direct_residual` spelling (pinned load leg).
+5. **Dead code / dead outputs**: `cross_task_source_lmc` and `all_task_source_lmc` are always `[]` (the evaluators are never called; `corrected_ft_states`/`corrected_ft_templates` are filled, including a CPU `deepcopy` of a model per task, and never read); `cross_task_lmc_pairs` task names are not validated against the task list; the `independent_base_*` variables are never populated so `independent_endpoint_baseline` carries `None`/`{}` fields.
+6. **`base_construction=independent_endpoint_average` has no numerical effect** under `brace_transport_then_merge`/`rebase_then_merge` (verified: identical `test_results` and `global_alpha_curve` with and without it); `independent_base_by_task` is only consumed by `brace_merge_then_transport`. It only adds validation and a summary stub.
+7. **(Fixed in P5.14/B7.)** Summary label with `discrete_index_match`: `block_extension_protocol.label` still reports `ariadne` although no BRACE step runs.
+8. **Unreachable guard**: `direct_residual merge_in_source_then_fit requires at least one non-native task` cannot fire; with every task native the "Native target checkpoints require a merge mode" check (merge_mode `none`) fires first.
+9. **(Fixed in P5.14/B9.)** Weights: `weights` of the wrong length fails with a bare `zip(strict=True)` message in merge_mode `none` (after all transports were computed) but with "weights length must match tuned checkpoints" in the merge modes; there is no up-front validation.
+10. **(Fixed in P5.14/B10.)** Exception types: an unknown `merge_method` was a `KeyError` (from the registry), not a `ValueError`.
+11. **Global RNG coupling**: `main()` seeds torch/numpy/random from `seed` once and the later stages draw from the global streams (e.g. every `iter(DataLoader)` consumes a base seed even with `shuffle=False`), so reordering loader construction or iteration can change downstream bits; this is what the P5.2 "call order and seeds" risk refers to, and these pins would catch it. No nondeterminism was observed: all cases are bit-identical across runs, processes and test orders.
+
+## BRACE extra coverage (P6.0)
+
+File: `tests/golden/test_brace_extra_golden.py` (173 tests, ~60 s on one CPU thread). Generating commit: HEAD
+`35f441e` with `eval/block_extension.py` and `eval/block_extension_llm.py` byte-identical to `c221d32` (last touched in
+`af5d144`). Same platform caveat as above (CPU, 1 thread, deterministic algorithms, this torch build). Every hashed case
+runs twice in-process and must agree before the hash is compared; `random` insertion order is seeded with
+`np.random.seed(20261001)` before each run, and the whole file was also verified bit-stable across two separate processes.
+Every option set goes through `resolve_block_extension_config`, so invalid combinations are rejected exactly as in a run.
+
+Parts hashed per case: `base_state`, `ft_state`, `task_vector` (ft - base), `layout` (`hash_json`); diagnostic-collector
+cases add `diag` (hash_json of every `record_map` call incl. W and b tensors). Key formats: `brace_x_vision:<case>:<part>`,
+`brace_x_decoder:<case>:<direction>:<part>` (extend = 2->4 or 4->6, shrink = 4->2 or 6->4). The hashes themselves live in
+`EXPECTED` in the test file (not duplicated here).
+
+| Group | Cases | Baseline (one factor changed) |
+|---|---|---|
+| Vision extend 3->5 | `ext_steer`, `ext_eager`, `ext_dup_eager`, `ext_share_ft_refs`, `ext_dampening`, `ext_dup_dampening`, `ext_skip_correction`, `ext_identity`, `ext_identity_inert`, `ext_scope_interleaved_once`, `ext_scope_iterative_all`, `ext_target_residual`, `ext_cascade_iters2`, `ext_component_ridge`, `ext_ridge_weight`, `ext_skip_final_ln`, `ext_order_{top_bottom,random}`, `ext_density_{spread_mod,clump}`, `ext_target_shared_correction` (shared, target backbone width 10 / depth 5, weight 0.5) | `extend_interpolate_independent` (ridge_identity 1.0) |
+| Vision extend 4->6 | `ext4_{spread,order_top_bottom,order_random,density_spread_mod,density_clump}` | `ext4_spread` |
+| Vision shrink 3->2 | `shr_{steer,eager,share_ft_refs,dampening,dup,skip_correction,cascade_iters2,component_ridge,ridge_weight,skip_final_ln}`; `shr_diag_{independent,steer,shared,shared_ft}` also pin the collector output (`diag`) | `shrink_interpolate_independent` |
+| Vision shrink 6->4 / 4->2 | `shr6_{spread,order_top_bottom,order_random,density_spread_mod,density_clump,clump_top_bottom,clump_random,disjoint,disjoint_top_bottom,disjoint_steer}`, `shr4_disjoint` (`collapse_schedule=disjoint_spans`) | `shr6_spread` |
+| Decoder (tiny Qwen2) extend/shrink | `dup`, `dup_shared`, `steer`, `steer_ridge1`, `shared_ft`, `skip_correction`, `dampening`, `dup_dampening`, `cascade_iters2`, `component_ridge`, `ridge_identity`, `share_ft_refs`, `order_{top_bottom,random}`, `density_{spread_mod,clump}` | pinned `brace_decoder_independent` |
+| Decoder deep (4->6 / 6->4) | `deep_{spread,order_top_bottom,order_random,density_spread_mod,density_clump,clump_top_bottom,clump_random}` | `deep_spread` |
+| Equivalences asserted in-process | decoder ignores `ridge_weight`, `collapse_schedule`, `reference_capture`, `insertion_target_mode`, `skip_final_ln`, `correction_scope`, `inserted_block_mode`, `target_shared_correction` (all hash-identical to baseline); decoder `duplicate` shrink == interpolate shrink; vision eager == lazy (extend and shrink); collector attached/not attached gives equal states | - |
+| Plain-data tables (no hashes) | `TABLES` in the test file: `_build_duplication_schedule`, `_build_collapse_schedule`, realized collapse spans, `_locate_collapse_pos` for BOTH classes; `spread_anchor_schedule`, `balanced_collapse_spans`, `disjoint_collapse_schedule`, `plan_inserted_positions`, `build_extension_layout`, `build_reduction_layout` | - |
+| Validation | `resolve_block_extension_config` rejection messages, vision shrink rejections (`inserted_block_mode`, `correction_scope`, `target_shared_correction`, bad `collapse_schedule`, `random` + `disjoint_spans`), run-time order/density/lmc/strategy errors for both classes, schedule error messages | - |
+
+Observed behaviour pinned as-is (nothing fixed in `src/`):
+
+1. `_build_collapse_schedule(..., "spread_mod")` diverges: vision spreads anchors with `np.linspace` (6 -> 4: `[0, 4]`, top-bottom `[4, 0]`), the decoder reuses `i % (curr - 1)` and ignores `insertion_order` (always `[0, 1]`).
+2. `_locate_collapse_pos` diverges: vision clamps to `len(chain) - 2`, the decoder returns `len(chain) - 1`, so `clump` + `top-bottom` shrink (same anchor repeated) completes in vision and raises `IndexError` in the decoder (`deep_clump_top_bottom:shrink` is pinned as a crash).
+3. Decoder `_shrink_per_weight` ignores `per_weight_mode`: `duplicate_per_weight` shrink is bit-identical to `interpolate_per_weight` shrink (vision honours it).
+4. The decoder silently ignores every vision-only field listed under "Equivalences"; `ridge_weight` is never plumbed (always 1e-6). `steer` is a no-op unless `ridge_identity > 0` in both classes (decoder default 0.0, hence `steer` == `independent` and the extra `steer_ridge1` pin).
+5. Vision `skip_final_ln` is accepted and unused (hash-identical to baseline); the decoder only references it in an unreachable interpolate path.
+6. The diagnostic collector receives nothing on the extension path (`_diagnostic_context` is only set by `_shrink_per_weight`); pinned as "records == []" in every lmc mode.
+7. `spread_mod` duplication with `curr_layers == 1` raises `ZeroDivisionError` in both classes.
+8. Vision eager and lazy reference capture are bit-identical on these fixtures.
+
+Regeneration recipe (only after establishing that a change is intended and documented):
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+rm -f /tmp/brace_x.txt
+GOLDEN_CAPTURE=/tmp/brace_x.txt .venv/bin/python -m pytest tests/golden/test_brace_extra_golden.py -q   # appends "name hash" lines, skips the hash asserts
+.venv/bin/python -m tests.golden.test_brace_extra_golden                                                  # prints the TABLES literal
+# paste both into the EXPECTED / TABLES literals at the bottom of the test file, then
+.venv/bin/ruff check --fix tests/golden/test_brace_extra_golden.py && .venv/bin/ruff format tests/golden/test_brace_extra_golden.py
+```
+
+## `llm_rebase.main()` end-to-end pins (`test_llm_main_golden.py`, S10a safety net)
+
+Drives the real `eval.llm_rebase.main()` on tiny real `Qwen2ForCausalLM` source/target (built from config) with an
+in-memory whitespace tokenizer. Faked by name over `PATCH_MODULES` (`raising=False`, so the file also runs on the
+pre-package single-module layout): `TextLM.build`, `load_aligned_tuned_from_ref`, `load_ckpt`, `build_nli_task_data`,
+the harness `run` (sigmoid of the negative cross-entropy of the evaluated weights, so it is weight sensitive) and
+`start_run`. Calibration text is `calibration_prompts` (real resolver); one case fakes `resolve_calibration_texts` to
+exercise the hold-out plumbing. Per case it pins `summary`, `resolved_config`, the harness call log (tasks, shots,
+limit, samples, depth, hash of the evaluated state dict per call), the `TextLM.build` log, the tuned/base checkpoint
+load log and every saved `.pt`; each case is run twice in-process and must be identical.
+
+- Cases (24): THESEUS same depth (fixed alpha; alpha search + `save_merged` + base ckpts; weights/limit/fewshot),
+  extend 2->3 with BRACE `skip_correction` true/false, default, `eval_before_rebase` (+ `eval_source_before_extension`),
+  shrink 3->2 (`interpolate_per_weight`), `theseus_gqa` (kv 2->1) same depth and extend, BiCo same depth and extend,
+  `delta_norm_match` {`uncorrected` x `transport_delta_source` corrected/uncorrected, literal `none`, same depth},
+  sequential/discrete/sobol alpha search, `save_merged`, `eval_before_rebase_only` (same depth, extend), NLI prompt-eval
+  backend with alpha search, hold-out samples + `harness_test_samples` re-scoring.
+- Error table (24 invalid configs): exception type, message, number of model builds and runs started, recorder status.
+  Config-only errors (missing model names, unknown method, Ariadne, `method_params.n_batches`) fire with 0 builds and
+  0 runs; everything resolved after the build fires with 2 builds, 1 run and status `failed`. Ariadne (both spellings)
+  is the explicit "Ariadne LLM entrypoint lands in S10" `ValueError`.
+- Perturbation sanity: a different tuned-checkpoint scale changes `summary` and the harness log, not `resolved_config`.
+- Cross-check: the identical file (hashes unchanged) passes 53/53 against a detached worktree of `bbcb59b`
+  (pre-package `eval/llm_rebase.py`, `PYTHONPATH=<wt>/src`), i.e. the S10a package split is behaviour neutral.
+- Not pinned: the LLM main has no alpha early stopping (only sequential/sobol planners); `head_logits` NLI eval and
+  `task_heads`; real lm-eval / dataset loading; bf16/fp16 or GPU; LoRA tuned references; Llama/Qwen3 families through
+  `main()`; `eval_only` entrypoint.
+- Runtime about 27 s (53 tests). Regenerate with `GOLDEN_CAPTURE=out.txt pytest tests/golden/test_llm_main_golden.py`.
+
+### Declared changes — 2026-10-03, P7.S10b (commit 914b8bf), tests/golden/test_llm_main_golden.py
+- `resolved_config` only for 5 depth-changing cases that now pin `"depth_defaults": "legacy"`: bico_extend,
+  eval_before_rebase_only_extend, theseus_extend_defaults_alpha_search, theseus_extend_eval_before_rebase,
+  theseus_shrink_per_weight. Summaries, evaluated weights (harness_calls), builds, tuned loads and saved files unchanged.
+- Retired error rows: `ariadne_not_yet`, `ariadne_direct_residual_spelling` (Ariadne now runs on LLMs).
+- New cases: ariadne_same_depth, ariadne_extend, direct_residual_spelling_same_depth (same evaluated weights as
+  ariadne_same_depth), theseus_extend_depth_defaults_method, bico_extend_discrete_index_match; new error row
+  theseus_extend_depth_defaults_guard (ConfigMeaningChangedError).
+
+### Declared changes — 2026-10-04, release review fix #6, tests/golden/test_llm_main_golden.py
+- `summary` only for ariadne_same_depth, ariadne_extend, direct_residual_spelling_same_depth: the LLM summary gains
+  `task_vectors.ariadne` (depth pairing; per task the task-vector sha256, calibration record, fit diagnostics and
+  timings). Additive: with that one key removed, each summary hashes to its previous value (verified case by case).
+  Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.

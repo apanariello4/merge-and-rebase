@@ -29,3 +29,11 @@ This page is generated from the registered task-vector transport class docstring
 ## Theseus
 
 ::: merge_and_rebase.rebase.methods.theseus.TheseusRebase
+
+## Theseus GQA
+
+::: merge_and_rebase.rebase.methods.theseus_gqa.TheseusGqaRebase
+
+## Ariadne
+
+::: merge_and_rebase.rebase.methods.ariadne.AriadneRebase

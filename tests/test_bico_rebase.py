@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from merge_and_rebase.rebase.block_extension.config import BlockExtensionConfig
+from merge_and_rebase.rebase.block_extension.vision import run_block_extension
+from merge_and_rebase.rebase.methods import bico as bico_method
+from merge_and_rebase.rebase.methods.bico import collect_bilinear_statistics
 from merge_and_rebase.rebase.registry import get_method, list_methods
 
 
@@ -30,6 +35,45 @@ class _TinyModel(nn.Module):
         return self.visual(x)
 
 
+class _TinyAttentionBlock(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(width)
+        self.attn = nn.MultiheadAttention(width, num_heads=2, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = self.ln_1(x)
+        attended, _ = self.attn(normalized, normalized, normalized, need_weights=False)
+        return x + attended
+
+
+class _TinyAttentionVisual(nn.Module):
+    def __init__(self, depth: int, in_dim: int = 6, width: int = 4, out_dim: int = 5) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(in_dim, width)
+        self.transformer = nn.Module()
+        self.transformer.resblocks = nn.ModuleList(
+            [_TinyAttentionBlock(width) for _ in range(depth)]
+        )
+        self.ln_post = nn.LayerNorm(width)
+        self.proj = nn.Linear(width, out_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x).unsqueeze(1).repeat(1, 3, 1)
+        for block in self.transformer.resblocks:
+            x = block(x)
+        return self.proj(self.ln_post(x).mean(dim=1))
+
+
+class _TinyAttentionModel(nn.Module):
+    def __init__(self, depth: int) -> None:
+        super().__init__()
+        self.visual = _TinyAttentionVisual(depth)
+
+    def encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        return self.visual(x)
+
+
 def _simple_recipe(model, batch):
     images, labels = batch
     outputs = model.encode_image(images)
@@ -44,9 +88,75 @@ def _make_loader(n_samples: int = 16, in_dim: int = 6, batch_size: int = 4) -> D
     return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
 
 
+class _TinyTextModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(32, 6)
+        self.model = nn.Linear(6, 8)
+
+    def forward(self, input_ids, attention_mask=None):
+        del attention_mask
+        return self.model(self.embed(input_ids))
+
+
+class _TinyTextFamily:
+    def transport_scope(self, model):
+        return model.model
+
+    def extract_calibration_batch(self, batch):
+        return {key: batch[key] for key in ("input_ids", "attention_mask", "labels") if key in batch}
+
+
+def _text_recipe(model, batch):
+    output = model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
+    return output.square().mean(), []
+
+
+def test_bico_collects_standard_text_batches() -> None:
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+        "labels": torch.tensor([[1, 2, 3], [4, 5, -100]]),
+    }
+    stats = collect_bilinear_statistics(
+        _TinyTextModel(),
+        _TinyTextModel(),
+        [batch],
+        [batch],
+        _text_recipe,
+        _text_recipe,
+        device="cpu",
+        seq_align="mean",
+        n_batches=1,
+        family_adapter=_TinyTextFamily(),
+    )
+    assert stats
+
+
 def test_bico_registered() -> None:
     assert "bico" in list_methods()
     assert get_method("bico").name == "bico"
+
+
+def test_bico_rejects_misaligned_calibration_labels() -> None:
+    source_model = _TinyModel()
+    target_model = _TinyModel()
+    x = torch.randn(4, 6)
+    source_loader = DataLoader(TensorDataset(x, torch.zeros(4, dtype=torch.long)), batch_size=4)
+    target_loader = DataLoader(TensorDataset(x, torch.ones(4, dtype=torch.long)), batch_size=4)
+
+    with pytest.raises(ValueError, match="not label-aligned"):
+        collect_bilinear_statistics(
+            source_model,
+            target_model,
+            source_loader,
+            target_loader,
+            _simple_recipe,
+            _simple_recipe,
+            device="cpu",
+            seq_align="mean",
+            n_batches=1,
+        )
 
 
 def test_bico_transport_smoke() -> None:
@@ -87,6 +197,111 @@ def test_bico_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
+
+
+def test_bico_split_qkv_after_per_weight_extension_has_full_transport_coverage() -> None:
+    torch.manual_seed(7)
+    source_base_model = _TinyAttentionModel(depth=1)
+    source_ft_model = _TinyAttentionModel(depth=1)
+    target_model = _TinyAttentionModel(depth=2)
+    loader = _make_loader(n_samples=8, batch_size=4)
+
+    run_block_extension(
+        source_base_model=source_base_model,
+        source_ft_model=source_ft_model,
+        calibration_loader=loader,
+        target_layers_total=2,
+        config=BlockExtensionConfig(
+            extension_strategy="interpolate_per_weight",
+            skip_correction=True,
+            n_batches_act=1,
+            verbose=False,
+            show_progress=False,
+        ),
+        device="cpu",
+    )
+
+    source_base = {
+        key: value.detach().clone() for key, value in source_base_model.state_dict().items()
+    }
+    source_ft = source_ft_model.state_dict()
+    target_base = {
+        key: value.detach().clone() for key, value in target_model.state_dict().items()
+    }
+    delta = {
+        key: source_ft[key].detach().clone() - value
+        for key, value in source_base.items()
+        if key.startswith("visual.") and value.is_floating_point()
+    }
+
+    method = bico_method.BiCoRebase()
+    prepared = method.prepare(
+        source_model=source_ft_model,
+        target_model=target_model,
+        source_dataloader=loader,
+        target_dataloader=loader,
+        source_recipe=_simple_recipe,
+        target_recipe=_simple_recipe,
+        target_base=target_base,
+        delta=delta,
+        device="cpu",
+        seq_align="mean",
+        num_batches=1,
+        verbose=False,
+        show_progress=False,
+    )
+
+    diagnostics = prepared["precompute_diagnostics"]
+    assert diagnostics["incomplete"] == 0
+    assert diagnostics["unsupported"] == 0
+    assert diagnostics["usable"] == diagnostics["slots"]
+
+    transported = method.apply(
+        prepared,
+        target_base=target_base,
+        delta=delta,
+        strict=True,
+        verbose=False,
+        show_progress=False,
+    )
+    assert set(transported) == set(delta)
+
+
+def test_bico_split_qkv_apply_unpacks_transform_diagnostics(monkeypatch) -> None:
+    target_base = {
+        "visual.block.attn.in_proj_weight": torch.zeros(6, 2),
+    }
+    delta = {
+        "visual.block.attn.in_proj_weight": torch.ones(6, 2),
+    }
+
+    def fake_apply_transforms(**kwargs):
+        return kwargs["visual_delta"], object()
+
+    monkeypatch.setattr(
+        bico_method._shared,
+        "_apply_transforms_to_visual_delta",
+        fake_apply_transforms,
+    )
+
+    transported = bico_method.BiCoRebase().apply(
+        {
+            "transforms_by_key": {},
+            "split_fused_qkv": True,
+            "compute_device": torch.device("cpu"),
+        },
+        target_base=target_base,
+        delta=delta,
+        strict=True,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert set(transported) == set(delta)
+    assert torch.equal(transported["visual.block.attn.in_proj_weight"], delta["visual.block.attn.in_proj_weight"])
 
 
 def test_bico_deterministic() -> None:
@@ -192,6 +407,9 @@ def test_bico_gradin_transport_smoke() -> None:
     for key, tensor in transported.items():
         assert tensor.shape == target_base[key].shape
         assert tensor.dtype == target_base[key].dtype
+    # A transport that assigns no transform still returns correctly shaped
+    # zeros, which every other assertion here accepts.
+    assert any(float(t.float().abs().sum()) > 0.0 for t in transported.values())
 
 
 def test_bico_gradin_deterministic() -> None:
@@ -249,3 +467,57 @@ def test_bico_gradin_deterministic() -> None:
     assert set(result_a.keys()) == set(result_b.keys())
     for key in result_a:
         assert torch.allclose(result_a[key], result_b[key]), f"Mismatch for key {key}"
+
+
+def test_bico_drops_padding_rows_from_text_statistics() -> None:
+    """Pad positions must not reach BiCo's covariances.
+
+    Text calibration batches are padded to a fixed length, so a short prompt is
+    mostly pad tokens. Their activations say nothing about how the two models
+    represent content, and folding them in lets padding dominate the fitted
+    maps -- which is why theseus drops them in its own collection. BiCo fits the
+    same kind of map from the same activations, so it must drop them too.
+    """
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
+        "labels": torch.tensor([[1, 2, 3, -100], [4, 5, -100, -100]]),
+    }
+    n_rows = int(batch["attention_mask"].numel())          # 8 padded rows
+    n_content = int(batch["attention_mask"].sum())         # 5 real rows
+    assert 0 < n_content < n_rows
+
+    stats = collect_bilinear_statistics(
+        _TinyTextModel(),
+        _TinyTextModel(),
+        [batch],
+        [batch],
+        _text_recipe,
+        _text_recipe,
+        device="cpu",
+        seq_align="interpolate",
+        n_batches=1,
+        family_adapter=_TinyTextFamily(),
+    )
+
+    assert stats
+    counts = {key: store.n_samples for key, store in stats.items()}
+    assert set(counts.values()) == {n_content}, counts
+
+
+def test_bico_vision_batches_keep_every_row() -> None:
+    """With no family adapter there is no padding, so no row may be dropped."""
+    loader = _make_loader(n_samples=8, batch_size=4)
+    stats = collect_bilinear_statistics(
+        _TinyModel(),
+        _TinyModel(),
+        loader,
+        loader,
+        _simple_recipe,
+        _simple_recipe,
+        device="cpu",
+        seq_align="mean",
+        n_batches=1,
+    )
+    assert stats
+    assert set(store.n_samples for store in stats.values()) == {4}

@@ -4,9 +4,14 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _load_runner_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "run_vision_experiments.py"
+    if not module_path.exists():
+        # scripts/ is local campaign material (git-ignored), absent on a fresh clone.
+        pytest.skip("scripts/run_vision_experiments.py is local-only and not present")
     spec = importlib.util.spec_from_file_location("run_vision_experiments", module_path)
     assert spec is not None
     assert spec.loader is not None

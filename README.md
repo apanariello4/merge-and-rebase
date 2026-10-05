@@ -27,6 +27,13 @@ python -m merge_and_rebase.eval.vision_merge \
   --config configs/vision8_task_arithmetic_hf_release.json
 ```
 
+Transport a task vector to a different (wider/deeper) base with Ariadne, on vision or on Qwen decoders:
+
+```bash
+python -m merge_and_rebase.eval.vision_rebase --config configs/examples/vision8_ariadne_b16_to_l14.json
+python -m merge_and_rebase.eval.llm_rebase    --config configs/examples/qwen2.5_0.5b_to_1.5b_ariadne.json
+```
+
 ## Official Implementations
 
 This repository hosts the official implementation of:
@@ -64,7 +71,9 @@ Fine-tuned TAK and DELTA checkpoints are then merged with `merge_and_rebase.eval
 - [Artifacts and checkpoints](docs/artifacts.md): released checkpoints, manifests, validation, and local checkpoints.
 - [Fine-tuning](docs/fine-tuning.md): vision and text configurations, strategies, regularizers, and logging.
 - [Merging](docs/merging.md): merge methods, evaluation, alpha search, and hyperparameter search.
-- [Rebasin](docs/rebasin.md): transport methods and Vision rebasin configurations.
+- [Rebasin](docs/rebasin.md): transport methods (Ariadne, THESEUS, BiCo, ...), depth change, vision and LLM entrypoints.
+- [Ariadne](docs/methods/ariadne.md): the method, its main configuration and ablation options.
+- [Changelog](CHANGELOG.md): changes, retired options and migration notes.
 - [Methods reference](docs/methods.md): registered methods, configuration parameters, and source-level APIs.
 - [Repository overview slides](docs/repo-overview-slides.md).
 

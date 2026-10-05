@@ -2,13 +2,47 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .io.utils import atomic_write_json
+
+
+@lru_cache(maxsize=1)
+def _code_fingerprint() -> dict[str, Any]:
+    """Best-effort git commit/dirty stamp, recorded into every run summary.
+
+    Two runs of a nominally identical config can silently execute different
+    code (an uncommitted local edit, a change landed between runs). That
+    should be the first thing checked when two "identical" runs disagree,
+    not something reconstructed after the fact from file mtimes and job
+    logs. Cached per process since the repo state doesn't change mid-run.
+    """
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+        )
+        return {"git_commit": commit or None, "git_dirty": dirty}
+    except Exception:
+        return {"git_commit": None, "git_dirty": None}
 
 DEFAULT_LOGGING_CONFIG: dict[str, Any] = {
     "use_wandb": False,
@@ -337,6 +371,8 @@ def start_run(
         if summary_path is not None
         else default_summary_path(entrypoint=entrypoint, logging_cfg=logging_cfg)
     )
+    metadata = dict(metadata)
+    metadata.setdefault("code_fingerprint", _code_fingerprint())
     print_config_args(
         _config_for_display(metadata),
         title=f"Run config ({entrypoint})",

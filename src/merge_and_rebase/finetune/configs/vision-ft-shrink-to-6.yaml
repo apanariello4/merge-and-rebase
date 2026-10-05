@@ -1,0 +1,113 @@
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: fp32
+
+  backbone:
+    name: openclip
+    clip_model: ViT-B-16
+    clip_pretrained: datacomp_xl_s13b_b90k
+
+  data:
+    batch_size: 128
+    num_workers: 0
+    val_fraction: 0.1
+    pin_memory: true
+
+  train:
+    epochs: null
+    optimizer:
+      name: adamw
+    lr: 1.0e-5
+    weight_decay: 0.1
+    accumulate_grad_batches: 1
+    lr_scheduler:
+      name: cosine
+    grad_clip_norm: 1.0
+    early_stopping: true
+    early_stopping_patience: 10
+
+  strategy:
+    name: full
+    forward_mode: standard
+    params: {}
+
+  block_extension:
+    enabled: true
+    target_layers_total: 6
+    insertion_order: "bottom-top"
+    extension_density: "spread"
+    extension_strategy: "interpolate_per_weight"
+    dampening_factor: 1.0
+    n_batches_act: 5
+    calibration_split: "train"
+    skip_correction: false
+    skip_final_ln: false
+    ridge_identity: 100.0
+    n_cascade_iters: 1
+    share_ft_refs: false
+    component_ridge:
+      ln_1: 5000
+      ln_2: 5000
+      q: 1000
+      k: 1000
+      v: 1000
+      out_proj: 100
+      c_proj: 100
+      c_fc: 500
+    verbose: true
+    show_progress: true
+    lmc_mode: independent
+
+  output:
+    out_dir: src/checkpoints/finetune_ft_shrink_to_6
+    save_format: full
+    save_last_epoch: true
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
+datasets_order:
+  - SUN397
+  - Cars
+  - RESISC45
+  - EuroSAT
+  - SVHN
+  - GTSRB
+  - MNIST
+  - DTD
+
+datasets:
+  SUN397:
+    train:
+      epochs: 14
+  Cars:
+    train:
+      epochs: 35
+  RESISC45:
+    train:
+      epochs: 15
+  EuroSAT:
+    train:
+      epochs: 12
+  SVHN:
+    train:
+      epochs: 4
+  GTSRB:
+    train:
+      epochs: 11
+  MNIST:
+    train:
+      epochs: 5
+  DTD:
+    train:
+      epochs: 76

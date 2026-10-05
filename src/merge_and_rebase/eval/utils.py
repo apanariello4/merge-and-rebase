@@ -78,6 +78,24 @@ def normalize_eval_split(split: Any) -> str:
     return resolved
 
 
+def resolve_eval_split_loader(loaders_obj: Any, split: str, *, strict: bool = False):
+    """Return the loader matching ``split`` ("val" or "test").
+
+    ``strict=True`` raises on unknown splits (previous vision_block_extension
+    behavior); ``strict=False`` silently falls back to the test loader for any
+    unknown split or missing val split (previous vision_rebase behavior).
+    """
+    resolved = str(split).strip().lower()
+    if resolved == "val":
+        if getattr(loaders_obj, "val", None) is not None or strict:
+            return loaders_obj.val
+    elif resolved == "test":
+        return loaders_obj.test
+    elif strict:
+        raise ValueError(f"Unknown eval split '{split}'. Expected one of: val, test.")
+    return loaders_obj.test
+
+
 def results_key_for_split(split: str) -> str:
     """Return the summary field used for metrics from ``split``."""
     resolved = normalize_eval_split(split)

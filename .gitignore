@@ -254,3 +254,37 @@ src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
 out
 sbatch*
+*.slurm
+
+# Local experiment strays (see CLAUDE.md: results live on scratch, not in-tree)
+/wandb
+/slurm-*.out
+docs/*.aux
+# Run summaries copied into the tree for analysis, and any results directory a
+# driver creates here by mistake. Neither belongs in Git.
+/results/
+/smoke_rho_sweep/
+/direct_p1_scope_all_gamma1_eurosat.json
+# LaTeX build output for the in-tree method write-ups; the .tex is the source.
+/docs/generated/
+
+# Local BRACE/ARIADNE research handoff and preserved pre-curation artifacts.
+/AGENTS.md
+/CLAUDE.md
+/docs/.local/
+/.repo-archive/
+/scripts/
+/configs/final/
+/tests/test_target_informed_campaign.py
+
+# Campaign configs are local experiment material (CLAUDE.md). Only reviewed
+# configs are tracked: those already in Git, plus configs/examples/. Anything
+# else must be force-added deliberately in a dedicated commit.
+/configs/**/*.json
+/configs/**/*.yaml
+!/configs/examples/
+!/configs/examples/**
+# Campaign design notes and local editor settings.
+/direct_target_p1_implementation_and_config_plan.md
+/docs/proposal_1_method.tex
+/.vscode/

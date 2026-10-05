@@ -131,9 +131,9 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         },
     ),
     "scitail": _TaskSpec(
-        hf_path="scitail",
-        hf_configs=("tsv_format", None),
-        split_map={"train": ("train",), "validation": ("validation", "dev"), "test": ("test",)},
+        hf_path="allenai/scitail",
+        hf_configs=("tsv_format",),
+        split_map={"train": ("train",), "validation": ("validation",), "test": ("test",)},
         premise_keys=("sentence1", "premise"),
         hypothesis_keys=("sentence2", "hypothesis"),
         label_keys=("label",),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from merge_and_rebase.eval.vision_connectivity import _load_checkpoint_payload
+from merge_and_rebase.eval.diagnostics.vision_connectivity import _load_checkpoint_payload
 from merge_and_rebase.eval.vision_merge import (
     _acc_cache_key,
     _assert_qkv_patched_before_linearizing,

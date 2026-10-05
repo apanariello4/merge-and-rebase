@@ -1,0 +1,185 @@
+# THESEUS on vision8 — reference config (every accepted key, annotated).
+#
+# Run:   python -m merge_and_rebase.eval.vision_rebase --config configs/examples/reference/vision/theseus.yaml
+# Twin:  configs/examples/vision8_theseus_b16_to_l14.json (same active keys; tests/test_reference_configs.py)
+#
+# Legend
+#   Active lines are the recommended setup (CLIP ViT-B/16 -> ViT-L/14, 8 tasks, BRACE depth prestep).
+#   "# key: value  # ..." lines list every other accepted key AT ITS DEFAULT: uncommenting one changes one factor.
+#   Tags: [main] used by the method as published, [ablation] alternative arm, [diagnostic] extra measurement,
+#         never changes the task vector, [legacy] kept for old configs, [deprecated] warns, [BRACE-only] inert
+#         under depth_rule=discrete_index_match. [default: method] = value injected by depth_defaults: method.
+#   Gradfix-only keys (mask_mode, vote, grad_*) are omitted.
+# Provenance: commit before launching; the summary records the git commit/dirty fingerprint.
+# Unknown top-level and method_params keys are NOT rejected: a misspelled key is silently ignored.
+
+# ---------------------------------------------------------------- models and checkpoints
+suite: vision8                              # task suite (key of SUITES).
+tasks: all                                  # "all" or a comma-separated subset of the suite.
+source_clip_model: ViT-B-16                 # open_clip architecture of the source (fine-tuned) base.
+source_clip_pretrained: datacomp_xl_s13b_b90k   # open_clip pretrained tag of the source base.
+target_clip_model: ViT-L-14                 # open_clip architecture of the target base.
+target_clip_pretrained: datacomp_xl_s13b_b90k   # open_clip pretrained tag of the target base.
+tuned_ckpts:                                # task -> fine-tuned source checkpoint (required, one per task).
+  Cars: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/best.pt
+  DTD: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/best.pt
+  EuroSAT: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/best.pt
+  GTSRB: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/best.pt
+  MNIST: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/best.pt
+  RESISC45: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/best.pt
+  SUN397: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/best.pt
+  SVHN: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt
+# weights: null                     # per-task merge weights, list of len(tasks); null = 1.0 each.
+# dtype: null                       # model dtype: fp16 | bf16 | fp32; null = checkpoint dtype.
+# device: "cuda"                    # torch device.
+# strict_load: false                # strict state-dict loading of the checkpoints.
+# native_target_tasks: []           # tasks whose checkpoints already live on the target base (mixed merging).
+# auto_detect_ckpt_base: true       # classify each checkpoint's base by key coverage.
+# attn_patch_cfg: null              # attention patch config (dict); enables patched_attn when set.
+# patched_attn: false               # patch attention before rebase; default = (attn_patch_cfg is not null).
+
+# ---------------------------------------------------------------- method and depth
+method: theseus                             # rebase method: theseus | bico | ariadne (alias direct_residual) | ...
+depth_defaults: method                      # method: THESEUS -> BRACE prestep with interpolate_per_weight and
+                                            #   skip_correction=true; legacy: pre-release behaviour. Absent: a depth
+                                            #   mismatch whose meaning changed raises ConfigMeaningChangedError.
+# depth_alignment: "ariadne"        # [legacy] alias of block_extension_params.depth_rule (ariadne == brace).
+# block_extension_enabled: true     # run the depth prestep on a depth mismatch (the CLI sets true when absent).
+
+# ---------------------------------------------------------------- block_extension_params (BRACE depth prestep)
+# Source and target depth differ (12 -> 24 blocks): BRACE inserts blocks into the source so THESEUS can
+# transport layer by layer. Not read when the depths match.
+# block_extension_params:
+  # depth_rule: "method_default"    # method_default | brace | discrete_index_match (THESEUS default: brace).
+  # blocks_to_add: null             # [BRACE-only] blocks to insert; null = target depth - source depth.
+  # target_layers_total: null       # [BRACE-only] explicit target depth; null = the target model's depth.
+  # insertion_order: "bottom-top"   # [BRACE-only] bottom-top | top-bottom | random.
+  # extension_density: "spread"     # [BRACE-only] anchor schedule: spread | spread_mod | clump.
+  # collapse_schedule: "cascade"    # [BRACE-only] shrink schedule: cascade | disjoint_spans.
+  # extension_strategy: "interpolate_per_weight"  # [BRACE-only] [main] new-block init: interpolate_per_weight |
+  #                                 #   duplicate_per_weight.
+  # dampening_factor: 1.0           # [BRACE-only] scale on the inserted block's output.
+  # n_batches_act: 2                # calibration batches captured by BRACE (int > 0).
+  # calibration_split: "test"       # split the BRACE calibration batches come from.
+  # calibration_dataset: null       # task-independent calibration set (str or dict); exclusive with calibration_task.
+  # calibration_task: null          # shorthand: calibrate every task on this one named task.
+  # skip_correction: true           # [BRACE-only] [default: method] skip the ridge correction of inserted blocks;
+  #                                 #   false = corrected BRACE arm (needs much more memory).
+  # skip_final_ln: false            # [BRACE-only] leave the final LayerNorm out of the correction.
+  # ridge_identity: 0.0             # [BRACE-only] ridge pull towards identity (>= 0).
+  # ridge_weight: 1.0e-6            # [BRACE-only] ridge weight of the correction (paper Eq. 9, >= 0).
+  # n_cascade_iters: 1              # [BRACE-only] cascade iterations (floored at 1).
+  # share_ft_refs: false            # [BRACE-only] share fine-tuned references across tasks.
+  # component_ridge: null           # [BRACE-only] per-component ridge override, {component: float}.
+  # lmc_mode: "independent"         # [BRACE-only] independent | steer | shared | shared_ft.
+  # reference_capture: "lazy"       # [BRACE-only] lazy | eager.
+  # inserted_block_mode: "ariadne"  # [BRACE-only] [ablation] ariadne | residual_identity | residual_identity_inert
+  #                                 #   (non-ariadne needs skip_correction=true).
+  # target_shared_correction:      # [BRACE-only] [ablation] absent = off. Blend target activations into the
+  #                                 #   correction target; needs skip_correction=false, lmc_mode=shared, inserted_block_mode=ariadne.
+    # enabled: true                 #   false == absent.
+    # target_weight: 0.0            #   required, >= 0; 0 reproduces standard BRACE.
+    # component: "c_proj"           #   only c_proj.
+    # added_blocks: "all"           #   only all.
+    # num_batches: null             #   must equal n_batches_act when set.
+  # correction_scope: "inserted"    # [BRACE-only] [ablation] inserted | interleaved_once | iterative_all.
+  # transport_activation_mode: "model"  # [BRACE-only] [ablation] model | interpolate_neighbors: how THESEUS reads
+  #                                 #   the inserted position's source activations (interpolate_neighbors needs
+  #                                 #   skip_correction=true).
+  # insertion_target_mode: "direct" # [BRACE-only] ridge fit target: direct | residual.
+  # eval_before_extension: false    # [diagnostic] read only by the BRACE diagnostic CLI
+  #                                 #   (python -m merge_and_rebase.eval.diagnostics.vision_block_extension).
+  # first_n_eval_batches: null      # [diagnostic] read only by that diagnostic CLI.
+  # verbose: true                   # log BRACE progress.
+  # show_progress: true             # progress bars.
+
+# ---------------------------------------------------------------- method_params (THESEUS)
+method_params:
+  num_batches: 10                           # [main] calibration batches for the per-layer maps.
+  seed: 89                                  # map-fit sampling seed (vision: popped and used instead of top-level seed).
+  seq_align: interpolate2d                  # token alignment between source and target grids:
+                                            #   interpolate2d | interpolate | mean | cls.
+  # n_batches: null                 # [legacy] alias of num_batches; wins when both are set.
+  # center_acts: false              # centre activations before the covariance.
+  # batch_size: null                # calibration batch-size override; null = top-level batch_size.
+  # patch_qkv: true                 # split fused qkv projections into q/k/v maps.
+  # split_qkv: null                 # [legacy] alias of patch_qkv.
+  # whiten_power: 0.0               # [ablation] whitening exponent in [0, 0.5]; needs covariance_source=base.
+  # whiten_eps: 1.0e-6              # whitening epsilon (> 0).
+  # covariance_mode: "activations"  # [ablation] activations | data_free (weight-space covariance).
+  # covariance_source: "base"       # [ablation] which source endpoint feeds the covariance: base | ft | delta |
+  #                                 #   mixture; non-base needs covariance_mode=activations and whiten_power=0.
+  # covariance_mixture_beta: 0.5    # [ablation] mixture weight in [0, 1] (covariance_source=mixture).
+  # transform_granularity: "param"  # [ablation] map sharing: param | module_type | block | global.
+  # device_transform: "cpu"         # device of the SVDs: cpu | gpu.
+  # activation_cache_dir: null      # activation cache directory (required when activation_cache_mode != off).
+  # activation_cache_mode: "off"    # off | auto | load | refresh.
+  # activation_cache_key: null      # explicit cache key.
+  # verbose: true                   # log progress.
+  # show_progress: true             # progress bars.
+# Injected by the stage, never set here (duplicate -> TypeError): source_model, target_model, source_model_ft,
+# source_dataloader, target_dataloader, target_base, delta, device, source_activation_plan, family_adapter.
+
+# ---------------------------------------------------------------- calibration and data
+batch_size: 32                              # loader batch size (calibration, alpha search, evaluation).
+num_workers: 0                              # loader workers.
+val_fraction: 0.1                           # fraction of train held out as the validation split.
+seed: 89                                    # global seed: splits, loaders, calibration sampling.
+# transport_calibration_data: "task_local"  # [ablation] task_local | tiny_imagenet (one task-independent paired
+#                                           #   context for every task's prepare).
+# no_humanize: true                 # true = raw class names in the zero-shot head; false = humanized names.
+
+# ---------------------------------------------------------------- alpha search and merge
+alpha_search: true                          # search the task-vector scale on a grid.
+alpha_min: 0.0                              # grid start.
+alpha_max: 1.0                              # grid end (>= alpha_min).
+alpha_step: 0.05                            # grid step (> 0).
+alpha_selection: per_task                   # per_task: one alpha per task; shared: one alpha for all.
+alpha_search_split: val                     # split used to pick alpha: val | test.
+# alpha: 1.0                        # fixed alpha, used only when alpha_search is false.
+# alpha_patience: 0                 # early stop of the alpha grid after N non-improving steps (0 = off).
+# merge_mode: "none"                # none | rebase_then_merge | merge_then_rebase | brace_transport_then_merge |
+#                                   #   brace_merge_then_transport | merge_then_brace_then_transport.
+# merge_method: "task_arithmetic"   # merge algorithm (merge registry name).
+# merge_params: {}                  # merge kwargs.
+# global_alpha_search: true         # hierarchical global alpha for merges.
+# base_construction: "per_task"     # per_task | independent_endpoint_average.
+# transport_calibration_protocol: "task_local"  # calibration of single-transport merge modes: task_local |
+#                                   #   task_local_10 | vision8_mix | vision8_mix_10 | tiny*.
+# transport_calibration_max_samples: 2048  # cap for the tiny* protocol.
+# transport_calibration_batches: 10 # batches for the mix protocols.
+# transport_calibration_split: "val"  # split for the mix protocols.
+
+# ---------------------------------------------------------------- evaluation
+# eval_before_rebase: false         # [diagnostic] evaluate the (extended) source on the target task first.
+# block_extension_eval_split: "test"  # [diagnostic] split for eval_before_rebase: val | test.
+
+# ---------------------------------------------------------------- artifacts and logging
+save_transported_tvs: auto                  # auto: save transported task vectors to <summary_dir>/transported_tvs;
+                                            #   if_dir_given (default): only when save_transported_tvs_dir is set.
+# save_transported_tvs_dir: null    # explicit directory for the transported task vectors.
+# save_transported_artifacts: false # also save artifacts; default = (save_transported_tvs_dir is set).
+# save_transported_tvs_legacy: false  # [legacy] legacy save format.
+# save_merged: null                 # path: save the merged state dict.
+# logging:                          # W&B / local logging.
+  # use_wandb: false
+  # project: null
+  # entity: null
+  # tags: []
+  # mode: "online"                  # online | offline | disabled (nodes are offline: use offline).
+  # local_log_dir: null
+  # log_every_n_steps: 50
+  # run_name: null
+
+# ---------------------------------------------------------------- diagnostics, legacy, deprecated
+# source_lmc_eval: false            # [diagnostic] linear-mode-connectivity curve on the source.
+# source_lmc_eval_split: "val"      # [diagnostic] val | test.
+# source_lmc_first_n_batches: null  # [diagnostic] limit the LMC evaluation batches.
+# source_lmc_alpha_min: 0.0         # [diagnostic] LMC grid.
+# source_lmc_alpha_max: 1.0         # [diagnostic]
+# source_lmc_alpha_step: 0.05       # [diagnostic]
+# source_only: false                # [diagnostic] stop after the source-side steps.
+# cross_task_lmc_pairs: []          # [deprecated] never evaluated; summary entries stay empty.
+# cross_task_lmc_eval_split: "val"  # [deprecated]
+# all_task_lmc_tasks: []            # [deprecated]
+# all_task_lmc_eval_split: "val"    # [deprecated]

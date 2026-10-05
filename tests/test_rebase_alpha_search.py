@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from merge_and_rebase.utils.alpha_search import PerTaskAlphaTracker, average_scores
 
+
 def test_average_scores_returns_mean() -> None:
     assert average_scores([1.0, 2.0, 5.0]) == 8.0 / 3.0
     assert average_scores([]) == 0.0

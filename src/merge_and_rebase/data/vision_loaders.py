@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import urllib.request
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,7 @@ from datasets import ClassLabel, DatasetDict, Features
 from datasets import Dataset as HFDataset
 from datasets import load_dataset as hf_load_dataset
 from PIL import ImageFile
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -197,7 +197,7 @@ class HFVisionDataset(Dataset):
 # HF loading helpers
 # ---------------------------
 
-_ALLOWED_SPLITS = ("train", "test", "val", "validation")
+_ALLOWED_SPLITS = ("train", "test", "val", "validation", "valid")
 
 
 def _repo_root() -> Path:
@@ -397,6 +397,7 @@ def build_vision_loaders(
     classnames_override: Sequence[str] | None = None,
     strict_classnames: bool = True,
     drop_last_train: bool = False,
+    shuffle_train: bool = True,
 ) -> VisionLoaders:
     """
     Build train/val/test DataLoaders for HF image classification datasets.
@@ -486,7 +487,7 @@ def build_vision_loaders(
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=bool(shuffle_train),
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last_train,
@@ -523,4 +524,120 @@ def build_vision_loaders(
         ft_epochs=int(ft_epochs),
         sizes=sizes,
         meta=meta,
+    )
+
+
+def build_vision_calibration_loader(
+    calibration_dataset: str | Mapping[str, Any],
+    *,
+    resolver: Callable[[str], tuple[str, str | None, dict[str, str]]],
+    preprocess: Callable[[Any], torch.Tensor],
+    calibration_split: str = "test",
+    batch_size: int = 128,
+    num_workers: int = 6,
+    pin_memory: bool = True,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+) -> DataLoader:
+    """Build a deterministic, task-independent vision calibration loader.
+
+    ``calibration_dataset`` may be a named benchmark task, e.g.
+    ``"ImageNet1K"``, or a Hugging Face dataset path/spec::
+
+        {"path": "zh-plus/tiny-imagenet", "split": "train"}
+
+    Calibration does not use labels, but the standard ``image``/``label``
+    columns are used so the resulting batches have the same ``(images,
+    labels)`` shape as the task loaders. The loader is deterministic even
+    when the source split is ``train`` so base and fine-tuned activations are
+    collected from the same examples.
+    """
+    if isinstance(calibration_dataset, str):
+        spec: Mapping[str, Any] = {"dataset": calibration_dataset}
+    elif isinstance(calibration_dataset, Mapping):
+        spec = calibration_dataset
+    else:
+        raise TypeError("calibration_dataset must be a dataset name/path or a mapping spec.")
+
+    named_task = spec.get("task")
+    if named_task is None:
+        candidate = spec.get("dataset")
+        if isinstance(candidate, str):
+            try:
+                resolver(candidate)
+            except (KeyError, ValueError):
+                pass
+            else:
+                named_task = candidate
+
+    if named_task is not None:
+        hf_path, hf_config, split_map = resolver(str(named_task))
+        loaders = build_vision_loaders(
+            load_hf_splits(
+                hf_path,
+                config=hf_config,
+                requested_splits=tuple(dict.fromkeys(split_map.values())),
+            ),
+            hf_path=hf_path,
+            preprocess=preprocess,
+            ft_epochs=1,
+            split_map=split_map,
+            batch_size=int(batch_size),
+            num_workers=int(num_workers),
+            pin_memory=bool(pin_memory),
+            val_fraction=float(val_fraction),
+            seed=int(seed),
+            # Calibration should present identical rows to base and FT model
+            # passes. Task training loaders intentionally remain shuffled.
+            shuffle_train=False,
+            strict_classnames=False,
+        )
+        split = str(spec.get("split", calibration_split)).strip().lower()
+        if split == "train":
+            return loaders.train
+        if split == "val":
+            return loaders.val
+        if split == "test":
+            return loaders.test
+        raise ValueError("Named calibration split must be one of: train, val, test.")
+
+    path = spec.get("path", spec.get("hf_path", spec.get("dataset")))
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(
+            "A direct calibration dataset spec must include a non-empty 'path' "
+            "(or use a named 'task')."
+        )
+    # A direct HF dataset has no benchmark split map. Its training split is
+    # the safest useful default for activation calibration; validation/test
+    # can be selected explicitly with ``{"split": ...}``.
+    raw_split = str(spec.get("split", "train")).strip()
+    if not raw_split:
+        raise ValueError("Calibration dataset split must be non-empty.")
+
+    hf_ds = load_hf_splits(
+        path,
+        config=(str(spec["config"]) if spec.get("config") is not None else None),
+        requested_splits=(raw_split,),
+    )
+    image_key = str(spec.get("image_key", "image"))
+    label_key = str(spec.get("label_key", "label"))
+    dataset: Dataset = HFVisionDataset(
+        hf_ds[raw_split],
+        transform=preprocess,
+        image_key=image_key,
+        label_key=label_key,
+    )
+    max_samples = spec.get("max_samples", None)
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if max_samples < 1:
+            raise ValueError("calibration_dataset.max_samples must be >= 1 when provided.")
+        dataset = Subset(dataset, range(min(max_samples, len(dataset))))
+
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
     )

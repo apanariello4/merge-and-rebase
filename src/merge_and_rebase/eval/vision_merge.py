@@ -918,50 +918,6 @@ def main() -> None:
         subspace_state_cache[cache_key] = state
         return state
 
-    def _subspace_state_for(candidate_method_params: dict[str, Any]) -> dict[str, Any]:
-        if peft_subspace == "full" or subspace is None or peft_cfg is None:
-            return {
-                "subspace_prepared": subspace_prepared,
-                "tuned_sds_list": tuned_sds_list,
-                "base_sd_for_merge": base_sd_for_merge,
-                "weights": merge_weights,
-            }
-
-        cache_key = stable_method_params_cache_key(candidate_method_params)
-        if cache_key in subspace_state_cache:
-            return subspace_state_cache[cache_key]
-
-        print(f"\nPreparing PEFT subspace: {peft_subspace} ({candidate_method_params})")
-        candidate_subspace_prepared = subspace.prepare(
-            lora_by_task=peft_state_by_task,
-            peft_cfg=peft_cfg,
-            method_params=candidate_method_params,
-            weights=resolved_merge_weights,
-            artifact_dir=subspace_artifact_dir,
-        )
-        candidate_weights = (
-            list(candidate_subspace_prepared.merge_weight_override)
-            if getattr(candidate_subspace_prepared, "merge_weight_override", None) is not None
-            else merge_weights_raw
-        )
-        projected_by_task = subspace.project(
-            candidate_subspace_prepared,
-            lora_by_task=peft_state_by_task,
-            peft_cfg=peft_cfg,
-        )
-        if not projected_by_task:
-            raise ValueError("Subspace projection returned empty projected_by_task.")
-        candidate_tuned_sds_list = [projected_by_task[t] for t in tasks]
-        candidate_base_sd_for_merge = to_cpu_fp32({k: torch.zeros_like(v) for k, v in candidate_tuned_sds_list[0].items()})
-        state = {
-            "subspace_prepared": candidate_subspace_prepared,
-            "tuned_sds_list": candidate_tuned_sds_list,
-            "base_sd_for_merge": candidate_base_sd_for_merge,
-            "weights": candidate_weights,
-        }
-        subspace_state_cache[cache_key] = state
-        return state
-
     def _prepared_for(candidate_method_params: dict[str, Any]) -> Any:
         if not isinstance(method, PreparedMergeMethod):
             return None

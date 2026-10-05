@@ -1,0 +1,136 @@
+"""Regression tests guarding against misplaced target-* keys at the top level.
+
+A campaign generator (target_informed_brace_20260918) produced 91 configs that set
+``target_residual_completion`` and ``target_shared_correction`` as TOP-LEVEL keys of
+the run config, instead of nesting them under ``block_extension_params``. The
+authoritative implementation only ever reads these from
+``block_extension_params.<key>`` (see ``_as_target_shared_correction`` and
+``resolve_block_extension_config``), so a top-level key is silently ignored and the
+run executes as a plain baseline while its filename/run_id claims to be an ablation.
+
+``resolve_block_extension_config`` must fail loudly on this instead of silently
+producing a mislabeled baseline result.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from merge_and_rebase.rebase.block_extension.config import resolve_block_extension_config
+
+_MISPLACED_KEYS = (
+    "target_shared_correction",
+    "capture_target_residual_reference",
+)
+
+_RETIRED_KEYS = ("target_residual_completion", "joint_blockwise_correction", "direct_p1_correction")
+
+
+@pytest.mark.parametrize("key", _MISPLACED_KEYS)
+def test_misplaced_top_level_key_raises(key: str) -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {},
+        key: {"enabled": True},
+    }
+    with pytest.raises(ValueError, match=rf"{key}.*top level"):
+        resolve_block_extension_config(cfg)
+
+
+@pytest.mark.parametrize("key", _MISPLACED_KEYS)
+def test_misplaced_top_level_key_message_names_nested_location(key: str) -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {},
+        key: {"enabled": True},
+    }
+    with pytest.raises(ValueError, match=rf"block_extension_params\.{key}"):
+        resolve_block_extension_config(cfg)
+
+
+def test_correctly_nested_target_shared_correction_resolves() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "target_shared_correction": {"target_weight": 0.3},
+        },
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction is not None
+    assert resolved.target_shared_correction.active
+    assert resolved.target_shared_correction.target_weight == pytest.approx(0.3)
+
+
+def test_config_without_target_shared_correction_defaults_to_none() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {},
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction is None
+
+
+# Regression for the 2026-09-19 smoke-job failure: a generator reduced
+# n_batches_act for the smoke family but left target_shared_correction's
+# nested num_batches at the full-campaign value, so the source-side c_proj
+# reference bank and the target-side reference bank were captured over
+# different numbers of calibration images and the per-image Procrustes
+# pairing in ``_blend_target_reference`` could not be formed. This must fail
+# at config-resolution time, not minutes into a GPU job.
+def test_target_shared_correction_num_batches_mismatch_raises() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 2,
+            "target_shared_correction": {"target_weight": 0.3, "num_batches": 5},
+        },
+    }
+    with pytest.raises(ValueError, match=r"num_batches=5.*n_batches_act=2"):
+        resolve_block_extension_config(cfg)
+
+
+def test_target_shared_correction_num_batches_equal_resolves() -> None:
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 2,
+            "target_shared_correction": {"target_weight": 0.3, "num_batches": 2},
+        },
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction.num_batches == 2
+    assert resolved.n_batches_act == 2
+
+
+def test_target_shared_correction_num_batches_unset_resolves() -> None:
+    """``num_batches: None`` defers to n_batches_act at runtime, so it never
+    conflicts with the invariant regardless of n_batches_act's value."""
+    cfg = {
+        "block_extension_enabled": True,
+        "block_extension_params": {
+            "lmc_mode": "shared",
+            "skip_correction": False,
+            "n_batches_act": 3,
+            "target_shared_correction": {"target_weight": 0.3},
+        },
+    }
+    _, resolved = resolve_block_extension_config(cfg)
+    assert resolved.target_shared_correction.num_batches is None
+
+
+@pytest.mark.parametrize("key", _RETIRED_KEYS)
+@pytest.mark.parametrize("nested", [False, True])
+def test_retired_completion_keys_raise(key: str, nested: bool) -> None:
+    cfg = {"block_extension_enabled": True, "block_extension_params": {}}
+    if nested:
+        cfg["block_extension_params"] = {key: {"enabled": True}}
+    else:
+        cfg[key] = {"enabled": True}
+    with pytest.raises(ValueError, match=rf"{key}.*retired"):
+        resolve_block_extension_config(cfg)

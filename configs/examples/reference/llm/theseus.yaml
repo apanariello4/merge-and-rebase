@@ -1,0 +1,174 @@
+# THESEUS on Qwen2.5 (0.5B -> 1.5B, ifeval) — reference config (every accepted key, annotated).
+#
+# Run:   python -m merge_and_rebase.eval.llm_rebase --config configs/examples/reference/llm/theseus.yaml
+# Twin:  configs/examples/qwen2.5_0.5b_to_1.5b_theseus.json (same active keys; tests/test_reference_configs.py)
+#
+# Legend
+#   Active lines are the recommended setup (24 -> 28 decoder layers, BRACE depth prestep, alpha 1, ifeval).
+#   "# key: value  # ..." lines list every other accepted key AT ITS DEFAULT: uncommenting one changes one factor.
+#   Tags: [main] used by the method as published, [ablation] alternative arm, [diagnostic] extra measurement,
+#         never changes the task vector, [legacy] kept for old configs, [BRACE-only] inert under
+#         depth_rule=discrete_index_match, [vision-only] the decoder ignores it (warning + summary note).
+#         [default: stage] = value the LLM stage injects when the key is absent.
+#   Vision keys (merge_mode, alpha_selection, alpha_patience, alpha_search_split, LMC keys, strict_load,
+#   save_transported_tvs*) are not read by llm_rebase and are omitted.
+# Provenance: commit before launching; the summary records the git commit/dirty fingerprint.
+# Unknown top-level and method_params keys are NOT rejected: a misspelled key is silently ignored.
+
+# ---------------------------------------------------------------- models and checkpoints
+source_model_name_or_path: Qwen/Qwen2.5-0.5B    # source base (HF id or local path; nodes are offline: cached).
+target_model_name_or_path: Qwen/Qwen2.5-1.5B    # target base.
+model_kind: causal_lm                       # causal_lm | sequence_classification.
+model_arch: qwen                            # family adapter: qwen | llama | t5 | auto (Qwen2, Qwen2.5, Qwen3; MoE fails fast).
+tuned_bodies:                               # task -> fine-tuned source body (HF id or path), or a list per task.
+  it: Qwen/Qwen2.5-0.5B-Instruct
+device: cuda                                # torch device.
+dtype: bf16                                 # fp16 | bf16 | fp32; null = checkpoint dtype.
+# source_base_ckpt: null            # override the source base weights.
+# target_base_ckpt: null            # override the target base weights.
+# weights: null                     # per-body weights (list or scalar); null = 1.0 each.
+# num_labels: 3                     # sequence_classification only.
+# task_heads: null                  # sequence_classification: path to classifier heads.
+# head_key_pattern: "modules_to_save"  # key filter for the heads.
+# trust_remote_code: false          # HF loading.
+# use_fast_tokenizer: true          # HF loading.
+
+# ---------------------------------------------------------------- method and depth
+method: theseus                             # rebase method: theseus | theseus_gqa | bico | ariadne.
+depth_defaults: method                      # method: THESEUS -> BRACE prestep with interpolate_per_weight and
+                                            #   skip_correction=true; legacy: pre-release behaviour. Absent: a depth
+                                            #   mismatch whose meaning changed raises ConfigMeaningChangedError.
+# depth_alignment: "ariadne"        # [legacy] alias of block_extension_params.depth_rule (ariadne == brace).
+# block_extension_enabled: true     # run the depth prestep on a depth mismatch (true when absent).
+
+# ---------------------------------------------------------------- block_extension_params (BRACE depth prestep)
+# Source and target depth differ (24 -> 28 layers): BRACE inserts decoder layers into the source so THESEUS can
+# transport layer by layer. On LLMs n_batches_act also sizes the shared calibration pool (see calibration below).
+block_extension_params:
+  n_batches_act: 100                        # [main] calibration batches captured by BRACE (int > 0).
+  # depth_rule: "method_default"    # method_default | brace | discrete_index_match (THESEUS default: brace).
+  # blocks_to_add: null             # [BRACE-only] layers to insert; null = target depth - source depth.
+  # target_layers_total: null       # [BRACE-only] explicit target depth; null = the target model's depth.
+  # insertion_order: "bottom-top"   # [BRACE-only] bottom-top | top-bottom | random.
+  # extension_density: "spread"     # [BRACE-only] anchor schedule: spread | spread_mod | clump.
+  # extension_strategy: "interpolate_per_weight"  # [BRACE-only] [main] new-layer init: interpolate_per_weight |
+  #                                 #   duplicate_per_weight (a shrink needs a per-weight strategy).
+  # dampening_factor: 1.0           # [BRACE-only] scale on the inserted layer's output (biases included).
+  # calibration_split: "test"       # split of a calibration_dataset; a harness source ignores it and always
+  #                                 #   holds its calibration docs out of the evaluation.
+  # calibration_dataset: null       # BRACE calibration corpus; the top-level calibration_dataset wins over it.
+  # calibration_task: null          # shorthand for a named task; exclusive with calibration_dataset.
+  # skip_correction: true           # [BRACE-only] [default: method] skip the ridge correction of inserted layers;
+  #                                 #   false = corrected arm (~175 GiB host RAM on this pair vs ~56 GiB).
+  # skip_final_ln: false            # [BRACE-only] leave the final norm out of the correction.
+  # ridge_identity: 0.0             # [BRACE-only] ridge pull towards identity (>= 0).
+  # n_cascade_iters: 1              # [BRACE-only] cascade iterations (floored at 1).
+  # share_ft_refs: false            # [BRACE-only] share fine-tuned references across tasks.
+  # component_ridge: null           # [BRACE-only] per-component ridge override, {component: float}.
+  # lmc_mode: "independent"         # [BRACE-only] independent | steer | shared | shared_ft.
+  # transport_activation_mode: "model"  # [BRACE-only] [ablation] model | interpolate_neighbors (read by the
+  #                                 #   vision stage only).
+  # verbose: true                   # log BRACE progress.
+  # show_progress: true             # progress bars.
+  # ridge_weight: 1.0e-6            # [BRACE-only] [vision-only] the decoder keeps its own ridge default.
+  # collapse_schedule: "cascade"    # [BRACE-only] [vision-only]
+  # reference_capture: "lazy"       # [BRACE-only] [vision-only]
+  # insertion_target_mode: "direct" # [BRACE-only] [vision-only]
+  # correction_scope: "inserted"    # [BRACE-only] [vision-only]
+  # inserted_block_mode: "ariadne"  # [BRACE-only] [vision-only]
+  # target_shared_correction:       # [BRACE-only] [vision-only] absent = off (see vision/theseus.yaml).
+  # eval_before_extension: false    # [diagnostic] read only by the vision BRACE diagnostic CLI.
+  # first_n_eval_batches: null      # [diagnostic] read only by the vision BRACE diagnostic CLI.
+
+# ---------------------------------------------------------------- method_params (THESEUS)
+method_params:
+  num_batches: 100                          # [main] calibration batches for the per-layer maps (n_batches is
+                                            #   rejected on LLMs). Absent: 2 batches.
+  seed: 0                                   # map-fit sampling seed. The top-level seed is NOT forwarded: set it here.
+  seq_align: interpolate                    # [default: stage] token alignment: interpolate | interpolate2d | mean | cls.
+  device_transform: gpu                     # device of the SVDs: cpu (default) | gpu.
+  # center_acts: false              # centre activations before the covariance.
+  # batch_size: null                # calibration batch-size override.
+  # patch_qkv: true                 # split fused qkv projections into q/k/v maps.
+  # split_qkv: null                 # [legacy] alias of patch_qkv.
+  # whiten_power: 0.0               # [ablation] whitening exponent in [0, 0.5].
+  # whiten_eps: 1.0e-6              # whitening epsilon (> 0).
+  # covariance_mode: "activations"  # [ablation] activations | data_free (weight-space covariance).
+  # covariance_source: "base"       # [vision-only] non-base needs the fine-tuned source model, which only the
+  #                                 #   vision stage supplies: raises on LLMs.
+  # covariance_mixture_beta: 0.5    # [vision-only] mixture weight (covariance_source=mixture).
+  # transform_granularity: "param"  # [ablation] map sharing: param | module_type | block | global.
+  # activation_cache_dir: null      # activation cache directory (required when activation_cache_mode != off).
+  # activation_cache_mode: "off"    # off | auto | load | refresh.
+  # activation_cache_key: null      # explicit cache key.
+  # verbose: true                   # log progress.
+  # show_progress: true             # progress bars.
+# Injected by the stage, never set here (duplicate -> TypeError): source_model, target_model, source_dataloader,
+# target_dataloader, target_base, delta, family_adapter, device (= top-level device).
+
+# ---------------------------------------------------------------- calibration
+# Text source, first match wins: calibration_prompts > calibration_dataset > harness_tasks (held out from the
+# evaluation docs). Pool size = max(n_batches_act, method_params.num_batches) x calibration_batch_size sequences.
+# Padding rows never enter any statistic: each model is masked by its own attention_mask.
+seed: 0                                     # calibration partition seed (and hyperparam_search sampling).
+calibration_batch_size: 4                   # calibration loader batch; default = batch_size, else 2.
+calibration_max_length: 192                 # calibration token length (default 128).
+# calibration_n_sequences: null     # explicit pool size (> 0) instead of the rule above.
+# calibration_prompts: null         # list of strings, or path to a JSON file {"prompts": [...]}.
+# calibration_dataset: null         # HF corpus decoupled from the evaluation (no hold-out): a path, or a mapping
+#                                   #   {path, name|config, split, text_column | text_columns + text_template}
+#                                   #   (text_columns + text_template build question/answer texts).
+# calibration_include_target: false # [ablation] append the gold target to harness calibration prompts.
+
+# ---------------------------------------------------------------- alpha and hyperparameter search
+alpha_search: false                         # search the task-vector scale on a grid.
+alpha: 1.0                                  # fixed alpha when alpha_search is false.
+# alpha_min: 0.0                    # grid start.
+# alpha_max: 2.0                    # grid end.
+# alpha_step: 0.1                   # grid step (> 0).
+# hyperparam_search: null           # alpha and method_params sweep: {strategy: sequential | sobol,
+#                                   #   num_samples: 16, refine_factor: 0.5, refinement_steps, refinement_samples,
+#                                   #   alpha: <dim>, method_params: {key: <dim>}}; <dim> = list | {values: [...]} |
+#                                   #   {min, max, type: float | int, step}.
+# transport_delta_source: "corrected"  # [ablation] which delta is transported: corrected | uncorrected.
+# delta_norm_match: null            # [ablation] null | none | uncorrected: rescale to the uncorrected norm.
+
+# ---------------------------------------------------------------- evaluation (lm-eval harness)
+harness_tasks:                              # lm-eval tasks (list or CSV). Without suite/tasks: harness-only mode.
+  - ifeval
+harness_num_fewshot: 0                      # few-shot count.
+harness_batch_size: 4                       # int or "auto".
+# harness_limit: null               # doc limit; exclusive with a held-out calibration slice.
+# harness_samples: null             # {task: [doc indices]} evaluated (must agree with the derived hold-out).
+# harness_test_samples: null        # {task: [doc indices]} disjoint docs that re-score the best alpha.
+# eval_before_rebase: false         # [diagnostic] score the (extended) source first; needs harness_tasks.
+# eval_before_rebase_only: false    # [diagnostic] stop after the prestep and that score.
+# eval_source_before_extension: false  # [diagnostic] also score the unextended source.
+
+# ---------------------------------------------------------------- evaluation (NLI suite, instead of the harness)
+# suite: null                       # nli6.
+# tasks: null                       # "all", CSV or list of suite tasks.
+# eval_mode: "auto"                 # auto (head_logits if task_heads else prompt) | prompt | head_logits.
+# allow_prompt_eval: false          # required for prompt evaluation on NLI.
+# split: "validation"               # train | validation | test.
+# max_samples_per_task: null        # sample cap per task.
+# max_prompt_tokens: null           # prompt token cap.
+# print_every: null                 # progress print interval.
+# prompt_template: null             # str with {premise} and {hypothesis}.
+# batch_size: 8                     # head_logits loader batch.
+# num_workers: 0                    # head_logits loader workers.
+# max_length: 512                   # head_logits token length.
+# task_mask_class: {}               # {task: masked class or null}.
+# fine_tuned_acc: null              # {task: accuracy} reference for normalized accuracy.
+
+# ---------------------------------------------------------------- artifacts and logging
+# save_merged: null                 # path: save the rebased state at the selected alpha.
+# logging:                          # W&B / local logging.
+  # use_wandb: false
+  # project: null
+  # entity: null
+  # tags: []
+  # mode: "online"                  # online | offline | disabled (nodes are offline: use offline).
+  # local_log_dir: null
+  # log_every_n_steps: 50
+  # run_name: null

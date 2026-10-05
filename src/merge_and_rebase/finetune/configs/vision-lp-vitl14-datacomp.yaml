@@ -1,0 +1,86 @@
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: fp32
+
+  backbone:
+    name: openclip
+    clip_model: ViT-L-14
+    clip_pretrained: datacomp_xl_s13b_b90k
+
+  data:
+    batch_size: 32
+    num_workers: 6
+    val_fraction: 0.1
+    pin_memory: true
+
+  train:
+    epochs: null
+    optimizer:
+      name: adamw
+    lr: 1.0e-3
+    weight_decay: 0.0
+    accumulate_grad_batches: 4
+    lr_scheduler:
+      name: cosine
+    grad_clip_norm: 1.0
+    early_stopping: true
+    early_stopping_patience: 10
+
+  strategy:
+    name: linear_probe
+    forward_mode: standard
+    params: {}
+
+  output:
+    out_dir: src/checkpoints/finetune_lp_vitl14_datacomp
+    save_format: full
+    save_last_epoch: true
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
+datasets_order:
+  - SUN397
+  - Cars
+  - RESISC45
+  - EuroSAT
+  - SVHN
+  - GTSRB
+  - MNIST
+  - DTD
+
+datasets:
+  SUN397:
+    train:
+      epochs: 14
+  Cars:
+    train:
+      epochs: 35
+  RESISC45:
+    train:
+      epochs: 15
+  EuroSAT:
+    train:
+      epochs: 12
+  SVHN:
+    train:
+      epochs: 4
+  GTSRB:
+    train:
+      epochs: 11
+  MNIST:
+    train:
+      epochs: 5
+  DTD:
+    train:
+      epochs: 76

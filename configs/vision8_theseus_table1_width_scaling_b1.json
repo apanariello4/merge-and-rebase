@@ -13,7 +13,8 @@
   "method_params": {
     "num_batches": 1,
     "batch_size": 32,
-    "seq_align": "interpolate2d"
+    "seq_align": "interpolate2d",
+    "device_transform": "cpu"
   },
   "alpha_selection": "per_task",
   "alpha_search": true,
