@@ -22,10 +22,6 @@ This page is generated from the registered task-vector transport class docstring
 
 ::: merge_and_rebase.rebase.methods.bico.BiCoRebase
 
-## BiCo GradIn
-
-::: merge_and_rebase.rebase.methods.bico.BiCoGradInRebase
-
 ## Theseus
 
 ::: merge_and_rebase.rebase.methods.theseus.TheseusRebase

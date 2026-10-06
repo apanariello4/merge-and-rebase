@@ -11,10 +11,6 @@ from typing import Any
 COMPONENT_FORWARD_ORDER: tuple[str, ...] = ("attn.out_proj", "mlp.c_proj")
 
 
-#: Internal (non-residual-writing) components, reachable only in the retired output_* modes.
-INTERNAL_COMPONENTS: tuple[str, ...] = ("attn.q_proj", "attn.k_proj", "attn.v_proj", "mlp.c_fc")
-
-
 #: Canonical block-forward order over all six names; the relative order of attn.out_proj and mlp.c_proj
 #: matches COMPONENT_FORWARD_ORDER.
 CANONICAL_COMPONENT_ORDER: tuple[str, ...] = (

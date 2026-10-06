@@ -68,7 +68,6 @@ tensors), `alignment` (maps), `summary`/`diagnostics`/`brace_and_delta`/`layout`
 
 | Case key | Pins | Config | SHA-256 |
 |---|---|---|---|
-| `bico_gradin_vision_fc` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | bico_gradin, seq_align=mean; num_batches=2, seed=123 | `4b121cac8c44864123a0f13437199be901082960669c91f705d965e25701d896` |
 | `bico_vision_fc` | `rebase.registry.get_method(...).transport` on tiny fc vision models (hidden 8 -> 7) | bico, seq_align=mean; num_batches=2, seed=123 | `c2ce523b8acc67770595cee94c0743591546615452bb058017495d2b886e173d` |
 | `brace_decoder_class_api:extend:base_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `6d084485a368c80528d0778abc623900edb8883201f6e8fdd98de25fa5a8484b` |
 | `brace_decoder_class_api:extend:ft_state` | `DecoderBlockExtender.extend_and_calibrate` (class API), real tiny Qwen2 | interpolate_per_weight, independent; depth 2 -> 4 / 4 -> 2 | `5c305892c9f78461a681ea761c543b890075617824e879ba462e4019aa18d637` |
@@ -395,7 +394,7 @@ cases use odd 2->3 extension or a 3->2 shrink, target-informed protocols need th
 
 - `method=transfusion`: `_load_or_compute_permutations` raises "requires CUDA" on CPU. Only its native-target guard is in the error table.
 - Attention patching (`attn_patch_cfg`, `patched_attn`), `dtype` other than fp32, every CUDA branch (peak-memory brackets, `torch.cuda.synchronize`).
-- `bico_gradin`, `theseus_reference`, `theseus_gqa`, `orthogonal_shift`, `identity` through `main()`; merge methods other than `task_arithmetic`; non-uniform `weights`.
+- `theseus_gqa`, `orthogonal_shift`, `identity` through `main()`; merge methods other than `task_arithmetic`; non-uniform `weights`.
 - `source_only` (always crashes, see quirks), `transport_calibration_protocol` values `vision8_mix*` (the default `task_local` goes through the same balanced builder), `procrustes_source=gradient` and the gradient-recipe paths through `main()` (need a real open_clip ViT).
 - The real data / checkpoint layer (`load_hf_splits`, `build_vision_loaders`, `load_ckpt` key renaming), real summary-JSON serialisation and the `code_fingerprint`, W&B logging: all faked or bypassed.
 - Numbers come from a chance-level toy head on 8 samples per split: they pin bits, not scientific behaviour.

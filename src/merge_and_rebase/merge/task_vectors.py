@@ -237,28 +237,6 @@ class TaskVector:
     # Masking and shaping
     # -------------------
 
-    def mask_by_magnitude(self, keep_ratio: float) -> TaskVector:
-        """
-        Keep only the largest |Δ| entries globally (unstructured pruning).
-        """
-        r = float(keep_ratio)
-        if not (0.0 < r <= 1.0):
-            raise ValueError("keep_ratio must be in (0, 1].")
-
-        # flatten magnitudes
-        mags = torch.cat([self.delta[k].abs().flatten().float() for k in self.keys()])
-        if mags.numel() == 0:
-            return self
-
-        k = max(1, int(round(r * mags.numel())))
-        thresh = torch.topk(mags, k=k, largest=True).values.min()
-
-        out: TensorDict = {}
-        for name, v in self.delta.items():
-            m = (v.abs().float() >= thresh).to(v.dtype)
-            out[name] = v * m
-        return TaskVector(delta=out)
-
     def mask_by_sign_agreement(self, other: TaskVector, *, strict: bool = True) -> TaskVector:
         """
         Keep entries where sign(Δ_self) == sign(Δ_other).

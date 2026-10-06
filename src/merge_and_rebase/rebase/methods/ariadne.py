@@ -69,8 +69,6 @@ from ._ariadne.streaming import (
 
 logger = logging.getLogger(__name__)
 
-_SEQUENTIAL_ENDPOINTS = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
-
 
 @dataclass(frozen=True)
 class AriadnePrepared:
