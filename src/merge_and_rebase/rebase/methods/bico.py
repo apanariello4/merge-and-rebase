@@ -403,6 +403,7 @@ class BiCoRebase:
         if device_transform not in {"cpu", "gpu"}:
             raise ValueError("device_transform must be one of: cpu, gpu")
         svd_device = device if device_transform == "gpu" else "cpu"
+        _shared.warn_unread_method_params(self.name, kwargs, read_by_apply=("zero_attention_delta",))
         del kwargs
 
         if n_batches is None:
