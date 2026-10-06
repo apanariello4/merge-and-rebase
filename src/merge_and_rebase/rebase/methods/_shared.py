@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -42,6 +43,22 @@ _V_PROJ_WEIGHT = ".attn.v_proj.weight"
 _Q_PROJ_BIAS = ".attn.q_proj.bias"
 _K_PROJ_BIAS = ".attn.k_proj.bias"
 _V_PROJ_BIAS = ".attn.v_proj.bias"
+
+
+def warn_unread_method_params(
+    method_name: str, leftover: Mapping[str, Any], *, read_by_apply: tuple[str, ...] = ()
+) -> None:
+    """Warn about ``method_params`` that ``prepare()`` received but nothing reads (they used to be dropped silently).
+
+    ``read_by_apply`` lists keys that reach ``prepare`` through ``transport(**kwargs)`` but are consumed by ``apply``.
+    """
+    unread = sorted(set(leftover) - set(read_by_apply))
+    if unread:
+        warnings.warn(
+            f"[{method_name}] method_params not read by this method and ignored: {unread}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def _resolve_device(device: str | torch.device) -> torch.device:

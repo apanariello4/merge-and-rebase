@@ -87,6 +87,7 @@ from ._shared import (  # noqa: F401
     _visual_module,  # noqa: F401
     _visual_state_dict,  # noqa: F401
     _WrongTransportShape,  # noqa: F401
+    warn_unread_method_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -517,6 +518,7 @@ class TheseusRebase:
         if device_transform not in {"cpu", "gpu"}:
             raise ValueError("device_transform must be one of: cpu, gpu")
         svd_device = device if device_transform == "gpu" else "cpu"
+        warn_unread_method_params(self.name, kwargs)
         del kwargs
         #Config fallbacks num_batches -> n_batches
         if n_batches is None:
