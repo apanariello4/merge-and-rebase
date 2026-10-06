@@ -67,6 +67,16 @@ def _owned_cpu_fp32(sd: Any) -> dict[str, torch.Tensor]:
     return {k: (v.clone() if v.data_ptr() == sd[k].data_ptr() else v) for k, v in out.items()}
 
 
+def _assert_target_base_unmutated(env: StageEnv, stage: str) -> str:
+    """Hash of ``env.target_base_sd``; raises if it differs from the hash taken before the task loop."""
+    hash_after = _state_dict_sha256(env.target_base_sd)
+    if hash_after != env.target_hash_before:
+        raise RuntimeError(
+            f"Native target base was mutated during {stage}: before={env.target_hash_before}, after={hash_after}."
+        )
+    return hash_after
+
+
 def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[str, Any]:
     """Run the per-task transport, merge dispatch and alpha search; returns the final summary dictionary."""
     cfg = runtime.cfg
@@ -94,8 +104,8 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     target_depth = plan.target_depth
 
     run_block_extension_prestep = plan.run_block_extension_prestep
+    calibration_dataset = calibration_dataset_spec(block_extension_cfg)
     if blockext_like_method:
-        calibration_dataset = calibration_dataset_spec(block_extension_cfg)
         if run_block_extension_prestep:
             print(
                 "Block extension preprocess: enabled "
@@ -105,18 +115,16 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 f"n_batches_act={block_extension_cfg.n_batches_act})."
             )
         else:
-            reason = "disabled by config"
-            if not block_extension_enabled:
-                reason = "disabled by config"
-            elif source_depth == target_depth:
+            if block_extension_enabled and source_depth == target_depth:
                 reason = "source/target depth already match"
+            else:
+                reason = "disabled by config"
             print(
                 "Block extension preprocess: skipped "
                 f"({reason}, source_depth={source_depth}, target_depth={target_depth})."
             )
 
     block_extension_calibration_loader = None
-    calibration_dataset = calibration_dataset_spec(block_extension_cfg)
     if run_block_extension_prestep and not block_extension_cfg.skip_correction and calibration_dataset is not None:
         block_extension_calibration_loader = build_vision_calibration_loader(
             calibration_dataset,
@@ -158,8 +166,8 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             )
         )
     else:
-        source_base_sd = _owned_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
-        target_base_sd = _owned_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
+        source_base_sd = _owned_cpu_fp32(dict(clf_source.model.state_dict()))
+        target_base_sd = _owned_cpu_fp32(dict(clf_target.model.state_dict()))
     target_hash_before = _state_dict_sha256(target_base_sd)
 
     use_humanized_classnames = not bool(cfg.get("no_humanize", True))
@@ -328,12 +336,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     if resolved.lmc.source_only:
         # source_only skips transport, merge and target evaluation (B2: this used to crash on a zip length
         # mismatch); only the source-side observers' rows exist.
-        source_only_hash_after = _state_dict_sha256(env.target_base_sd)
-        if source_only_hash_after != env.target_hash_before:
-            raise RuntimeError(
-                "Native target base was mutated during source-only preparation: "
-                f"before={env.target_hash_before}, after={source_only_hash_after}."
-            )
+        source_only_hash_after = _assert_target_base_unmutated(env, "source-only preparation")
         return {
             "suite": resolved.suite_name,
             "tasks": resolved.tasks,
@@ -396,6 +399,11 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ):
             print(f"  {item['task']}: rebase={r_a:.3f}  baseline={b_a:.3f}")
 
+    # TransFusion's once-only prepare may have swapped these run-level objects on ``env``. Checked before
+    # ``save_merged`` so a mutated target base never reaches disk.
+    target_hash_before = env.target_hash_before
+    target_hash_after = _assert_target_base_unmutated(env, "merge/transport preparation")
+
     saved_merged_path: str | None = None
     if cfg.get("save_merged"):
         if merge_mode == "none":
@@ -409,21 +417,10 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 alpha=float(alpha.best_alpha),
             )
             out_path = str(cfg["save_merged"])
-            out_parent = Path(out_path).parent
-            if str(out_parent):
-                out_parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(to_cpu_fp32(best_merged_state), out_path)
             saved_merged_path = out_path
             print(f"Saved merged model (alpha={alpha.best_alpha:.3f}) -> {out_path}")
-
-    # TransFusion's once-only prepare may have swapped these run-level objects on ``env``.
-    target_hash_before = env.target_hash_before
-    target_hash_after = _state_dict_sha256(env.target_base_sd)
-    if target_hash_after != target_hash_before:
-        raise RuntimeError(
-            "Native target base was mutated during merge/transport preparation: "
-            f"before={target_hash_before}, after={target_hash_after}."
-        )
 
     return assemble_summary(
         RunRecord.from_run(

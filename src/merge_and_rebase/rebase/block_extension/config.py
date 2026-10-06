@@ -53,6 +53,7 @@ class BlockExtensionConfig:
     extension_strategy: str = "interpolate_per_weight"
     dampening_factor: float = 1.0
     n_batches_act: int = 2
+    # Intentional default: BRACE calibrates on the test split of its calibration dataset.
     calibration_split: str = "test"
     calibration_dataset: str | dict[str, Any] | None = None
     # Backward-compatible/ergonomic alias for a named calibration dataset.

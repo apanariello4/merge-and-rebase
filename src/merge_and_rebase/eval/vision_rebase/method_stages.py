@@ -452,13 +452,8 @@ class AriadneStage:
             axpy_state_dict(source_base_sd, merged_direction, alpha=1.0),
             strict=True,
         )
-        # Direct Residual has no dedicated calibration-dataset config
-        # field of its own (unlike block_extension_cfg's calibration_dataset):
-        # the once-only merged fit has no single "task" to draw loaders
-        # from, so it falls back to the first contributing task's train
-        # loaders, mirroring the existing calibration-loader fallback
-        # pattern (`calibration_loader = ...; if None: select_loader(...)`)
-        # used elsewhere in this function when no dedicated loader is set.
+        # The once-only merged fit has no single task to draw loaders from: it uses the shared Ariadne
+        # calibration context when one is configured, else the first contributing task's train loaders.
         merged_calibration_task_ctx = (
             self.calibration_ctx if self.calibration_ctx is not None else self.task_contexts[merge_in_source_tasks[0]]
         )
@@ -494,15 +489,8 @@ class AriadneStage:
         cfg = env.cfg
         direct_residual_cfg = self.cfg
         t = task.task
-        # Direct Residual never resizes anything: capture must run
-        # against the NATIVE, un-resized source models, never a
-        # block-extended reference from elsewhere in this function
-        # (source_base_model_task/source_ft_model_task are only
-        # ever populated when blockext_like_method is True, which
-        # is never the case for direct_residual_like -- see the
-        # method-dispatch resolution above -- so freshly building
-        # native copies here, rather than reusing those variables,
-        # is both correct and the only option).
+        # Ariadne never resizes: capture runs on freshly built native (un-resized) source models. The
+        # block-extension prestep never runs for Ariadne (it is not a blockext_like_method).
         pairing = self.pairing(env)
         if cfg.get("load_direct_residual_tvs_dir"):
             transported_delta, loaded_meta = _load_saved_sequential_tv(
