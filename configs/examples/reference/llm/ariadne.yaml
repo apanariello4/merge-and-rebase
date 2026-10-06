@@ -80,6 +80,12 @@ ariadne_params:
   # streaming_fingerprint_tol: 1.0e-9  # streaming consistency check tolerance (> 0); bf16 drift is reported.
   # copy_shape_matching_source_deltas: false  # [ablation] also copy shape-matching source deltas of non-fitted
   #                                 #   parameters (embeddings, norms, ...); default: the task vector is only the fit.
+  # depth_fit: "independent"        # [ablation] independent (each block fitted on the untouched target) | sequential
+  #                                 #   (block j fitted against D_j minus what blocks < j already realize; streaming, one component).
+  # procrustes_rank: null           # [ablation] keep only the top-k singular pairs of each block's cross-covariance
+  #                                 #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
+  # procrustes_energy: null         # [ablation] smallest k whose PLAIN singular values hold this share of their sum,
+  #                                 #   in (0, 1]; exclusive with procrustes_rank; null = full map.
   # procrustes_source: "activation" # [vision-only] the decoder rejects gradient.
   # tv_scaling: "none"              # [vision-only] the decoder rejects global | per_block.
   # tv_scaling_iters: 3             # [vision-only]

@@ -92,6 +92,12 @@ ariadne_params:
   # fidelity_holdout_batches: 10    # [diagnostic] held-out batches (> 0).
   # copy_shape_matching_source_deltas: false  # [ablation] also copy shape-matching source deltas of non-fitted
   #                                 #   parameters (default: the task vector is only the fit).
+  # depth_fit: "independent"        # [ablation] independent (each block fitted on the untouched target) | sequential
+  #                                 #   (block j fitted against D_j minus what blocks < j already realize; streaming, one component).
+  # procrustes_rank: null           # [ablation] keep only the top-k singular pairs of each block's cross-covariance
+  #                                 #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
+  # procrustes_energy: null         # [ablation] smallest k whose PLAIN singular values hold this share of their sum,
+  #                                 #   in (0, 1]; exclusive with procrustes_rank; null = full map.
 # load_direct_residual_tvs_dir: null  # [ablation] load saved sequential-endpoint task vectors instead of fitting;
 #                                   #   exclusive with save_transported_tvs_dir / save_transported_artifacts.
 
