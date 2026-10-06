@@ -162,7 +162,7 @@ class ResolvedRunConfig:
         return self.method_kind is MethodKind.ARIADNE
 
     @property
-    def theseus_like_method(self) -> bool:
+    def theseus_mode(self) -> bool:
         return self.method_name in _THESEUS_LIKE
 
     @property
