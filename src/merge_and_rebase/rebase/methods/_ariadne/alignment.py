@@ -548,6 +548,37 @@ def _procrustes_from_cross(cross: Tensor, *, return_rank: bool = False):
     return q
 
 
+@cost_phase_decorator("transformation")
+def _truncated_procrustes_from_cross(cross: Tensor, *, rank: int | None = None, energy: float | None = None):
+    """Rank-truncated Procrustes map ``U[:, :k] @ Vh[:k]`` from the SVD of ``cross`` (a partial isometry of rank k).
+
+    ``rank`` fixes k (clipped to ``min(cross.shape)``); ``energy`` picks, from the PLAIN (not squared) singular
+    values ``s``, the smallest k with ``sum(s[:k]) / sum(s) >= energy``. Exactly one must be given. Returns
+    ``(q, rank_used, kept_mass, kept_energy)`` with ``kept_mass = sum(s[:k]) / sum(s)`` and
+    ``kept_energy = sum(s[:k]**2) / sum(s**2)`` (both 1.0 when ``cross`` is zero). For k = min(shape) the SVD and
+    ``U @ Vh`` are those of `_procrustes_from_cross`, so q is bit-identical to the full map.
+    """
+    if (rank is None) == (energy is None):
+        raise ValueError("exactly one of rank and energy must be given")
+    u, s, vh = torch.linalg.svd(cross, full_matrices=False)
+    full = int(s.shape[0])
+    total = float(s.sum().item())
+    if rank is not None:
+        k = min(int(rank), full)
+    elif total <= 0.0:
+        k = full
+    else:
+        cum = torch.cumsum(s, dim=0) / s.sum()
+        # smallest k with cum[k-1] >= energy; float rounding of the last entry must not leave k undefined
+        hit = (cum >= float(energy)).nonzero()
+        k = int(hit[0].item()) + 1 if hit.numel() else full
+    q = u @ vh if k == full else u[:, :k] @ vh[:k]
+    mass = float(s[:k].sum().item()) / total if total > 0.0 else 1.0
+    sq_total = float((s**2).sum().item())
+    kept_energy = float((s[:k] ** 2).sum().item()) / sq_total if sq_total > 0.0 else 1.0
+    return q, k, mass, kept_energy
+
+
 def _check_rows(h: Tensor, e: Tensor, h_name: str, e_name: str) -> None:
     if h.ndim != 2 or e.ndim != 2:
         raise ValueError(f"{h_name} and {e_name} must be rank-2")

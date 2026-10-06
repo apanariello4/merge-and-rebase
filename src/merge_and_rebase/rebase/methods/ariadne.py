@@ -195,6 +195,8 @@ def _fit_body(
             alignment_row_weighting=config.alignment_row_weighting,
             alignment_seed=config.alignment_seed,
             fidelity_alignment_diagnostics=bool(config.fidelity_holdout),
+            procrustes_rank=config.procrustes_rank,
+            procrustes_energy=config.procrustes_energy,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )

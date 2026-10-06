@@ -18,6 +18,7 @@ from .alignment import (
     _derive_block_seed,
     _procrustes_from_cross,
     _random_isometry_map,
+    _truncated_procrustes_from_cross,
     _validate_alignment_options,
     procrustes_rank_diagnostics,
 )
@@ -135,6 +136,8 @@ def prepare_direct_residual_streaming(
     alignment_row_weighting: str = "uniform",
     alignment_seed: int = 0,
     fidelity_alignment_diagnostics: bool = False,
+    procrustes_rank: int | None = None,
+    procrustes_energy: float | None = None,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` + ``compute_desired_effects``.
 
@@ -154,7 +157,10 @@ def prepare_direct_residual_streaming(
     ``procrustes_diagnostics`` is the scalar-only per-position dict merged into the diagnostics rows: always the
     rank diagnostics of the cross-covariance solved from and ``procrustes_source``; in gradient mode also the
     activation-vs-gradient overlap and map distance; with ``fidelity_alignment_diagnostics`` also the alignment_*
-    scalars. The q/mu_s/mu_t tensors are not duplicated into rows (unlike the resident path); they stay in
+    scalars. ``procrustes_rank`` / ``procrustes_energy`` (opt-in, polar + activation only, mutually exclusive) keep only
+    the top-k singular pairs of the cross-covariance (``procrustes_energy`` thresholds the cumulative PLAIN singular
+    value share) and add ``procrustes_rank_used`` / ``procrustes_kept_singular_mass`` /
+    ``procrustes_kept_singular_energy`` to the rows. The q/mu_s/mu_t tensors are not duplicated into rows (unlike the resident path); they stay in
     ``q_by_position`` / ``source_mean_by_position`` / ``target_mean_by_position``.
     """
     if pairing.target_depth < 1:
@@ -164,6 +170,14 @@ def prepare_direct_residual_streaming(
     if procrustes_source not in {"activation", "gradient"}:
         raise ValueError("procrustes_source must be 'activation' or 'gradient'")
     _validate_alignment_options(alignment_map, alignment_row_weighting, procrustes_source)
+    truncate = procrustes_rank is not None or procrustes_energy is not None
+    if truncate and (alignment_map != "polar" or procrustes_source != "activation"):
+        raise ValueError(
+            "procrustes_rank/procrustes_energy require alignment_map='polar' and procrustes_source='activation'"
+        )
+    if procrustes_rank is not None and procrustes_energy is not None:
+        raise ValueError("procrustes_rank and procrustes_energy are mutually exclusive")
+    truncation_info: dict[int, dict[str, Any]] = {}
     gradient_mode = procrustes_source == "gradient"
     if gradient_mode and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires source_recipe and target_recipe")
@@ -258,7 +272,18 @@ def prepare_direct_residual_streaming(
         """Return ``(q, rank, polar_derived, map_scalars)`` for one position."""
         cross = acc.cross()
         if alignment_map == "polar":
-            q, rank = _procrustes_from_cross(cross, return_rank=True)
+            if truncate:
+                q, k_used, mass, kept_energy = _truncated_procrustes_from_cross(
+                    cross, rank=procrustes_rank, energy=procrustes_energy
+                )
+                rank = _cross_rank(cross)
+                truncation_info[position] = {
+                    "procrustes_rank_used": int(k_used),
+                    "procrustes_kept_singular_mass": mass,
+                    "procrustes_kept_singular_energy": kept_energy,
+                }
+            else:
+                q, rank = _procrustes_from_cross(cross, return_rank=True)
             scalars: dict[str, Any] = {"alignment_map": "polar", "alignment_row_weighting": alignment_row_weighting}
             if alignment_row_weighting != "uniform":
                 # Resident normalises the row weights to total mass 1; Chan's weights sum to the image count.
@@ -296,6 +321,7 @@ def prepare_direct_residual_streaming(
             "procrustes_source": "activation",
             **procrustes_rank_diagnostics(rank, q64.shape[0], q64.shape[1], polar_derived=polar_derived),
         }
+        row.update(truncation_info.get(j, {}))
         if fidelity_alignment_diagnostics:
             row.update(
                 {

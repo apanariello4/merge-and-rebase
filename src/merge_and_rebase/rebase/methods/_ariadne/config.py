@@ -122,6 +122,13 @@ class DirectResidualConfig:
     # carrying the fitted updates of blocks < j (residual target D_j - U_j); streaming path only (see
     # streaming.fit_direct_residual_sequential_streaming). Serialized only when non-default.
     depth_fit: str = "independent"
+    # Ablation (polar map, procrustes_source='activation', streaming only; mutually exclusive, default None = full
+    # map): rank-truncate the Procrustes map Q_j = U V^T to its top-k singular pairs, Q_j^k = U[:, :k] Vh[:k].
+    # 'procrustes_rank': fixed k >= 1 (k >= min(d_source, d_target) is the full map). 'procrustes_energy': in (0, 1],
+    # per block the smallest k with sum(s[:k]) / sum(s) >= procrustes_energy, s the PLAIN singular values of the
+    # centered cross-covariance (NOT squared); 1.0 is the full map. Serialized only when set.
+    procrustes_rank: int | None = None
+    procrustes_energy: float | None = None
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
@@ -130,6 +137,8 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "streaming_fingerprint_tol": 1e-9,
     "copy_shape_matching_source_deltas": False,
     "depth_fit": "independent",
+    "procrustes_rank": None,
+    "procrustes_energy": None,
 }
 
 
@@ -221,6 +230,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "streaming_fingerprint_tol",
         "copy_shape_matching_source_deltas",
         "depth_fit",
+        "procrustes_rank",
+        "procrustes_energy",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -414,6 +425,20 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     tol = cfg.streaming_fingerprint_tol
     if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
         raise ValueError("streaming_fingerprint_tol must be a positive finite number")
+    rank, energy = cfg.procrustes_rank, cfg.procrustes_energy
+    if rank is not None and energy is not None:
+        raise ValueError("procrustes_rank and procrustes_energy are mutually exclusive")
+    if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 1):
+        raise ValueError("procrustes_rank must be an integer >= 1 or None")
+    if energy is not None and (
+        isinstance(energy, bool) or not isinstance(energy, (int, float)) or not 0.0 < float(energy) <= 1.0
+    ):
+        raise ValueError("procrustes_energy must be a real number in (0, 1] or None")
+    if rank is not None or energy is not None:
+        need = {"alignment_map": "polar", "procrustes_source": "activation", "activation_storage": "streaming"}
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"procrustes_rank/procrustes_energy require {need}; got incompatible {bad}")
     if cfg.depth_fit not in {"independent", "sequential"}:
         raise ValueError("depth_fit must be 'independent' or 'sequential'")
     if cfg.depth_fit == "sequential":
