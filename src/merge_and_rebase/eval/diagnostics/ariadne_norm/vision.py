@@ -1,7 +1,7 @@
 """Vision (OpenCLIP) adapter of the ``ariadne_norm`` diagnostics.
 
 ``build_vision_inputs(cfg, device)`` re-creates, task by task, exactly what a reference ``eval.vision_rebase`` Ariadne
-run handed to ``AriadneRebase().prepare`` (``AriadneStage.run``, ``eval/vision_rebase/method_stages.py``), so that a
+run handed to ``AriadneRebase().prepare`` (``DirectFitStage.run``, ``eval/vision_rebase/method_stages.py``), so that a
 re-fit with the same code is bit-identical to the run's saved task vector. Everything is derived from the reference
 summary JSON: its ``run_logging.metadata.resolved_config`` is the merged config the run resolved, and it is resolved
 here through the same ``resolve_run_config`` call.
@@ -45,7 +45,7 @@ from merge_and_rebase.eval.vision_rebase.context import (
     _TaskContext,
 )
 from merge_and_rebase.eval.vision_rebase.merge import _infer_ckpt_base
-from merge_and_rebase.eval.vision_rebase.method_stages import AriadneStage
+from merge_and_rebase.eval.vision_rebase.method_stages import DirectFitStage
 from merge_and_rebase.eval.vision_rebase.pipeline import _owned_cpu_fp32
 from merge_and_rebase.io.ckpt import load_ckpt, load_into_model, resolve_ckpt_path
 from merge_and_rebase.io.peft_helpers import normalize_attn_patch_cfg
@@ -192,7 +192,7 @@ def build_vision_inputs(
 
     # Same call as vision_rebase.cli.main (cfg is the merged config with the block_extension_enabled default applied).
     resolved = resolve_run_config(ref_cfg, suites=SUITES)
-    if not resolved.direct_residual_like or resolved.ariadne_cfg is None:
+    if not resolved.direct_fit or resolved.ariadne_cfg is None:
         raise ValueError(f"reference run is not an Ariadne run (method {resolved.method_name!r})")
     config = resolved.ariadne_cfg
     if config.merge_mode != "per_task_then_merge":
@@ -271,7 +271,7 @@ def build_vision_inputs(
         run_logger=None,
     )
     # The stage object only supplies `.pairing(env)` here (computed from the same config/depths as in the run).
-    stage = AriadneStage(
+    stage = DirectFitStage(
         env, task_contexts={}, tasks=list(resolved.tasks), merge_weights=[], calibration_ctx=None, calibration_meta={}
     )
     pairing = stage.pairing(env)
@@ -360,7 +360,7 @@ def build_vision_inputs(
     current_fingerprint = _code_fingerprint()
 
     for task in requested:
-        # AriadneStage.run: native copies of the source models, never a reference from elsewhere in the pipeline.
+        # DirectFitStage.run: native copies of the source models, never a reference from elsewhere in the pipeline.
         ckpt_path = str(tuned_by_task[task])
         raw_sd = load_ckpt(ckpt_path)
         if is_native(task, raw_sd):

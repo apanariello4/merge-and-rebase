@@ -134,7 +134,7 @@ class TransportedTvSaveSpec:
         cfg: Mapping[str, Any],
         *,
         method_name: str,
-        ariadne_like: bool,
+        direct_fit: bool,
         ariadne_cfg: Any,
         summary_dir: str | os.PathLike[str] | None,
     ) -> TransportedTvSaveSpec:
@@ -146,7 +146,7 @@ class TransportedTvSaveSpec:
         if policy == "auto" and not directory and summary_dir is not None:
             directory = os.path.join(os.fspath(summary_dir), "transported_tvs")
         default_artifacts = bool(directory)
-        sequential = ariadne_like and ariadne_cfg.endpoint_construction in _SEQUENTIAL_ENDPOINT_CONSTRUCTIONS
+        sequential = direct_fit and ariadne_cfg.endpoint_construction in _SEQUENTIAL_ENDPOINT_CONSTRUCTIONS
         return cls(
             directory=directory,
             artifacts=bool(cfg.get("save_transported_artifacts", default_artifacts)),

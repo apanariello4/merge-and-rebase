@@ -52,7 +52,7 @@ class RunRecord:
     global_alpha_search: Any
     best_alpha: Any
     best_baseline_alpha: Any
-    direct_residual_like: Any
+    direct_fit: Any
     # The independent-endpoint diagnostics are never populated (dead since the endpoint-average baseline moved
     # into the BRACE stage); the summary keeps the keys.
     independent_base_dispersion: Any = None
@@ -145,7 +145,7 @@ class RunRecord:
             global_alpha_search=resolved.merge.global_alpha_search,
             best_alpha=alpha.best_alpha,
             best_baseline_alpha=alpha.best_baseline_alpha,
-            direct_residual_like=resolved.direct_residual_like,
+            direct_fit=resolved.direct_fit,
             single_tv_test_accs=alpha.single_tv_test_accs,
             single_tv_alpha_protocol=alpha.single_tv_alpha_protocol,
             direct_residual_calibration_meta=ariadne.calibration_meta,
@@ -357,7 +357,7 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
                 "sequential_endpoints_by_task": record.direct_residual_sequential_endpoints,
                 "loaded_vectors_by_task": record.loaded_direct_residual_tvs,
             }
-            if record.direct_residual_like
+            if record.direct_fit
             else None
         ),
         # Reports whichever depth-alignment mode was active for a Theseus-/

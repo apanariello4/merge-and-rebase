@@ -189,7 +189,7 @@ def apply_gradfix_mask(
 
 
 # ---------------------------------------------------------------------------
-# GradFix as a RebaseMethod
+# GradFix as a TransportMethod
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +198,7 @@ class GradFixRebase:
     """
     GradFix rebase method.
 
-    Implements ``PreparedRebaseMethod``:
+    Implements ``PreparedTransportMethod``:
       - ``prepare``: compute gradient signs from target model + dataloader
       - ``apply``: mask a delta using precomputed gradient signs
       - ``transport``: prepare + apply in one call

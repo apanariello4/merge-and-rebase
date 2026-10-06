@@ -233,7 +233,7 @@ def build_llm_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
             raise ValueError(f"tasks {missing} not in the reference run's tasks {task_names}")
         task_names = wanted
 
-    # -- AriadneStage.run, step by step ---------------------------------------------------------------------------
+    # -- DirectFitStage.run, step by step ---------------------------------------------------------------------------
     materialized: list[str] = []
     if config.missing_bias == "materialize":
         materialized = list(

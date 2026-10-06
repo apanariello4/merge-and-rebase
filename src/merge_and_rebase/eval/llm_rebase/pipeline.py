@@ -17,7 +17,6 @@ from ...io.ckpt import load_into_model
 from ...merge.runtime import compose_weighted_deltas
 from ...rebase.orchestration import TaskPipeline
 from ...rebase.prestep import StageEnv
-from ...rebase.run_config import MethodKind
 from .merge import _summarize_merged_delta, report_merged_delta
 from .method_stages import build_method_stage
 from .stages import build_prestep, build_prestep_observers, build_task_models
@@ -143,7 +142,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         runtime=rt,
     )
     # eval_before_rebase_only stops each task after its prestep, so its transport options are never resolved.
-    method_stage = None if eval_before_rebase_only else build_method_stage(cfg, ariadne=rt.resolved.method_kind is MethodKind.ARIADNE)
+    method_stage = None if eval_before_rebase_only else build_method_stage(cfg, direct_fit=rt.resolved.direct_fit)
     pipeline = TaskPipeline(
         prestep=build_prestep(rt.plan),
         observers=build_prestep_observers(rt.plan),

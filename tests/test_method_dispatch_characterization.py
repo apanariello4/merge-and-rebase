@@ -24,24 +24,24 @@ DEPTHS = {"vision": (12, 24), "llm": (24, 28)}
 
 # fmt: off
 EXPECTED = {
-    "ariadne/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "ariadne/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "bico/vision": {"bico_mode": True, "blockext_like_method": True, "depth_rule": "discrete_index_match", "direct_fit": False, "method_name": "bico", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": True, "theseus_mode": False, "transfusion_mode": False},
-    "bico/llm": {"bico_mode": True, "blockext_like_method": True, "depth_rule": "discrete_index_match", "direct_fit": False, "method_name": "bico", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": True, "theseus_mode": False, "transfusion_mode": False},
-    "direct_residual/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "direct_residual", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "direct_residual/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "direct_residual", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "gradfix/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "gradfix", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "gradfix/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "gradfix", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "identity/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "identity", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "identity/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "identity", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "orthogonal_shift/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "orthogonal_shift", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "orthogonal_shift/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "orthogonal_shift", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "theseus/vision": {"bico_mode": False, "blockext_like_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": True, "transfusion_mode": False},
-    "theseus/llm": {"bico_mode": False, "blockext_like_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": True, "transfusion_mode": False},
-    "theseus_gqa/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus_gqa", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "theseus_gqa/llm": {"bico_mode": False, "blockext_like_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus_gqa", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "transfusion/vision": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "transfusion", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": True},
-    "transfusion/llm": {"bico_mode": False, "blockext_like_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "transfusion", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": True},
+    "ariadne/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "ariadne/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "bico/vision": {"bico_mode": True, "depth_prestep_method": True, "depth_rule": "discrete_index_match", "direct_fit": False, "method_name": "bico", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": True, "theseus_mode": False, "transfusion_mode": False},
+    "bico/llm": {"bico_mode": True, "depth_prestep_method": True, "depth_rule": "discrete_index_match", "direct_fit": False, "method_name": "bico", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": True, "theseus_mode": False, "transfusion_mode": False},
+    "direct_residual/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "direct_residual", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "direct_residual/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "direct_residual", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "gradfix/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "gradfix", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "gradfix/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "gradfix", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "identity/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "identity", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "identity/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "identity", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "orthogonal_shift/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "orthogonal_shift", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "orthogonal_shift/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "orthogonal_shift", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "theseus/vision": {"bico_mode": False, "depth_prestep_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": True, "transfusion_mode": False},
+    "theseus/llm": {"bico_mode": False, "depth_prestep_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": True, "transfusion_mode": False},
+    "theseus_gqa/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus_gqa", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "theseus_gqa/llm": {"bico_mode": False, "depth_prestep_method": True, "depth_rule": "brace", "direct_fit": False, "method_name": "theseus_gqa", "run_block_extension_prestep": True, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
+    "transfusion/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": False, "method_name": "transfusion", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": True},
+    "transfusion/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": False, "method_name": "transfusion", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": True},
 }
 # fmt: on
 
@@ -81,19 +81,15 @@ def _llm(method: str) -> dict:
 def _record(resolved, plan) -> dict:
     return {
         "method_name": resolved.method_name,
-        "direct_fit": bool(_get(resolved, "direct_fit", "direct_residual_like")),
+        "direct_fit": bool(resolved.direct_fit),
         "theseus_mode": bool(resolved.theseus_mode),
         "bico_mode": bool(resolved.bico_mode),
         "transfusion_mode": bool(resolved.transfusion_mode),
-        "blockext_like_method": bool(resolved.blockext_like_method),
+        "depth_prestep_method": bool(resolved.depth_prestep_method),
         "depth_rule": resolved.depth_rule.kind,
         "run_block_extension_prestep": plan.run_block_extension_prestep,
         "run_discrete_layer_match_prestep": plan.run_discrete_layer_match_prestep,
     }
-
-
-def _get(obj, new: str, old: str):
-    return getattr(obj, new) if hasattr(obj, new) else getattr(obj, old)
 
 
 def _outcome(modality: str, method: str) -> dict | str:

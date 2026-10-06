@@ -15,7 +15,6 @@ from ...merge.base import PreparedMergeMethod
 from ...merge.methods._common import axpy_state_dict
 from ...merge.registry import get_method as get_merge_method
 from ...merge.task_vectors import TaskVector
-from ...rebase.block_extension.vision import run_block_extension
 from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
     _SINGLE_TRANSPORT_MODES,
     _TRANSPORT_THEN_MERGE_MODES,
@@ -31,7 +30,7 @@ from .context import (
     _select_dedicated_brace_loader,
     _TaskContext,
 )
-from .stages import _resolve_source_activation_plan, _visual_only_filter
+from .stages import _resolve_source_activation_plan, _visual_only_filter, apply_brace
 
 #: Key prefix of the vision tower in an OpenCLIP state dict.
 _VISUAL_PREFIX = "visual."
@@ -481,33 +480,22 @@ def compose_rebased_deltas(
                 transport_loader=transport_ctx.source_loaders.train,
                 correction_enabled=not block_extension_cfg.skip_correction,
             )
-            merged_extension_layout = {}
-            final_depth = run_block_extension(
-                source_base_model=source_base_model_once,
-                source_ft_model=source_ft_model_once,
+            brace = apply_brace(
+                source_base_model_once,
+                source_ft_model_once,
                 calibration_loader=brace_loader,
-                target_layers_total=target_depth,
+                target_depth=target_depth,
                 config=block_extension_cfg,
                 device=device,
-                layout_out=merged_extension_layout,
             )
-            if final_depth != target_depth:
+            if brace.final_depth != target_depth:
                 raise RuntimeError(
-                    f"Merged-pair BRACE depth mismatch: final_depth={final_depth}, target_depth={target_depth}."
+                    f"Merged-pair BRACE depth mismatch: final_depth={brace.final_depth}, target_depth={target_depth}."
                 )
-            merged_source_base = to_cpu_fp32(dict(source_base_model_once.state_dict()))
-            merged_source_ft = to_cpu_fp32(dict(source_ft_model_once.state_dict()))
-            merged_source_direction = TaskVector.from_checkpoints(
-                merged_source_base,
-                merged_source_ft,
-                strict=True,
-                key_filter=_visual_only_filter,
-            ).delta
+            merged_source_base, merged_source_direction = brace.base_sd, brace.delta
             source_template_once = deepcopy(source_base_model_once).cpu()
             prepared_has_brace = True
-            merged_source_activation_plan = _resolve_source_activation_plan(
-                block_extension_cfg, merged_extension_layout
-            )
+            merged_source_activation_plan = brace.activation_plan
         else:  # pragma: no cover - validated by _resolve_merge_mode_config
             raise AssertionError(f"Unhandled merge mode: {merge_mode}")
 
@@ -522,7 +510,7 @@ def compose_rebased_deltas(
             grad_num_batches=grad_num_batches,
             theseus_mode=theseus_mode,
             bico_mode=bico_mode,
-            run_block_extension_prestep=prepared_has_brace,
+            depth_aligned_source=prepared_has_brace,
             clf_source=clf_source,
             clf_target=clf_target,
             classnames=list(transport_ctx.classnames),

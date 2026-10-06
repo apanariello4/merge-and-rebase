@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from golden.test_llm_main_golden import CASES, World, _base_cfg, _launch
 
-from merge_and_rebase.eval.llm_rebase.method_stages import TransportMethodStage
+from merge_and_rebase.eval.llm_rebase.method_stages import TransportStage
 from merge_and_rebase.eval.llm_rebase.stages import BracePrestep
 
 
 def _record(monkeypatch, events: list[str]) -> None:
-    prestep_run, transport = BracePrestep.run, TransportMethodStage.run
+    prestep_run, transport = BracePrestep.run, TransportStage.run
 
     def pre_run(self, env, task, models):
         events.append(f"prepare:{task.task}")
@@ -22,7 +22,7 @@ def _record(monkeypatch, events: list[str]) -> None:
         return result
 
     monkeypatch.setattr(BracePrestep, "run", pre_run)
-    monkeypatch.setattr(TransportMethodStage, "run", stage_run)
+    monkeypatch.setattr(TransportStage, "run", stage_run)
 
 
 def test_tasks_are_interleaved_and_resized_models_freed(tmp_path, monkeypatch):

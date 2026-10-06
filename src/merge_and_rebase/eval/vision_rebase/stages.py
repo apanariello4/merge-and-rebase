@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -69,7 +70,7 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     """Per-task source base / fine-tuned copies, only when a prestep or the target-dataset eval needs them."""
     plan = env.plan
     if not (
-        env.resolved.blockext_like_method
+        env.resolved.depth_prestep_method
         and (
             plan.task_block_extension_prestep
             or plan.task_discrete_layer_match_prestep
@@ -176,6 +177,56 @@ class NoPrestep(_NativeDeltaMixin):
         )
 
 
+@dataclass
+class BraceOutcome:
+    """Depth-aligned (base, fine-tuned) source endpoints produced by one BRACE run."""
+
+    final_depth: int
+    layout: dict[str, Any]
+    activation_plan: Any
+    base_sd: dict[str, torch.Tensor]
+    ft_sd: dict[str, torch.Tensor]
+    delta: dict[str, torch.Tensor]
+
+
+def apply_brace(
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    *,
+    calibration_loader: Any,
+    target_depth: int,
+    config: Any,
+    device: Any,
+    target_model: torch.nn.Module | None = None,
+) -> BraceOutcome:
+    """Run BRACE in place on a source (base, fine-tuned) pair; return the aligned endpoints and their visual delta.
+
+    The single BRACE call site: the per-task prestep and the once-only ``merge_then_brace_then_transport`` path
+    (on the merged pair) both go through it. Callers check ``final_depth`` against the target depth.
+    """
+    layout: dict[str, Any] = {}
+    final_depth = run_block_extension(
+        source_base_model=source_base_model,
+        source_ft_model=source_ft_model,
+        calibration_loader=calibration_loader,
+        target_layers_total=target_depth,
+        config=config,
+        device=device,
+        layout_out=layout,
+        target_model=target_model,
+    )
+    base_sd = to_cpu_fp32(dict(source_base_model.state_dict()))
+    ft_sd = to_cpu_fp32(dict(source_ft_model.state_dict()))
+    return BraceOutcome(
+        final_depth=final_depth,
+        layout=layout,
+        activation_plan=_resolve_source_activation_plan(config, layout),
+        base_sd=base_sd,
+        ft_sd=ft_sd,
+        delta=TaskVector.from_checkpoints(base_sd, ft_sd, strict=True, key_filter=_visual_only_filter).delta,
+    )
+
+
 class BracePrestep:
     """BRACE/ARIADNE block-extension prestep: reference capture, resize, layout, delta, bookkeeping."""
 
@@ -206,33 +257,26 @@ class BracePrestep:
                 val_loader=source_loaders.val,
             )
         references.source_calibration_loader = calibration_loader
-        task_extension_layout: dict[str, Any] = {}
-        final_depth = run_block_extension(
-            source_base_model=source_base_model_task,
-            source_ft_model=source_ft_model_task,
+        brace = apply_brace(
+            source_base_model_task,
+            source_ft_model_task,
             calibration_loader=calibration_loader,
-            target_layers_total=target_depth,
+            target_depth=target_depth,
             config=block_extension_cfg,
             device=device,
-            layout_out=task_extension_layout,
             # Only the target-informed correction option reads this; every
             # standard ARIADNE path leaves the target backbone untouched.
             target_model=(env.clf_target.model if block_extension_cfg.target_shared_correction is not None else None),
         )
-        env.recorded_extension_layout = dict(task_extension_layout)
-        task_source_activation_plan = _resolve_source_activation_plan(block_extension_cfg, task_extension_layout)
-        if final_depth != target_depth:
+        env.recorded_extension_layout = dict(brace.layout)
+        if brace.final_depth != target_depth:
             raise RuntimeError(
-                f"Block extension preprocess failed for task '{t}': final_depth={final_depth}, expected={target_depth}."
+                f"Block extension preprocess failed for task '{t}': final_depth={brace.final_depth}, "
+                f"expected={target_depth}."
             )
-        task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
-        task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
-        task_delta = TaskVector.from_checkpoints(
-            task_source_base_sd,
-            task_source_ft_sd,
-            strict=True,
-            key_filter=_visual_only_filter,
-        ).delta
+        task_extension_layout, task_source_activation_plan = brace.layout, brace.activation_plan
+        task_source_base_sd, task_source_ft_sd, task_delta = brace.base_sd, brace.ft_sd, brace.delta
+        final_depth = brace.final_depth
         endpoints = env.endpoints
         merge_mode = resolved.merge.mode
         base_construction = resolved.merge.base_construction
