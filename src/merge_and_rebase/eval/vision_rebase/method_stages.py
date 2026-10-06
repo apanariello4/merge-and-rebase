@@ -44,7 +44,7 @@ def _build_rebase_prepared(
     grad_batch_size: int | None,
     grad_imgs_per_class: int | None,
     grad_num_batches: int | None,
-    theseus_like_method: bool,
+    theseus_mode: bool,
     bico_mode: bool,
     run_block_extension_prestep: bool,
     clf_source: OpenClipClassifier,
@@ -104,13 +104,13 @@ def _build_rebase_prepared(
             **method_params,
         )
 
-    if source_activation_plan is not None and not (theseus_like_method or bico_mode):
+    if source_activation_plan is not None and not (theseus_mode or bico_mode):
         raise ValueError(
             "The interpolated-activation baseline only applies to the activation-aligned "
             f"transport methods; method '{method_name}' does not consume activations."
         )
 
-    if theseus_like_method:
+    if theseus_mode:
         theseus_params = dict(method_params)
         transport_seed = int(theseus_params.pop("seed", cfg.get("seed", 42)))
         if run_block_extension_prestep:
@@ -298,7 +298,7 @@ class TransportMethodStage:
                     grad_batch_size=resolved.grad_batch_size,
                     grad_imgs_per_class=resolved.grad_imgs_per_class,
                     grad_num_batches=resolved.grad_num_batches,
-                    theseus_like_method=resolved.theseus_like_method,
+                    theseus_mode=resolved.theseus_mode,
                     bico_mode=resolved.bico_mode,
                     run_block_extension_prestep=plan.task_block_extension_prestep
                     or plan.task_discrete_layer_match_prestep,

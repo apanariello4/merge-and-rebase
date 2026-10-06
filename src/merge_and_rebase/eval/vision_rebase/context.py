@@ -196,7 +196,7 @@ DIRECT_RESIDUAL_TINY_IMAGENET_SPEC = {"path": "zh-plus/tiny-imagenet", "split": 
 TRANSPORT_CALIBRATION_DATA = ("task_local", "tiny_imagenet")
 
 
-def _resolve_transport_calibration_data(cfg: Mapping[str, Any], *, theseus_like_method: bool, bico_mode: bool) -> str:
+def _resolve_transport_calibration_data(cfg: Mapping[str, Any], *, theseus_mode: bool, bico_mode: bool) -> str:
     """Validate the top-level ``transport_calibration_data`` key.
 
     ``"task_local"`` (default) keeps THESEUS/BiCo calibrating on each task's own
@@ -209,7 +209,7 @@ def _resolve_transport_calibration_data(cfg: Mapping[str, Any], *, theseus_like_
     value = str(cfg.get("transport_calibration_data", "task_local")).strip().lower()
     if value not in TRANSPORT_CALIBRATION_DATA:
         raise ValueError(f"transport_calibration_data must be one of {TRANSPORT_CALIBRATION_DATA}, got {value!r}")
-    if value != "task_local" and not (theseus_like_method or bico_mode):
+    if value != "task_local" and not (theseus_mode or bico_mode):
         raise ValueError(
             "transport_calibration_data applies to THESEUS/BiCo only (Direct Residual uses calibration_data)"
         )
@@ -375,7 +375,7 @@ def build_run_calibration(
     """
     suite = resolved.suite
     tasks = resolved.tasks
-    theseus_like_method = resolved.theseus_like_method
+    theseus_mode = resolved.theseus_mode
     transfusion_mode = resolved.transfusion_mode
     bico_mode = resolved.bico_mode
     direct_residual_like = resolved.direct_residual_like
@@ -397,7 +397,7 @@ def build_run_calibration(
             target_cfg=target_cfg,
             use_humanized_classnames=use_humanized_classnames,
             need_source_loaders=bool(
-                (theseus_like_method or transfusion_mode or bico_mode or direct_residual_like)
+                (theseus_mode or transfusion_mode or bico_mode or direct_residual_like)
                 and task not in native_tasks
             ),
         )
@@ -439,7 +439,7 @@ def build_run_calibration(
     # one paired context for every task's prepare; alpha search and
     # evaluation keep each task's own splits.
     transport_calibration_data = _resolve_transport_calibration_data(
-        cfg, theseus_like_method=theseus_like_method, bico_mode=bico_mode
+        cfg, theseus_mode=theseus_mode, bico_mode=bico_mode
     )
     transport_calibration_ctx: _TaskContext | None = None
     transport_calibration_meta: dict[str, Any] = {"transport_calibration_data": transport_calibration_data}

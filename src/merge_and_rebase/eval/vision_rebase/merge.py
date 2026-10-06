@@ -265,7 +265,7 @@ def compose_rebased_deltas(
     grad_batch_size = resolved.grad_batch_size
     grad_imgs_per_class = resolved.grad_imgs_per_class
     grad_num_batches = resolved.grad_num_batches
-    theseus_like_method = resolved.theseus_like_method
+    theseus_mode = resolved.theseus_mode
     bico_mode = resolved.bico_mode
     device = env.device
     clf_source = env.clf_source
@@ -517,7 +517,7 @@ def compose_rebased_deltas(
             grad_batch_size=grad_batch_size,
             grad_imgs_per_class=grad_imgs_per_class,
             grad_num_batches=grad_num_batches,
-            theseus_like_method=theseus_like_method,
+            theseus_mode=theseus_mode,
             bico_mode=bico_mode,
             run_block_extension_prestep=prepared_has_brace,
             clf_source=clf_source,
