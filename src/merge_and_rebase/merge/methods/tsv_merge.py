@@ -8,11 +8,11 @@ from tqdm import tqdm
 
 from ..base import TensorDict
 from ..registry import register
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class TSVMerge:
+class TSVMerge(DirectionMerge):
     """Merge matrix-valued task deltas through truncated singular-vector components.
 
     ``sv_reduction`` and ``max_rank`` control the retained rank; ``svd_dtype``
@@ -41,28 +41,6 @@ class TSVMerge:
         )
         return base, direction
 
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _parse_dtype(name: str | torch.dtype) -> torch.dtype:

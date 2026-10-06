@@ -9,7 +9,7 @@ from tqdm import tqdm
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 from .functional import merge_functional
 
 
@@ -28,7 +28,7 @@ def _should_actmerge_key(key: str, tensor: torch.Tensor, *, merge_all_2d: bool) 
 
 
 @dataclass(frozen=True)
-class ActMerge:
+class ActMerge(DirectionMerge):
     """
     ACTMat / ACTMerge on dense task vectors.
 
@@ -112,29 +112,6 @@ class ActMerge:
             ).to(dtype=ref.dtype, device=ref.device)
 
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
 
 register(ActMerge())

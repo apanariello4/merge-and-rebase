@@ -8,11 +8,11 @@ import torch
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector, assert_compatible, default_key_filter, filter_state_dict, intersect_keys
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class DAREMerge:
+class DAREMerge(DirectionMerge):
     """Merge randomly sparsified task vectors with optional expectation-preserving rescaling.
 
     ``drop_rate`` (or ``p``) controls the fraction of delta entries removed from
@@ -67,29 +67,6 @@ class DAREMerge:
         merged_flat = self._dare_delta(flat, w=w, drop_rate=drop_rate, rescale=rescale, seed=seed)
         direction: TensorDict = TaskVector.unflatten_like(merged_flat, like=base, keys=keys)
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _dare_delta(
