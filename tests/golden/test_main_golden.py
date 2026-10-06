@@ -1213,12 +1213,11 @@ ERRORS: dict[str, Err] = {
         run_started=True,
     ),
     # ---- after the classifiers are built ------------------------------------------------------------
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "native_target_task_not_in_task_list": Err(
         {"native_target_tasks": ["Bogus"]},
         ValueError,
         E("native_target_tasks contains tasks not in the task list: ['Bogus']"),
-        before_build=False,
-        run_started=True,
     ),
     "merge_then_rebase_with_block_extension_prestep": Err(
         {"merge_mode": "merge_then_rebase"},
@@ -1263,12 +1262,20 @@ ERRORS: dict[str, Err] = {
         world=dict(_NATIVE_DTD),
     ),
     # B6 (P5.14): used to run as a silent no-op identical to base_construction='per_task'.
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "independent_endpoint_average_has_no_effect": Err(
         {"merge_mode": "brace_transport_then_merge", "base_construction": "independent_endpoint_average", **_SEARCH},
         ValueError,
         P("base_construction='independent_endpoint_average' has no effect with merge_mode='brace_transport_then_merge'"),
+    ),
+    # Auto-detected native tasks are only known after classification: their merge-mode check stays post-build.
+    "auto_detected_native_task_with_merge_mode_none": Err(
+        {},
+        ValueError,
+        P("Native target checkpoints require a merge mode; merge_mode='none' evaluates "),
         before_build=False,
         run_started=True,
+        world=dict(_NATIVE_DTD),
     ),
     "strict_load_partial_visual_coverage": Err(
         {"strict_load": True},
@@ -1278,22 +1285,21 @@ ERRORS: dict[str, Err] = {
         run_started=True,
         mutate=("ckpt://MNIST", _drop_block0_c_proj),
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "native_target_task_with_merge_mode_none": Err(
         {"native_target_tasks": ["DTD"]},
         ValueError,
         P("Native target checkpoints require a merge mode; merge_mode='none' evaluates "),
-        before_build=False,
-        run_started=True,
         world=dict(_NATIVE_DTD),
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "native_target_task_with_single_transport_mode": Err(
         {"native_target_tasks": ["DTD"], "merge_mode": "merge_then_rebase"},
         ValueError,
         P("Native target checkpoints cannot participate in merge_then_rebase: "),
-        before_build=False,
-        run_started=True,
         world=dict(_NATIVE_DTD),
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "native_target_task_with_transfusion": Err(
         {
             "method": "transfusion",
@@ -1303,17 +1309,15 @@ ERRORS: dict[str, Err] = {
         },
         NotImplementedError,
         P("Native target checkpoints with transfusion are not supported: "),
-        before_build=False,
-        run_started=True,
         world=dict(_NATIVE_DTD),
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "independent_endpoint_average_needs_transport_then_merge": Err(
         {"base_construction": "independent_endpoint_average"},
         ValueError,
         E("base_construction='independent_endpoint_average' requires merge_mode='brace_transport_then_merge'."),
-        before_build=False,
-        run_started=True,
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "independent_endpoint_average_needs_shared_alpha": Err(
         {
             "base_construction": "independent_endpoint_average",
@@ -1322,9 +1326,8 @@ ERRORS: dict[str, Err] = {
         },
         ValueError,
         P("base_construction='independent_endpoint_average' requires alpha_selection='shared'; "),
-        before_build=False,
-        run_started=True,
     ),
+    # P6: config-only check, now raised by resolve_run_config before any model is built.
     "independent_endpoint_average_rejects_native_tasks": Err(
         {
             "base_construction": "independent_endpoint_average",
@@ -1333,8 +1336,6 @@ ERRORS: dict[str, Err] = {
         },
         ValueError,
         P("base_construction='independent_endpoint_average' requires every task to be an independently transformed "),
-        before_build=False,
-        run_started=True,
         world=dict(_NATIVE_DTD),
     ),
     "transport_calibration_data_unknown": Err(
@@ -1373,10 +1374,15 @@ ERRORS: dict[str, Err] = {
         before_build=False,
         run_started=True,
     ),
+    # P6: with auto_detect_ckpt_base=false the classification now applies the same checks, so a checkpoint that
+    # matches neither base fails there (it used to fail later, at alignment: "No tensors from tuned checkpoint
+    # aligned to source base keys ...").
     "tuned_checkpoint_aligns_no_tensors": Err(
         {"auto_detect_ckpt_base": False},
         ValueError,
-        P("No tensors from tuned checkpoint aligned to source base keys for task 'MNIST': ckpt://MNIST. "),
+        P(
+            "Tuned checkpoint for task 'MNIST' matches neither the source nor the target visual backbone (ckpt://MNIST). "
+        ),
         before_build=False,
         run_started=True,
         mutate=("ckpt://MNIST", _prefix_junk),

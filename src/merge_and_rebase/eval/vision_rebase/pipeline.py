@@ -28,14 +28,13 @@ from ...merge.methods._common import axpy_state_dict
 from ...rebase.block_extension.config import calibration_dataset_spec
 from ...rebase.orchestration import AriadneRunRecord, TaskPipeline
 from ...rebase.prestep import StageEnv
+from ...rebase.run_config import check_native_target_tasks
 from ..print_utils import pretty_print_task_accuracies
 from ..utils import patch_base_for_attn, to_cpu_fp32
 from .alpha_search import AlphaSearchSpec, TargetEvaluator, run_alpha_search
 from .artifacts import TransportedTvSaver, TransportedTvSaveSpec, _state_dict_sha256
 from .context import build_run_calibration
 from .merge import (
-    _SINGLE_TRANSPORT_MODES,
-    _TRANSPORT_THEN_MERGE_MODES,
     _ckpt_visual_base_coverage,
     _infer_ckpt_base,
     _visual_key_fingerprint,
@@ -96,13 +95,12 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     method = resolved.method
     method_label = resolved.method_label
     block_extension_cfg = resolved.block_extension_cfg
-    blockext_like_method = resolved.blockext_like_method
+    depth_prestep_method = resolved.depth_prestep_method
     block_extension_enabled = resolved.block_extension_enabled
     transfusion_mode = resolved.transfusion_mode
     strict_load = resolved.strict_load
     device = resolved.device
     merge_mode = resolved.merge.mode
-    base_construction = resolved.merge.base_construction
     alpha_selection = resolved.alpha.selection
     suite = resolved.suite
     tasks = resolved.tasks
@@ -111,7 +109,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
 
     run_block_extension_prestep = plan.run_block_extension_prestep
     calibration_dataset = calibration_dataset_spec(block_extension_cfg)
-    if blockext_like_method:
+    if depth_prestep_method:
         if run_block_extension_prestep:
             print(
                 "Block extension preprocess: enabled "
@@ -181,100 +179,48 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     print(f"Rebase method: {method_label}")
 
     # ---- Mixed-merging pre-pass: classify each tuned checkpoint by its base ----
-    native_tasks_requested = [str(t) for t in (cfg.get("native_target_tasks", []) or [])]
-    unknown_native_tasks = [t for t in native_tasks_requested if t not in tasks]
-    if unknown_native_tasks:
-        raise ValueError(f"native_target_tasks contains tasks not in the task list: {unknown_native_tasks}")
+    # native_target_tasks, its merge-mode constraints and base_construction were validated by resolve_run_config.
+    native_tasks: set[str] = {str(t) for t in (cfg.get("native_target_tasks", []) or [])}
     auto_detect_ckpt_base = bool(cfg.get("auto_detect_ckpt_base", True))
-    native_tasks: set[str] = set(native_tasks_requested)
-
-    if native_tasks or auto_detect_ckpt_base:
-        print("Checkpoint base classification (visual-key coverage vs source/target):")
-        for task in tasks:
-            if task in native_tasks:
-                print(f"  {task}: native target checkpoint (explicit)")
-                continue
-            raw_sd = load_ckpt(str(tuned_by_task[task]))
-            inferred = _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd)
-            if inferred is None:
-                fingerprint = _visual_key_fingerprint(raw_sd)
-                raise ValueError(
-                    f"Tuned checkpoint for task '{task}' matches neither the source nor the target "
-                    f"visual backbone ({tuned_by_task[task]}). Checkpoint fingerprint: {fingerprint}. "
-                    f"Source fingerprint: {_visual_key_fingerprint(source_base_sd)}. "
-                    f"Target fingerprint: {_visual_key_fingerprint(target_base_sd)}."
-                )
-            if inferred == "target":
-                if not auto_detect_ckpt_base:
-                    raise ValueError(
-                        f"Tuned checkpoint for task '{task}' matches the target architecture; "
-                        "add it to native_target_tasks or set auto_detect_ckpt_base=true."
-                    )
-                native_tasks.add(task)
-                print(f"  {task}: native target checkpoint (auto-detected)")
-            else:
-                if strict_load:
-                    coverage = _ckpt_visual_base_coverage(raw_sd, source_base_sd)
-                    if coverage != 1.0:
-                        raise ValueError(
-                            f"Strict visual checkpoint coverage failed for task '{task}': "
-                            f"coverage={coverage:.6f}, expected=1.0 ({tuned_by_task[task]})."
-                        )
-                print(f"  {task}: source checkpoint (transport required)")
-            del raw_sd
-    else:
-        # auto_detect_ckpt_base=false with no native_target_tasks: nothing may be classified as native, but a
-        # target-architecture checkpoint must still be refused (B3: it used to be treated as a source checkpoint
-        # and silently produced an empty task vector).
-        for task in tasks:
-            raw_sd = load_ckpt(str(tuned_by_task[task]))
-            if _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd) == "target":
+    print("Checkpoint base classification (visual-key coverage vs source/target):")
+    for task in tasks:
+        if task in native_tasks:
+            print(f"  {task}: native target checkpoint (explicit)")
+            continue
+        # Classification reads keys and shapes only: memory-map the file instead of reading every tensor
+        # (the stage that needs the weights loads the checkpoint itself).
+        raw_sd = load_ckpt(str(tuned_by_task[task]), mmap=True)
+        inferred = _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd)
+        if inferred is None:
+            fingerprint = _visual_key_fingerprint(raw_sd)
+            raise ValueError(
+                f"Tuned checkpoint for task '{task}' matches neither the source nor the target "
+                f"visual backbone ({tuned_by_task[task]}). Checkpoint fingerprint: {fingerprint}. "
+                f"Source fingerprint: {_visual_key_fingerprint(source_base_sd)}. "
+                f"Target fingerprint: {_visual_key_fingerprint(target_base_sd)}."
+            )
+        if inferred == "target":
+            if not auto_detect_ckpt_base:
+                # B3: a target-architecture checkpoint used to be treated as a source one (empty task vector).
                 raise ValueError(
                     f"Tuned checkpoint for task '{task}' matches the target architecture; "
                     "add it to native_target_tasks or set auto_detect_ckpt_base=true."
                 )
-            del raw_sd
+            native_tasks.add(task)
+            print(f"  {task}: native target checkpoint (auto-detected)")
+        else:
+            if strict_load:
+                coverage = _ckpt_visual_base_coverage(raw_sd, source_base_sd)
+                if coverage != 1.0:
+                    raise ValueError(
+                        f"Strict visual checkpoint coverage failed for task '{task}': "
+                        f"coverage={coverage:.6f}, expected=1.0 ({tuned_by_task[task]})."
+                    )
+            print(f"  {task}: source checkpoint (transport required)")
+        del raw_sd
 
-    if native_tasks:
-        if merge_mode == "none":
-            raise ValueError(
-                "Native target checkpoints require a merge mode; merge_mode='none' evaluates "
-                "per-task transported deltas only. Use merge_mode='rebase_then_merge'."
-            )
-        if merge_mode in _SINGLE_TRANSPORT_MODES:
-            raise ValueError(
-                "Native target checkpoints cannot participate in merge_then_rebase: the merge "
-                "happens on the source base, where native target deltas do not exist."
-            )
-        if transfusion_mode:
-            raise NotImplementedError(
-                "Native target checkpoints with transfusion are not supported: the permutation "
-                "prepare step swaps the target keyspace. Use a theseus/bico transport method."
-            )
-
-    if base_construction == "independent_endpoint_average":
-        if merge_mode not in _TRANSPORT_THEN_MERGE_MODES:
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires merge_mode='brace_transport_then_merge'."
-            )
-        if alpha_selection != "shared":
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires "
-                "alpha_selection='shared'; per-task alpha search is not part of this baseline."
-            )
-        if native_tasks:
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires every task to be "
-                "an independently transformed source endpoint; native target tasks are not allowed."
-            )
-        # B6: in the accepted merge modes the independent base is computed for nobody -- it is consumed only by
-        # brace_merge_then_transport, which this option cannot be combined with -- so the run would silently be
-        # identical to base_construction='per_task'.
-        raise ValueError(
-            f"base_construction='independent_endpoint_average' has no effect with merge_mode='{merge_mode}': the "
-            "independent endpoint base is only consumed by merge_mode='brace_merge_then_transport', which does "
-            "not support it. Use base_construction='per_task' (the identical computation)."
-        )
+    if native_tasks:  # auto-detected native tasks are only known here
+        check_native_target_tasks(merge_mode, transfusion=transfusion_mode)
 
     calibration = build_run_calibration(
         resolved,
@@ -310,7 +256,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         TransportedTvSaveSpec.from_config(
             cfg,
             method_name=method.name,
-            ariadne_like=resolved.direct_residual_like,
+            direct_fit=resolved.direct_fit,
             ariadne_cfg=resolved.ariadne_cfg,
             summary_dir=runtime.summary_dir,
         ),
@@ -326,7 +272,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ariadne_calibration_ctx=calibration.ariadne_calibration_ctx,
         ariadne_calibration_meta=calibration.ariadne_calibration_meta,
     )
-    ariadne_record = method_stage.record if resolved.direct_residual_like else AriadneRunRecord()
+    ariadne_record = method_stage.record if resolved.direct_fit else AriadneRunRecord()
     # merge_then_brace_then_transport merges deltas on the native source base first and only then runs its own
     # once-only structural step, so neither prestep fires per-task under it (gating resolved in
     # `ResolvedRunConfig.bind`).

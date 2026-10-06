@@ -382,7 +382,7 @@ def build_run_calibration(
     theseus_mode = resolved.theseus_mode
     transfusion_mode = resolved.transfusion_mode
     bico_mode = resolved.bico_mode
-    direct_residual_like = resolved.direct_residual_like
+    direct_fit = resolved.direct_fit
     direct_residual_cfg = resolved.ariadne_cfg
     block_extension_cfg = resolved.block_extension_cfg
     run_block_extension_prestep = plan.run_block_extension_prestep
@@ -401,7 +401,7 @@ def build_run_calibration(
             target_cfg=target_cfg,
             use_humanized_classnames=use_humanized_classnames,
             need_source_loaders=bool(
-                (theseus_mode or transfusion_mode or bico_mode or direct_residual_like)
+                (theseus_mode or transfusion_mode or bico_mode or direct_fit)
                 and task not in native_tasks
             ),
         )
@@ -424,7 +424,7 @@ def build_run_calibration(
     # change; each task's alpha search and evaluation keep its own splits.
     direct_residual_calibration_ctx: _TaskContext | None = None
     direct_residual_calibration_meta: dict[str, Any] = {"calibration_data": "task_local"}
-    if direct_residual_like and direct_residual_cfg.calibration_data != "task_local":
+    if direct_fit and direct_residual_cfg.calibration_data != "task_local":
         direct_residual_calibration_ctx, direct_residual_calibration_meta = _build_direct_residual_calibration(
             direct_residual_cfg.calibration_data,
             per_task=[item for item in per_task if item["task"] not in native_tasks],

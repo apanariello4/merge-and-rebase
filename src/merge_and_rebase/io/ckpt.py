@@ -198,9 +198,15 @@ def align_to_base_keys(sd: Mapping[str, torch.Tensor], base: Mapping[str, torch.
     return out
 
 
-def load_ckpt(path: str) -> TensorDict:
-    # print(f"Loading checkpoint from {path}")
-    obj = torch.load(path, map_location="cpu")
+def load_ckpt(path: str, *, mmap: bool = False) -> TensorDict:
+    """Load a checkpoint state dict. ``mmap=True`` memory-maps the tensors (read lazily, for key/shape inspection);
+    files in the legacy non-zip format, which cannot be memory-mapped, are read normally."""
+    try:
+        obj = torch.load(path, map_location="cpu", mmap=mmap)
+    except RuntimeError:
+        if not mmap:
+            raise
+        obj = torch.load(path, map_location="cpu")
     sd = unwrap_state_dict(obj)
     return normalize_common_prefixes(sd)
 

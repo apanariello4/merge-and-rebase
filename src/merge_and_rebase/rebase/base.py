@@ -9,9 +9,10 @@ TensorDict = dict[str, torch.Tensor]
 
 
 @runtime_checkable
-class RebaseMethod(Protocol):
+class TransportMethod(Protocol):
     """
-    Minimal API for transporting a task vector delta from source base to target base.
+    Minimal API for transporting a task vector delta from source base to target base
+    (``MethodFamily.ACTIVATION_ALIGNED`` and ``WEIGHT_SPACE`` in ``rebase.capabilities``).
     """
 
     name: str
@@ -28,7 +29,7 @@ class RebaseMethod(Protocol):
 
 
 @runtime_checkable
-class PreparedRebaseMethod(Protocol):
+class PreparedTransportMethod(Protocol):
     """
     Optional API for rebase methods that have an expensive prepare step
     (e.g. gradient computation) and a cheap apply step (e.g. masking).
@@ -74,3 +75,15 @@ class PreparedRebaseMethod(Protocol):
         strict: bool = False,
         **kwargs,
     ) -> TensorDict: ...
+
+
+@runtime_checkable
+class FitMethod(Protocol):
+    """
+    A method that fits the target task vector from paired source/target activations instead of transporting the
+    source delta (``MethodFamily.DIRECT_FIT``, e.g. Ariadne): ``prepare`` takes live models and calibration loaders.
+    """
+
+    name: str
+
+    def prepare(self, **kwargs) -> Any: ...

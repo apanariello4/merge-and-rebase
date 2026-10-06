@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from ...data.llm_calibration import build_text_calibration_loader as _build_text_calibration_loader
+from ...rebase.capabilities import MethodFamily, method_family
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods._ariadne.alignment import apply_depth_pairing_override
 from ...rebase.methods._ariadne.biases import materialize_missing_projection_biases
@@ -23,8 +24,6 @@ from ...rebase.orchestration import MethodResult
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs
 from .merge import norm_match_transported, resolve_delta_source, resolve_norm_match
 from .stages import _DEFAULT_CALIB_BATCHES
-
-HYBRID_METHODS = ("theseus", "theseus_gqa", "bico")
 
 
 def passthrough_to_target(
@@ -43,7 +42,7 @@ def passthrough_to_target(
     return out, skipped_passthrough
 
 
-class TransportMethodStage:
+class TransportStage:
     """One task's transport: hybrid prepare+transport for THESEUS/theseus_gqa/BiCo, plain transport otherwise.
 
     ``run`` follows ``rebase.orchestration.MethodStage``: it picks the delta to transport (``transport_delta_source``),
@@ -101,7 +100,7 @@ class TransportMethodStage:
         family_adapter = rt.family_adapter
         device = rt.device
         target_base_sd = rt.target_base_sd
-        if method_name in HYBRID_METHODS and transport_keys:
+        if method_family(method_name) is MethodFamily.ACTIVATION_ALIGNED and transport_keys:
             # Hybrid: transport body keys, identity-pass the rest
             body_delta = {k: v for k, v in delta.items() if k in transport_keys}
             passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
@@ -182,7 +181,7 @@ class TransportMethodStage:
         return transported
 
 
-class AriadneStage:
+class DirectFitStage:
     """One task's Ariadne fit on the native source pair (no prestep, no parameter transport).
 
     The task vector is only the fitted corrections of the target's residual-writing projections; with
@@ -300,13 +299,13 @@ def _indices_sha256(indices: Any) -> str | None:
     return hashlib.sha256(repr([int(i) for i in indices]).encode()).hexdigest()
 
 
-def build_method_stage(cfg: Any, *, ariadne: bool = False) -> TransportMethodStage | AriadneStage:
+def build_method_stage(cfg: Any, *, direct_fit: bool = False) -> TransportStage | DirectFitStage:
     """Resolves ``transport_delta_source`` / ``delta_norm_match`` (their config errors surface here)."""
     delta_source, norm_match = resolve_delta_source(cfg), resolve_norm_match(cfg)
-    if ariadne:
+    if direct_fit:
         if delta_source != "corrected" or norm_match not in (None, "none"):
             raise ValueError(
                 "Ariadne fits its task vector directly: transport_delta_source and delta_norm_match do not apply."
             )
-        return AriadneStage()
-    return TransportMethodStage(delta_source=delta_source, norm_match=norm_match)
+        return DirectFitStage()
+    return TransportStage(delta_source=delta_source, norm_match=norm_match)

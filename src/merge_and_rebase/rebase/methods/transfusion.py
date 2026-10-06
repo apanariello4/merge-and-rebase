@@ -2,7 +2,7 @@
 TransFusion rebase method: permutation-based task vector transport.
 
 Implements the TransFusion workflow from repro_transfusion_main.py as a
-RebaseMethod that can be used with vision_rebase --method transfusion.
+TransportMethod that can be used with vision_rebase --method transfusion.
 
 Follows the prepare/apply/transport pattern used by GradFix and Theseus:
   - prepare(): one-time expensive setup (model patching, permutation compute, sanity check)

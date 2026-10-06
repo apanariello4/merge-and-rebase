@@ -20,10 +20,9 @@ from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
-from ...rebase.capabilities import check_pair, uses_calibration
+from ...rebase.capabilities import check_pair, depth_prestep_methods, uses_calibration
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
-from ...rebase.run_config import MethodKind
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
 from .pipeline import LlmRuntime
 from .run_config import bind_llm_plan, resolve_llm_run_config
@@ -149,7 +148,7 @@ def build_runtime(
     target_meta = target_family.metadata(target_llm.model) if target_family else None
 
     # Block extension config
-    blockext_like_method = method_name in {"theseus", "theseus_gqa", "bico"}
+    depth_prestep_method = method_name in depth_prestep_methods("llm")
     if "block_extension_enabled" not in cfg:
         cfg["block_extension_enabled"] = True
     block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
@@ -162,11 +161,11 @@ def build_runtime(
         method_name,
         source_meta,
         target_meta,
-        allow_depth_mismatch=bool(blockext_like_method and block_extension_enabled and depth_mismatch),
+        allow_depth_mismatch=bool(depth_prestep_method and block_extension_enabled and depth_mismatch),
     )
     print(f"Capability check passed for {method_name}")
 
-    if source_depth > target_depth and blockext_like_method and block_extension_enabled:
+    if source_depth > target_depth and depth_prestep_method and block_extension_enabled:
         shrink_strategies = {
             "per_weight",
             "per-weight",
@@ -195,7 +194,7 @@ def build_runtime(
     )
     # The per-method depth defaults may have rewritten the block-extension config (THESEUS skip_correction).
     block_extension_cfg = resolved.block_extension_cfg
-    if resolved.method_kind is MethodKind.ARIADNE:
+    if resolved.direct_fit:
         resolved = replace(
             resolved,
             ariadne_cfg=resolve_ariadne_decoder_config(_ariadne_params(cfg), target_family or source_family),
@@ -208,7 +207,7 @@ def build_runtime(
         target_depth=target_depth,
     )
     run_block_extension_prestep = plan.run_block_extension_prestep
-    if blockext_like_method:
+    if depth_prestep_method:
         if run_block_extension_prestep:
             print(
                 f"Block extension preprocess: enabled "

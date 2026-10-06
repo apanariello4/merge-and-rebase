@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from .base import RebaseMethod
+from .base import FitMethod, TransportMethod
 
-_METHODS: dict[str, RebaseMethod] = {}
+_METHODS: dict[str, TransportMethod | FitMethod] = {}
 # alias -> canonical registered name. An alias resolves to the very same method
 # object (e.g. "direct_residual" -> "ariadne"), so every dispatch decision keyed
 # on the canonical name is identical for both spellings.
 _ALIASES: dict[str, str] = {}
 
 
-def register(method: RebaseMethod) -> None:
+def register(method: TransportMethod | FitMethod) -> None:
     if method.name in _METHODS or method.name in _ALIASES:
         raise KeyError(f"Rebase method '{method.name}' already registered")
     _METHODS[method.name] = method
@@ -28,7 +28,7 @@ def canonical_method_name(name: str) -> str:
     return _ALIASES.get(name, name)
 
 
-def get_method(name: str) -> RebaseMethod:
+def get_method(name: str) -> TransportMethod | FitMethod:
     canonical = canonical_method_name(name)
     if canonical not in _METHODS:
         raise KeyError(f"Unknown rebase method '{name}'. Available: {list_methods()}")

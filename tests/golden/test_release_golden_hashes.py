@@ -778,7 +778,7 @@ def _build_vision_orchestration(method_name, source_depth, target_depth, *, pres
         grad_num_batches=None,
         theseus_mode=method_name.startswith("theseus"),
         bico_mode=method_name.startswith("bico"),
-        run_block_extension_prestep=prestep,
+        depth_aligned_source=prestep,
         clf_source=clf_source,
         clf_target=clf_target,
         classnames=[],

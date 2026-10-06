@@ -3,28 +3,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -69,11 +69,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -83,6 +78,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -111,7 +107,7 @@
    "method": {
     "name": "ariadne"
    },
-   "method_kind": "ariadne",
+   "method_family": "direct_fit",
    "method_label": "ariadne",
    "method_name": "ariadne",
    "method_params": {},
@@ -125,28 +121,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -191,11 +187,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -205,6 +196,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -237,7 +229,7 @@
    "method": {
     "name": "bico"
    },
-   "method_kind": "bico_like",
+   "method_family": "activation_aligned",
    "method_label": "bico",
    "method_name": "bico",
    "method_params": {
@@ -255,28 +247,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -321,11 +313,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": "interpolate_per_weight",
@@ -335,6 +322,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -368,7 +356,7 @@
    "method": {
     "name": "theseus"
    },
-   "method_kind": "theseus_like",
+   "method_family": "activation_aligned",
    "method_label": "theseus",
    "method_name": "theseus",
    "method_params": {
@@ -387,28 +375,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -453,11 +441,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -467,6 +450,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -495,7 +479,7 @@
    "method": {
     "name": "ariadne"
    },
-   "method_kind": "ariadne",
+   "method_family": "direct_fit",
    "method_label": "ariadne",
    "method_name": "ariadne",
    "method_params": {},
@@ -509,28 +493,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -575,11 +559,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -589,6 +568,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -621,7 +601,7 @@
    "method": {
     "name": "bico"
    },
-   "method_kind": "bico_like",
+   "method_family": "activation_aligned",
    "method_label": "bico",
    "method_name": "bico",
    "method_params": {
@@ -639,28 +619,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -705,11 +685,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": "interpolate_per_weight",
@@ -719,6 +694,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -752,7 +728,7 @@
    "method": {
     "name": "theseus"
    },
-   "method_kind": "theseus_like",
+   "method_family": "activation_aligned",
    "method_label": "theseus",
    "method_name": "theseus",
    "method_params": {
@@ -771,28 +747,28 @@
   "modality": "llm",
   "plans": {
    "24->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->28": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 28,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 28
    },
    "28->24": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 28,
-    "target_depth": 24,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    }
   },
   "resolved": {
@@ -837,11 +813,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus",
-    "theseus_gqa"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": "interpolate_per_weight",
@@ -851,6 +822,7 @@
    },
    "depth_rule_resolved": {},
    "device": "cpu",
+   "entrypoint": "llm",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -884,7 +856,7 @@
    "method": {
     "name": "theseus_gqa"
    },
-   "method_kind": "other",
+   "method_family": "activation_aligned",
    "method_label": "theseus_gqa",
    "method_name": "theseus_gqa",
    "method_params": {
@@ -903,28 +875,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -1028,10 +1000,6 @@
     "verbose": true
    },
    "block_extension_enabled": false,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -1047,6 +1015,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -1095,7 +1064,7 @@
     "params": {}
    },
    "method": "<types.SimpleNamespace>",
-   "method_kind": "ariadne",
+   "method_family": "direct_fit",
    "method_label": "Ariadne",
    "method_name": "ariadne",
    "method_params": {},
@@ -1131,28 +1100,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -1219,10 +1188,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -1238,6 +1203,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -1288,7 +1254,7 @@
    "method": {
     "name": "bico"
    },
-   "method_kind": "bico_like",
+   "method_family": "activation_aligned",
    "method_label": "bico(batches=10, align=interpolate2d)",
    "method_name": "bico",
    "method_params": {
@@ -1327,28 +1293,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -1415,10 +1381,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": "interpolate_per_weight",
@@ -1434,6 +1396,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -1484,7 +1447,7 @@
    "method": {
     "name": "theseus"
    },
-   "method_kind": "theseus_like",
+   "method_family": "activation_aligned",
    "method_label": "theseus(batches=10, align=interpolate2d, cov=activations, whiten=0)",
    "method_name": "theseus",
    "method_params": {
@@ -1524,28 +1487,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -1649,10 +1612,6 @@
     "verbose": true
    },
    "block_extension_enabled": false,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -1668,6 +1627,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -1716,7 +1676,7 @@
     "params": {}
    },
    "method": "<types.SimpleNamespace>",
-   "method_kind": "ariadne",
+   "method_family": "direct_fit",
    "method_label": "Ariadne",
    "method_name": "ariadne",
    "method_params": {},
@@ -1752,28 +1712,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": true,
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": true
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -1840,10 +1800,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": null,
@@ -1859,6 +1815,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -1909,7 +1866,7 @@
    "method": {
     "name": "bico"
    },
-   "method_kind": "bico_like",
+   "method_family": "activation_aligned",
    "method_label": "bico(batches=10, align=interpolate2d)",
    "method_name": "bico",
    "method_params": {
@@ -1948,28 +1905,28 @@
   "modality": "vision",
   "plans": {
    "12->12": {
-    "run_block_extension_prestep": false,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 12,
-    "task_block_extension_prestep": false,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    },
    "12->24": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 12,
-    "target_depth": 24,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 24
    },
    "24->12": {
-    "run_block_extension_prestep": true,
-    "run_discrete_layer_match_prestep": false,
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
     "source_depth": 24,
-    "target_depth": 12,
-    "task_block_extension_prestep": true,
-    "task_discrete_layer_match_prestep": false
+    "target_depth": 12
    }
   },
   "resolved": {
@@ -2036,10 +1993,6 @@
     "verbose": true
    },
    "block_extension_enabled": true,
-   "blockext_methods": [
-    "bico",
-    "theseus"
-   ],
    "depth_guard": null,
    "depth_rule": {
     "extension_strategy": "interpolate_per_weight",
@@ -2055,6 +2008,7 @@
     "source": "method_default"
    },
    "device": "cuda",
+   "entrypoint": "vision",
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
@@ -2105,7 +2059,7 @@
    "method": {
     "name": "theseus"
    },
-   "method_kind": "theseus_like",
+   "method_family": "activation_aligned",
    "method_label": "theseus(batches=10, align=interpolate2d, cov=activations, whiten=0)",
    "method_name": "theseus",
    "method_params": {

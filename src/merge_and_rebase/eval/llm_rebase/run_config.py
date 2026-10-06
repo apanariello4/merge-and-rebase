@@ -15,18 +15,16 @@ from typing import Any
 from ...merge.methods._common import get_method_params
 from ...rebase import get_method
 from ...rebase.block_extension.config import BlockExtensionConfig
+from ...rebase.capabilities import default_depth_prestep, method_family
 from ...rebase.run_config import (
     AlphaSpec,
     DepthRule,
     MergeSpec,
-    MethodKind,
     ResolvedRunConfig,
     RunPlan,
     SourceLmcSpec,
     resolve_depth_rule,
 )
-
-LLM_BLOCKEXT_METHODS = frozenset({"theseus", "theseus_gqa", "bico"})
 
 
 def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
@@ -60,11 +58,10 @@ def resolve_llm_run_config(
     The depth rule is resolved by the shared ``resolve_depth_rule`` (per-method defaults behind ``depth_defaults``,
     with the same meaning-changed guard as vision); ``theseus_gqa`` counts as THESEUS for the depth rule.
     """
-    blockext_like = method_name in LLM_BLOCKEXT_METHODS
-    depth_kind = MethodKind.THESEUS_LIKE if method_name == "theseus_gqa" else MethodKind.of(method_name)
-    if blockext_like:
+    default_rule = default_depth_prestep(method_name, "llm")
+    if default_rule is not None:
         depth_rule, block_extension_cfg, depth_guard = resolve_depth_rule(
-            depth_kind, method_name, cfg, block_extension_enabled, block_extension_cfg
+            default_rule, method_name, cfg, block_extension_enabled, block_extension_cfg
         )
     else:
         depth_rule, depth_guard = DepthRule(kind="none"), None
@@ -74,7 +71,7 @@ def resolve_llm_run_config(
         method_name=method_name,
         method_params=method_params,
         method_label=method_name,
-        method_kind=MethodKind.of(method_name),
+        method_family=method_family(method_name),
         block_extension_enabled=block_extension_enabled,
         block_extension_cfg=block_extension_cfg,
         depth_rule=depth_rule,
@@ -111,7 +108,7 @@ def resolve_llm_run_config(
         suite_name="",
         suite=None,
         tasks=[],
-        blockext_methods=LLM_BLOCKEXT_METHODS,
+        entrypoint="llm",
     )
 
 
@@ -121,5 +118,6 @@ def bind_llm_plan(
     """``resolved.bind`` plus the LLM rule that the prestep needs both family metadata records."""
     plan = resolved.bind(source_depth, target_depth)
     if source_meta is None or target_meta is None:
-        plan = replace(plan, run_block_extension_prestep=False, task_block_extension_prestep=False)
+        if plan.depth_alignment.rule == "brace":
+            plan = replace(plan, depth_alignment=replace(plan.depth_alignment, rule="none"))
     return plan

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -9,8 +11,23 @@ from .model_families.base import ModelFamilyMetadata
 from .registry import canonical_method_name
 
 
+class MethodFamily(enum.Enum):
+    """How a rebase method obtains the target task vector."""
+
+    #: The source task vector is mapped through maps estimated from calibration activations / gradients
+    #: (THESEUS, BiCo).
+    ACTIVATION_ALIGNED = "activation_aligned"
+    #: The source task vector is transformed in weight space (permutation, gradient-sign mask, identity, rotation).
+    WEIGHT_SPACE = "weight_space"
+    #: The target task vector is fitted from paired source/target activations; nothing is transported (Ariadne).
+    DIRECT_FIT = "direct_fit"
+
+
 @dataclass(frozen=True)
-class _PairSupport:
+class MethodTraits:
+    """Static traits of a registered rebase method: the single table every dispatch decision reads."""
+
+    family: MethodFamily
     cross_size: bool = False
     required: bool = True
     # Optional method-specific explanation used instead of the generic message when
@@ -21,44 +38,75 @@ class _PairSupport:
     # The method reads calibration activations; on LLM harness runs that calibration text is held out of the
     # evaluation docs, so the evaluation slice must be resolved before the first evaluation.
     calibrates: bool = False
+    # Default depth prestep for a depth-mismatched pair (``None``: the method runs no depth prestep) ...
+    depth_prestep: Literal["brace", "discrete_index_match"] | None = None
+    # ... and the entrypoints that run it (``theseus_gqa`` exists only for decoders).
+    depth_prestep_entrypoints: frozenset[str] = frozenset({"vision", "llm"})
 
 
-_METHOD_SUPPORT: dict[str, _PairSupport] = {
-    "theseus": _PairSupport(cross_size=True, calibrates=True),
-    "theseus_gqa": _PairSupport(cross_size=True, calibrates=True),
-    "bico": _PairSupport(cross_size=True, calibrates=True),
-    "identity": _PairSupport(cross_size=False),
-    "orthogonal_shift": _PairSupport(cross_size=False),
-    "gradfix": _PairSupport(cross_size=False),
-    "transfusion": _PairSupport(cross_size=False, required=False),
+_ACT = MethodFamily.ACTIVATION_ALIGNED
+_WEIGHT = MethodFamily.WEIGHT_SPACE
+
+METHOD_TRAITS: dict[str, MethodTraits] = {
+    "theseus": MethodTraits(_ACT, cross_size=True, calibrates=True, depth_prestep="brace"),
+    "theseus_gqa": MethodTraits(
+        _ACT, cross_size=True, calibrates=True, depth_prestep="brace", depth_prestep_entrypoints=frozenset({"llm"})
+    ),
+    "bico": MethodTraits(_ACT, cross_size=True, calibrates=True, depth_prestep="discrete_index_match"),
+    "identity": MethodTraits(_WEIGHT, cross_size=False),
+    "orthogonal_shift": MethodTraits(_WEIGHT, cross_size=False),
+    "gradfix": MethodTraits(_WEIGHT, cross_size=False),
+    "transfusion": MethodTraits(_WEIGHT, cross_size=False, required=False),
     # "direct_residual" is a registry alias of "ariadne" and resolves to this entry.
-    "ariadne": _PairSupport(cross_size=True, any_depth=True, calibrates=True),
+    "ariadne": MethodTraits(MethodFamily.DIRECT_FIT, cross_size=True, any_depth=True, calibrates=True),
 }
 
 
-def _support_for(method_name: str) -> _PairSupport | None:
-    return _METHOD_SUPPORT.get(canonical_method_name(method_name))
+def method_traits(method_name: str) -> MethodTraits | None:
+    """Traits of a registered method (aliases resolved); ``None`` for an unknown name."""
+    return METHOD_TRAITS.get(canonical_method_name(method_name))
+
+
+def method_family(method_name: str) -> MethodFamily | None:
+    traits = method_traits(method_name)
+    return None if traits is None else traits.family
+
+
+def depth_prestep_methods(entrypoint: str) -> frozenset[str]:
+    """Methods whose depth-mismatched pairs run the depth prestep in ``entrypoint`` (``"vision"`` / ``"llm"``)."""
+    return frozenset(
+        name
+        for name, traits in METHOD_TRAITS.items()
+        if traits.depth_prestep is not None and entrypoint in traits.depth_prestep_entrypoints
+    )
+
+
+def default_depth_prestep(method_name: str, entrypoint: str) -> str | None:
+    """The method's default depth prestep rule in ``entrypoint``, or ``None`` when it runs none there."""
+    if method_name not in depth_prestep_methods(entrypoint):
+        return None
+    return METHOD_TRAITS[method_name].depth_prestep
 
 
 def supports_cross_size(method_name: str) -> bool:
     """Whether the method can rebase across different hidden/intermediate sizes."""
-    support = _support_for(method_name)
+    support = method_traits(method_name)
     if support is None:
-        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(_METHOD_SUPPORT)}")
+        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(METHOD_TRAITS)}")
     return support.cross_size
 
 
 def is_text_supported(method_name: str) -> bool:
     """Whether the method is wired for text/decoder rebasing."""
-    support = _support_for(method_name)
+    support = method_traits(method_name)
     if support is None:
-        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(_METHOD_SUPPORT)}")
+        raise ValueError(f"Unknown rebase method '{method_name}'. Supported: {sorted(METHOD_TRAITS)}")
     return support.required
 
 
 def uses_calibration(method_name: str) -> bool:
     """Whether the method fits on calibration activations (unknown methods: no)."""
-    support = _support_for(method_name)
+    support = method_traits(method_name)
     return bool(support is not None and support.calibrates)
 
 
@@ -81,22 +129,22 @@ def check_pair(
     allow_depth_mismatch: bool = False,
     block_extension_params: Mapping[str, object] | None = None,
 ) -> None:
-    support = _support_for(method_name)
+    support = method_traits(method_name)
     if support is None:
         raise ValueError(
             f"Unknown rebase method '{method_name}'. "
-            f"Supported: {sorted(_METHOD_SUPPORT)}"
+            f"Supported: {sorted(METHOD_TRAITS)}"
         )
 
     if not support.required:
         if support.unavailable_reason is not None:
             raise ValueError(
                 f"Method '{method_name}' is not available for text/decoder rebasing: {support.unavailable_reason} "
-                f"Supported: {sorted(n for n, s in _METHOD_SUPPORT.items() if s.required)}"
+                f"Supported: {sorted(n for n, s in METHOD_TRAITS.items() if s.required)}"
             )
         raise ValueError(
             f"Method '{method_name}' is not available for text/decoder rebasing in v1. "
-            f"Supported: {sorted(n for n, s in _METHOD_SUPPORT.items() if s.required)}"
+            f"Supported: {sorted(n for n, s in METHOD_TRAITS.items() if s.required)}"
         )
 
     if source_meta is None or target_meta is None:
@@ -122,7 +170,7 @@ def check_pair(
 
     # Ariadne pairs blocks itself; BiCo with a discrete index match works on the reindexed stack.
     if support.any_depth or (
-        canonical_method_name(method_name) == "bico"
+        support.depth_prestep == "discrete_index_match"
         and resolve_depth_strategy(method_name, block_extension_params, source_meta, target_meta).rule
         == "discrete_index_match"
     ):
@@ -195,19 +243,22 @@ def resolve_depth_strategy(
     Any legacy key in ``block_extension_params`` (depth_rule / extension_strategy / skip_correction) keeps the
     legacy semantics: the given values verbatim, unset ``skip_correction`` meaning False.
     """
-    name = canonical_method_name(method_name)
+    traits = method_traits(method_name)
     params = block_extension_params or {}
-    if name == "ariadne":
+    # Methods without a depth prestep (Ariadne pairs blocks itself) and equal depths need no rule.
+    if traits is None or traits.depth_prestep is None:
         return DepthStrategy(rule="none")
     if source_meta is not None and target_meta is not None:
         if source_meta.num_hidden_layers == target_meta.num_hidden_layers:
             return DepthStrategy(rule="none")
-    if name not in ("theseus", "theseus_gqa", "bico"):
-        return DepthStrategy(rule="none")
     if any(k in params for k in _LEGACY_DEPTH_KEYS):
         rule = str(params.get("depth_rule") or "")
         if rule in ("", "method_default"):
-            rule = "discrete_index_match" if name == "bico" and "skip_correction" not in params else "brace"
+            rule = (
+                "discrete_index_match"
+                if traits.depth_prestep == "discrete_index_match" and "skip_correction" not in params
+                else "brace"
+            )
         ext = params.get("extension_strategy")
         return DepthStrategy(
             rule=rule,
@@ -215,6 +266,6 @@ def resolve_depth_strategy(
             extension_strategy=None if ext is None else str(ext),
             legacy=True,
         )
-    if name == "bico":
+    if traits.depth_prestep == "discrete_index_match":
         return DepthStrategy(rule="discrete_index_match")
     return DepthStrategy(rule="brace", skip_correction=True, extension_strategy="interpolate_per_weight")
