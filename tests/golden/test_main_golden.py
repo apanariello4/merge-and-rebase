@@ -1503,3 +1503,19 @@ def test_main_sequential_load_reads_vectors_saved_under_the_ariadne_spelling(tmp
     loaded = run_main(load_cfg, tmp_path / "run2", monkeypatch, world=World(**case.world))
     by_task = loaded.summary["direct_residual"]["loaded_vectors_by_task"]
     assert by_task and all(str(meta["path"]).endswith("_ariadne_transported_native.pt") for meta in by_task.values())
+
+
+def test_main_mutated_target_base_is_never_saved(tmp_path, monkeypatch):
+    """The target-base mutation guard runs before ``save_merged``: a run that fails it leaves no merged checkpoint."""
+    from merge_and_rebase.eval.vision_rebase import pipeline
+
+    calls: list[int] = []
+
+    def fake_hash(_sd):
+        calls.append(1)
+        return "before" if len(calls) == 1 else "after"
+
+    monkeypatch.setattr(pipeline, "_state_dict_sha256", fake_hash)
+    with pytest.raises(RuntimeError, match="mutated during merge/transport preparation"):
+        _run_case("theseus_rebase_then_merge_save_merged", tmp_path, monkeypatch)
+    assert not (tmp_path / "merged" / "merged.pt").exists()

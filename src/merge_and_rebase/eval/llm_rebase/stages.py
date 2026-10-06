@@ -41,8 +41,6 @@ class _PreparedTaskDelta:
     # Realized block chain from the resize, needed by residual completion to
     # address inserted positions by ancestry instead of a depth pattern.
     extension_layout: dict[str, Any] | None = None
-    # Proposal-1 native reference banks, captured before the resize.
-
 
 
 # Calibration batches used by theseus/bico when a config names neither
@@ -132,8 +130,6 @@ def _prepare_resized_task_delta(
         uncorrected_delta=uncorrected_delta,
         extension_layout=extension_layout or None,
     )
-
-
 
 
 @dataclass
