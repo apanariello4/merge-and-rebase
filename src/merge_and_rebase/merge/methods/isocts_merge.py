@@ -8,11 +8,11 @@ import torch
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class IsoCTSMerge:
+class IsoCTSMerge(DirectionMerge):
     """Compose matrix deltas from common and task-specific singular subspaces.
 
     ``common_space_fraction`` allocates the shared subspace; the remaining rank
@@ -61,29 +61,6 @@ class IsoCTSMerge:
             else:
                 direction[k] = torch.zeros_like(b)
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _isocts_delta(mats: list[torch.Tensor], w: torch.Tensor, common_space_fraction: float) -> torch.Tensor:

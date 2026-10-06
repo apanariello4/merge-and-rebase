@@ -8,11 +8,11 @@ import torch
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector, assert_compatible, default_key_filter, filter_state_dict, intersect_keys
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class TIESMerge:
+class TIESMerge(DirectionMerge):
     """Prune task vectors, resolve their signs, and merge agreeing entries.
 
     ``topk`` retains a magnitude fraction per task vector (or a percentage
@@ -61,31 +61,6 @@ class TIESMerge:
 
         direction: TensorDict = TaskVector.unflatten_like(merged_flat, like=base, keys=keys)
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        keep_ratio: float | None = None,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            keep_ratio=keep_ratio,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _topk_mask(M: torch.Tensor, topk: float) -> tuple[torch.Tensor, torch.Tensor]:

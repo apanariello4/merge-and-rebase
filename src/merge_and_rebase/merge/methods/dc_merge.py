@@ -8,12 +8,12 @@ from tqdm import tqdm
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, get_method_params
+from ._common import DirectionMerge, get_method_params
 from .functional import merge_functional
 
 
 @dataclass(frozen=True)
-class DCMerge:
+class DCMerge(DirectionMerge):
     """Merge dense task deltas through whitened low-rank coordinate covers.
 
     The method truncates and optionally smooths each matrix spectrum, merges
@@ -53,29 +53,6 @@ class DCMerge:
             ).to(dtype=ref.dtype, device=ref.device)
 
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
 
 register(DCMerge())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any, ClassVar
 
 import torch
 
@@ -36,3 +37,29 @@ def get_method_params(kwargs: dict) -> dict:
     if not isinstance(method_params, dict):
         raise ValueError("method_params must be a dict.")
     return method_params
+
+
+class DirectionMerge:
+    """Shared ``apply`` / ``merge`` of the merge methods whose ``prepare`` returns ``(base, merged direction)``:
+    the merged model is ``base + alpha * direction``."""
+
+    #: ``merge`` passes its extra ``**kwargs`` (``method_params``, ...) on to ``prepare``.
+    forward_merge_kwargs: ClassVar[bool] = True
+
+    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs: Any) -> TensorDict:
+        base, direction = prepared
+        return axpy_state_dict(base, direction, alpha=float(alpha))
+
+    def merge(
+        self,
+        *,
+        base: TensorDict,
+        tuned: Sequence[TensorDict],
+        weights: Sequence[float] | None = None,
+        alpha: float = 1.0,
+        strict: bool = False,
+        **kwargs: Any,
+    ) -> TensorDict:
+        extra = kwargs if self.forward_merge_kwargs else {}
+        prepared = self.prepare(base=base, tuned=tuned, weights=weights, strict=strict, **extra)  # type: ignore[attr-defined]
+        return self.apply(prepared, alpha=float(alpha))

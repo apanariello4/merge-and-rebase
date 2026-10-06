@@ -9,11 +9,11 @@ import torch
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class CARTMerge:
+class CARTMerge(DirectionMerge):
     """Compose low-rank task-vector updates with Cartesian pruning and scaling.
 
     ``pruning_rank`` selects the retained rank fraction for matrix deltas and
@@ -55,28 +55,6 @@ class CARTMerge:
                 direction[k] = torch.zeros_like(b)
         return base, direction
 
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _cart_delta(

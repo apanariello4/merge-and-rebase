@@ -9,11 +9,11 @@ from tqdm import tqdm
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class IsoCMerge:
+class IsoCMerge(DirectionMerge):
     """Merge matrix deltas after replacing their singular spectrum with its mean.
 
     The method operates on compatible two-dimensional floating-point tensors.
@@ -57,29 +57,6 @@ class IsoCMerge:
             else:
                 direction[k] = torch.zeros_like(b)
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _isoc_delta(mats: list[torch.Tensor], w: torch.Tensor) -> torch.Tensor:

@@ -2,23 +2,26 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights
+from ._common import DirectionMerge, default_weights
 
 
 @dataclass(frozen=True)
-class TaskArithmeticMerge:
+class TaskArithmeticMerge(DirectionMerge):
     """Add weighted task vectors to the shared base checkpoint.
 
     The prepared direction is ``sum_i w_i * (tuned_i - base)`` and ``apply``
     returns ``base + alpha * direction``. Task Arithmetic has no
     method-specific parameters.
     """
+
+    forward_merge_kwargs: ClassVar[bool] = False  # merge() never passed its **kwargs to prepare()
 
     name: str = "task_arithmetic"
 
@@ -46,23 +49,6 @@ class TaskArithmeticMerge:
             direction[k] = acc
 
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(base=base, tuned=tuned, weights=weights, strict=strict)
-        return self.apply(prepared, alpha=float(alpha))
 
 
 register(TaskArithmeticMerge())
