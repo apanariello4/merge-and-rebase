@@ -160,7 +160,6 @@ class TransportStage:
                     target_base=target_base_sd,
                     delta=body_delta,
                     strict=False,
-                    curvature_dataloader=None,
                     **shared_kwargs,
                     **transport_kwargs,
                 )

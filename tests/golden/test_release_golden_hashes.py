@@ -1165,7 +1165,6 @@ def _llm_orchestration(method_name, direction):
 
         shared["source_recipe"] = causal_lm_recipe(device="cpu")
         shared["target_recipe"] = causal_lm_recipe(device="cpu")
-        kwargs["curvature_dataloader"] = None
     transported = method.transport(
         source_base=prepared_task.source_base,
         target_base=target_base_sd,

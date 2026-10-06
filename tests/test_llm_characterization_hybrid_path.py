@@ -76,7 +76,6 @@ def _hybrid(source_base_model, target_model, method_name):
         kwargs.update(
             source_recipe=causal_lm_recipe(device="cpu"),
             target_recipe=causal_lm_recipe(device="cpu"),
-            curvature_dataloader=None,
         )
     transported = get_method(method_name).transport(
         source_base=source_base, target_base=target_base, delta=body, strict=False, prepared=None, **kwargs

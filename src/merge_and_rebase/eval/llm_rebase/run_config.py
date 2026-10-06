@@ -16,6 +16,7 @@ from ...merge.methods._common import get_method_params
 from ...rebase import get_method
 from ...rebase.block_extension.config import BlockExtensionConfig
 from ...rebase.capabilities import default_depth_prestep, method_family
+from ...rebase.config_schema import canonicalize
 from ...rebase.run_config import (
     AlphaSpec,
     DepthRule,
@@ -29,6 +30,7 @@ from ...rebase.run_config import (
 
 def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Pre-model validation: method lookup, the Ariadne stop and the ``method_params.n_batches`` rename."""
+    cfg = canonicalize(cfg)
     method_name = str(cfg.get("method", "theseus"))
     method = get_method(method_name)
     method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
