@@ -21,6 +21,9 @@ from ..rebase_metrics import normalized_accuracy_ratio
 from ..utils import eval_task_top1
 from .merge import _TRANSPORT_THEN_MERGE_MODES, MergePlan, _merge_direction, _scale_deltas_by
 
+#: An alpha replaces the incumbent best only when it improves the average accuracy by more than this.
+_ALPHA_IMPROVEMENT_EPS = 1e-12
+
 
 def _norm_acc(result_acc: float, baseline_acc: float) -> float:
     return normalized_accuracy_ratio(result_acc, baseline_acc)
@@ -496,7 +499,6 @@ def run_alpha_search(spec: AlphaSearchSpec, evaluator: TargetEvaluator, merge_pl
                 },
             )
 
-            eps = 1e-12
             # Track baseline best alpha independently of rebased best alpha,
             # but only when there is at least one untransported baseline task
             # (otherwise the baseline is target_zeroshot and alpha-independent).
@@ -505,15 +507,15 @@ def run_alpha_search(spec: AlphaSearchSpec, evaluator: TargetEvaluator, merge_pl
                     avg_baseline_for_track = float("-inf")
                 else:
                     avg_baseline_for_track = float(avg_baseline)
-                if avg_baseline_for_track > best_baseline_avg + eps:
+                if avg_baseline_for_track > best_baseline_avg + _ALPHA_IMPROVEMENT_EPS:
                     best_baseline_avg = avg_baseline_for_track
                     best_baseline_alpha = float(alpha)
 
-            if avg_rebase > best_rebase_avg + eps:
+            if avg_rebase > best_rebase_avg + _ALPHA_IMPROVEMENT_EPS:
                 best_rebase_avg = avg_rebase
                 best_alpha = float(alpha)
                 shared_bad_steps = 0
-            elif avg_rebase + eps >= best_rebase_avg:
+            elif avg_rebase + _ALPHA_IMPROVEMENT_EPS >= best_rebase_avg:
                 shared_bad_steps = 0
             elif len(sweep_alphas) > 1:
                 shared_bad_steps += 1

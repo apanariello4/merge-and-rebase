@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from ...data.vision_loaders import DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.config import select_loader
@@ -106,7 +107,7 @@ class _NativeDeltaMixin:
                     classnames=task.classnames,
                     source_build_cfg=task.source_build_cfg_task,
                     device=device,
-                    seed=int(cfg.get("seed", 42)),
+                    seed=int(cfg.get("seed", DEFAULT_SEED)),
                     **resolved.method_params,
                 )
                 transfusion_prepared = env.transfusion_prepared

@@ -32,7 +32,14 @@ from ...cli_args import (
     parse_json_object_arg,
 )
 from ...data.templates import get_templates
-from ...data.vision_loaders import build_vision_loaders, load_hf_splits
+from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
+    build_vision_loaders,
+    load_hf_splits,
+)
 from ...eval.utils import (
     TaskAttentionMeta,
     assert_qkv_patched_before_linearizing,
@@ -61,7 +68,7 @@ from ...models.forward_modes import (
     resolve_auto_forward_mode,
     resolve_shared_forward_mode_params,
 )
-from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR, OpenClipBuildConfig, OpenClipClassifier
 from ...run_logging import print_config_args
 from ..datasets.vision8_14_20 import SUITES
 
@@ -299,11 +306,11 @@ def _build_task_contexts(
             preprocess=clf.preprocess,
             ft_epochs=1,
             split_map=split_map,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
 
         classnames = list(loaders.classnames)
@@ -326,7 +333,7 @@ def _build_task_contexts(
             classnames=classnames,
             build_cfg=build_cfg_task,
             tuned_text_features=payload.tuned_text_features,
-            cache_dir="src/.cache/zs_cache",
+            cache_dir=ZERO_SHOT_CACHE_DIR,
             force_rebuild_zeroshot=False,
             task_name=task,
             ckpt_path=tuned_ckpt_by_task[task],
@@ -383,7 +390,7 @@ def _prepare_text_features(clf: OpenClipClassifier, item: TaskEvalContext, devic
         clf.build_zeroshot_text_features(
             item.classnames,
             item.build_cfg_task,
-            cache_dir="src/.cache/zs_cache",
+            cache_dir=ZERO_SHOT_CACHE_DIR,
             force_rebuild=False,
         )
         return
@@ -550,9 +557,9 @@ def _reference_cache_metadata(
         else [_template_id(template) for template in list(prompt_templates)],
         "text_features_mode": item.text_features_mode,
         "text_features": _tensor_signature(item.text_features),
-        "batch_size": int(cfg.get("batch_size", 128)),
-        "val_fraction": float(cfg.get("val_fraction", 0.1)),
-        "seed": int(cfg.get("seed", 42)),
+        "batch_size": int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+        "val_fraction": float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+        "seed": int(cfg.get("seed", DEFAULT_SEED)),
         "classnames_mode": "humanized" if not bool(cfg.get("no_humanize", True)) else "raw",
     }
 

@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+#: Default on-disk cache of zero-shot text features (relative to the working directory).
+ZERO_SHOT_CACHE_DIR = "src/.cache/zs_cache"
+
 
 @dataclass(frozen=True)
 class OpenClipBuildConfig:
@@ -348,7 +351,7 @@ class OpenClipClassifier(nn.Module):
         classnames: list[str],
         build_cfg: OpenClipBuildConfig,
         tuned_text_features: torch.Tensor | None,
-        cache_dir: str | None = "src/.cache/zs_cache",
+        cache_dir: str | None = ZERO_SHOT_CACHE_DIR,
         force_rebuild_zeroshot: bool = False,
         task_name: str | None = None,
         ckpt_path: str | None = None,

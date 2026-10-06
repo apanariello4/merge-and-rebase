@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 
+from ...data.vision_loaders import DEFAULT_NUM_WORKERS, DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
@@ -86,8 +87,8 @@ def _build_rebase_prepared(
             grad_batch_size=grad_batch_size,
             grad_imgs_per_class=grad_imgs_per_class,
             grad_num_batches=grad_num_batches,
-            num_workers=int(cfg.get("num_workers", 6)),
-            seed=int(cfg.get("seed", 42)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
         recipe = clip_contrastive_recipe(
             clf_target,
@@ -112,7 +113,7 @@ def _build_rebase_prepared(
 
     if theseus_mode:
         theseus_params = dict(method_params)
-        transport_seed = int(theseus_params.pop("seed", cfg.get("seed", 42)))
+        transport_seed = int(theseus_params.pop("seed", cfg.get("seed", DEFAULT_SEED)))
         if run_block_extension_prestep:
             if source_base_model_task is None:
                 raise RuntimeError("Theseus block-extension preprocess requires the corrected source base model.")
@@ -180,7 +181,7 @@ def _build_rebase_prepared(
         from ...models.grad_recipes import clip_contrastive_recipe
 
         bico_params = dict(method_params)
-        transport_seed = int(bico_params.pop("seed", cfg.get("seed", 42)))
+        transport_seed = int(bico_params.pop("seed", cfg.get("seed", DEFAULT_SEED)))
 
         if run_block_extension_prestep:
             if source_base_model_task is None:
