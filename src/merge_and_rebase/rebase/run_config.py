@@ -47,8 +47,8 @@ from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config,
 from .registry import canonical_method_name
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
 
-_THESEUS_LIKE = frozenset({"theseus", "theseus_reference"})
-_BICO_LIKE = frozenset({"bico", "bico_gradin"})
+_THESEUS_LIKE = frozenset({"theseus"})
+_BICO_LIKE = frozenset({"bico"})
 _BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
 
 

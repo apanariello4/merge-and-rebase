@@ -36,11 +36,6 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         dev_transform = str(method_params.get("device_transform", "cpu"))
         dev_suffix = f", device={dev_transform}" if dev_transform != "cpu" else ""
         return f"theseus(batches={batches}, align={seq_align}, cov={covariance_mode}, whiten={whiten_power:g}){dev_suffix}"
-    if method_name == "theseus_reference":
-        batches = int(method_params.get("num_batches", 1))
-        token_strategy = str(method_params.get("token_strategy", "interpolate_2d"))
-        transport = str(method_params.get("method", "svd"))
-        return f"theseus_reference(batches={batches}, token={token_strategy}, transport={transport})"
     if method_name == "transfusion":
         max_iter = int(method_params.get("max_iter", 100))
         intra_head = bool(method_params.get("intra_head", True))
@@ -51,8 +46,4 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         dev_transform = str(method_params.get("device_transform", "cpu"))
         dev_suffix = f", device={dev_transform}" if dev_transform != "cpu" else ""
         return f"bico(batches={batches}, align={seq_align}){dev_suffix}"
-    if method_name == "bico_gradin":
-        batches = int(method_params.get("num_batches", 1))
-        seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico_gradin(batches={batches}, align={seq_align}, in=grad)"
     return method_name

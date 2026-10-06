@@ -17,7 +17,7 @@ python -m merge_and_rebase.eval.llm_rebase    --config configs/examples/qwen2.5_
 | `ariadne` (alias `direct_residual`) | fits the target's residual-writing projections from paired activations; no parameter transport ([details](methods/ariadne.md)) | yes | yes | yes | yes, by `depth_pairing` |
 | `theseus` | activation-aligned parameter transport | yes | yes | yes | via BRACE prestep |
 | `theseus_gqa` | THESEUS with head-aware attention for GQA decoders (choose explicitly) | — | yes | yes | via BRACE prestep |
-| `bico` / `bico_gradin` | bidirectional coupling (activations + gradients) | yes | `bico` | yes | via BiCo discrete index match |
+| `bico` | bidirectional coupling (activations + gradients) | yes | `bico` | yes | via BiCo discrete index match |
 | `transfusion`, `gradfix`, `identity`, `orthogonal_shift` | other transports (see [methods](methods.md)) | yes | `gradfix`, `identity`, `orthogonal_shift` (same size) | — | — |
 
 Mixture-of-experts decoders are rejected.

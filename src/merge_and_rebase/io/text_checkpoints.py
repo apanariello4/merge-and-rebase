@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,10 +8,8 @@ from typing import Any
 import torch
 
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ..io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
+from ..io.peft_helpers import is_peft_adapter_dir_ckpt
 from ..merge import runtime as _merge_utils
-from ..merge.methods._common import default_weights
-from ..merge.task_vectors import default_key_filter
 from ..models.text_lm import TextBuildConfig
 
 _is_peft_checkpoint = _merge_utils.is_peft_checkpoint
@@ -19,8 +17,6 @@ _extract_peft_components = _merge_utils.extract_peft_components
 _ensure_peft_cfg_map = _merge_utils.ensure_peft_cfg_map
 _get_peft_cfg = _merge_utils.get_peft_cfg
 _to_cpu_fp32 = _merge_utils.to_cpu_fp32
-
-_HEAD_FORMAT_MARKERS = ("heads.pt",)
 
 
 class HeadCheckpointError(ValueError):
@@ -281,34 +277,6 @@ def load_peft_components_from_adapter_ref(adapter_ref: str) -> tuple[dict[str, t
     if not state:
         raise ValueError(f"Invalid PEFT adapter '{adapter_ref}': adapter state has no tensors.")
     return state, {"default": cfg_dict}
-
-
-def load_peft_components_for_subspace(
-    *,
-    ckpt_ref: str,
-) -> tuple[dict[str, torch.Tensor], dict[str, Any], str]:
-    resolved_ref = resolve_checkpoint_reference(str(ckpt_ref))
-    p = Path(resolved_ref)
-    if p.exists() and p.is_file():
-        obj = torch.load(str(p), map_location="cpu", weights_only=False)
-        if is_peft_adapter_dir_ckpt(obj):
-            adapter_dir = str(obj["peft_adapter_dir"])
-            state, cfg_map = load_peft_adapter_dir_components(adapter_dir)
-            return state, cfg_map, adapter_dir
-        if isinstance(obj, dict) and isinstance(obj.get("peft_adapter_dir"), str):
-            adapter_dir = str(obj["peft_adapter_dir"])
-            state, cfg_map = load_peft_adapter_dir_components(adapter_dir)
-            return state, cfg_map, adapter_dir
-        if _is_peft_checkpoint(obj):
-            state, cfg_map = _extract_peft_components(obj)
-            return state, cfg_map, resolved_ref
-        raise ValueError(f"peft_subspace requires PEFT checkpoints. Got non-PEFT checkpoint payload: {resolved_ref}")
-
-    if is_adapter_reference(resolved_ref):
-        state, cfg_map = load_peft_components_from_adapter_ref(resolved_ref)
-        return state, cfg_map, resolved_ref
-
-    raise ValueError(f"peft_subspace requires PEFT adapter references or PEFT checkpoints. Got: {ckpt_ref}")
 
 
 def _build_lora_aligned_adapter_view(
@@ -598,172 +566,3 @@ def load_aligned_tuned_from_ref(
         if used_adapter:
             miss, unexp = load_into_model(model, base_sd, strict=False)
             print(f"Restored base model after adapter materialization. missing={miss}, unexpected={unexp}")
-
-
-class LazyAlignedTunedSequence(Sequence[Mapping[str, torch.Tensor]]):
-    def __init__(
-        self,
-        *,
-        tuned_refs: list[str],
-        base_sd: dict[str, torch.Tensor],
-        build_cfg: TextBuildConfig,
-        model: Any,
-        force_fp32: bool = True,
-        prefer_lora_view: bool = True,
-    ) -> None:
-        self._refs = [str(x) for x in tuned_refs]
-        self._base_sd = base_sd
-        self._build_cfg = build_cfg
-        self._model = model
-        self._force_fp32 = bool(force_fp32)
-        self._prefer_lora_view = bool(prefer_lora_view)
-        self._index_cache: dict[int, Mapping[str, torch.Tensor]] = {}
-        self._adapter_view_cache: dict[str, _LoRAAlignedAdapterView] = {}
-
-    def __len__(self) -> int:
-        return len(self._refs)
-
-    def __getitem__(self, idx: int) -> Mapping[str, torch.Tensor]:
-        i = int(idx)
-        if i < 0:
-            i += len(self._refs)
-        if i < 0 or i >= len(self._refs):
-            raise IndexError(idx)
-
-        cached = self._index_cache.get(i, None)
-        if cached is not None:
-            return cached
-
-        aligned = load_aligned_tuned_from_ref(
-            ckpt_ref=self._refs[i],
-            base_sd=self._base_sd,
-            build_cfg=self._build_cfg,
-            model=self._model,
-            prefer_lora_view=self._prefer_lora_view,
-            adapter_view_cache=self._adapter_view_cache,
-        )
-        if self._force_fp32:
-            out = _to_cpu_fp32(aligned)
-            del aligned
-            return out
-        if isinstance(aligned, _LoRAAlignedAdapterView):
-            self._index_cache[i] = aligned
-        return aligned
-
-    def __repr__(self):
-        return f"LazyAlignedTunedSequence(refs={self._refs}, prefer_lora_view={self._prefer_lora_view})"
-
-
-def load_tuned_sequence_for_preparation(
-    *,
-    tuned_refs: list[str],
-    base_sd: dict[str, torch.Tensor],
-    build_cfg: TextBuildConfig,
-    model: Any,
-    strict_load: bool,
-    use_low_memory_prepare: bool,
-) -> tuple[Sequence[Mapping[str, torch.Tensor]], dict[str, torch.Tensor]]:
-    if use_low_memory_prepare:
-        print("Using low-memory lazy checkpoint loading for method preparation.")
-        tuned_sds_list: Sequence[Mapping[str, torch.Tensor]] = LazyAlignedTunedSequence(
-            tuned_refs=tuned_refs,
-            base_sd=base_sd,
-            build_cfg=build_cfg,
-            model=model,
-            force_fp32=False,
-            prefer_lora_view=(not strict_load),
-        )
-        return tuned_sds_list, {k: v.detach().cpu() for k, v in base_sd.items()}
-
-    eager_list: list[dict[str, torch.Tensor]] = []
-    for ckpt_ref in tuned_refs:
-        aligned = load_aligned_tuned_from_ref(
-            ckpt_ref=ckpt_ref,
-            base_sd=base_sd,
-            build_cfg=build_cfg,
-            model=model,
-            prefer_lora_view=(not strict_load),
-        )
-        eager_list.append(_to_cpu_fp32(aligned))
-        del aligned
-    return eager_list, _to_cpu_fp32(base_sd)
-
-
-def _resolve_merge_weights(n: int, weights: Any) -> list[float]:
-    return [float(w) for w in default_weights(int(n), weights).tolist()]
-
-
-def prepare_task_arithmetic_streaming(
-    *,
-    base_sd: dict[str, torch.Tensor],
-    tuned_refs: list[str],
-    weights: Any,
-    strict: bool,
-    build_cfg: TextBuildConfig,
-    model: Any,
-    prefer_lora_view: bool = False,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    if not tuned_refs:
-        raise ValueError("No tuned checkpoints provided for streaming task_arithmetic.")
-
-    w = _resolve_merge_weights(len(tuned_refs), weights)
-    active_keys: set[str] | None = None
-    direction: dict[str, torch.Tensor] = {}
-    expected_base_keys = {k for k, v in base_sd.items() if default_key_filter(k, v)}
-
-    for i, ckpt_ref in enumerate(tuned_refs):
-        aligned = load_aligned_tuned_from_ref(
-            ckpt_ref=ckpt_ref,
-            base_sd=base_sd,
-            build_cfg=build_cfg,
-            model=model,
-            prefer_lora_view=prefer_lora_view,
-        )
-        current_keys: set[str] = set()
-        wi = float(w[i])
-
-        for k, t in aligned.items():
-            b = base_sd.get(k, None)
-            if b is None:
-                continue
-            if not default_key_filter(k, b):
-                continue
-            if not isinstance(t, torch.Tensor):
-                continue
-            if t.shape != b.shape:
-                continue
-            current_keys.add(k)
-
-        if active_keys is None:
-            active_keys = set(current_keys)
-            for k in active_keys:
-                b = base_sd[k]
-                t = aligned[k].to(dtype=b.dtype, device="cpu")
-                direction[k] = wi * (t - b)
-        else:
-            shared = active_keys.intersection(current_keys)
-            dropped = active_keys - shared
-            for k in dropped:
-                direction.pop(k, None)
-            for k in shared:
-                b = base_sd[k]
-                d = direction[k]
-                t = aligned[k].to(dtype=d.dtype, device="cpu")
-                d.add_(wi * (t - b.to(dtype=d.dtype, device="cpu")))
-            active_keys = shared
-
-        print(
-            f"[stream] processed {i + 1}/{len(tuned_refs)} tuned checkpoints; "
-            f"active merged keys={0 if active_keys is None else len(active_keys)}"
-        )
-        del aligned
-
-    if not active_keys:
-        raise RuntimeError("Streaming task_arithmetic found no common mergeable keys across checkpoints.")
-    if strict and active_keys != expected_base_keys:
-        missing = sorted(expected_base_keys - active_keys)
-        raise ValueError(
-            "Strict mode: tuned checkpoints do not match base floating-point keyspace.\n"
-            f"Missing keys (sample): {missing[:10]}"
-        )
-    return base_sd, direction

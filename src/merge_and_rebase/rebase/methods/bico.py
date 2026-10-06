@@ -347,158 +347,6 @@ def collect_bilinear_statistics(
     return registry
 
 
-def collect_gradin_statistics(
-    source_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    source_dataloader: Iterable[Any],
-    target_dataloader: Iterable[Any],
-    source_recipe,
-    target_recipe,
-    *,
-    device: str | torch.device,
-    seq_align: str,
-    n_batches: int | None,
-    seed: int = 0,
-    batch_size: int | None = None,
-    store_grams: bool = False,
-    family_adapter: Any = None,
-    projection_mode: str = "gradient",
-    source_activation_plan: _shared.InterpolatedBlockActivations | None = None,
-    padding_stats: dict[str, int] | None = None,
-) -> dict[str, _shared.ActivationStore]:
-    """
-    Like collect_bilinear_statistics, but fills .in using input-side gradients
-    (grad_input[0]) instead of forward activations.
-
-    Falls back to forward activations for modules where grad_input[0] is None
-    (e.g. the first layer whose input does not carry gradient).
-
-    Returns a dict with keys:
-      {module_name}.in  -> ActivationStore (input gradients, or forward activations)
-      {module_name}.out -> ActivationStore (output gradients, dL/dy)
-    """
-    if family_adapter is not None:
-        source_scope = family_adapter.transport_scope(source_model)
-        target_scope = family_adapter.transport_scope(target_model)
-    else:
-        source_scope = None
-        target_scope = None
-
-    registry: dict[str, _shared.ActivationStore] = {}
-    source_hook = _BiCoHook(source_model, scope=source_scope)
-    target_hook = _BiCoHook(target_model, scope=target_scope)
-    dev = _shared._resolve_device(device)
-
-    cpu_device = torch.device("cpu")
-
-    source_model.to(cpu_device)
-    target_model.to(cpu_device)
-
-    try:
-        iterator = _shared._iter_random_dataset_batches(
-            source_dataloader,
-            target_dataloader,
-            n_batches=n_batches,
-            seed=seed,
-            batch_size=batch_size,
-        )
-        if iterator is None:
-            iterator = zip(source_dataloader, target_dataloader, strict=True)
-
-        for idx, (source_batch, target_batch) in enumerate(iterator):
-            if n_batches is not None and idx >= n_batches:
-                break
-
-            source_inputs = _calibration_primary_input(source_batch, family_adapter)
-            target_inputs = _calibration_primary_input(target_batch, family_adapter)
-            if source_inputs.shape[0] != target_inputs.shape[0]:
-                raise ValueError(
-                    "BiCo gradin calibration expects aligned batch sizes. "
-                    f"Got {source_inputs.shape[0]} and {target_inputs.shape[0]}."
-                )
-            del source_inputs, target_inputs
-
-            row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
-            _attn = _calibration_attention_masks(source_batch, target_batch, family_adapter)
-            if _attn is not None:
-                _shared._note_padding_rows(padding_stats, _attn[0] if _attn[0] is not None else _attn[1], row_mask)
-            if row_mask is not None and not bool(row_mask.any()):
-                continue  # all-padding batch: contributes no rows (and its loss would be undefined)
-
-            # Source: forward + backward on GPU with inputs marked grad
-            source_hook.clear()
-            _collect_batch(
-                source_model, source_recipe, source_batch, source_hook,
-                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
-            )
-            source_model.to(cpu_device)
-            torch.cuda.empty_cache()
-
-            # Target: forward + backward on GPU with inputs marked grad
-            target_hook.clear()
-            _collect_batch(
-                target_model, target_recipe, target_batch, target_hook,
-                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
-            )
-            target_model.to(cpu_device)
-            torch.cuda.empty_cache()
-
-            if source_activation_plan is not None:
-                source_activation_plan.apply(source_hook.in_grads)
-                source_activation_plan.apply(source_hook.inputs)
-                source_activation_plan.apply(source_hook.out_grads)
-
-            # Collect .in from grad_input, fallback to forward inputs
-            all_keys = set(source_hook.in_grads.keys())
-            all_keys |= set(source_hook.inputs.keys())
-            all_keys &= set(target_hook.in_grads.keys()) | set(target_hook.inputs.keys())
-
-            for key in all_keys:
-                if key in source_hook.in_grads and key in target_hook.in_grads:
-                    src_rows, tgt_rows = _shared._align_features(
-                        source_hook.in_grads[key], target_hook.in_grads[key], mode=seq_align, content_mask=row_mask
-                    )
-                elif key in source_hook.inputs and key in target_hook.inputs:
-                    if not _shared._poolable(seq_align, source_hook.inputs[key], target_hook.inputs[key]):
-                        continue  # integer hook inputs (embedding input_ids) cannot be pooled
-                    src_rows, tgt_rows = _shared._align_features(
-                        source_hook.inputs[key], target_hook.inputs[key], mode=seq_align, content_mask=row_mask
-                    )
-                else:
-                    continue
-                src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
-                reg_key = f"{key}.in"
-                store = registry.setdefault(
-                    reg_key,
-                    _shared.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
-                )
-                store.update(src_rows, tgt_rows)
-
-            # Collect .out from output gradients (same as bico)
-            common_grads = set(source_hook.out_grads.keys()) & set(target_hook.out_grads.keys())
-            for key in common_grads:
-                src_rows, tgt_rows = _shared._align_features(
-                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align, content_mask=row_mask
-                )
-                src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
-                reg_key = f"{key}.out"
-                store = registry.setdefault(
-                    reg_key,
-                    _shared.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
-                )
-                store.update(src_rows, tgt_rows)
-
-        _shared._require_content_rows(padding_stats, method="BiCo")
-
-    finally:
-        source_hook.remove()
-        target_hook.remove()
-        source_model.to(cpu_device)
-        target_model.to(cpu_device)
-
-    return registry
-
-
 @dataclass(frozen=True)
 class BiCoRebase:
     """
@@ -512,7 +360,6 @@ class BiCoRebase:
     """
 
     name: str = "bico"
-    _collect_fn = staticmethod(collect_bilinear_statistics)  # class-level, override in subclasses
 
     def prepare(
         self,
@@ -617,7 +464,7 @@ class BiCoRebase:
             if verbose:
                 print(f"{log_prefix} prepare: collecting bilinear statistics (input activations + output gradients)")
 
-            activation_registry = self._collect_fn(
+            activation_registry = collect_bilinear_statistics(
                 source_model,
                 target_model,
                 source_dataloader,
@@ -942,20 +789,3 @@ class BiCoRebase:
 
 
 register(BiCoRebase())
-
-
-@dataclass(frozen=True)
-class BiCoGradInRebase(BiCoRebase):
-    """
-    Variant of BiCo where T_in is computed from input-side gradients
-    (grad_input[0]) instead of forward activations.
-
-    Falls back to forward activations for modules whose grad_input is None
-    (e.g. the first layer whose input has no gradient requirement).
-    """
-
-    name: str = "bico_gradin"
-    _collect_fn = staticmethod(collect_gradin_statistics)
-
-
-register(BiCoGradInRebase())

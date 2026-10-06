@@ -133,7 +133,6 @@ Task Arithmetic has no method-specific parameters. It adds weighted task vectors
 | `theseus` | `TheseusRebase` | Builds activation-aligned coordinate transforms for matrix updates. |
 | `transfusion` | `TransFusionRebase` | Uses Transformer-aware weight permutations. |
 | `bico` | `BiCoRebase` | Estimates bilinear input/output coordinate maps from activations and gradients. |
-| `bico_gradin` | `BiCoGradInRebase` | BiCo variant using input-side gradients for the input map. |
 
 ### Identity and Orthogonal Shift
 
