@@ -42,6 +42,7 @@ from .block_extension.config import (
     warn_brace_only_fields_under_discrete,
 )
 from .capabilities import MethodFamily, default_depth_prestep, depth_prestep_methods, method_family
+from .config_schema import canonicalize
 from .merge_modes import _SINGLE_TRANSPORT_MODES, _TRANSPORT_THEN_MERGE_MODES, _resolve_merge_mode_config
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
@@ -419,6 +420,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     """
     if suites is None:
         from ..eval.datasets.vision8_14_20 import SUITES as suites
+    cfg = canonicalize(cfg)  # canonical or legacy key names; see rebase/config_schema.py
 
     method_name, method_params = resolve_rebase_method_config(cfg)
     # Ariadne (formerly Direct Residual; "direct_residual" is a registry alias of "ariadne" and
