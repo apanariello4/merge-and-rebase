@@ -25,12 +25,16 @@ from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
 from ...rebase.prestep import StageEnv
 from ..utils import to_cpu_fp32
 from .context import (
+    DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
     _build_balanced_calibration_context,
     _build_direct_paired_calibration_context,
     _select_dedicated_brace_loader,
     _TaskContext,
 )
 from .stages import _resolve_source_activation_plan, _visual_only_filter
+
+#: Key prefix of the vision tower in an OpenCLIP state dict.
+_VISUAL_PREFIX = "visual."
 
 
 def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
@@ -75,7 +79,7 @@ def _average_visual_state_dicts(
     usable_keys: list[str] = []
     for key in sorted(common_keys):
         values = [state[key] for _, state in task_items]
-        if not key.startswith("visual.") or any(not value.is_floating_point() for value in values):
+        if not key.startswith(_VISUAL_PREFIX) or any(not value.is_floating_point() for value in values):
             continue
         shape = tuple(values[0].shape)
         if any(tuple(value.shape) != shape for value in values[1:]):
@@ -140,9 +144,9 @@ def _visual_key_fingerprint(sd: Mapping[str, torch.Tensor]) -> dict[str, Any]:
     """Compact shape fingerprint of a checkpoint's visual backbone for diagnostics."""
     depths = [k for k in sd if ".resblocks." in k]
     block_ids = {int(k.split(".resblocks.")[1].split(".")[0]) for k in depths if ".resblocks." in k}
-    visual_widths = sorted({int(v.shape[0]) for k, v in sd.items() if k.startswith("visual.") and v.dim() >= 1})
+    visual_widths = sorted({int(v.shape[0]) for k, v in sd.items() if k.startswith(_VISUAL_PREFIX) and v.dim() >= 1})
     return {
-        "n_visual_keys": sum(1 for k in sd if k.startswith("visual.")),
+        "n_visual_keys": sum(1 for k in sd if k.startswith(_VISUAL_PREFIX)),
         "max_block_id": max(block_ids) if block_ids else None,
         "n_blocks": len(block_ids),
         "visual_out_dims_sample": visual_widths[:4],
@@ -154,7 +158,7 @@ def _ckpt_visual_base_coverage(
     base_sd: Mapping[str, torch.Tensor],
 ) -> float:
     """Fraction of the base's visual keys covered (key + shape) by sd after conservative alignment."""
-    visual_base_keys = [k for k, v in base_sd.items() if k.startswith("visual.") and isinstance(v, torch.Tensor)]
+    visual_base_keys = [k for k, v in base_sd.items() if k.startswith(_VISUAL_PREFIX) and isinstance(v, torch.Tensor)]
     if not visual_base_keys:
         return 0.0
     aligned = align_to_base_keys(sd, base_sd)
@@ -374,8 +378,7 @@ def compose_rebased_deltas(
         single_transport_calibration_metadata = calibration_metadata
         if transport_protocol.startswith("tiny"):
             direct_spec = {
-                "path": "zh-plus/tiny-imagenet",
-                "split": "valid",
+                **DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
                 "max_samples": int(cfg.get("transport_calibration_max_samples", 2048)),
             }
             transport_ctx = _build_direct_paired_calibration_context(

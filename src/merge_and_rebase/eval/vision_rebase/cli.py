@@ -19,6 +19,7 @@ from ...cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ...data.vision_loaders import DEFAULT_SEED
 from ...io.ckpt import resolve_ckpt_path
 from ...merge.registry import list_methods as list_merge_methods
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
@@ -189,7 +190,7 @@ def main() -> None:
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
         cfg["logging"] = logging_cfg
-        _set_deterministic_seed(int(cfg.get("seed", 42)))
+        _set_deterministic_seed(int(cfg.get("seed", DEFAULT_SEED)))
 
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True

@@ -31,7 +31,14 @@ from ...cli_args import (
     parse_json_object_arg,
 )
 from ...data.templates import get_templates
-from ...data.vision_loaders import build_vision_loaders, load_hf_splits
+from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
+    build_vision_loaders,
+    load_hf_splits,
+)
 from ...eval.utils import (
     TaskAttentionMeta,
     assert_qkv_patched_before_linearizing,
@@ -53,7 +60,7 @@ from ...models.forward_modes import (
     resolve_auto_forward_mode,
     resolve_shared_forward_mode_params,
 )
-from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR, OpenClipBuildConfig, OpenClipClassifier
 from ...run_logging import default_summary_path, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
 
@@ -316,7 +323,7 @@ def _eval_task_metrics(
         clf.build_zeroshot_text_features(
             item.classnames,
             item.build_cfg_task,
-            cache_dir="src/.cache/zs_cache",
+            cache_dir=ZERO_SHOT_CACHE_DIR,
             force_rebuild=False,
         )
     return _eval_loader_top1_and_loss(
@@ -606,11 +613,11 @@ def _build_task_static_contexts(
             preprocess=preprocess,
             ft_epochs=1,
             split_map=split_map,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
 
         classnames = list(loaders.classnames)
@@ -653,7 +660,7 @@ def _build_eval_contexts_for_pair(
             classnames=static.classnames,
             build_cfg=static.build_cfg_task,
             tuned_text_features=tuned_text_features_by_task.get(task, None),
-            cache_dir="src/.cache/zs_cache",
+            cache_dir=ZERO_SHOT_CACHE_DIR,
             force_rebuild_zeroshot=False,
             task_name=task,
             ckpt_path=tuned_ckpt_by_task.get(task, "<unknown>"),
@@ -670,7 +677,7 @@ def _build_eval_contexts_for_pair(
                     classnames=static.classnames,
                     build_cfg=static.build_cfg_task,
                     tuned_text_features=None,
-                    cache_dir="src/.cache/zs_cache",
+                    cache_dir=ZERO_SHOT_CACHE_DIR,
                     force_rebuild_zeroshot=False,
                     task_name=task,
                     ckpt_path=None,

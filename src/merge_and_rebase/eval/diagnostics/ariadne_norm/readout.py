@@ -81,7 +81,11 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 from merge_and_rebase.eval.vision_rebase.merge import _infer_ckpt_base
 from merge_and_rebase.io.ckpt import load_ckpt, load_into_model
 from merge_and_rebase.merge.methods._common import axpy_state_dict
-from merge_and_rebase.models.openclip_classifier import normalize_features, zero_shot_logits_from_features
+from merge_and_rebase.models.openclip_classifier import (
+    ZERO_SHOT_CACHE_DIR,
+    normalize_features,
+    zero_shot_logits_from_features,
+)
 from merge_and_rebase.rebase.methods._ariadne.capture import (
     _dataset_identity,
     _register_capture_hooks,
@@ -1044,7 +1048,7 @@ def readout_task(
     gate_logit_tol: float = 1e-4,
     gate_acc_tol: float = 1e-3,
     gate_cls_tol: float = 1e-5,
-    zs_cache_dir: str | None = "src/.cache/zs_cache",
+    zs_cache_dir: str | None = ZERO_SHOT_CACHE_DIR,
     max_batches: int | None = None,
     native_ckpt_path: str | None = None,
     boundary_max_batches: int | None = 10,
@@ -1529,7 +1533,7 @@ def main(argv: list[str] | None = None) -> None:
             gate_logit_tol=float(cfg.get("gate_logit_tol", 1e-4)),
             gate_acc_tol=float(cfg.get("gate_acc_tol", 1e-3)),
             gate_cls_tol=float(cfg.get("gate_cls_tol", 1e-5)),
-            zs_cache_dir=cfg.get("zs_cache_dir", "src/.cache/zs_cache"),
+            zs_cache_dir=cfg.get("zs_cache_dir", ZERO_SHOT_CACHE_DIR),
             max_batches=cfg.get("max_batches_per_split"),
             native_ckpt_path=(
                 cfg["native_target_ckpt_template"].format(task=inp.task)

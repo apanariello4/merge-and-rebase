@@ -15,7 +15,13 @@ from typing import Any
 
 import torch
 
-from ...data.vision_loaders import build_vision_calibration_loader
+from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
+    build_vision_calibration_loader,
+)
 from ...io.ckpt import load_ckpt
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.methods._common import axpy_state_dict
@@ -131,11 +137,11 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             resolver=suite.resolver,
             preprocess=clf_source.preprocess,
             calibration_split=block_extension_cfg.calibration_split,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
         print(
             f"Block extension preprocess: using one task-independent calibration loader from {calibration_dataset!r}."

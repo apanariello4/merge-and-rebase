@@ -22,13 +22,17 @@ from ...cli_args import (
 )
 from ...data.templates import get_templates
 from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
     build_vision_calibration_loader,
     build_vision_loaders,
     load_hf_splits,
 )
 from ...eval.utils import humanize, resolve_eval_split_loader, to_cpu_fp32
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
-from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR, OpenClipBuildConfig, OpenClipClassifier
 from ...rebase.block_extension.config import calibration_dataset_spec, resolve_block_extension_config, select_loader
 from ...rebase.block_extension.vision import run_block_extension
 from ...run_logging import default_summary_path, merge_logging_config, start_run
@@ -59,7 +63,7 @@ def _evaluate_model_top1(
         eval_loader = itertools.islice(iter(eval_loader), max(1, int(first_n_batches)))
 
     eval_clf.build_zeroshot_text_features(
-        classnames, build_cfg_task, cache_dir="src/.cache/zs_cache", force_rebuild=False
+        classnames, build_cfg_task, cache_dir=ZERO_SHOT_CACHE_DIR, force_rebuild=False
     )
     return float(eval_clf.top1(eval_loader, device=device))
 
@@ -257,11 +261,11 @@ def main() -> None:
             resolver=suite.resolver,
             preprocess=clf_source.preprocess,
             calibration_split=block_extension_cfg.calibration_split,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
         print(
             "[block_extension.runner] using task-independent calibration dataset "
@@ -283,11 +287,11 @@ def main() -> None:
             preprocess=clf_source.preprocess,
             ft_epochs=1,
             split_map=split_map,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
 
         classnames = list(source_loaders.classnames)

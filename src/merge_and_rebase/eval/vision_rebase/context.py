@@ -11,6 +11,10 @@ import torch
 from ...data.balanced_calibration import Vision8TaskContext, build_balanced_vision8_calibration_loaders
 from ...data.templates import get_templates
 from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
     build_vision_calibration_loader,
     build_vision_loaders,
     extract_classnames,
@@ -73,22 +77,22 @@ def _build_direct_paired_calibration_context(
         resolver=suite.resolver,
         preprocess=clf_source.preprocess,
         calibration_split=str(dataset_spec.get("split", "valid")),
-        batch_size=int(cfg.get("batch_size", 128)),
-        num_workers=int(cfg.get("num_workers", 6)),
+        batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+        num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
         pin_memory=True,
-        val_fraction=float(cfg.get("val_fraction", 0.1)),
-        seed=int(cfg.get("seed", 42)),
+        val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+        seed=int(cfg.get("seed", DEFAULT_SEED)),
     )
     target_loader = build_vision_calibration_loader(
         dataset_spec,
         resolver=suite.resolver,
         preprocess=clf_target.preprocess,
         calibration_split=str(dataset_spec.get("split", "valid")),
-        batch_size=int(cfg.get("batch_size", 128)),
-        num_workers=int(cfg.get("num_workers", 6)),
+        batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+        num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
         pin_memory=True,
-        val_fraction=float(cfg.get("val_fraction", 0.1)),
-        seed=int(cfg.get("seed", 42)),
+        val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+        seed=int(cfg.get("seed", DEFAULT_SEED)),
     )
     path = str(dataset_spec.get("path", dataset_spec.get("hf_path", dataset_spec.get("dataset", ""))))
     split = str(dataset_spec.get("split", "valid"))
@@ -161,9 +165,9 @@ def _build_balanced_calibration_context(
     balanced = build_balanced_vision8_calibration_loaders(
         contexts,
         n_batches=int(n_batches),
-        batch_size=int(cfg.get("batch_size", 128)),
-        seed=int(cfg.get("seed", 42)),
-        num_workers=int(cfg.get("num_workers", 6)),
+        batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+        seed=int(cfg.get("seed", DEFAULT_SEED)),
+        num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
         pin_memory=True,
     )
 
@@ -257,7 +261,7 @@ def _build_direct_residual_calibration(
             "num_samples": len(context.loaders.train.dataset),
         }
     if calibration_data == "vision8_mix":
-        batch_size = int(cfg.get("batch_size", 128))
+        batch_size = int(cfg.get("batch_size", DEFAULT_BATCH_SIZE))
         if not per_task or batch_size % len(per_task):
             raise ValueError(
                 f"calibration_data='vision8_mix' needs batch_size divisible by the {len(per_task)} "
@@ -302,11 +306,11 @@ def _build_task_context(
         hf_path=hf_path,
         ft_epochs=1,
         split_map=split_map,
-        batch_size=int(cfg.get("batch_size", 128)),
-        num_workers=int(cfg.get("num_workers", 6)),
+        batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+        num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
         pin_memory=True,
-        val_fraction=float(cfg.get("val_fraction", 0.1)),
-        seed=int(cfg.get("seed", 42)),
+        val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+        seed=int(cfg.get("seed", DEFAULT_SEED)),
     )
     loaders = build_vision_loaders(preprocess=clf_target.preprocess, **loader_kwargs)
 

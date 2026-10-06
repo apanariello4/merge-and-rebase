@@ -40,6 +40,7 @@ from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, Ope
 from merge_and_rebase.models.patch_openclip_projection import patch_openclip_visual_proj, restore_openclip_proj_keyspace
 
 from ..merge import runtime as _merge_utils
+from ..models.openclip_classifier import ZERO_SHOT_CACHE_DIR
 
 is_peft_checkpoint = _merge_utils.is_peft_checkpoint
 extract_peft_components = _merge_utils.extract_peft_components
@@ -562,7 +563,7 @@ def eval_task_top1(
                 expected_num_classes=len(classnames),
             )
         )
-    clf.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache", force_rebuild=False)
+    clf.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir=ZERO_SHOT_CACHE_DIR, force_rebuild=False)
     return float(clf.top1(eval_loader, device=device))
 
 

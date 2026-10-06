@@ -11,9 +11,12 @@ import torch.nn.functional as F
 
 from ...eval.utils import resolve_eval_split_loader
 from ...io.ckpt import load_into_model
-from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR, OpenClipBuildConfig, OpenClipClassifier
 
-_ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", "src/.cache/zs_cache")
+_ZERO_SHOT_CACHE_DIR = os.environ.get("BRACE_ZS_CACHE_DIR", ZERO_SHOT_CACHE_DIR)
+
+#: Tolerance for recognising the endpoint alphas 0 and 1 in an LMC grid.
+_ENDPOINT_ALPHA_TOL = 1e-8
 
 
 def _evaluate_source_model_top1(
@@ -72,8 +75,8 @@ def _evaluate_source_lmc(
     """
     if (
         not alphas
-        or not any(abs(float(a)) < 1e-8 for a in alphas)
-        or not any(abs(float(a) - 1.0) < 1e-8 for a in alphas)
+        or not any(abs(float(a)) < _ENDPOINT_ALPHA_TOL for a in alphas)
+        or not any(abs(float(a) - 1.0) < _ENDPOINT_ALPHA_TOL for a in alphas)
     ):
         raise ValueError("source LMC alphas must include both 0 and 1")
     if set(endpoint_a_sd) != set(endpoint_b_sd):
@@ -192,8 +195,8 @@ def _evaluate_cross_task_source_lmc(
     """Measure the source-space chord between two BRACE-corrected task endpoints."""
     if (
         not alphas
-        or not any(abs(float(a)) < 1e-8 for a in alphas)
-        or not any(abs(float(a) - 1.0) < 1e-8 for a in alphas)
+        or not any(abs(float(a)) < _ENDPOINT_ALPHA_TOL for a in alphas)
+        or not any(abs(float(a) - 1.0) < _ENDPOINT_ALPHA_TOL for a in alphas)
     ):
         raise ValueError("cross-task source LMC alphas must include both 0 and 1")
     if set(endpoint_a_sd) != set(endpoint_b_sd):

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import functional_call
 
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR
 from ..base import PostMergeContext
 from ..task_delta_bank import TaskDeltaBank
 
@@ -48,7 +49,7 @@ class VisionPostmergeTrainer:
                 self.clf.build_zeroshot_text_features(
                     list(item["classnames"]),
                     item["build_cfg_task"],
-                    cache_dir="src/.cache/zs_cache",
+                    cache_dir=ZERO_SHOT_CACHE_DIR,
                     force_rebuild=False,
                 )
                 text_features = self.clf._zs_text_features.detach().cpu()

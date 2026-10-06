@@ -58,6 +58,7 @@ from merge_and_rebase.rebase.prestep import StageEnv
 from merge_and_rebase.rebase.run_config import resolve_run_config
 from merge_and_rebase.run_logging import _code_fingerprint
 
+from ....data.vision_loaders import DEFAULT_BATCH_SIZE, DEFAULT_SEED, DEFAULT_VAL_FRACTION
 from .inputs import DiagnosticInputs
 
 #: The fitted projection of the vision layout (the reference runs fit ``components == ("mlp.c_proj",)`` only).
@@ -144,11 +145,11 @@ def _generic_target_batches(
         resolver=suite.resolver,
         preprocess=clf_target.preprocess,
         calibration_split=str(DIRECT_RESIDUAL_TINY_IMAGENET_SPEC["split"]),
-        batch_size=int(ref_cfg.get("batch_size", 128)),
+        batch_size=int(ref_cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
         num_workers=0,
         pin_memory=False,
-        val_fraction=float(ref_cfg.get("val_fraction", 0.1)),
-        seed=int(ref_cfg.get("seed", 42)),
+        val_fraction=float(ref_cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+        seed=int(ref_cfg.get("seed", DEFAULT_SEED)),
     )
     _, batches, meta = paired_calibration(loader, loader, num_batches=int(num_batches), seed=int(seed))
     provenance = {
@@ -207,7 +208,7 @@ def build_vision_inputs(
 
     # vision_rebase.cli.main seeds before anything is built. Loader construction here uses explicit seeds only, but the
     # global state is reproduced anyway.
-    _set_deterministic_seed(int(ref_cfg.get("seed", 42)))
+    _set_deterministic_seed(int(ref_cfg.get("seed", DEFAULT_SEED)))
 
     tuned_by_task = {t: resolve_ckpt_path(str(p)) for t, p in ref_cfg["tuned_ckpts"].items()}
     source_clf, source_cfg = _build_clf(
@@ -424,7 +425,7 @@ def build_vision_inputs(
             "tuned_checkpoint": ckpt_path,
             "source_clip": [source_cfg.model_name, source_cfg.pretrained],
             "target_clip": [target_cfg.model_name, target_cfg.pretrained],
-            "run_seed": int(ref_cfg.get("seed", 42)),
+            "run_seed": int(ref_cfg.get("seed", DEFAULT_SEED)),
             "calibration": {
                 **calibration_source,
                 "source_loader": _calibration_loader_identity(
