@@ -133,7 +133,30 @@ def _generic_texts(name: str, n_texts: int, seed: int) -> tuple[list[str], dict[
     }
 
 
-def build_llm_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
+def _heldout_docs(rt: Any) -> list[dict[str, Any]]:
+    """The harness docs the reference run held out of calibration (the ones it scored), rendered as the harness does."""
+    from lm_eval.tasks import TaskManager
+
+    from merge_and_rebase.data.llm_calibration import _task_docs
+
+    eval_samples = rt._calibration().eval_samples
+    if len(eval_samples) != 1:
+        raise ValueError(f"expected exactly one held-out harness task, got {sorted(eval_samples)}")
+    ((task_name, indices),) = eval_samples.items()
+    task = TaskManager().load_task_or_group([task_name])[task_name]
+    docs = _task_docs(task)
+    out = []
+    for i in indices:
+        doc = docs[i]
+        out.append({"task": task_name, "doc_index": int(i), "key": doc.get("key"), "text": task.doc_to_text(doc)})
+    return out
+
+
+def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None = None) -> Iterator[DiagnosticInputs]:
+    """``context_sink`` (default ``None``: behaviour unchanged) is refilled with ``runtime``, ``run_cfg``,
+    ``ref_summary``, ``build_cfg`` (name -> TextBuildConfig as the run builds it), ``eval_samples`` and the rendered
+    held-out ``heldout_docs``. With ``context_sink["context_only"]`` true the generator returns right after.
+    """
     # Imported here: llm_rebase pulls in lm-eval/transformers machinery the vision adapter never needs.
     from merge_and_rebase.eval.llm_rebase.context import _ariadne_params, build_runtime
     from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method
@@ -232,6 +255,21 @@ def build_llm_inputs(cfg: dict, device: str) -> Iterator[DiagnosticInputs]:
         if missing:
             raise ValueError(f"tasks {missing} not in the reference run's tasks {task_names}")
         task_names = wanted
+
+    if context_sink is not None:
+        context_only = bool(context_sink.get("context_only"))
+        context_sink.clear()
+        context_sink.update(
+            context_only=context_only,
+            runtime=rt,
+            run_cfg=run_cfg,
+            ref_summary=ref_summary,
+            build_cfg=_build_cfg,
+            eval_samples=rt._calibration().eval_samples,
+            heldout_docs=_heldout_docs(rt),
+        )
+        if context_only:
+            return
 
     # -- DirectFitStage.run, step by step ---------------------------------------------------------------------------
     materialized: list[str] = []
