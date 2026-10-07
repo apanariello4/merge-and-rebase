@@ -53,6 +53,15 @@ Optional analyses (all off by default; without them the output is unchanged):
   target accuracies on the same rows are in ``extras.subset.reference_curves_same_rows``. Exclusive with
   ``max_batches_per_split``.
 
+- ``score_target`` (false): class scores are a coordinate system the source and target CLIP classifiers share (same class
+  names and prompts). Per image, ``delta_s`` = source fine-tuned minus source base zero-shot scores (source head), ``J`` =
+  Jacobian of the target scores w.r.t. the final CLS state at ``t0`` (``ln_post -> proj -> normalise -> logits``,
+  ``torch.func.jacrev``, float64). With ``J`` and ``delta_s`` centred over classes, ``delta_z = J^T (J J^T + lam I)^-1
+  delta_s``, ``lam = 1e-3 trace(J J^T) / C``; variant ``t0 + alpha delta_z`` (alpha chosen on the search split). Result:
+  ``extras.score_target`` (curves, selection, per split cos(delta_z, d), cos(delta_z, n) with the native model,
+  ||delta_z||/||d||, linearisation error at alpha = 1) and the gate ``g4_score_target_jacobian_vs_finite_difference``
+  (``eps = 1e-3``, relative ``1e-2``, first ``gate_batches`` test batches).
+
 Output: ``<out_dir>/<task>/readout.json`` (curves, selection, statistics, gates, provenance),
 ``<out_dir>/<task>/arrays.pt`` (per-image predictions / scalars) and ``<out_dir>/run.json``. A violated gate raises
 after the task's files are written.
@@ -940,6 +949,147 @@ def _same_rows_base_full(
     }
 
 
+# ---- optional analysis: score target (class scores as a coordinate system shared by source and target) -----------------
+
+
+class ScoreMap:
+    """The target head as a differentiable float64 map ``z -> class scores`` (``ln_post -> proj -> normalise -> logits``).
+
+    Same operations as ``VisionHead.logits`` (``normalize_features`` / the classifier's ``logit_scale`` and text
+    features), on float64 copies, without ``no_grad`` so that ``torch.func`` can differentiate it.
+    """
+
+    def __init__(self, head: VisionHead):
+        ln = head.ln_post
+        self.ln_shape = tuple(ln.normalized_shape)
+        self.ln_eps = float(ln.eps)
+        self.ln_w = ln.weight.detach().double()
+        self.ln_b = ln.bias.detach().double()
+        self.proj = None if head.proj is None else head.proj.detach().double()
+        self.normalize = bool(head.classifier.normalize)
+        self.scale = float(head.classifier.logit_scale)
+        self.text = head.text_features.detach().double()
+
+    def scores(self, z: Tensor) -> Tensor:
+        """``[..., D] -> [..., C]`` (float64)."""
+        x = torch.nn.functional.layer_norm(z.double(), self.ln_shape, self.ln_w, self.ln_b, self.ln_eps)
+        if self.proj is not None:
+            x = x @ self.proj
+        if self.normalize:
+            x = normalize_features(x)
+        return self.scale * (x @ self.text.t())
+
+    def jacobian(self, z: Tensor, chunk: int = 256) -> Tensor:
+        """Per-row Jacobian ``d scores / d z``: ``[B, D] -> [B, C, D]`` (float64, ``jacrev`` + ``vmap``)."""
+        out = []
+        with torch.enable_grad():
+            fn = torch.func.vmap(torch.func.jacrev(self.scores))
+            for start in range(0, z.shape[0], chunk):
+                out.append(fn(z[start : start + chunk].double()).detach())
+        return torch.cat(out)
+
+
+def score_target_solve(jac: Tensor, delta_s: Tensor, ridge_scale: float = 1e-3) -> dict[str, Tensor]:
+    """Per row: ``delta_z = Jc^T (Jc Jc^T + lam I)^-1 ds_c`` with class-centred ``Jc`` / ``ds_c``.
+
+    ``lam = ridge_scale * trace(Jc Jc^T) / C`` per row. Equal to the primal ridge solution ``(Jc^T Jc + lam I)^-1 Jc^T
+    ds_c`` (the dual form only inverts a ``C x C`` matrix). Returns ``delta_z`` ``[B, D]``, the centred ``Jc``, ``ds_c``
+    and ``lam`` (float64).
+    """
+    jc = jac.double() - jac.double().mean(dim=-2, keepdim=True)
+    ds = delta_s.double() - delta_s.double().mean(dim=-1, keepdim=True)
+    n_classes = jc.shape[-2]
+    gram = jc @ jc.transpose(-1, -2)
+    lam = float(ridge_scale) * torch.diagonal(gram, dim1=-2, dim2=-1).sum(-1) / n_classes
+    eye = torch.eye(n_classes, dtype=gram.dtype, device=gram.device)
+    sol = torch.linalg.solve(gram + lam[:, None, None] * eye, ds[..., None])
+    dz = (jc.transpose(-1, -2) @ sol)[..., 0]
+    return {"delta_z": dz, "jc": jc, "ds": ds, "lam": lam}
+
+
+def _cos_rows(a: Tensor, b: Tensor) -> Tensor:
+    a, b = a.double(), b.double()
+    return (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-300)
+
+
+def score_target_rows(
+    score_map: ScoreMap, t0: Tensor, delta_s: Tensor, device: Any, ridge_scale: float = 1e-3, chunk: int = 256
+) -> dict[str, Tensor]:
+    """``delta_z`` for every row plus its linearisation quality at alpha = 1 (all float64, CPU)."""
+    dz_all, lin_all, fit_all, lam_all = [], [], [], []
+    for start in range(0, t0.shape[0], chunk):
+        z = t0[start : start + chunk].to(device).double()
+        jac = score_map.jacobian(z, chunk=chunk)
+        sol = score_target_solve(jac, delta_s[start : start + chunk].to(device), ridge_scale)
+        dz = sol["delta_z"]
+        jdz = (jac @ dz[..., None])[..., 0]
+        exact = score_map.scores(z + dz) - score_map.scores(z)
+        lin_all.append(((exact - jdz).norm(dim=-1) / jdz.norm(dim=-1).clamp_min(1e-300)).cpu())
+        jdz_c = (sol["jc"] @ dz[..., None])[..., 0]
+        fit_all.append(((jdz_c - sol["ds"]).norm(dim=-1) / sol["ds"].norm(dim=-1).clamp_min(1e-300)).cpu())
+        dz_all.append(dz.cpu())
+        lam_all.append(sol["lam"].cpu())
+    return {
+        "delta_z": torch.cat(dz_all),
+        "linearization_rel_error": torch.cat(lin_all),
+        "fit_rel_residual": torch.cat(fit_all),
+        "lam": torch.cat(lam_all),
+    }
+
+
+def jacobian_finite_difference_gate(
+    score_map: ScoreMap, t0: Tensor, delta_z: Tensor, device: Any, eps: float = 1e-3, tol: float = 1e-2
+) -> dict[str, Any]:
+    """``scores(t0 + eps dz) - scores(t0)`` against ``eps J dz``: max relative error over rows must be ``< tol``."""
+    z, dz = t0.to(device).double(), delta_z.to(device).double()
+    jdz = (score_map.jacobian(z) @ dz[..., None])[..., 0]
+    fd = score_map.scores(z + eps * dz) - score_map.scores(z)
+    rel = ((fd - eps * jdz).norm(dim=-1) / (eps * jdz.norm(dim=-1)).clamp_min(1e-300)).cpu()
+    worst = float(rel.max()) if rel.numel() else float("nan")
+    return {
+        "eps": eps,
+        "n_rows": int(rel.numel()),
+        "max_relative_error": worst,
+        "median_relative_error": float(rel.median()) if rel.numel() else float("nan"),
+        "tolerance": tol,
+        "passed": bool(worst < tol) if rel.numel() else None,
+    }
+
+
+@torch.no_grad()
+def collect_source_score_delta(
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    source_clf: Any,
+    source_loader: Any,
+    *,
+    device: Any,
+    expected_labels: Tensor,
+    max_batches: int | None = None,
+) -> Tensor:
+    """``scores(source fine-tuned) - scores(source base)`` per image, ``[n, C]`` float64 on CPU.
+
+    Scores are the source classifier's own zero-shot logits (its head, its text features, built for the same class names
+    and templates as the target's) on the SOURCE view.
+    """
+    labels: list[Tensor] = []
+    out: list[Tensor] = []
+    for batch in _tap(_take(source_loader, max_batches), labels):
+        x = batch[0].to(device)
+        s = []
+        for model in (source_ft_model, source_base_model):
+            feats = model.encode_image(x)
+            s.append(zero_shot_logits_from_features(source_clf, feats).double())
+        out.append((s[0] - s[1]).cpu())
+    if not torch.equal(torch.cat(labels), expected_labels):
+        raise ValueError("score target: the source loader's label sequence differs from the target's")
+    return torch.cat(out)
+
+
+def _stat_pair(values: Tensor) -> dict[str, float]:
+    return {"median": _finite_stat(values, "median"), "mean": _finite_stat(values, "mean")}
+
+
 # ---- gates ---------------------------------------------------------------------------------------------------------
 
 
@@ -1058,6 +1208,7 @@ def readout_task(
     eval_subset_size: int | None = None,
     eval_subset_applies_to_all: bool = False,
     eval_subset_seed: int = 0,
+    score_target: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the readout for one task. ``inp`` is the task's `DiagnosticInputs`, ``sink`` the adapter's context sink."""
     device = inp.device
@@ -1239,6 +1390,41 @@ def readout_task(
         native_rec["native_head_vs_plain_forward_max_logit_diff"] = native_gate
         lap("native_pass")
 
+    # (A.4) optional score target: the target-state change whose first-order effect on the class scores equals the
+    # source's fine-tuning change of ITS class scores (class scores are shared by both zero-shot classifiers).
+    st_dz: dict[str, Tensor] = {}
+    st_rows: dict[str, dict[str, Tensor]] = {}
+    st_gate: dict[str, Any] | None = None
+    if score_target:
+        source_clf = sink.get("source_clf")
+        if source_clf is None:
+            raise ValueError("score_target needs the source classifier in the context sink (sink['source_clf'])")
+        source_clf.build_zeroshot_text_features(
+            list(ctx.classnames), ctx.source_build_cfg_task, cache_dir=zs_cache_dir, force_rebuild=False
+        )
+        if source_clf._zs_text_features.shape[0] != head.text_features.shape[0]:
+            raise ValueError("score target: source and target classifiers disagree on the number of classes")
+        inp.source_base_model.to(device)
+        inp.source_ft_model.to(device)
+        score_map = ScoreMap(head)
+        for split, (src_loader, _) in loaders.items():
+            ds = collect_source_score_delta(
+                inp.source_base_model,
+                inp.source_ft_model,
+                source_clf,
+                src_loader,
+                device=device,
+                expected_labels=ref_states[split]["labels"],
+                max_batches=max_batches,
+            )
+            st_rows[split] = score_target_rows(score_map, ref_states[split]["t0"], ds, device)
+            st_dz[split] = st_rows[split]["delta_z"]
+        gate_rows = max(1, int(gate_batches)) * int(loaders["test"][1].batch_size)
+        st_gate = jacobian_finite_difference_gate(
+            score_map, ref_states["test"]["t0"][:gate_rows], st_dz["test"][:gate_rows], device
+        )
+        lap("score_target")
+
     mounted = copy.deepcopy(inp.target_model)
     native_curves = {s: {v: [] for v in ("aligned_native", "orthogonal_native")} for s in native_state}
     native_stats: dict[str, dict[str, list]] = {s: {} for s in native_state}
@@ -1416,6 +1602,56 @@ def readout_task(
         lap("oracle_patching")
         same_rows = _same_rows_base_full(arrays, ref_states, extra_rows, alphas, ref_i)
         extras["oracle"]["same_rows_references"] = same_rows
+    if score_target:
+        st_curves: dict[str, list[float]] = {}
+        st_preds: dict[str, Tensor] = {}
+        for split, dz in st_dz.items():
+            t0_s, lab = ref_states[split]["t0"], ref_states[split]["labels"]
+            preds = [
+                predictions_from_states(head, (t0_s.double() + float(a) * dz).float(), device).to(torch.int32)
+                for a in alphas
+            ]
+            st_preds[split] = torch.stack(preds)
+            st_curves[split] = [float((p.long() == lab).double().mean()) for p in preds]
+        i_st = select_alpha(alphas, st_curves[sel_split])
+        st_stats: dict[str, Any] = {}
+        for split, dz in st_dz.items():
+            d_s = ref_states[split]["d"]
+            rows = st_rows[split]
+            stat: dict[str, Any] = {
+                "cos_dz_d": _stat_pair(_cos_rows(dz, d_s)),
+                "norm_dz_over_norm_d": _stat_pair(dz.norm(dim=-1) / d_s.double().norm(dim=-1).clamp_min(1e-300)),
+                "linearization_rel_error_alpha1": _stat_pair(rows["linearization_rel_error"]),
+                "fit_rel_residual": _stat_pair(rows["fit_rel_residual"]),
+            }
+            if split in native_state:
+                ridx = extra_rows[split]
+                stat["cos_dz_n"] = _stat_pair(_cos_rows(dz if ridx is None else dz[ridx], native_state[split]["n"]))
+            st_stats[split] = stat
+        extras["score_target"] = {
+            "curves": st_curves,
+            "selection": {
+                "selected_alpha": alphas[i_st],
+                "selected_index": i_st,
+                "selection_split": sel_split,
+                "val_acc": st_curves["val"][i_st],
+                "test_acc": st_curves["test"][i_st],
+                "test_acc_at_reference_alpha": st_curves["test"][ref_i],
+                "val_acc_at_reference_alpha": st_curves["val"][ref_i],
+            },
+            "stats": st_stats,
+            "ridge_scale": 1e-3,
+            "jacobian_gate": st_gate,
+        }
+        arrays["score_target"] = {
+            s_: {
+                "preds": st_preds[s_],
+                "delta_z_norm": st_dz[s_].norm(dim=-1),
+                "cos_dz_d": _cos_rows(st_dz[s_], ref_states[s_]["d"]),
+                "linearization_rel_error": st_rows[s_]["linearization_rel_error"],
+            }
+            for s_ in st_dz
+        }
     del native
 
     reference["n_val"] = n["val"]
@@ -1440,6 +1676,8 @@ def readout_task(
             "tolerance": gate_logit_tol,
             "passed": bool(max(diffs.values()) < gate_logit_tol) if diffs else None,
         }
+    if st_gate is not None:
+        gates["g4_score_target_jacobian_vs_finite_difference"] = st_gate
     failed = [name for name, g in gates.items() if g.get("passed") is False]
     record = {
         "task": task,
@@ -1547,6 +1785,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_subset_size=cfg.get("eval_subset_size"),
             eval_subset_applies_to_all=bool(cfg.get("eval_subset_applies_to_all", False)),
             eval_subset_seed=int(cfg.get("eval_subset_seed", 0)),
+            score_target=bool(cfg.get("score_target", False)),
         )
         task_dir = out_dir / inp.task
         task_dir.mkdir()
