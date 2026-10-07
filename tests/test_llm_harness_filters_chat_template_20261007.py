@@ -175,3 +175,15 @@ def test_task_decoding_swaps_generation_config_only_during_eval(monkeypatch):
     assert seen[-1] == "checkpoint-config"
     with pytest.raises(ValueError, match="harness_decoding"):
         harness.run(["ifeval"], model, _Tok(), device="cpu", decoding="greedy")
+
+
+def test_langdetect_is_seeded_so_ifeval_scoring_is_deterministic(monkeypatch):
+    """IFEval's language checks call langdetect.detect, which is random unless seeded."""
+    langdetect = pytest.importorskip("langdetect")
+    calls: list[dict] = []
+    _install_fake_lm_eval(monkeypatch, calls, IFEVAL)
+    monkeypatch.setattr(langdetect.DetectorFactory, "seed", None)
+    harness.run(["ifeval"], nn.Linear(1, 1), _Tok(), device="cpu")
+    assert langdetect.DetectorFactory.seed == 0
+    text = "ok fine ya"  # short and ambiguous: unseeded detection varies between calls
+    assert len({langdetect.detect(text) for _ in range(30)}) == 1

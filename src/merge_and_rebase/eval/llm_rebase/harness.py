@@ -198,6 +198,21 @@ def task_decoding_config(tokenizer: Any, *, apply_chat_template: bool) -> Any:
     )
 
 
+def _seed_langdetect() -> None:
+    """Make lm-eval's IFEval language checks deterministic.
+
+    ``lm_eval.tasks.ifeval.instructions`` calls ``langdetect.detect`` (language / all-uppercase / all-lowercase
+    instructions), which samples n-grams from an unseeded RNG: identical responses scored in two runs can get
+    different verdicts (observed: 2 of 501 IFEval prompts, smoke job 59637629_5 vs its reference). With a class-level
+    seed every Detector reseeds before each detection.
+    """
+    try:
+        from langdetect import DetectorFactory
+    except ImportError:
+        return
+    DetectorFactory.seed = 0
+
+
 def run(
     tasks: list[str],
     model: nn.Module,
@@ -258,6 +273,7 @@ def run(
         ) from None
 
     _check_samples_conflict(limit, samples)
+    _seed_langdetect()
     if apply_chat_template and getattr(tokenizer, "chat_template", None) is None:
         raise ValueError(
             "harness_apply_chat_template=true but the tokenizer has no chat_template; "
