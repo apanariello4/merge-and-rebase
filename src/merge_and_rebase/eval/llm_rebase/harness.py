@@ -146,6 +146,58 @@ def _check_samples_conflict(limit: int | None, samples: dict[str, list[int]] | N
         )
 
 
+#: harness_decoding values: "model" (historical) lets the checkpoint's own generation_config shape lm-eval's
+#: generation; "task" makes decoding a property of the evaluation protocol, identical for every model.
+HARNESS_DECODING = ("model", "task")
+
+
+def chat_end_of_turn_token_id(tokenizer: Any) -> int | None:
+    """The special token a chat template closes an assistant turn with (Qwen: ``<|im_end|>``), else ``None``.
+
+    Read from the template itself: render a one-turn exchange and take the first token after the assistant content.
+    """
+    marker = "XQZ"
+    try:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"}, {"role": "assistant", "content": marker}], tokenize=False
+        )
+    except Exception:
+        return None
+    tail = text[text.rfind(marker) + len(marker) :]
+    ids = tokenizer(tail, add_special_tokens=False)["input_ids"] if tail else []
+    if ids and ids[0] in set(getattr(tokenizer, "all_special_ids", ())):
+        return int(ids[0])
+    return None
+
+
+def task_decoding_config(tokenizer: Any, *, apply_chat_template: bool) -> Any:
+    """Neutral generation config for ``harness_decoding="task"``.
+
+    Greedy, no repetition penalty and no ``max_new_tokens`` (so lm-eval's ``max_gen_toks`` is the only length cap);
+    stops at the tokenizer's EOS, its padding token when that is a special token, and, with a chat template, at
+    the template's end-of-turn token. Checkpoints ship
+    different ``generation_config.json`` files (Qwen2.5 base: ``max_new_tokens=2048``; Instruct:
+    ``repetition_penalty=1.1`` and an extra EOS), which ``model.generate`` would otherwise merge into every call.
+    """
+    from transformers import GenerationConfig
+
+    # Stop on every special token that ends text, so the stop set does not depend on which tokenizer of a family
+    # is passed (Qwen2.5 base EOS is <|endoftext|>, Instruct EOS is <|im_end|>; both pad with <|endoftext|>).
+    special = set(getattr(tokenizer, "all_special_ids", ()))
+    candidates = [tokenizer.eos_token_id]
+    if apply_chat_template:
+        candidates.append(chat_end_of_turn_token_id(tokenizer))
+    if tokenizer.pad_token_id in special:
+        candidates.append(tokenizer.pad_token_id)
+    eos = sorted({int(t) for t in candidates if t is not None})
+    return GenerationConfig(
+        do_sample=False,
+        eos_token_id=eos or None,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+    )
+
+
 def run(
     tasks: list[str],
     model: nn.Module,
@@ -158,6 +210,7 @@ def run(
     apply_chat_template: bool = False,
     system_instruction: str | None = None,
     dump_generations_dir: str | None = None,
+    decoding: str = "model",
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -183,6 +236,9 @@ def run(
     system_instruction : Optional system prompt; only used with apply_chat_template.
     dump_generations_dir : Opt-in. Directory receiving "<NNN>_<task>.jsonl" with the
         rendered prompt and response of every generate_until sample.
+    decoding : "model" (default, historical): the checkpoint's generation_config is merged into lm-eval's
+        generate calls. "task": a neutral config (see ``task_decoding_config``) replaces it for the duration of
+        the evaluation, so the same weights decode identically whatever model object carries them.
 
     Returns
     -------
@@ -208,9 +264,15 @@ def run(
             "use an instruct tokenizer or leave the flag off."
         )
 
+    if decoding not in HARNESS_DECODING:
+        raise ValueError(f"harness_decoding must be one of {HARNESS_DECODING}, got {decoding!r}")
+
     model.eval()
     if hasattr(model, "to"):
         model.to(device)
+    saved_generation_config = getattr(model, "generation_config", None)
+    if decoding == "task":
+        model.generation_config = task_decoding_config(tokenizer, apply_chat_template=apply_chat_template)
 
     fewshot_by_task = _resolve_fewshot_by_task(list(tasks), num_fewshot)
     groups: dict[int, list[str]] = {}
@@ -267,6 +329,8 @@ def run(
             out.update(_extract_metrics(results))
     finally:
         TaskConfig.to_dict = _original_to_dict
+        if decoding == "task":
+            model.generation_config = saved_generation_config
 
     return out
 

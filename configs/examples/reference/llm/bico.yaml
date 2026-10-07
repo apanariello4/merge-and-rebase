@@ -151,6 +151,9 @@ harness_batch_size: 4                       # int or "auto".
 # harness_system_instruction: null          # system prompt for the chat template; required when source and target
 #                                           #   templates differ only in their default system prompt (Qwen2.5 families).
 # harness_dump_generations_dir: null        # dir: one jsonl per generate_until task (prompt, response, metrics).
+# harness_decoding: "model"                # model: the checkpoint's generation_config shapes lm-eval's generation
+#                                           #   (Qwen2.5 base: max_new_tokens=2048; Instruct: repetition_penalty=1.1);
+#                                           #   task: neutral greedy config, lm-eval's max_gen_toks, uniform stop tokens.
 # allow_tuned_config_mismatch: false        # permit parameter transport from a tuned body whose own HF config
 #                                           #   (e.g. rope_theta) differs from the source base; recorded in the summary.
 # harness_samples: null                     # {task: [doc indices]} evaluated (must agree with the derived hold-out).

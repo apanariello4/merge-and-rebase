@@ -119,3 +119,59 @@ def test_dump_generations(monkeypatch, tmp_path):
     assert rec["doc_id"] == 7 and rec["prompt"] == "Q: 1+1?"
     assert rec["response"] == ["2"] and rec["raw_response"] == [["raw 2"]]
     assert rec["metrics"] == {"exact_match": 1.0} and rec["filter"] == "strict-match"
+
+
+_QWEN = ("Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-Math-1.5B", "Qwen/Qwen2.5-Math-1.5B-Instruct")
+
+
+def _qwen_tokenizer(name):
+    transformers = pytest.importorskip("transformers")
+    try:
+        return transformers.AutoTokenizer.from_pretrained(name, local_files_only=True)
+    except OSError:
+        pytest.skip(f"{name} tokenizer not in the local HF cache")
+
+
+@pytest.mark.parametrize("name", _QWEN)
+def test_task_decoding_is_identical_across_qwen_checkpoints(name):
+    """Base, Instruct and Math tokenizers: same neutral config, end of turn read from the chat template."""
+    tok = _qwen_tokenizer(name)
+    assert harness.chat_end_of_turn_token_id(tok) == tok.convert_tokens_to_ids("<|im_end|>")
+    cfg = harness.task_decoding_config(tok, apply_chat_template=True)
+    assert cfg.do_sample is False and cfg.max_new_tokens is None
+    assert cfg.repetition_penalty in (None, 1.0)
+    assert set(cfg.eos_token_id) == {
+        tok.convert_tokens_to_ids("<|endoftext|>"),
+        tok.convert_tokens_to_ids("<|im_end|>"),
+    }
+    plain = harness.task_decoding_config(tok, apply_chat_template=False)
+    assert tok.eos_token_id in plain.eos_token_id and tok.convert_tokens_to_ids("<|endoftext|>") in plain.eos_token_id
+
+
+class _ModelWithGenerationConfig(nn.Linear):
+    def __init__(self) -> None:
+        super().__init__(1, 1)
+        self.generation_config = "checkpoint-config"
+
+
+def test_task_decoding_swaps_generation_config_only_during_eval(monkeypatch):
+    seen: list = []
+    model = _ModelWithGenerationConfig()
+
+    def simple_evaluate(**kwargs):
+        seen.append(model.generation_config)
+        return IFEVAL
+
+    cfg_mod = types.ModuleType("lm_eval.config.task")
+    cfg_mod.TaskConfig = type("TaskConfig", (), {"to_dict": lambda self, keep_callable=False: {}})
+    monkeypatch.setitem(sys.modules, "lm_eval", types.SimpleNamespace(simple_evaluate=simple_evaluate))
+    monkeypatch.setitem(sys.modules, "lm_eval.config", types.ModuleType("lm_eval.config"))
+    monkeypatch.setitem(sys.modules, "lm_eval.config.task", cfg_mod)
+    neutral = object()
+    monkeypatch.setattr(harness, "task_decoding_config", lambda tok, apply_chat_template: neutral)
+    harness.run(["ifeval"], model, _Tok(), device="cpu", decoding="task")
+    assert seen == [neutral] and model.generation_config == "checkpoint-config"
+    harness.run(["ifeval"], model, _Tok(), device="cpu")  # default "model": untouched
+    assert seen[-1] == "checkpoint-config"
+    with pytest.raises(ValueError, match="harness_decoding"):
+        harness.run(["ifeval"], model, _Tok(), device="cpu", decoding="greedy")
