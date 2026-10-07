@@ -43,6 +43,124 @@ _TEXT_COLUMN_CANDIDATES = (
 )
 
 
+#: lm-eval's own default few-shot sampler seed (``DEFAULT_OTHER_SEED``; ``harness.run`` never overrides it).
+_LM_EVAL_FEWSHOT_SEED = 1234
+
+
+class CalibrationTextList(list):
+    """``list[str]`` that remembers how its texts must be tokenized.
+
+    Chat-template-rendered texts already carry their special tokens, so they must be tokenized with
+    ``add_special_tokens=False``; every consumer that does ``build_text_calibration_loader(texts=...calibration().texts)``
+    then picks this up without a signature change. Plain lists (and ``CalibrationTextList(add_special_tokens=True)``)
+    keep the historical ``tokenizer(...)`` defaults.
+    """
+
+    def __init__(self, items: Sequence[str] = (), *, add_special_tokens: bool = True) -> None:
+        super().__init__(items)
+        self.add_special_tokens = bool(add_special_tokens)
+
+
+def tokenizer_chat_template_sha256(tokenizer: Any) -> str:
+    """sha256 of ``tokenizer.chat_template`` (a dict of named templates is hashed in canonical JSON form)."""
+    template = getattr(tokenizer, "chat_template", None)
+    if template is None:
+        raise ValueError("Tokenizer has no chat_template; cannot apply a chat template to the calibration text.")
+    if not isinstance(template, str):
+        template = json.dumps(template, sort_keys=True)
+    return hashlib.sha256(template.encode()).hexdigest()
+
+
+def make_chat_template_fn(tokenizer: Any) -> Any:
+    """Equivalent of lm-eval's ``HFLM.apply_chat_template`` (0.4.12) for a bare HF tokenizer.
+
+    Same call (``tokenize=False``, ``continue_final_message=not add_generation_prompt``) and same fallback on a
+    jinja ``TemplateError`` (retry without the system turn). ``HFLM.chat_template_args`` is empty unless
+    ``enable_thinking`` is given, which this harness never does.
+    """
+    import jinja2
+
+    def apply(chat_history: list[dict[str, str]], add_generation_prompt: bool = True) -> str:
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+            "continue_final_message": not add_generation_prompt,
+        }
+        try:
+            return tokenizer.apply_chat_template(chat_history, **kwargs)
+        except jinja2.exceptions.TemplateError:
+            chat_history = [m for m in chat_history if m["role"] != "system"]
+            return tokenizer.apply_chat_template(chat_history, **kwargs)
+
+    return apply
+
+
+def _render_user_text(chat_template_fn: Any, text: str, system_instruction: str | None) -> str:
+    messages = ([{"role": "system", "content": system_instruction}] if system_instruction else []) + [
+        {"role": "user", "content": text}
+    ]
+    return chat_template_fn(messages, add_generation_prompt=True)
+
+
+#: Probe conversations rendered under both templates when they differ (single turn, and multi-turn few-shot).
+_TEMPLATE_PROBES = (
+    [{"role": "user", "content": "Question: probe\nAnswer:"}],
+    [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1 #### 1"},
+        {"role": "user", "content": "Q2"},
+    ],
+)
+
+
+def check_calibration_tokenizers(
+    source_tokenizer: Any,
+    target_tokenizer: Any,
+    texts: Sequence[str],
+    *,
+    add_special_tokens: bool,
+    system_instruction: str | None = None,
+) -> dict[str, str]:
+    """Source and target calibration batches are tokenized separately: require identical ids for every text.
+
+    The texts are rendered once, with the source template. Different template strings are accepted only when
+    they render the same prompts: Qwen2.5 base / Instruct / Math templates differ solely in the default system
+    prompt they insert when none is given, so a mismatch requires an explicit ``system_instruction``, and both
+    templates must render identical probe conversations with it. Returns the chat-template sha256 of each
+    tokenizer; raises ``ValueError`` on a rendering or token-id mismatch.
+    """
+    sha = {
+        "source": tokenizer_chat_template_sha256(source_tokenizer),
+        "target": tokenizer_chat_template_sha256(target_tokenizer),
+    }
+    if sha["source"] != sha["target"]:
+        if not system_instruction:
+            raise ValueError(
+                "Chat-template calibration: source and target tokenizers have different chat_template "
+                f"(sha256 source={sha['source'][:12]}, target={sha['target'][:12]}) and no system instruction "
+                "is set, so each template inserts its own default system prompt; set harness_system_instruction."
+            )
+        src_fn, tgt_fn = make_chat_template_fn(source_tokenizer), make_chat_template_fn(target_tokenizer)
+        for probe in _TEMPLATE_PROBES:
+            conversation = [{"role": "system", "content": system_instruction}, *probe]
+            if src_fn(conversation) != tgt_fn(conversation):
+                raise ValueError(
+                    "Chat-template calibration: source and target chat templates render the same conversation "
+                    f"differently (sha256 source={sha['source'][:12]}, target={sha['target'][:12]}); the two "
+                    "models would be calibrated and evaluated on different prompts."
+                )
+    kwargs = {"add_special_tokens": bool(add_special_tokens), "truncation": False}
+    src_ids = source_tokenizer(list(texts), **kwargs)["input_ids"]
+    tgt_ids = target_tokenizer(list(texts), **kwargs)["input_ids"]
+    bad = [i for i, (a, b) in enumerate(zip(src_ids, tgt_ids, strict=True)) if list(a) != list(b)]
+    if bad:
+        raise ValueError(
+            f"Chat-template calibration: source and target tokenizers disagree on input_ids for {len(bad)}/"
+            f"{len(src_ids)} calibration texts (first indices {bad[:5]}); paired calibration requires identical tokens."
+        )
+    return sha
+
+
 class CalibrationTexts:
     """Resolved calibration corpus plus the eval doc indices it leaves free.
 
@@ -60,9 +178,15 @@ class CalibrationTexts:
         eval_samples: dict[str, list[int]] | None = None,
         notes: list[str] | None = None,
         decoupled: bool = False,
+        chat_template: Mapping[str, Any] | None = None,
     ) -> None:
         if not texts:
             raise ValueError(f"Calibration source {source!r} produced no text.")
+        #: Chat-template rendering record (None = off, historical plain text). ``sha256`` is filled by
+        #: ``check_calibration_tokenizers`` once the source/target tokenizers have been compared.
+        self.chat_template = dict(chat_template) if chat_template is not None else None
+        if self.chat_template is not None:
+            texts = CalibrationTextList(texts, add_special_tokens=False)
         self.texts = texts
         self.source = source
         self.eval_samples = dict(eval_samples or {})
@@ -82,6 +206,10 @@ class CalibrationTexts:
             "holdout_sizes": {k: len(v) for k, v in sorted(self.eval_samples.items())},
             "decoupled_from_eval": self.decoupled,
             "notes": list(self.notes),
+            "chat_template_applied": self.chat_template is not None,
+            "chat_template_sha256": (self.chat_template or {}).get("sha256"),
+            "chat_template": {k: v for k, v in (self.chat_template or {}).items() if k != "sha256"} or None,
+            "rendered_texts_sha256": hashlib.sha256(json.dumps(list(self.texts)).encode()).hexdigest(),
         }
 
     def __len__(self) -> int:
@@ -104,6 +232,11 @@ def resolve_calibration_texts(
     n_sequences: int,
     seed: int = 0,
     include_target: bool = False,
+    apply_chat_template: bool = False,
+    system_instruction: str | None = None,
+    tokenizer: Any = None,
+    num_fewshot: int | Sequence[int] | Mapping[str, int] = 0,
+    fewshot_seed: int = _LM_EVAL_FEWSHOT_SEED,
 ) -> CalibrationTexts:
     """Resolve the calibration corpus for an LLM run.
 
@@ -124,23 +257,48 @@ def resolve_calibration_texts(
     include_target : Harness source only (default off): append each doc's gold target (``doc_to_target``; an int
         index is mapped through ``doc_to_choice``) to its rendered prompt. Tasks without a gold target fall back to
         the prompt alone and the fallback is recorded in ``CalibrationTexts.notes``.
+    apply_chat_template : Opt-in (default off = byte-identical plain text). Render calibration text the way the
+        chat-template evaluation does, so the activations see the evaluation's prompt format. Harness source: each
+        calibration doc goes through ``task.fewshot_context(doc, num_fewshot, system_instruction,
+        apply_chat_template=True, fewshot_as_multiturn=num_fewshot > 0, chat_template=...)`` (lm-eval's own path;
+        same hold-out indices as with the flag off). Prompts / HF dataset: one user turn (after the optional system
+        turn) with the generation prompt. Needs ``tokenizer`` (the source tokenizer); tokenize with
+        ``add_special_tokens=False`` (``CalibrationTexts.texts`` carries that).
+    system_instruction : System turn used with ``apply_chat_template`` (lm-eval's ``system_instruction``).
+    num_fewshot : Harness source with ``apply_chat_template`` only; same shapes as ``harness_num_fewshot``.
+    fewshot_seed : Seed of lm-eval's few-shot sampler for the calibration docs (default = lm-eval's evaluation seed).
     """
     if n_sequences <= 0:
         raise ValueError("n_sequences must be > 0.")
+    chat_fn = None
+    if apply_chat_template:
+        if include_target:
+            raise NotImplementedError("calibration_include_target is not supported with harness_apply_chat_template.")
+        if tokenizer is None:
+            raise ValueError("apply_chat_template calibration needs the source tokenizer (tokenizer=...).")
+        chat_fn = make_chat_template_fn(tokenizer)
+        # Fails early (clear message) when the tokenizer has no template.
+        tokenizer_chat_template_sha256(tokenizer)
 
     if prompts:
         bad = [i for i, p in enumerate(prompts) if p is None or not str(p).strip()]
         if bad:
             raise ValueError(f"config['calibration_prompts'] has empty entries at indices {bad[:10]}.")
-        return CalibrationTexts(
-            [str(p) for p in prompts], source="config['calibration_prompts']", decoupled=True
+        return _finalize_rendered(
+            CalibrationTexts([str(p) for p in prompts], source="config['calibration_prompts']", decoupled=True),
+            chat_fn,
+            system_instruction,
         )
 
     if calibration_dataset is not None:
-        return _from_hf_dataset(
-            calibration_dataset,
-            calibration_split=calibration_split,
-            n_sequences=n_sequences,
+        return _finalize_rendered(
+            _from_hf_dataset(
+                calibration_dataset,
+                calibration_split=calibration_split,
+                n_sequences=n_sequences,
+            ),
+            chat_fn,
+            system_instruction,
         )
 
     if harness_tasks:
@@ -150,6 +308,10 @@ def resolve_calibration_texts(
             n_sequences=n_sequences,
             seed=seed,
             include_target=include_target,
+            chat_template_fn=chat_fn,
+            system_instruction=system_instruction,
+            num_fewshot=num_fewshot,
+            fewshot_seed=fewshot_seed,
         )
 
     raise ValueError(
@@ -157,6 +319,20 @@ def resolve_calibration_texts(
         "config['calibration_prompts'], "
         "config['block_extension_params']['calibration_dataset'], "
         "or config['harness_tasks']."
+    )
+
+
+def _finalize_rendered(resolved: CalibrationTexts, chat_fn: Any, system_instruction: str | None) -> CalibrationTexts:
+    """Chat-template flag on: one rendered user turn per raw text (flag off: ``resolved`` unchanged)."""
+    if chat_fn is None:
+        return resolved
+    return CalibrationTexts(
+        [_render_user_text(chat_fn, t, system_instruction) for t in resolved.texts],
+        source=resolved.source,
+        eval_samples=resolved.eval_samples,
+        notes=resolved.notes,
+        decoupled=resolved.decoupled,
+        chat_template={"system_instruction": system_instruction, "sha256": None, "num_fewshot": 0},
     )
 
 
@@ -239,6 +415,10 @@ def _from_harness_tasks(
     n_sequences: int,
     seed: int,
     include_target: bool = False,
+    chat_template_fn: Any = None,
+    system_instruction: str | None = None,
+    num_fewshot: int | Sequence[int] | Mapping[str, int] = 0,
+    fewshot_seed: int = _LM_EVAL_FEWSHOT_SEED,
 ) -> CalibrationTexts:
     from lm_eval.tasks import TaskManager
 
@@ -250,6 +430,11 @@ def _from_harness_tasks(
     texts: list[str] = []
     notes: list[str] = []
     eval_samples: dict[str, list[int]] = {}
+    fewshot_by_task: dict[str, int] = {}
+    if chat_template_fn is not None:
+        from ..eval.llm_rebase.harness import _resolve_fewshot_by_task
+
+        fewshot_by_task = _resolve_fewshot_by_task(list(tasks), num_fewshot)
     per_task = max(1, -(-n_sequences // max(1, len(tasks))))
 
     for task_name in tasks:
@@ -272,6 +457,28 @@ def _from_harness_tasks(
         eval_samples[task_name] = sorted(order[n_calib:])
 
         n_without_target = 0
+        if chat_template_fn is not None:
+            # lm-eval's own rendering (what build_all_requests sends with apply_chat_template=True). Its few-shot
+            # sampler is one stateful Random(seed) consumed in doc order (and lm-eval's
+            # sampler excludes the eval doc when fewshot split == test split), so reseed per task and walk the
+            # calibration docs in sorted order: deterministic, though not the shots the eval docs receive.
+            n_shot = fewshot_by_task[task_name]
+            if hasattr(task, "set_fewshot_seed"):
+                task.set_fewshot_seed(seed=int(fewshot_seed))
+            for i in calib_idx:
+                ctx = task.fewshot_context(
+                    docs[i],
+                    num_fewshot=n_shot,
+                    system_instruction=system_instruction,
+                    apply_chat_template=True,
+                    fewshot_as_multiturn=n_shot > 0,
+                    chat_template=chat_template_fn,
+                )
+                # multiple-input tasks (e.g. winogrande) return one context per choice
+                for text in ctx if isinstance(ctx, list) else [ctx]:
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text)
+            continue
         for i in calib_idx:
             rendered = task.doc_to_text(docs[i])
             if isinstance(rendered, str) and rendered.strip():
@@ -299,6 +506,17 @@ def _from_harness_tasks(
         source=f"lm-harness {'+'.join(tasks)}[holdout]",
         eval_samples=eval_samples,
         notes=notes,
+        chat_template=(
+            {
+                "system_instruction": system_instruction,
+                "sha256": None,
+                "num_fewshot": dict(fewshot_by_task),
+                "fewshot_as_multiturn": any(n > 0 for n in fewshot_by_task.values()),
+                "fewshot_seed": int(fewshot_seed),
+            }
+            if chat_template_fn is not None
+            else None
+        ),
     )
 
 
@@ -364,15 +582,22 @@ def build_text_calibration_loader(
     texts: list[str],
     batch_size: int = 2,
     max_length: int = 128,
+    add_special_tokens: bool | None = None,
 ) -> DataLoader:
+    # None: follow the corpus (``CalibrationTextList``: False for chat-template-rendered text, else True).
+    if add_special_tokens is None:
+        add_special_tokens = getattr(texts, "add_special_tokens", True)
     prompt_list = list(texts)
     if not prompt_list:
         raise ValueError("Calibration loader needs at least one text sequence.")
+    # Default (True) keeps the historical call (tokenizer's own default add_special_tokens) untouched.
+    special_kwargs = {} if add_special_tokens else {"add_special_tokens": False}
     enc = tokenizer(
         prompt_list,
         truncation=True,
         max_length=int(max_length),
         padding="max_length",
+        **special_kwargs,
     )
     features: list[dict[str, Any]] = []
     for i in range(len(prompt_list)):
@@ -404,7 +629,10 @@ def build_text_calibration_loader(
 
 def tokenization_stats(tokenizer: Any, texts: Sequence[str], max_length: int) -> dict[str, Any]:
     """Token-level provenance of a calibration corpus under ``max_length`` padding (summary record)."""
-    lengths = [len(ids) for ids in tokenizer(list(texts), truncation=False, add_special_tokens=True)["input_ids"]]
+    add_special_tokens = getattr(texts, "add_special_tokens", True)
+    lengths = [
+        len(ids) for ids in tokenizer(list(texts), truncation=False, add_special_tokens=add_special_tokens)["input_ids"]
+    ]
     n = len(lengths)
     kept = [min(length, int(max_length)) for length in lengths]
     total_slots = n * int(max_length)

@@ -11,7 +11,7 @@
 #         depth_alignment.rule=discrete_index_match, [vision-only] the decoder ignores it (warning + summary note).
 #         [default: stage] = value the LLM stage injects when the key is absent.
 #   Vision keys (merge_mode, alpha_selection, alpha_patience, alpha_search_split, LMC keys, strict_load,
-#   save_transported_tvs*) are not read by llm_rebase and are omitted.
+#   save_transported_tvs policy/legacy layouts) are not read by llm_rebase and are omitted.
 # Provenance: commit before launching; the summary records the git commit/dirty fingerprint.
 # Unknown method.params keys of THESEUS/BiCo raise; unknown top-level keys are ignored.
 # Canonical names (rebase/config_schema.py); the legacy flat names still work and warn.
@@ -108,6 +108,8 @@ alpha:
 # ---------------------------------------------------------------- artifacts
 # save:
   # merged: null                            # path: save the rebased state at the selected alpha.
+  # transported_task_vectors: null          # dir: save the unscaled transported task vector + sidecar (sha256,
+  #                                         #   selected alpha, alpha curve); write-once.
 
 # ---------------------------------------------------------------- run, data and diagnostics
 source_model_name_or_path: Qwen/Qwen2.5-0.5B # source base (HF id or local path; nodes are offline: cached).
@@ -148,6 +150,13 @@ harness_tasks:                              # lm-eval tasks (list or CSV). Witho
 harness_num_fewshot: 0                      # few-shot count.
 harness_batch_size: 4                       # int or "auto".
 # harness_limit: null                       # doc limit; exclusive with a held-out calibration slice.
+# harness_apply_chat_template: false       # render eval prompts (and calibration texts) with the chat template;
+#                                           #   few-shot examples become multi-turn. Off = plain prompts.
+# harness_system_instruction: null          # system prompt for the chat template; required when source and target
+#                                           #   templates differ only in their default system prompt (Qwen2.5 families).
+# harness_dump_generations_dir: null        # dir: one jsonl per generate_until task (prompt, response, metrics).
+# allow_tuned_config_mismatch: false        # permit parameter transport from a tuned body whose own HF config
+#                                           #   (e.g. rope_theta) differs from the source base; recorded in the summary.
 # harness_samples: null                     # {task: [doc indices]} evaluated (must agree with the derived hold-out).
 # harness_test_samples: null                # {task: [doc indices]} disjoint docs that re-score the best alpha.
 # eval_before_rebase: false                 # [diagnostic] score the (extended) source first; needs harness_tasks.

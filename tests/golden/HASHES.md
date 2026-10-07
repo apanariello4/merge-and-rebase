@@ -511,3 +511,12 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   `task_vectors.ariadne` (depth pairing; per task the task-vector sha256, calibration record, fit diagnostics and
   timings). Additive: with that one key removed, each summary hashes to its previous value (verified case by case).
   Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.
+
+### Declared changes — 2026-10-07, LLM Table-3 rerun support, tests/golden/test_llm_main_golden.py
+- `summary` only, all 29 cases that record one: the LLM summary gains `calibration_provenance.{chat_template,
+  chat_template_applied, chat_template_sha256, rendered_texts_sha256}` (opt-in chat-template calibration, off here)
+  and `task_vectors.forward_geometry` (rope_theta / max_position_embeddings / use_sliding_window of the live source
+  base, source fine-tuned and target models). Additive: with exactly those keys removed every summary hashes to its
+  previous value (all 59 cases, via a pytest plugin that strips them before `hash_json`).
+  `tuned_config_overrides` is written only when a tuned body carries its own computation config (none here).
+  Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.

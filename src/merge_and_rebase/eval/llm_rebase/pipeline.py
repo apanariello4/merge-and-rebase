@@ -53,6 +53,7 @@ class LlmRuntime:
     harness_batch_size: Any
     harness_limit: Any
     harness_samples: Any
+    harness_render: Any
     run_before_rebase_eval: Any
     eval_before_rebase_only: Any
     ignored_block_extension_fields: Any
@@ -158,6 +159,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         # Transport is the expensive half and contributes nothing here.
         print("\nStopping after the before-rebase eval (eval_before_rebase_only).")
         if run_logger is not None:
+            overrides = {t: c.config_overrides for t, c in rt.task_contexts.items() if c.config_overrides}
             run_logger.log_summary({
                 "ignored_block_extension_fields": ignored_block_extension_fields,
                 "calibration_provenance": _calibration_provenance(),
@@ -170,6 +172,8 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
                 ),
                 "source_depth": source_depth,
                 "target_depth": target_depth,
+                # additive: present only when a tuned body carries its own computation config
+                **({"tuned_config_overrides": overrides} if overrides else {}),
             })
             run_logger.finish("success")
         return None
@@ -182,6 +186,14 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         "delta_norm_match": method_stage.norm_match or "none",
         "per_task": loop.task_vector_norms,
     }
+    forward_geometry = {t: c.forward_geometry for t, c in rt.task_contexts.items() if c.forward_geometry}
+    if forward_geometry:
+        task_vector_report["forward_geometry"] = forward_geometry
+    config_overrides = {t: c.config_overrides for t, c in rt.task_contexts.items() if c.config_overrides}
+    if config_overrides:
+        # Tuned bodies whose own HF config differs from the source base's: {task: {field: [source, tuned]}}.
+        task_vector_report["tuned_config_overrides"] = config_overrides
+        task_vector_report["allow_tuned_config_mismatch"] = bool(cfg.get("allow_tuned_config_mismatch", False))
     if getattr(method_stage, "materialized_bias_keys", None) is not None:
         task_vector_report["materialized_bias_keys"] = list(method_stage.materialized_bias_keys)
     if hasattr(method_stage, "report"):
