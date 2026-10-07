@@ -520,3 +520,7 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   previous value (all 59 cases, via a pytest plugin that strips them before `hash_json`).
   `tuned_config_overrides` is written only when a tuned body carries its own computation config (none here).
   Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.
+- Then `summary` only, the 27 cases with a task-vector report: `task_vectors.depth_handling` (resolved depth rule
+  and its source, the prestep that actually executed, and for BRACE the extension_strategy / skip_correction it
+  used) plus `task_vectors.rebase_wall_seconds` / `rebase_peak_cuda_allocated_bytes` (volatile, not hashed).
+  Additive: with `depth_handling` removed all 59 cases hash to the values above.
