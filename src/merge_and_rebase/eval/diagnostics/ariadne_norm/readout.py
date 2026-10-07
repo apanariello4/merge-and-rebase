@@ -1040,13 +1040,16 @@ def score_target_rows(
 def jacobian_finite_difference_gate(
     score_map: ScoreMap, t0: Tensor, delta_z: Tensor, device: Any, eps: float = 1e-3, tol: float = 1e-2
 ) -> dict[str, Any]:
-    """``scores(t0 + eps dz) - scores(t0)`` against ``eps J dz``: max relative error over rows must be ``< tol``."""
+    """Central difference ``(scores(t0 + eps dz) - scores(t0 - eps dz)) / 2`` against ``eps J dz``: max relative error
+    over rows must be ``< tol``. Central, not one-sided: the one-sided difference carries a first-order curvature term
+    (``O(eps)``) that reached ~1.7e-2 on 397-class SUN397 with a correct Jacobian; the central one is ``O(eps^2)``."""
     z, dz = t0.to(device).double(), delta_z.to(device).double()
     jdz = (score_map.jacobian(z) @ dz[..., None])[..., 0]
-    fd = score_map.scores(z + eps * dz) - score_map.scores(z)
+    fd = 0.5 * (score_map.scores(z + eps * dz) - score_map.scores(z - eps * dz))
     rel = ((fd - eps * jdz).norm(dim=-1) / (eps * jdz.norm(dim=-1)).clamp_min(1e-300)).cpu()
     worst = float(rel.max()) if rel.numel() else float("nan")
     return {
+        "scheme": "central",
         "eps": eps,
         "n_rows": int(rel.numel()),
         "max_relative_error": worst,
