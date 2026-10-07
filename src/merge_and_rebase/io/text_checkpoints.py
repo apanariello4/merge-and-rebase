@@ -566,3 +566,112 @@ def load_aligned_tuned_from_ref(
         if used_adapter:
             miss, unexp = load_into_model(model, base_sd, strict=False)
             print(f"Restored base model after adapter materialization. missing={miss}, unexpected={unexp}")
+
+
+# HF config fields that change what a forward pass computes. Bookkeeping (transformers_version, _name_or_path,
+# torch_dtype, architectures, ...) is deliberately absent: it must never trigger a rebuild.
+COMPUTATION_CONFIG_KEYS: tuple[str, ...] = (
+    "rope_theta",
+    "rope_scaling",
+    "partial_rotary_factor",
+    "max_position_embeddings",
+    "sliding_window",
+    "layer_types",
+    "rms_norm_eps",
+    "layer_norm_eps",
+    "hidden_act",
+    "attention_bias",
+    "mlp_bias",
+    "vocab_size",
+    "tie_word_embeddings",
+)
+
+
+def _computation_config(config: Any) -> dict[str, Any]:
+    """The computation-relevant fields of an HF config, with the transformers 4.x/5.x rope layouts normalised."""
+    d = config.to_dict() if hasattr(config, "to_dict") else dict(vars(config))
+    rope_params = d.get("rope_parameters") or {}
+    out: dict[str, Any] = {}
+    for key in COMPUTATION_CONFIG_KEYS:
+        if key == "rope_theta":
+            value = d.get("rope_theta", rope_params.get("rope_theta"))
+        elif key == "rope_scaling":
+            value = d.get("rope_scaling") or {k: v for k, v in rope_params.items() if k != "rope_theta"}
+            kind = value.get("rope_type") or value.get("type") if value else None
+            if not value or (set(value) <= {"rope_type", "type"} and kind == "default"):
+                value = None
+        elif key == "sliding_window":
+            # transformers 4 keeps the raw window when use_sliding_window is off; it is only effective when on.
+            value = d.get("sliding_window") if d.get("use_sliding_window", d.get("sliding_window") is not None) else None
+        elif key == "layer_types":
+            # The per-layer attention pattern (full / sliding); max_window_layers only acts through it. Derived the
+            # transformers-5 way when the config predates layer_types.
+            value = d.get("layer_types")
+            if value is None and d.get("num_hidden_layers") is not None:
+                window, first_full = out.get("sliding_window"), d.get("max_window_layers") or 0
+                value = [
+                    "sliding_attention" if window is not None and i >= first_full else "full_attention"
+                    for i in range(int(d["num_hidden_layers"]))
+                ]
+        else:
+            value = d.get(key)
+        out[key] = value
+    # max_position_embeddings only sizes the RoPE cache; it changes the computation only under a scaled RoPE type
+    # (dynamic / yarn / longrope ...), i.e. when rope_scaling is set.
+    if out["rope_scaling"] is None:
+        out["max_position_embeddings"] = None
+    return out
+
+
+def diff_computation_configs(source_config: Any, tuned_config: Any) -> dict[str, list[Any]]:
+    """``{field: [source, tuned]}`` for every computation-relevant field that differs (empty: equivalent)."""
+    src, tuned = _computation_config(source_config), _computation_config(tuned_config)
+    return {k: [src[k], tuned[k]] for k in COMPUTATION_CONFIG_KEYS if src[k] != tuned[k]}
+
+
+def tuned_config_mismatch(ckpt_ref: str, source_config: Any, *, trust_remote_code: bool = False) -> dict[str, list[Any]]:
+    """Computation-relevant config fields where a tuned dense HF ref disagrees with the source base.
+
+    Only a dense HF reference (hub id or directory with a ``config.json``) carries a config of its own: raw
+    state-dict files and PEFT adapters are weights *for the source architecture* by construction, so they return ``{}``.
+    """
+    ref = str(resolve_checkpoint_reference(str(ckpt_ref)))
+    if ref.endswith((".pt", ".bin", ".safetensors", ".ckpt", ".pth")) or source_config is None:
+        return {}
+    try:
+        from transformers import AutoConfig
+
+        tuned_config = AutoConfig.from_pretrained(ref, trust_remote_code=bool(trust_remote_code))
+    except Exception:
+        return {}
+    if getattr(tuned_config, "model_type", None) is None:
+        return {}
+    return diff_computation_configs(source_config, tuned_config)
+
+
+def build_model_with_tuned_config(
+    ckpt_ref: str, build_cfg: TextBuildConfig, tuned_sd: Mapping[str, torch.Tensor]
+) -> torch.nn.Module:
+    """A model built from the tuned ref's own config (RoPE, window, ...) carrying exactly the aligned tuned weights.
+
+    Device/dtype follow ``build_cfg``; the weights are then overwritten with ``tuned_sd`` so they are identical to the
+    ones the parameter delta is defined by.
+    """
+    from transformers import AutoModelForCausalLM
+
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    model = AutoModelForCausalLM.from_pretrained(
+        resolve_checkpoint_reference(str(ckpt_ref)),
+        trust_remote_code=bool(build_cfg.trust_remote_code),
+        torch_dtype=dtype_map.get(build_cfg.dtype, None),
+    )
+    missing, unexpected = model.load_state_dict(dict(tuned_sd), strict=False)
+    # A tied lm_head may be absent from either side; any other gap would leave from_pretrained weights in place.
+    tied = {"lm_head.weight"} if getattr(model.config, "tie_word_embeddings", False) else set()
+    missing, unexpected = sorted(set(missing) - tied), sorted(set(unexpected) - tied)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Tuned-config model for {ckpt_ref!r}: aligned tuned weights do not cover the model "
+            f"(missing {missing[:10]}, unexpected {unexpected[:10]})."
+        )
+    return model.to(build_cfg.device).eval()

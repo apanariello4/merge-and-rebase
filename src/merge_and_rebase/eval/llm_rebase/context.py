@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy  # noqa: F401
 from dataclasses import replace
 from typing import Any
@@ -13,9 +14,9 @@ from merge_and_rebase.utils.helpers import load_json, parse_csv
 from ...data.llm_calibration import (
     build_text_calibration_loader as _build_text_calibration_loader,
 )
-from ...data.llm_calibration import resolve_calibration_texts, tokenization_stats
+from ...data.llm_calibration import check_calibration_tokenizers, resolve_calibration_texts, tokenization_stats
 from ...io.ckpt import load_ckpt, load_into_model
-from ...io.text_checkpoints import load_aligned_tuned_from_ref
+from ...io.text_checkpoints import load_aligned_tuned_from_ref, tuned_config_mismatch
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
@@ -47,6 +48,10 @@ class TextCalibrationCache:
         seed: int,
         include_target: bool,
         tokenizer: Any,
+        apply_chat_template: bool = False,
+        system_instruction: str | None = None,
+        num_fewshot: Any = 0,
+        target_tokenizer: Any = None,
     ) -> None:
         self._prompts = prompts
         self._calibration_dataset_cfg = calibration_dataset_cfg
@@ -59,6 +64,10 @@ class TextCalibrationCache:
         self._seed = seed
         self._include_target = include_target
         self._tokenizer = tokenizer
+        self._apply_chat_template = bool(apply_chat_template)
+        self._system_instruction = system_instruction
+        self._num_fewshot = num_fewshot
+        self._target_tokenizer = target_tokenizer
         self._cache: list[Any] = []
 
     def get(self) -> Any:
@@ -80,7 +89,20 @@ class TextCalibrationCache:
                 ),
                 seed=self._seed,
                 include_target=self._include_target,
+                apply_chat_template=self._apply_chat_template,
+                system_instruction=self._system_instruction,
+                tokenizer=self._tokenizer,
+                num_fewshot=self._num_fewshot,
             )
+            if self._apply_chat_template:
+                # Source and target tokenize the same texts separately: they must yield identical ids.
+                resolved.chat_template["sha256"] = check_calibration_tokenizers(
+                    self._tokenizer,
+                    self._target_tokenizer if self._target_tokenizer is not None else self._tokenizer,
+                    resolved.texts,
+                    add_special_tokens=False,
+                    system_instruction=self._system_instruction,
+                )
             for note in resolved.notes:
                 print(f"Calibration note: {note}")
             print(f"Calibration corpus: {resolved.describe()}")
@@ -236,6 +258,17 @@ def build_runtime(
     harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
     harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
     harness_limit = cfg.get("harness_limit", None)
+    # Prompt rendering shared by every harness call of the run (before-rebase reference, alpha search, test slice).
+    # Only options that are set are passed, so a run without them makes exactly the historical harness call.
+    harness_render = {
+        k: v
+        for k, v in (
+            ("apply_chat_template", bool(cfg.get("harness_apply_chat_template", False))),
+            ("system_instruction", cfg.get("harness_system_instruction", None)),
+            ("dump_generations_dir", cfg.get("harness_dump_generations_dir", None)),
+        )
+        if v
+    }
 
     # The "before rebase" reference is the SOURCE model exactly as transport
     # sees it: resized (and LMC-corrected) to the target depth by block
@@ -273,6 +306,7 @@ def build_runtime(
             batch_size=harness_batch_size,
             limit=harness_limit,
             samples=harness_samples,
+            **harness_render,
         )
         for task_name, acc in results.items():
             print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")
@@ -390,6 +424,9 @@ def build_runtime(
         raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
     calibration_dataset_cfg = cfg.get("calibration_dataset", None)
     calibration_include_target = bool(cfg.get("calibration_include_target", False))
+    #   harness_apply_chat_template  render calibration text with the tokenizer's chat template (same prompt format
+    #                                as the chat-template evaluation); harness_system_instruction is its system turn
+    calibration_apply_chat_template = bool(cfg.get("harness_apply_chat_template", False))
     _calibration_cache = TextCalibrationCache(
         prompts=calibration_prompts_cfg,
         calibration_dataset_cfg=calibration_dataset_cfg,
@@ -402,6 +439,10 @@ def build_runtime(
         seed=int(cfg.get("seed", 0)),
         include_target=calibration_include_target,
         tokenizer=source_llm.tokenizer,
+        apply_chat_template=calibration_apply_chat_template,
+        system_instruction=cfg.get("harness_system_instruction", None),
+        num_fewshot=cfg.get("harness_num_fewshot", 0),
+        target_tokenizer=target_llm.tokenizer,
     )
     _calibration = _calibration_cache.get
     _calibration_provenance = _calibration_cache.provenance
@@ -474,6 +515,7 @@ def build_runtime(
         harness_batch_size=harness_batch_size,
         harness_limit=harness_limit,
         harness_samples=harness_samples,
+        harness_render=harness_render,
         run_before_rebase_eval=run_before_rebase_eval,
         eval_before_rebase_only=eval_before_rebase_only,
         ignored_block_extension_fields=ignored_block_extension_fields,
@@ -493,20 +535,62 @@ def build_runtime(
         load_tuned=load_aligned_tuned_from_ref,
         resolved=resolved,
         plan=plan,
-        task_contexts=_task_contexts(tasks, tuned_ref_list),
+        task_contexts=_task_contexts(
+            tasks,
+            tuned_ref_list,
+            source_config=getattr(source_llm.model, "config", None),
+            trust_remote_code=bool(source_build_cfg.trust_remote_code),
+            transports_delta=not resolved.direct_fit,
+            allow_mismatch=bool(cfg.get("allow_tuned_config_mismatch", False)),
+        ),
     )
 
 
-def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
-    """One context per tuned body; with named tasks the two lists must have equal length."""
+def _task_contexts(
+    tasks,
+    tuned_ref_list,
+    *,
+    source_config: Any = None,
+    trust_remote_code: bool = False,
+    transports_delta: bool = False,
+    allow_mismatch: bool = False,
+) -> dict[str, LlmTaskContext]:
+    """One context per tuned body; with named tasks the two lists must have equal length.
+
+    Each context records where the tuned ref's own HF config disagrees with the source base's (``config_overrides``).
+    Methods that transport the parameter delta (THESEUS, theseus_gqa, BiCo) refuse such a pairing unless
+    ``allow_tuned_config_mismatch``; activation-based Ariadne just runs its fine-tuned forwards under the tuned config.
+    """
     if tasks and len(tasks) != len(tuned_ref_list):
         raise ValueError(
             f"{len(tuned_ref_list)} tuned bodies for {len(tasks)} tasks: every tuned body needs exactly one task name"
         )
-    return {
-        (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
+    contexts = {
+        (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(
+            ckpt_ref=ref,
+            index=i,
+            config_overrides=tuned_config_mismatch(ref, source_config, trust_remote_code=trust_remote_code),
+        )
         for i, ref in enumerate(tuned_ref_list)
     }
+    for task, ctx in contexts.items():
+        if not ctx.config_overrides:
+            continue
+        changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(ctx.config_overrides.items()))
+        if transports_delta and not allow_mismatch:
+            raise ValueError(
+                f"Tuned body {ctx.ckpt_ref!r} (task '{task}') has its own config, differing from the source base at "
+                f"[{changed}]. This method transports the parameter delta theta_ft - theta_base, which presumes a "
+                "fine-tune of the same architecture and positional geometry. Set allow_tuned_config_mismatch=true "
+                "to run anyway (the fine-tuned forwards then use the tuned config and the mismatch is recorded)."
+            )
+        warnings.warn(
+            f"Task '{task}': tuned body {ctx.ckpt_ref!r} differs from the source base config ({changed}); "
+            "its fine-tuned forwards use the tuned config.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return contexts
 
 
 def _ariadne_params(cfg) -> dict:

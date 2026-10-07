@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import json
+from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
@@ -69,11 +72,50 @@ def _extract_metrics(results: dict[str, Any] | None) -> dict[str, float]:
     for task_name, task_results in results.get("results", {}).items():
         for key, value in task_results.items():
             # keys look like "exact_match,none", "acc_norm,none", "exact_match_stderr,none", ...
-            metric, _, _filter_name = str(key).partition(",")
+            metric, _, filter_name = str(key).partition(",")
             if metric in _NON_METRIC_KEYS or metric.endswith("_stderr") or not isinstance(value, int | float):
                 continue
-            out[f"{task_name}_{metric}"] = float(value)
+            # A task can report one metric under several filters (gsm8k: strict-match and
+            # flexible-extract); keep them apart. The "none" filter keeps the bare key.
+            suffix = "" if filter_name in ("", "none") else f"_{filter_name}"
+            out[f"{task_name}_{metric}{suffix}"] = float(value)
     return out
+
+
+# Per-process counter so successive harness calls never overwrite each other's dumps.
+_DUMP_COUNTER = itertools.count()
+
+
+def _dump_generations(results: dict[str, Any] | None, out_dir: str) -> None:
+    """Write one jsonl per generate_until task: prompt sent, raw/filtered response, per-sample metrics."""
+    if not results:
+        return
+    for task_name, entries in (results.get("samples") or {}).items():
+        gen = [e for e in entries if _is_generation_sample(e)]
+        if not gen:
+            continue
+        path = Path(out_dir) / f"{next(_DUMP_COUNTER):03d}_{task_name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            for e in gen:
+                rec = {
+                    "doc_id": e.get("doc_id"),
+                    "filter": e.get("filter"),
+                    "prompt": e["arguments"][0][0],
+                    "response": e.get("filtered_resps"),
+                    "raw_response": e.get("resps"),
+                    "target": e.get("target"),
+                    "metrics": {m: e.get(m) for m in e.get("metrics", [])},
+                }
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+
+def _is_generation_sample(entry: dict[str, Any]) -> bool:
+    """generate_until requests carry (context, gen_kwargs dict); loglikelihood ones (context, continuation str)."""
+    try:
+        return isinstance(entry["arguments"][0][1], dict)
+    except (KeyError, IndexError, TypeError):
+        return False
 
 
 def _samples_for(
@@ -113,6 +155,9 @@ def run(
     batch_size: str = "auto",
     limit: int | None = None,
     samples: dict[str, list[int]] | None = None,
+    apply_chat_template: bool = False,
+    system_instruction: str | None = None,
+    dump_generations_dir: str | None = None,
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -132,12 +177,20 @@ def run(
     samples : Optional explicit doc indices to score per task. Used to keep
         the scored docs disjoint from the calibration slice carved out of
         the same task (see `data.llm_calibration`).
+    apply_chat_template : Opt-in. Render prompts with the tokenizer's chat template
+        (few-shot examples become multi-turn when n_shot > 0). Off by default: the
+        simple_evaluate call is then identical to the plain-prompt one.
+    system_instruction : Optional system prompt; only used with apply_chat_template.
+    dump_generations_dir : Opt-in. Directory receiving "<NNN>_<task>.jsonl" with the
+        rendered prompt and response of every generate_until sample.
 
     Returns
     -------
     dict[str, float] : Flat "{task}_{metric}" -> value dict, for every
         non-stderr metric lm-eval reports for each task (e.g. "acc", "acc_norm",
         "exact_match", "math_verify" ...), whichever apply to the given tasks.
+        Metrics reported under a non-trivial filter are suffixed with it
+        ("gsm8k_exact_match_strict-match", "gsm8k_exact_match_flexible-extract").
     """
     try:
         from lm_eval import simple_evaluate
@@ -149,6 +202,11 @@ def run(
         ) from None
 
     _check_samples_conflict(limit, samples)
+    if apply_chat_template and getattr(tokenizer, "chat_template", None) is None:
+        raise ValueError(
+            "harness_apply_chat_template=true but the tokenizer has no chat_template; "
+            "use an instruct tokenizer or leave the flag off."
+        )
 
     model.eval()
     if hasattr(model, "to"):
@@ -167,6 +225,16 @@ def run(
     try:
         out: dict[str, float] = {}
         for n_shot, group_tasks in groups.items():
+            # Opt-in kwargs are added only when requested, so the default call is unchanged.
+            extra: dict[str, Any] = {}
+            if apply_chat_template:
+                extra.update(
+                    apply_chat_template=True,
+                    fewshot_as_multiturn=n_shot > 0,
+                    system_instruction=system_instruction,
+                )
+            if dump_generations_dir:
+                extra["log_samples"] = True
             try:
                 results = simple_evaluate(
                     model="hf",
@@ -180,6 +248,7 @@ def run(
                     device=device,
                     limit=limit,
                     **_samples_for(samples, group_tasks),
+                    **extra,
                 )
             except TypeError:
                 results = simple_evaluate(
@@ -191,7 +260,10 @@ def run(
                     device=device,
                     limit=limit,
                     **_samples_for(samples, group_tasks),
+                    **extra,
                 )
+            if dump_generations_dir:
+                _dump_generations(results, dump_generations_dir)
             out.update(_extract_metrics(results))
     finally:
         TaskConfig.to_dict = _original_to_dict
