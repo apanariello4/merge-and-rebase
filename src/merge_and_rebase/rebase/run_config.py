@@ -24,7 +24,6 @@ Ariadne never reaches ``get_method`` or ``resolve_block_extension_config`` (see
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -66,20 +65,43 @@ class DepthRule:
 
 
 @dataclass(frozen=True)
-class SourceLmcSpec:
+class PrestepEvalSpec:
+    """Source/target evaluation around the depth prestep (``eval_before_rebase``) and ``source_only`` runs."""
+
     block_extension_eval_requested: bool
     block_extension_eval_enabled: bool
     block_extension_eval_split: str
     block_extension_eval_first_n_batches: Any
-    eval: bool
-    eval_split: str
-    first_n_batches: int | None
-    alphas: list[float]
-    cross_task_pairs: list[tuple[str, str]]
-    cross_task_split: str
-    all_task_tasks: list[str]
-    all_task_split: str
     source_only: bool
+
+
+#: Source-model linear-mode-connectivity (LMC) evaluation was removed. Configs that ask for it fail loudly; keys left
+#: at their "off" value are ignored, since they never influenced a result.
+_REMOVED_LMC_KEYS = (
+    "source_lmc_eval",
+    "source_lmc_eval_split",
+    "source_lmc_first_n_batches",
+    "source_lmc_alpha_min",
+    "source_lmc_alpha_max",
+    "source_lmc_alpha_step",
+    "cross_task_lmc_pairs",
+    "cross_task_lmc_eval_split",
+    "all_task_lmc_tasks",
+    "all_task_lmc_eval_split",
+)
+
+
+def _reject_removed_lmc_keys(cfg: Mapping[str, Any]) -> None:
+    requested = [
+        key
+        for key in ("source_lmc_eval", "cross_task_lmc_pairs", "all_task_lmc_tasks")
+        if cfg.get(key)  # true / a non-empty list asks for an evaluation that no longer exists
+    ]
+    if requested:
+        raise ValueError(
+            f"source-model LMC evaluation was removed; drop {requested} (and the other "
+            "source_lmc_* / cross_task_lmc_* / all_task_lmc_* keys) from the config."
+        )
 
 
 @dataclass(frozen=True)
@@ -117,7 +139,7 @@ class ResolvedRunConfig:
     ariadne_preset: str | None
     merge: MergeSpec
     alpha: AlphaSpec
-    lmc: SourceLmcSpec
+    prestep_eval: PrestepEvalSpec
     strict_load: bool
     device: str
     grad_batch_size: int | None
@@ -491,60 +513,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     if block_extension_eval_split not in {"val", "test"}:
         raise ValueError("block_extension_eval_split must be one of: val, test")
     block_extension_eval_first_n_batches = block_extension_cfg.first_n_eval_batches
-    source_lmc_eval = bool(cfg.get("source_lmc_eval", False))
-    source_lmc_eval_split = str(cfg.get("source_lmc_eval_split", "val")).strip().lower()
-    if source_lmc_eval_split not in {"val", "test"}:
-        raise ValueError("source_lmc_eval_split must be one of: val, test")
-    source_lmc_first_n_batches_raw = cfg.get("source_lmc_first_n_batches", None)
-    source_lmc_first_n_batches = (
-        int(source_lmc_first_n_batches_raw) if source_lmc_first_n_batches_raw is not None else None
-    )
-    source_lmc_alpha_min = float(cfg.get("source_lmc_alpha_min", 0.0))
-    source_lmc_alpha_max = float(cfg.get("source_lmc_alpha_max", 1.0))
-    source_lmc_alpha_step = float(cfg.get("source_lmc_alpha_step", 0.05))
-    if source_lmc_alpha_step <= 0:
-        raise ValueError("source_lmc_alpha_step must be > 0")
-    source_lmc_alphas = torch.arange(
-        source_lmc_alpha_min,
-        source_lmc_alpha_max + source_lmc_alpha_step * 0.5,
-        source_lmc_alpha_step,
-    ).tolist()
-    cross_task_lmc_pairs_raw = cfg.get("cross_task_lmc_pairs", [])
-    if cross_task_lmc_pairs_raw is None:
-        cross_task_lmc_pairs_raw = []
-    if not isinstance(cross_task_lmc_pairs_raw, (list, tuple)):
-        raise ValueError("cross_task_lmc_pairs must be a list of two-task lists.")
-    cross_task_lmc_pairs: list[tuple[str, str]] = []
-    for pair in cross_task_lmc_pairs_raw:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise ValueError("Each cross_task_lmc_pairs item must contain exactly two task names.")
-        task_a, task_b = str(pair[0]), str(pair[1])
-        if task_a == task_b:
-            raise ValueError("cross_task_lmc_pairs cannot interpolate a task with itself.")
-        cross_task_lmc_pairs.append((task_a, task_b))
-    cross_task_lmc_split = str(cfg.get("cross_task_lmc_eval_split", source_lmc_eval_split)).strip().lower()
-    if cross_task_lmc_split not in {"val", "test"}:
-        raise ValueError("cross_task_lmc_eval_split must be one of: val, test")
-    all_task_lmc_tasks_raw = cfg.get("all_task_lmc_tasks", [])
-    if all_task_lmc_tasks_raw is None:
-        all_task_lmc_tasks_raw = []
-    if not isinstance(all_task_lmc_tasks_raw, (list, tuple)):
-        raise ValueError("all_task_lmc_tasks must be a list of task names.")
-    all_task_lmc_tasks = [str(task) for task in all_task_lmc_tasks_raw]
-    if all_task_lmc_tasks and (len(all_task_lmc_tasks) < 2 or len(set(all_task_lmc_tasks)) != len(all_task_lmc_tasks)):
-        raise ValueError("all_task_lmc_tasks must contain at least two distinct task names.")
-    all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
-    if all_task_lmc_split not in {"val", "test"}:
-        raise ValueError("all_task_lmc_eval_split must be one of: val, test")
-    if cross_task_lmc_pairs or all_task_lmc_tasks:
-        # B5 / D-P5c: the cross-task and all-task LMC evaluators are never called, so these keys only ever
-        # produced empty summary entries. Keys are kept (deprecated) so old configs still load.
-        warnings.warn(
-            "cross_task_lmc_pairs / all_task_lmc_tasks are deprecated: the cross-task and all-task source-LMC "
-            "evaluations are not implemented and their summary entries are always empty.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    _reject_removed_lmc_keys(cfg)
     source_only = bool(cfg.get("source_only", False))
     strict_load = bool(cfg.get("strict_load", False))
     device = str(cfg.get("device", "cuda"))
@@ -658,19 +627,11 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
             alphas=alphas,
             selection=alpha_selection,
         ),
-        lmc=SourceLmcSpec(
+        prestep_eval=PrestepEvalSpec(
             block_extension_eval_requested=block_extension_eval_requested,
             block_extension_eval_enabled=block_extension_eval_enabled,
             block_extension_eval_split=block_extension_eval_split,
             block_extension_eval_first_n_batches=block_extension_eval_first_n_batches,
-            eval=source_lmc_eval,
-            eval_split=source_lmc_eval_split,
-            first_n_batches=source_lmc_first_n_batches,
-            alphas=source_lmc_alphas,
-            cross_task_pairs=cross_task_lmc_pairs,
-            cross_task_split=cross_task_lmc_split,
-            all_task_tasks=all_task_lmc_tasks,
-            all_task_split=all_task_lmc_split,
             source_only=source_only,
         ),
         strict_load=strict_load,

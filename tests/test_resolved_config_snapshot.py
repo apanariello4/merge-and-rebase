@@ -20,6 +20,7 @@ import pytest
 
 from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method, resolve_llm_run_config
 from merge_and_rebase.rebase.block_extension import config as be_config
+from merge_and_rebase.rebase.config_schema import canonicalize
 from merge_and_rebase.rebase.run_config import resolve_run_config
 from merge_and_rebase.utils.helpers import load_json
 
@@ -61,7 +62,7 @@ def _normalize(obj):
 
 
 def _resolve(rel: str) -> dict:
-    cfg = dict(load_json(EXAMPLES / rel))
+    cfg = dict(canonicalize(load_json(EXAMPLES / rel)))  # the examples use the canonical names
     modality = _modality(rel, cfg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

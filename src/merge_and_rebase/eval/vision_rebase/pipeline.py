@@ -262,7 +262,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ),
         env,
     )
-    eval_observer, lmc_observer = build_prestep_observers()
+    (eval_observer,) = build_prestep_observers()
     method_stage = build_method_stage(
         env,
         transport_calibration_ctx=calibration.transport_calibration_ctx,
@@ -278,14 +278,14 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     # `ResolvedRunConfig.bind`).
     pipeline = TaskPipeline(
         prestep=build_prestep(plan),
-        observers=(eval_observer, lmc_observer),
+        observers=(eval_observer,),
         method_stage=method_stage,
         saver=saver,
         build_models=build_task_models,
     )
     loop_outputs = pipeline.run(env, tasks, calibration.task_context_by_name)
 
-    if resolved.lmc.source_only:
+    if resolved.prestep_eval.source_only:
         # source_only skips transport, merge and target evaluation (B2: this used to crash on a zip length
         # mismatch); only the source-side observers' rows exist.
         source_only_hash_after = _assert_target_base_unmutated(env, "source-only preparation")
@@ -298,7 +298,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             "target_hash_before": env.target_hash_before,
             "target_hash_after": source_only_hash_after,
             "block_extension_target_dataset_eval": eval_observer.rows,
-            "source_lmc": lmc_observer.rows,
             "depth_alignment": resolved.depth_alignment_mode,
             "depth_rule_resolved": resolved.depth_rule_resolved,
         }
@@ -385,7 +384,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             alpha=alpha,
             ariadne=ariadne_record,
             block_extension_eval_rows=eval_observer.rows,
-            source_lmc_rows=lmc_observer.rows,
             transported_artifacts=saver.artifacts,
             target_hash_before=target_hash_before,
             target_hash_after=target_hash_after,

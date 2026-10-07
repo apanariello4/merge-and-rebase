@@ -76,7 +76,7 @@ BRACE_RENAMES: tuple[tuple[str, str], ...] = (
     ("correction_endpoint", "lmc_mode"),
 )
 #: ``correction_endpoint`` value <-> legacy ``lmc_mode`` value.
-CORRECTION_ENDPOINTS = {"per_endpoint": "independent", "base": "shared", "finetuned": "shared_ft"}
+CORRECTION_ENDPOINTS = {"per_endpoint": "independent", "steer": "steer", "base": "shared", "finetuned": "shared_ft"}
 #: Legacy ``depth_alignment`` string -> ``depth_alignment.rule``.
 LEGACY_DEPTH_ALIGNMENT = {"ariadne": "brace", "discrete_index_match": "discrete_index_match"}
 
@@ -143,8 +143,8 @@ def legacy_keys_used(cfg: Mapping[str, Any]) -> list[str]:
     if "no_humanize" in cfg:
         used.append("no_humanize")
     method_params = cfg.get("method_params")
-    if isinstance(method_params, Mapping) and "n_batches" in method_params:
-        used.append("method_params.n_batches")
+    if isinstance(method_params, Mapping):
+        used += [f"method_params.{key}" for key in ("n_batches", "patch_qkv") if key in method_params]
     return used
 
 
@@ -249,7 +249,10 @@ def to_canonical(cfg: Mapping[str, Any]) -> dict[str, Any]:
         for key in sources:
             src.pop(key)
         params = out.setdefault("method", {}).setdefault("params", {})
-        for key, value in dict(chosen).items():
+        chosen = dict(chosen)
+        if "patch_qkv" in chosen and "split_qkv" not in chosen:  # THESEUS/BiCo: legacy name of split_qkv
+            chosen["split_qkv"] = chosen.pop("patch_qkv")
+        for key, value in chosen.items():
             if key in params:
                 raise ValueError(f"method parameter '{key}' collides with a canonical method.params entry")
             params[key] = value
@@ -277,6 +280,39 @@ def to_canonical(cfg: Mapping[str, Any]) -> dict[str, Any]:
         out["humanize_classnames"] = not bool(src.pop("no_humanize"))
     out.update(src)
     return out
+
+
+def legacy_location(path: tuple[str, ...], *, direct_fit: bool = False) -> tuple[str, ...]:
+    """Where a canonical key path lives in the flat legacy form (paths with no legacy spelling are returned as is).
+
+    ``direct_fit`` selects ``ariadne_params`` for ``method.params``. Used to document / check the reference configs.
+    """
+    dotted = ".".join(path)
+    for canonical, legacy in sorted(LEGACY_KEYS, key=lambda item: -len(item[0])):
+        if dotted == canonical or dotted.startswith(canonical + "."):
+            return (legacy,) + path[len(canonical.split(".")) :]
+    if path[:2] == ("method", "params"):
+        return ("ariadne_params" if direct_fit else "method_params",) + path[2:]
+    if path == ("depth_alignment", "rule"):
+        return ("block_extension_params", "depth_rule")
+    if path[:2] == ("depth_alignment", "brace"):
+        rest = ".".join(path[2:])
+        for new, old in BRACE_RENAMES:
+            if rest == new:
+                return ("block_extension_params", old)
+        return ("block_extension_params",) + path[2:]
+    if path == ("humanize_classnames",):
+        return ("no_humanize",)
+    return path
+
+
+def legacy_value(path: tuple[str, ...], value: Any) -> Any:
+    """The legacy value of a canonical leaf (``correction_endpoint`` and ``humanize_classnames`` are re-coded)."""
+    if path[-1:] == ("correction_endpoint",) and value in CORRECTION_ENDPOINTS:
+        return CORRECTION_ENDPOINTS[value]
+    if path == ("humanize_classnames",) and isinstance(value, bool):
+        return not value
+    return value
 
 
 def load_run_config(cfg: Mapping[str, Any]) -> tuple[Mapping[str, Any], list[str]]:

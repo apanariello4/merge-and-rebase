@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from merge_and_rebase.rebase.config_schema import canonicalize
 from merge_and_rebase.rebase.registry import list_methods
 from merge_and_rebase.utils.helpers import load_json
 
@@ -49,7 +50,7 @@ EXPECTED = {
 def _vision(method: str) -> dict:
     from merge_and_rebase.rebase.run_config import resolve_run_config
 
-    cfg = dict(load_json(VISION_BASE))
+    cfg = dict(canonicalize(load_json(VISION_BASE)))
     cfg.update(method=method, method_params={}, block_extension_enabled=True)
     resolved = resolve_run_config(cfg)
     plan = resolved.bind(*DEPTHS["vision"])
@@ -60,7 +61,7 @@ def _llm(method: str) -> dict:
     from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method, resolve_llm_run_config
     from merge_and_rebase.rebase.block_extension import config as be_config
 
-    cfg = dict(load_json(LLM_BASE))
+    cfg = dict(canonicalize(load_json(LLM_BASE)))
     cfg.update(method=method, method_params={}, block_extension_enabled=True)
     method_name, method_obj, method_params = resolve_llm_method(cfg)
     enabled, be_cfg = be_config.resolve_block_extension_config(cfg)

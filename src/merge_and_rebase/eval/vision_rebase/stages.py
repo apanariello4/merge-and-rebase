@@ -35,7 +35,7 @@ from ...rebase.prestep import (
 )
 from ..utils import to_cpu_fp32
 from .artifacts import _state_dict_sha256
-from .source_lmc import _evaluate_source_lmc, _evaluate_source_model_top1
+from .source_eval import _evaluate_source_model_top1
 
 
 def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
@@ -74,7 +74,7 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         and (
             plan.task_block_extension_prestep
             or plan.task_discrete_layer_match_prestep
-            or env.resolved.lmc.block_extension_eval_enabled
+            or env.resolved.prestep_eval.block_extension_eval_enabled
         )
     ):
         return None
@@ -376,18 +376,18 @@ class BraceTargetEvalObserver:
 
     def before(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> None:
         resolved = env.resolved
-        lmc = resolved.lmc
-        if not (lmc.block_extension_eval_enabled and task.source_loaders is not None):
+        prestep_eval = resolved.prestep_eval
+        if not (prestep_eval.block_extension_eval_enabled and task.source_loaders is not None):
             return
         device = env.device
         source_base_model_task = None if models is None else models.source_base
         source_ft_model_task = None if models is None else models.source_ft
         eval_row: dict[str, Any] = {
             "task": task.task,
-            "split": lmc.block_extension_eval_split,
+            "split": prestep_eval.block_extension_eval_split,
             "first_n_batches": (
-                int(lmc.block_extension_eval_first_n_batches)
-                if lmc.block_extension_eval_first_n_batches is not None
+                int(prestep_eval.block_extension_eval_first_n_batches)
+                if prestep_eval.block_extension_eval_first_n_batches is not None
                 else None
             ),
             "extension_applied": bool(env.plan.task_block_extension_prestep),
@@ -403,8 +403,8 @@ class BraceTargetEvalObserver:
                     loaders_obj=task.source_loaders,
                     classnames_task=task.classnames,
                     source_build_cfg_task=task.source_build_cfg_task,
-                    split=lmc.block_extension_eval_split,
-                    first_n_batches=lmc.block_extension_eval_first_n_batches,
+                    split=prestep_eval.block_extension_eval_split,
+                    first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                     device=device,
                 )
             )
@@ -418,10 +418,10 @@ class BraceTargetEvalObserver:
         self.rows.append(eval_row)
 
     def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
-        lmc = env.resolved.lmc
+        prestep_eval = env.resolved.prestep_eval
         t = task.task
         if result.kind is PrestepKind.BRACE:
-            if not lmc.block_extension_eval_enabled:
+            if not prestep_eval.block_extension_eval_enabled:
                 return
             device = env.device
             zero_post = _evaluate_source_model_top1(
@@ -430,8 +430,8 @@ class BraceTargetEvalObserver:
                 loaders_obj=task.source_loaders,
                 classnames_task=task.classnames,
                 source_build_cfg_task=task.source_build_cfg_task,
-                split=lmc.block_extension_eval_split,
-                first_n_batches=lmc.block_extension_eval_first_n_batches,
+                split=prestep_eval.block_extension_eval_split,
+                first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                 device=device,
             )
             ft_post = _evaluate_source_model_top1(
@@ -440,8 +440,8 @@ class BraceTargetEvalObserver:
                 loaders_obj=task.source_loaders,
                 classnames_task=task.classnames,
                 source_build_cfg_task=task.source_build_cfg_task,
-                split=lmc.block_extension_eval_split,
-                first_n_batches=lmc.block_extension_eval_first_n_batches,
+                split=prestep_eval.block_extension_eval_split,
+                first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                 device=device,
             )
             last_row = self.rows[-1]
@@ -462,7 +462,7 @@ class BraceTargetEvalObserver:
                 },
                 context=last_row,
             )
-        elif result.kind is PrestepKind.NONE and lmc.block_extension_eval_enabled and self.rows:
+        elif result.kind is PrestepKind.NONE and prestep_eval.block_extension_eval_enabled and self.rows:
             last_row = self.rows[-1]
             print(f"  {t}: source target-dataset eval zero_shot={last_row['zero_shot']:.6f} ft={last_row['ft']:.6f}")
             env.run_logger.log_event(
@@ -475,80 +475,6 @@ class BraceTargetEvalObserver:
             )
 
 
-class SourceLmcObserver:
-    """Source-endpoint LMC barrier before and after BRACE, one row per BRACE task."""
-
-    def __init__(self) -> None:
-        self.rows: list[dict[str, Any]] = []
-        self._row: dict[str, Any] | None = None
-
-    def before(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> None:
-        self._row = None
-        lmc = env.resolved.lmc
-        if not (lmc.eval and env.plan.task_block_extension_prestep):
-            return
-        t = task.task
-        source_base_model_task = None if models is None else models.source_base
-        source_ft_model_task = None if models is None else models.source_ft
-        if task.source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
-            raise RuntimeError("Source LMC evaluation requires initialized source models and loaders.")
-        source_lmc_row: dict[str, Any] = {
-            "task": t,
-            "lmc_mode": env.resolved.block_extension_cfg.lmc_mode,
-        }
-        source_pre_base_sd = to_cpu_fp32({key: value for key, value in source_base_model_task.state_dict().items()})
-        source_pre_ft_sd = to_cpu_fp32({key: value for key, value in source_ft_model_task.state_dict().items()})
-        print(f"  {t}: evaluating source LMC before block extension")
-        source_lmc_row["before_brace"] = _evaluate_source_lmc(
-            model=source_base_model_task,
-            restore_sd=source_pre_base_sd,
-            endpoint_a_sd=source_pre_base_sd,
-            endpoint_b_sd=source_pre_ft_sd,
-            clf_source=env.clf_source,
-            loaders_obj=task.source_loaders,
-            classnames_task=task.classnames,
-            source_build_cfg_task=task.source_build_cfg_task,
-            split=lmc.eval_split,
-            first_n_batches=lmc.first_n_batches,
-            alphas=lmc.alphas,
-            device=env.device,
-        )
-        self._row = source_lmc_row
-
-    def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
-        source_lmc_row = self._row
-        if source_lmc_row is None or result.kind is not PrestepKind.BRACE:
-            return
-        lmc = env.resolved.lmc
-        t = task.task
-        print(f"  {t}: evaluating source LMC after block extension")
-        source_lmc_row["after_brace"] = _evaluate_source_lmc(
-            model=result.source_base_model,
-            restore_sd=result.source_base_sd,
-            endpoint_a_sd=result.source_base_sd,
-            endpoint_b_sd=result.source_ft_sd,
-            clf_source=env.clf_source,
-            loaders_obj=task.source_loaders,
-            classnames_task=task.classnames,
-            source_build_cfg_task=task.source_build_cfg_task,
-            split=lmc.eval_split,
-            first_n_batches=lmc.first_n_batches,
-            alphas=lmc.alphas,
-            device=env.device,
-        )
-        self.rows.append(source_lmc_row)
-        env.run_logger.log_event(
-            "source_lmc",
-            metrics={
-                f"source_lmc/{t}/before/max_loss_barrier": source_lmc_row["before_brace"]["max_loss_barrier"],
-                f"source_lmc/{t}/after/max_loss_barrier": source_lmc_row["after_brace"]["max_loss_barrier"],
-                f"source_lmc/{t}/before/max_error_barrier": source_lmc_row["before_brace"]["max_error_barrier"],
-                f"source_lmc/{t}/after/max_error_barrier": source_lmc_row["after_brace"]["max_error_barrier"],
-            },
-            context={"task": t, "lmc_mode": env.resolved.block_extension_cfg.lmc_mode},
-        )
-
-
-def build_prestep_observers() -> tuple[BraceTargetEvalObserver, SourceLmcObserver]:
-    """Observers in ``before`` order; ``after`` runs them in reverse (LMC after, then eval post)."""
-    return BraceTargetEvalObserver(), SourceLmcObserver()
+def build_prestep_observers() -> tuple[BraceTargetEvalObserver]:
+    """Observers around the per-task prestep (``eval_before_rebase``: source models before / after it)."""
+    return (BraceTargetEvalObserver(),)

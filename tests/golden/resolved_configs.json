@@ -82,21 +82,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -111,6 +96,13 @@
    "method_label": "ariadne",
    "method_name": "ariadne",
    "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
    "strict_load": false,
    "suite": null,
    "suite_name": "",
@@ -200,21 +192,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -236,6 +213,13 @@
     "num_batches": 100,
     "seed": 0,
     "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": null,
@@ -326,21 +310,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -364,6 +333,13 @@
     "num_batches": 100,
     "seed": 0,
     "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": null,
@@ -454,21 +430,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -483,6 +444,13 @@
    "method_label": "ariadne",
    "method_name": "ariadne",
    "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
    "strict_load": false,
    "suite": null,
    "suite_name": "",
@@ -572,21 +540,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -608,6 +561,13 @@
     "num_batches": 100,
     "seed": 0,
     "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": null,
@@ -698,21 +658,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -736,6 +681,13 @@
     "num_batches": 100,
     "seed": 0,
     "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": null,
@@ -826,21 +778,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": null,
@@ -864,6 +801,13 @@
     "num_batches": 100,
     "seed": 0,
     "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": null,
@@ -944,7 +888,6 @@
      "mlp.c_proj"
     ],
     "copy_shape_matching_source_deltas": false,
-    "depth_fit": "independent",
     "depth_pairing": "relative",
     "endpoint_construction": "native_delta",
     "exact_form": true,
@@ -953,8 +896,6 @@
     "merge_mode": "per_task_then_merge",
     "missing_bias": "error",
     "num_batches": 10,
-    "procrustes_energy": null,
-    "procrustes_rank": null,
     "procrustes_source": "activation",
     "realization_diagnostics": false,
     "residual_target": "transported_delta",
@@ -1019,43 +960,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -1068,6 +972,13 @@
    "method_label": "Ariadne",
    "method_name": "ariadne",
    "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
    "strict_load": false,
    "suite": {
     "name": "vision8",
@@ -1207,43 +1118,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -1260,6 +1134,13 @@
    "method_params": {
     "num_batches": 10,
     "seed": 89
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": {
@@ -1400,43 +1281,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -1454,6 +1298,13 @@
     "num_batches": 10,
     "seed": 89,
     "seq_align": "interpolate2d"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": {
@@ -1556,7 +1407,6 @@
      "mlp.c_proj"
     ],
     "copy_shape_matching_source_deltas": false,
-    "depth_fit": "independent",
     "depth_pairing": "relative",
     "endpoint_construction": "native_delta",
     "exact_form": true,
@@ -1565,8 +1415,6 @@
     "merge_mode": "per_task_then_merge",
     "missing_bias": "error",
     "num_batches": 10,
-    "procrustes_energy": null,
-    "procrustes_rank": null,
     "procrustes_source": "activation",
     "realization_diagnostics": false,
     "residual_target": "transported_delta",
@@ -1631,43 +1479,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -1680,6 +1491,13 @@
    "method_label": "Ariadne",
    "method_name": "ariadne",
    "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
    "strict_load": false,
    "suite": {
     "name": "vision8",
@@ -1819,43 +1637,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -1872,6 +1653,13 @@
    "method_params": {
     "num_batches": 10,
     "seed": 89
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": {
@@ -2012,43 +1800,6 @@
    "grad_batch_size": null,
    "grad_imgs_per_class": null,
    "grad_num_batches": null,
-   "lmc": {
-    "all_task_split": "val",
-    "all_task_tasks": [],
-    "alphas": [
-     0.0,
-     0.05000000074505806,
-     0.10000000149011612,
-     0.15000000596046448,
-     0.20000000298023224,
-     0.25,
-     0.30000001192092896,
-     0.3499999940395355,
-     0.4000000059604645,
-     0.45000001788139343,
-     0.5,
-     0.550000011920929,
-     0.6000000238418579,
-     0.6499999761581421,
-     0.699999988079071,
-     0.75,
-     0.800000011920929,
-     0.8500000238418579,
-     0.8999999761581421,
-     0.949999988079071,
-     1.0
-    ],
-    "block_extension_eval_enabled": false,
-    "block_extension_eval_first_n_batches": null,
-    "block_extension_eval_requested": false,
-    "block_extension_eval_split": "test",
-    "cross_task_pairs": [],
-    "cross_task_split": "val",
-    "eval": false,
-    "eval_split": "val",
-    "first_n_batches": null,
-    "source_only": false
-   },
    "merge": {
     "base_construction": "per_task",
     "global_alpha_search": true,
@@ -2066,6 +1817,13 @@
     "num_batches": 10,
     "seed": 89,
     "seq_align": "interpolate2d"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
    },
    "strict_load": false,
    "suite": {

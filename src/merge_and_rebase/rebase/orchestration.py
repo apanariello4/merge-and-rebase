@@ -155,7 +155,7 @@ class TaskPipeline:
             if "alignment_calibration" in pre.timings:
                 out.alignment_calibration_timings[task] = pre.timings["alignment_calibration"]
 
-            if resolved.lmc.source_only:
+            if resolved.prestep_eval.source_only:
                 continue
 
             # TransFusion's once-only prepare rebinds run-level objects on ``env`` (see NoPrestep.load_delta).
