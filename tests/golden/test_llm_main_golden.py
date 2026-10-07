@@ -735,7 +735,7 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "tuned_bodies_wrong_type": ["ValueError", "tuned_bodies must be a dict or list.", 2, 1, ["failed"]],
     "unknown_method": [
         "KeyError",
-        "\"Unknown rebase method 'nope'. Available: ['ariadne', 'bico', 'bico_gradin', 'direct_residual', 'gradfix', 'identity', 'orthogonal_shift', 'theseus', 'theseus_gqa', 'transfusion']\"",
+        "\"Unknown rebase method 'nope'. Available: ['ariadne', 'bico', 'direct_residual', 'gradfix', 'identity', 'orthogonal_shift', 'theseus', 'theseus_gqa', 'transfusion']\"",
         0,
         0,
         [],

@@ -8,143 +8,146 @@
 #   "# key: value  # ..." lines list every other accepted key AT ITS DEFAULT: uncommenting one changes one factor.
 #   Tags: [main] used by the method as published, [ablation] alternative arm, [diagnostic] extra measurement,
 #         never changes the task vector, [legacy] kept for old configs, [deprecated] warns, [BRACE-only] inert
-#         under depth_rule=discrete_index_match. [default: preset] = value set by preset: ariadne.
+#         under depth_alignment.rule=discrete_index_match. [default: preset] = value set by preset: ariadne.
 #   Ariadne fits the target directly (no depth prestep): block_extension_*, depth_alignment, method_params,
 #   transport_calibration_data and eval_before_rebase are not read or are rejected, so they are omitted here.
-#   Gradfix-only keys (mask_mode, vote, grad_*) are omitted.
+#   Gradfix-only keys (method.params.mask_mode / vote, method.params.gradient.*) are omitted.
 #   Method contract: docs/methods/ariadne.md.
 # Provenance: commit before launching; the summary records the git commit/dirty fingerprint.
-# Unknown top-level and method_params keys are NOT rejected: a misspelled key is silently ignored.
+# Unknown method.params keys of THESEUS/BiCo raise; unknown top-level keys are ignored.
+# Canonical names (rebase/config_schema.py); the legacy flat names still work and warn.
 
-# ---------------------------------------------------------------- models and checkpoints
+
+# ---------------------------------------------------------------- suite
 suite: vision8                              # task suite (key of SUITES).
 tasks: all                                  # "all" or a comma-separated subset of the suite.
-source_clip_model: ViT-B-16                 # open_clip architecture of the source (fine-tuned) base.
-source_clip_pretrained: datacomp_xl_s13b_b90k   # open_clip pretrained tag of the source base.
-target_clip_model: ViT-L-14                 # open_clip architecture of the target base.
-target_clip_pretrained: datacomp_xl_s13b_b90k   # open_clip pretrained tag of the target base.
-tuned_ckpts:                                # task -> fine-tuned source checkpoint (required, one per task).
-  Cars: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/best.pt
-  DTD: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/best.pt
-  EuroSAT: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/best.pt
-  GTSRB: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/best.pt
-  MNIST: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/best.pt
-  RESISC45: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/best.pt
-  SUN397: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/best.pt
-  SVHN: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt
-# weights: null                     # per-task merge weights, list of len(tasks); null = 1.0 each.
-# dtype: null                       # model dtype: fp16 | bf16 | fp32; null = checkpoint dtype.
-# device: "cuda"                    # torch device.
-# strict_load: false                # strict state-dict loading of the checkpoints.
-# native_target_tasks: []           # tasks whose checkpoints already live on the target base (mixed merging).
-# auto_detect_ckpt_base: true       # classify each checkpoint's base by key coverage.
-# attn_patch_cfg: null              # attention patch config (dict); enables patched_attn when set.
-# patched_attn: false               # patch attention before rebase; default = (attn_patch_cfg is not null).
 
-# ---------------------------------------------------------------- method
-method: ariadne                             # Ariadne (legacy alias: direct_residual, same method object).
-depth_defaults: method                      # no effect on Ariadne (no depth rule); kept identical across examples.
+# ---------------------------------------------------------------- models and checkpoints
+models:
+  source:
+    model: ViT-B-16                         # open_clip architecture of the source (fine-tuned) base.
+    pretrained: datacomp_xl_s13b_b90k       # open_clip pretrained tag of the source base.
+  target:
+    model: ViT-L-14                         # open_clip architecture of the target base.
+    pretrained: datacomp_xl_s13b_b90k       # open_clip pretrained tag of the target base.
+  tuned_checkpoints:                        # task -> fine-tuned source checkpoint (required, one per task).
+    Cars: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/best.pt
+    DTD: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/best.pt
+    EuroSAT: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/best.pt
+    GTSRB: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/best.pt
+    MNIST: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/best.pt
+    RESISC45: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/best.pt
+    SUN397: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/best.pt
+    SVHN: checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt
 
-# ---------------------------------------------------------------- ariadne_params (legacy key: direct_residual_params)
-# Ariadne fits, per target block boundary, the correction that makes the target reproduce the source's fine-tuned
-# effect, read through a Procrustes alignment of paired activations. The task vector is only this fit.
-# Unknown keys raise. Explicit keys override the preset.
-ariadne_params:
-  preset: ariadne                           # [main] expands to components=[mlp.c_proj], activation_storage=streaming,
+# ---------------------------------------------------------------- method (name + its own parameters)
+method:
+  name: ariadne                             # Ariadne (legacy alias: direct_residual, same method object).
+  # Ariadne fits, per target block boundary, the correction that makes the target reproduce the source's fine-tuned
+  # effect, read through a Procrustes alignment of paired activations. The task vector is only this fit.
+  # Unknown keys raise. Explicit keys override the preset.
+  params:
+    preset: ariadne                         # [main] expands to components=[mlp.c_proj], activation_storage=streaming,
                                             #   ridge_estimator=empirical_bayes (dataclass defaults are unchanged).
-  num_batches: 10                           # [main] calibration batches (never part of the preset).
-  seed: 89                                  # calibration sampling seed (never part of the preset).
-  # components: ["mlp.c_proj"]      # [main] [default: preset] fitted projections, subset of attn.out_proj, mlp.c_proj
-  #                                 #   (dataclass default: both; ["attn.out_proj", "mlp.c_proj"] = O+D ablation arm).
-  # activation_storage: "streaming" # [main] [default: preset] streaming | resident (resident is needed by block_split,
-  #                                 #   sequential endpoints; agrees with streaming to ~1e-7 rel, not bitwise).
-  # ridge_estimator: "empirical_bayes"  # [main] [default: preset] empirical_bayes | fixed_relative | none.
-  # ridge_relative: 0.01            # ridge strength for fixed_relative (finite, > 0).
-  # strength: 1.0                   # scale of the fitted task vector (finite, >= 0).
-  # cascade_order: "independent"    # schema parity only, orders nothing: independent | bottom_top | top_bottom.
-  # exact_form: true                # exact form with intercept (bias) term.
-  # missing_bias: "error"           # target projections without bias: error | materialize | skip (skip needs
-  #                                 #   exact_form=false).
-  # merge_mode: "per_task_then_merge"  # [ablation] per_task_then_merge | merge_in_source_then_fit (needs
-  #                                 #   alpha_selection=shared). Independent of the top-level merge_mode.
-  # endpoint_construction: "native_delta"  # [ablation] native_delta | sequential_source_endpoints |
-  #                                 #   sequential_delta_on_synthesized_base (sequential: components=[mlp.c_proj],
-  #                                 #   resident storage, block_split=none, tv_scaling=none, per-task merge).
-  # component_target: "block_boundary"  # only block_boundary (output_local / output_total are retired).
-  # realization_diagnostics: false  # [diagnostic] extra per-row realization fields in the summary.
-  # block_split: "none"             # [ablation] intra-block solve: none | backfit | joint (resident only).
-  # backfit_max_iters: 20           # [ablation] backfit sweeps (> 0).
-  # backfit_tol: 1.0e-4             # [ablation] backfit tolerance (> 0).
-  # residual_target: "transported_delta"  # [ablation] transported_delta | transported_endpoint.
-  # procrustes_source: "activation" # [ablation] statistic for the alignment: activation | gradient (gradient Q is
-  #                                 #   not unique under rank-deficient cross-covariance; flagged in diagnostics).
-  # alignment_map: "polar"          # [ablation] polar | ridge | random_isometry.
-  # alignment_row_weighting: "uniform"  # [ablation] uniform | cls_balanced | delta_magnitude.
-  # alignment_seed: 0               # [ablation] seed of random_isometry.
-  # tv_scaling: "none"              # [ablation] label-free task-vector rescale: none | global | per_block.
-  # tv_scaling_iters: 3             # [ablation] Jacobi rounds for per_block (> 0).
-  # streaming_position_chunk: null  # block positions per capture sweep (bounds host RAM); null = all at once.
-  # streaming_fingerprint_tol: 1.0e-9  # streaming consistency check tolerance (> 0).
-  # calibration_data: "task_local"  # [ablation] calibration images: task_local | tiny_imagenet | vision8_mix.
-  # depth_pairing: "relative"       # [main] source/target block pairing: relative (uniform nearest index) |
-  #                                 #   spread_duplicate | [ablation] reversed | shift_plus1 | shift_minus1.
-  # fidelity_holdout: false         # [diagnostic] held-out fidelity measurement (never read by the fit).
-  # fidelity_holdout_batches: 10    # [diagnostic] held-out batches (> 0).
-  # copy_shape_matching_source_deltas: false  # [ablation] also copy shape-matching source deltas of non-fitted
-  #                                 #   parameters (default: the task vector is only the fit).
-# load_direct_residual_tvs_dir: null  # [ablation] load saved sequential-endpoint task vectors instead of fitting;
-#                                   #   exclusive with save_transported_tvs_dir / save_transported_artifacts.
+    num_batches: 10                         # [main] calibration batches (never part of the preset).
+    seed: 89                                # calibration sampling seed (never part of the preset).
+    # components: ["mlp.c_proj"]            # [main] [default: preset] fitted projections, subset of attn.out_proj, mlp.c_proj
+    #                                       #   (dataclass default: both; ["attn.out_proj", "mlp.c_proj"] = O+D ablation arm).
+    # activation_storage: "streaming"       # [main] [default: preset] streaming | resident (resident is needed by block_split,
+    #                                       #   sequential endpoints; agrees with streaming to ~1e-7 rel, not bitwise).
+    # ridge_estimator: "empirical_bayes"    # [main] [default: preset] empirical_bayes | fixed_relative | none.
+    # ridge_relative: 0.01                  # ridge strength for fixed_relative (finite, > 0).
+    # strength: 1.0                         # scale of the fitted task vector (finite, >= 0).
+    # cascade_order: "independent"          # schema parity only, orders nothing: independent | bottom_top | top_bottom.
+    # exact_form: true                      # exact form with intercept (bias) term.
+    # missing_bias: "error"                 # target projections without bias: error | materialize | skip (skip needs
+    #                                       #   exact_form=false).
+    # merge_mode: "per_task_then_merge"     # [ablation] per_task_then_merge | merge_in_source_then_fit (needs
+    #                                       #   alpha_selection=shared). Independent of the top-level merge_mode.
+    # endpoint_construction: "native_delta" # [ablation] native_delta | sequential_source_endpoints |
+    #                                       #   sequential_delta_on_synthesized_base (sequential: components=[mlp.c_proj],
+    #                                       #   resident storage, block_split=none, tv_scaling=none, per-task merge).
+    # component_target: "block_boundary"    # only block_boundary (output_local / output_total are retired).
+    # realization_diagnostics: false        # [diagnostic] extra per-row realization fields in the summary.
+    # block_split: "none"                   # [ablation] intra-block solve: none | backfit | joint (resident only).
+    # backfit_max_iters: 20                 # [ablation] backfit sweeps (> 0).
+    # backfit_tol: 1.0e-4                   # [ablation] backfit tolerance (> 0).
+    # residual_target: "transported_delta"  # [ablation] transported_delta | transported_endpoint.
+    # procrustes_source: "activation"       # [ablation] statistic for the alignment: activation | gradient (gradient Q is
+    #                                       #   not unique under rank-deficient cross-covariance; flagged in diagnostics).
+    # alignment_map: "polar"                # [ablation] polar | ridge | random_isometry.
+    # alignment_row_weighting: "uniform"    # [ablation] uniform | cls_balanced | delta_magnitude.
+    # alignment_seed: 0                     # [ablation] seed of random_isometry.
+    # tv_scaling: "none"                    # [ablation] label-free task-vector rescale: none | global | per_block.
+    # tv_scaling_iters: 3                   # [ablation] Jacobi rounds for per_block (> 0).
+    # streaming_position_chunk: null        # block positions per capture sweep (bounds host RAM); null = all at once.
+    # streaming_fingerprint_tol: 1.0e-9     # streaming consistency check tolerance (> 0).
+    # calibration_data: "task_local"        # [ablation] calibration images: task_local | tiny_imagenet | vision8_mix.
+    # depth_pairing: "relative"             # [main] source/target block pairing: relative (uniform nearest index) |
+    #                                       #   spread_duplicate | [ablation] reversed | shift_plus1 | shift_minus1.
+    # fidelity_holdout: false               # [diagnostic] held-out fidelity measurement (never read by the fit).
+    # fidelity_holdout_batches: 10          # [diagnostic] held-out batches (> 0).
+    # copy_shape_matching_source_deltas: false # [ablation] also copy shape-matching source deltas of non-fitted
+    #                                       #   parameters (default: the task vector is only the fit).
 
-# ---------------------------------------------------------------- calibration and data
+# ---------------------------------------------------------------- depth alignment (source depth -> target depth)
+depth_alignment:
+  defaults: method                          # no effect on Ariadne (no depth rule); kept identical across examples.
+
+# ---------------------------------------------------------------- merge
+# merge:
+  # weights: null                           # per-task merge weights, list of len(tasks); null = 1.0 each.
+  # mode: "none"                            # none | rebase_then_merge | merge_then_rebase | brace_transport_then_merge |
+  #                                         #   brace_merge_then_transport | merge_then_brace_then_transport
+  #                                         #   (Ariadne rejects the three single-transport modes).
+  # method: "task_arithmetic"               # merge algorithm (merge registry name).
+  # params: {}                              # merge kwargs.
+  # global_alpha_search: true               # hierarchical global alpha for merges.
+  # base_construction: "per_task"           # per_task | independent_endpoint_average.
+
+# ---------------------------------------------------------------- alpha search
+alpha:
+  search: true                              # search the task-vector scale on a grid.
+  min: 0.0                                  # grid start.
+  max: 1.0                                  # grid end (>= alpha.min).
+  step: 0.05                                # grid step (> 0).
+  selection: per_task                       # per_task: one alpha per task; shared: one alpha for all.
+  split: val                                # split used to pick alpha: val | test.
+  # value: 1.0                              # fixed alpha, used only when alpha.search is false.
+  # patience: 0                             # early stop of the alpha grid after N non-improving steps (0 = off).
+
+# ---------------------------------------------------------------- artifacts
+save:
+  transported_task_vectors_policy: auto     # auto: save transported task vectors to <summary_dir>/transported_tvs;
+                                            #   if_dir_given (default): only when save.transported_task_vectors is set.
+  # transported_task_vectors: null          # explicit directory for the transported task vectors.
+  # transported_artifacts: false            # also save artifacts; default = (save.transported_task_vectors is set).
+  # legacy_task_vector_layouts: false       # [legacy] legacy save format.
+  # merged: null                            # path: save the merged state dict.
+# load:
+  # transported_task_vectors: null          # [ablation] load saved sequential-endpoint task vectors instead of fitting;
+  #                                         #   exclusive with save_transported_tvs_dir / save_transported_artifacts.
+
+# ---------------------------------------------------------------- run, data and diagnostics
+# dtype: null                               # model dtype: fp16 | bf16 | fp32; null = checkpoint dtype.
+# device: "cuda"                            # torch device.
+# strict_load: false                        # strict state-dict loading of the checkpoints.
+# native_target_tasks: []                   # tasks whose checkpoints already live on the target base (mixed merging).
+# auto_detect_ckpt_base: true               # classify each checkpoint's base by key coverage.
+# attn_patch_cfg: null                      # attention patch config (dict); enables patched_attn when set.
+# patched_attn: false                       # patch attention before rebase; default = (attn_patch_cfg is not null).
 batch_size: 32                              # loader batch size (calibration, alpha search, evaluation).
 num_workers: 0                              # loader workers.
 val_fraction: 0.1                           # fraction of train held out as the validation split.
 seed: 89                                    # global seed: splits, loaders, calibration sampling.
-# no_humanize: true                 # true = raw class names in the zero-shot head; false = humanized names.
-
-# ---------------------------------------------------------------- alpha search and merge
-alpha_search: true                          # search the task-vector scale on a grid.
-alpha_min: 0.0                              # grid start.
-alpha_max: 1.0                              # grid end (>= alpha_min).
-alpha_step: 0.05                            # grid step (> 0).
-alpha_selection: per_task                   # per_task: one alpha per task; shared: one alpha for all.
-alpha_search_split: val                     # split used to pick alpha: val | test.
-# alpha: 1.0                        # fixed alpha, used only when alpha_search is false.
-# alpha_patience: 0                 # early stop of the alpha grid after N non-improving steps (0 = off).
-# merge_mode: "none"                # none | rebase_then_merge | merge_then_rebase | brace_transport_then_merge |
-#                                   #   brace_merge_then_transport | merge_then_brace_then_transport
-#                                   #   (Ariadne rejects the three single-transport modes).
-# merge_method: "task_arithmetic"   # merge algorithm (merge registry name).
-# merge_params: {}                  # merge kwargs.
-# global_alpha_search: true         # hierarchical global alpha for merges.
-# base_construction: "per_task"     # per_task | independent_endpoint_average.
-
-# ---------------------------------------------------------------- artifacts and logging
-save_transported_tvs: auto                  # auto: save transported task vectors to <summary_dir>/transported_tvs;
-                                            #   if_dir_given (default): only when save_transported_tvs_dir is set.
-# save_transported_tvs_dir: null    # explicit directory for the transported task vectors.
-# save_transported_artifacts: false # also save artifacts; default = (save_transported_tvs_dir is set).
-# save_transported_tvs_legacy: false  # [legacy] legacy save format.
-# save_merged: null                 # path: save the merged state dict.
-# logging:                          # W&B / local logging.
+# humanize_classnames: false                # true = raw class names in the zero-shot head; false = humanized names.
+# logging:                                  # W&B / local logging.
   # use_wandb: false
   # project: null
   # entity: null
   # tags: []
-  # mode: "online"                  # online | offline | disabled (nodes are offline: use offline).
+  # mode: "online"                          # online | offline | disabled (nodes are offline: use offline).
   # local_log_dir: null
   # log_every_n_steps: 50
   # run_name: null
-
-# ---------------------------------------------------------------- diagnostics, legacy, deprecated
-# source_lmc_eval: false            # [diagnostic] linear-mode-connectivity curve on the source.
-# source_lmc_eval_split: "val"      # [diagnostic] val | test.
-# source_lmc_first_n_batches: null  # [diagnostic] limit the LMC evaluation batches.
-# source_lmc_alpha_min: 0.0         # [diagnostic] LMC grid.
-# source_lmc_alpha_max: 1.0         # [diagnostic]
-# source_lmc_alpha_step: 0.05       # [diagnostic]
-# source_only: false                # [diagnostic] stop after the source-side steps.
-# cross_task_lmc_pairs: []          # [deprecated] never evaluated; summary entries stay empty.
-# cross_task_lmc_eval_split: "val"  # [deprecated]
-# all_task_lmc_tasks: []            # [deprecated]
-# all_task_lmc_eval_split: "val"    # [deprecated]
+# source_only: false                        # [diagnostic] stop after the source-side steps.

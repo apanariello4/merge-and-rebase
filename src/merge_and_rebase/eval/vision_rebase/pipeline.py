@@ -15,21 +15,26 @@ from typing import Any
 
 import torch
 
-from ...data.vision_loaders import build_vision_calibration_loader
+from ...data.vision_loaders import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SEED,
+    DEFAULT_VAL_FRACTION,
+    build_vision_calibration_loader,
+)
 from ...io.ckpt import load_ckpt
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.methods._common import axpy_state_dict
 from ...rebase.block_extension.config import calibration_dataset_spec
 from ...rebase.orchestration import AriadneRunRecord, TaskPipeline
 from ...rebase.prestep import StageEnv
+from ...rebase.run_config import check_native_target_tasks
 from ..print_utils import pretty_print_task_accuracies
 from ..utils import patch_base_for_attn, to_cpu_fp32
 from .alpha_search import AlphaSearchSpec, TargetEvaluator, run_alpha_search
 from .artifacts import TransportedTvSaver, TransportedTvSaveSpec, _state_dict_sha256
 from .context import build_run_calibration
 from .merge import (
-    _SINGLE_TRANSPORT_MODES,
-    _TRANSPORT_THEN_MERGE_MODES,
     _ckpt_visual_base_coverage,
     _infer_ckpt_base,
     _visual_key_fingerprint,
@@ -67,6 +72,16 @@ def _owned_cpu_fp32(sd: Any) -> dict[str, torch.Tensor]:
     return {k: (v.clone() if v.data_ptr() == sd[k].data_ptr() else v) for k, v in out.items()}
 
 
+def _assert_target_base_unmutated(env: StageEnv, stage: str) -> str:
+    """Hash of ``env.target_base_sd``; raises if it differs from the hash taken before the task loop."""
+    hash_after = _state_dict_sha256(env.target_base_sd)
+    if hash_after != env.target_hash_before:
+        raise RuntimeError(
+            f"Native target base was mutated during {stage}: before={env.target_hash_before}, after={hash_after}."
+        )
+    return hash_after
+
+
 def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[str, Any]:
     """Run the per-task transport, merge dispatch and alpha search; returns the final summary dictionary."""
     cfg = runtime.cfg
@@ -80,13 +95,12 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     method = resolved.method
     method_label = resolved.method_label
     block_extension_cfg = resolved.block_extension_cfg
-    blockext_like_method = resolved.blockext_like_method
+    depth_prestep_method = resolved.depth_prestep_method
     block_extension_enabled = resolved.block_extension_enabled
     transfusion_mode = resolved.transfusion_mode
     strict_load = resolved.strict_load
     device = resolved.device
     merge_mode = resolved.merge.mode
-    base_construction = resolved.merge.base_construction
     alpha_selection = resolved.alpha.selection
     suite = resolved.suite
     tasks = resolved.tasks
@@ -94,8 +108,8 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     target_depth = plan.target_depth
 
     run_block_extension_prestep = plan.run_block_extension_prestep
-    if blockext_like_method:
-        calibration_dataset = calibration_dataset_spec(block_extension_cfg)
+    calibration_dataset = calibration_dataset_spec(block_extension_cfg)
+    if depth_prestep_method:
         if run_block_extension_prestep:
             print(
                 "Block extension preprocess: enabled "
@@ -105,29 +119,27 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 f"n_batches_act={block_extension_cfg.n_batches_act})."
             )
         else:
-            reason = "disabled by config"
-            if not block_extension_enabled:
-                reason = "disabled by config"
-            elif source_depth == target_depth:
+            if block_extension_enabled and source_depth == target_depth:
                 reason = "source/target depth already match"
+            else:
+                reason = "disabled by config"
             print(
                 "Block extension preprocess: skipped "
                 f"({reason}, source_depth={source_depth}, target_depth={target_depth})."
             )
 
     block_extension_calibration_loader = None
-    calibration_dataset = calibration_dataset_spec(block_extension_cfg)
     if run_block_extension_prestep and not block_extension_cfg.skip_correction and calibration_dataset is not None:
         block_extension_calibration_loader = build_vision_calibration_loader(
             calibration_dataset,
             resolver=suite.resolver,
             preprocess=clf_source.preprocess,
             calibration_split=block_extension_cfg.calibration_split,
-            batch_size=int(cfg.get("batch_size", 128)),
-            num_workers=int(cfg.get("num_workers", 6)),
+            batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
             pin_memory=True,
-            val_fraction=float(cfg.get("val_fraction", 0.1)),
-            seed=int(cfg.get("seed", 42)),
+            val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
         print(
             f"Block extension preprocess: using one task-independent calibration loader from {calibration_dataset!r}."
@@ -158,8 +170,8 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             )
         )
     else:
-        source_base_sd = _owned_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
-        target_base_sd = _owned_cpu_fp32({k: v for k, v in clf_target.model.state_dict().items()})
+        source_base_sd = _owned_cpu_fp32(dict(clf_source.model.state_dict()))
+        target_base_sd = _owned_cpu_fp32(dict(clf_target.model.state_dict()))
     target_hash_before = _state_dict_sha256(target_base_sd)
 
     use_humanized_classnames = not bool(cfg.get("no_humanize", True))
@@ -167,100 +179,48 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
     print(f"Rebase method: {method_label}")
 
     # ---- Mixed-merging pre-pass: classify each tuned checkpoint by its base ----
-    native_tasks_requested = [str(t) for t in (cfg.get("native_target_tasks", []) or [])]
-    unknown_native_tasks = [t for t in native_tasks_requested if t not in tasks]
-    if unknown_native_tasks:
-        raise ValueError(f"native_target_tasks contains tasks not in the task list: {unknown_native_tasks}")
+    # native_target_tasks, its merge-mode constraints and base_construction were validated by resolve_run_config.
+    native_tasks: set[str] = {str(t) for t in (cfg.get("native_target_tasks", []) or [])}
     auto_detect_ckpt_base = bool(cfg.get("auto_detect_ckpt_base", True))
-    native_tasks: set[str] = set(native_tasks_requested)
-
-    if native_tasks or auto_detect_ckpt_base:
-        print("Checkpoint base classification (visual-key coverage vs source/target):")
-        for task in tasks:
-            if task in native_tasks:
-                print(f"  {task}: native target checkpoint (explicit)")
-                continue
-            raw_sd = load_ckpt(str(tuned_by_task[task]))
-            inferred = _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd)
-            if inferred is None:
-                fingerprint = _visual_key_fingerprint(raw_sd)
-                raise ValueError(
-                    f"Tuned checkpoint for task '{task}' matches neither the source nor the target "
-                    f"visual backbone ({tuned_by_task[task]}). Checkpoint fingerprint: {fingerprint}. "
-                    f"Source fingerprint: {_visual_key_fingerprint(source_base_sd)}. "
-                    f"Target fingerprint: {_visual_key_fingerprint(target_base_sd)}."
-                )
-            if inferred == "target":
-                if not auto_detect_ckpt_base:
-                    raise ValueError(
-                        f"Tuned checkpoint for task '{task}' matches the target architecture; "
-                        "add it to native_target_tasks or set auto_detect_ckpt_base=true."
-                    )
-                native_tasks.add(task)
-                print(f"  {task}: native target checkpoint (auto-detected)")
-            else:
-                if strict_load:
-                    coverage = _ckpt_visual_base_coverage(raw_sd, source_base_sd)
-                    if coverage != 1.0:
-                        raise ValueError(
-                            f"Strict visual checkpoint coverage failed for task '{task}': "
-                            f"coverage={coverage:.6f}, expected=1.0 ({tuned_by_task[task]})."
-                        )
-                print(f"  {task}: source checkpoint (transport required)")
-            del raw_sd
-    else:
-        # auto_detect_ckpt_base=false with no native_target_tasks: nothing may be classified as native, but a
-        # target-architecture checkpoint must still be refused (B3: it used to be treated as a source checkpoint
-        # and silently produced an empty task vector).
-        for task in tasks:
-            raw_sd = load_ckpt(str(tuned_by_task[task]))
-            if _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd) == "target":
+    print("Checkpoint base classification (visual-key coverage vs source/target):")
+    for task in tasks:
+        if task in native_tasks:
+            print(f"  {task}: native target checkpoint (explicit)")
+            continue
+        # Classification reads keys and shapes only: memory-map the file instead of reading every tensor
+        # (the stage that needs the weights loads the checkpoint itself).
+        raw_sd = load_ckpt(str(tuned_by_task[task]), mmap=True)
+        inferred = _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd)
+        if inferred is None:
+            fingerprint = _visual_key_fingerprint(raw_sd)
+            raise ValueError(
+                f"Tuned checkpoint for task '{task}' matches neither the source nor the target "
+                f"visual backbone ({tuned_by_task[task]}). Checkpoint fingerprint: {fingerprint}. "
+                f"Source fingerprint: {_visual_key_fingerprint(source_base_sd)}. "
+                f"Target fingerprint: {_visual_key_fingerprint(target_base_sd)}."
+            )
+        if inferred == "target":
+            if not auto_detect_ckpt_base:
+                # B3: a target-architecture checkpoint used to be treated as a source one (empty task vector).
                 raise ValueError(
                     f"Tuned checkpoint for task '{task}' matches the target architecture; "
                     "add it to native_target_tasks or set auto_detect_ckpt_base=true."
                 )
-            del raw_sd
+            native_tasks.add(task)
+            print(f"  {task}: native target checkpoint (auto-detected)")
+        else:
+            if strict_load:
+                coverage = _ckpt_visual_base_coverage(raw_sd, source_base_sd)
+                if coverage != 1.0:
+                    raise ValueError(
+                        f"Strict visual checkpoint coverage failed for task '{task}': "
+                        f"coverage={coverage:.6f}, expected=1.0 ({tuned_by_task[task]})."
+                    )
+            print(f"  {task}: source checkpoint (transport required)")
+        del raw_sd
 
-    if native_tasks:
-        if merge_mode == "none":
-            raise ValueError(
-                "Native target checkpoints require a merge mode; merge_mode='none' evaluates "
-                "per-task transported deltas only. Use merge_mode='rebase_then_merge'."
-            )
-        if merge_mode in _SINGLE_TRANSPORT_MODES:
-            raise ValueError(
-                "Native target checkpoints cannot participate in merge_then_rebase: the merge "
-                "happens on the source base, where native target deltas do not exist."
-            )
-        if transfusion_mode:
-            raise NotImplementedError(
-                "Native target checkpoints with transfusion are not supported: the permutation "
-                "prepare step swaps the target keyspace. Use a theseus/bico transport method."
-            )
-
-    if base_construction == "independent_endpoint_average":
-        if merge_mode not in _TRANSPORT_THEN_MERGE_MODES:
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires merge_mode='brace_transport_then_merge'."
-            )
-        if alpha_selection != "shared":
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires "
-                "alpha_selection='shared'; per-task alpha search is not part of this baseline."
-            )
-        if native_tasks:
-            raise ValueError(
-                "base_construction='independent_endpoint_average' requires every task to be "
-                "an independently transformed source endpoint; native target tasks are not allowed."
-            )
-        # B6: in the accepted merge modes the independent base is computed for nobody -- it is consumed only by
-        # brace_merge_then_transport, which this option cannot be combined with -- so the run would silently be
-        # identical to base_construction='per_task'.
-        raise ValueError(
-            f"base_construction='independent_endpoint_average' has no effect with merge_mode='{merge_mode}': the "
-            "independent endpoint base is only consumed by merge_mode='brace_merge_then_transport', which does "
-            "not support it. Use base_construction='per_task' (the identical computation)."
-        )
+    if native_tasks:  # auto-detected native tasks are only known here
+        check_native_target_tasks(merge_mode, transfusion=transfusion_mode)
 
     calibration = build_run_calibration(
         resolved,
@@ -296,13 +256,13 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         TransportedTvSaveSpec.from_config(
             cfg,
             method_name=method.name,
-            ariadne_like=resolved.direct_residual_like,
+            direct_fit=resolved.direct_fit,
             ariadne_cfg=resolved.ariadne_cfg,
             summary_dir=runtime.summary_dir,
         ),
         env,
     )
-    eval_observer, lmc_observer = build_prestep_observers()
+    (eval_observer,) = build_prestep_observers()
     method_stage = build_method_stage(
         env,
         transport_calibration_ctx=calibration.transport_calibration_ctx,
@@ -312,28 +272,23 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ariadne_calibration_ctx=calibration.ariadne_calibration_ctx,
         ariadne_calibration_meta=calibration.ariadne_calibration_meta,
     )
-    ariadne_record = method_stage.record if resolved.direct_residual_like else AriadneRunRecord()
+    ariadne_record = method_stage.record if resolved.direct_fit else AriadneRunRecord()
     # merge_then_brace_then_transport merges deltas on the native source base first and only then runs its own
     # once-only structural step, so neither prestep fires per-task under it (gating resolved in
     # `ResolvedRunConfig.bind`).
     pipeline = TaskPipeline(
         prestep=build_prestep(plan),
-        observers=(eval_observer, lmc_observer),
+        observers=(eval_observer,),
         method_stage=method_stage,
         saver=saver,
         build_models=build_task_models,
     )
     loop_outputs = pipeline.run(env, tasks, calibration.task_context_by_name)
 
-    if resolved.lmc.source_only:
+    if resolved.prestep_eval.source_only:
         # source_only skips transport, merge and target evaluation (B2: this used to crash on a zip length
         # mismatch); only the source-side observers' rows exist.
-        source_only_hash_after = _state_dict_sha256(env.target_base_sd)
-        if source_only_hash_after != env.target_hash_before:
-            raise RuntimeError(
-                "Native target base was mutated during source-only preparation: "
-                f"before={env.target_hash_before}, after={source_only_hash_after}."
-            )
+        source_only_hash_after = _assert_target_base_unmutated(env, "source-only preparation")
         return {
             "suite": resolved.suite_name,
             "tasks": resolved.tasks,
@@ -343,7 +298,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             "target_hash_before": env.target_hash_before,
             "target_hash_after": source_only_hash_after,
             "block_extension_target_dataset_eval": eval_observer.rows,
-            "source_lmc": lmc_observer.rows,
             "depth_alignment": resolved.depth_alignment_mode,
             "depth_rule_resolved": resolved.depth_rule_resolved,
         }
@@ -396,6 +350,11 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         ):
             print(f"  {item['task']}: rebase={r_a:.3f}  baseline={b_a:.3f}")
 
+    # TransFusion's once-only prepare may have swapped these run-level objects on ``env``. Checked before
+    # ``save_merged`` so a mutated target base never reaches disk.
+    target_hash_before = env.target_hash_before
+    target_hash_after = _assert_target_base_unmutated(env, "merge/transport preparation")
+
     saved_merged_path: str | None = None
     if cfg.get("save_merged"):
         if merge_mode == "none":
@@ -409,21 +368,10 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
                 alpha=float(alpha.best_alpha),
             )
             out_path = str(cfg["save_merged"])
-            out_parent = Path(out_path).parent
-            if str(out_parent):
-                out_parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(to_cpu_fp32(best_merged_state), out_path)
             saved_merged_path = out_path
             print(f"Saved merged model (alpha={alpha.best_alpha:.3f}) -> {out_path}")
-
-    # TransFusion's once-only prepare may have swapped these run-level objects on ``env``.
-    target_hash_before = env.target_hash_before
-    target_hash_after = _state_dict_sha256(env.target_base_sd)
-    if target_hash_after != target_hash_before:
-        raise RuntimeError(
-            "Native target base was mutated during merge/transport preparation: "
-            f"before={target_hash_before}, after={target_hash_after}."
-        )
 
     return assemble_summary(
         RunRecord.from_run(
@@ -436,7 +384,6 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             alpha=alpha,
             ariadne=ariadne_record,
             block_extension_eval_rows=eval_observer.rows,
-            source_lmc_rows=lmc_observer.rows,
             transported_artifacts=saver.artifacts,
             target_hash_before=target_hash_before,
             target_hash_after=target_hash_after,

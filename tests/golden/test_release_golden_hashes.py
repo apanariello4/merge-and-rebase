@@ -38,7 +38,6 @@ from ._hashing import deterministic_cpu, flatten_tensors, hash_json, hash_tensor
 # Expected hashes (captured at 7a7ee9a, CPU, torch.set_num_threads(1), deterministic algos).
 # --------------------------------------------------------------------------------------
 EXPECTED: dict[str, str] = {
-    "bico_gradin_vision_fc": "4b121cac8c44864123a0f13437199be901082960669c91f705d965e25701d896",
     "bico_vision_fc": "c2ce523b8acc67770595cee94c0743591546615452bb058017495d2b886e173d",
     "brace_decoder_class_api:extend:base_state": "e1aed95cfd7b20c7491faf29512838fe3943e56ea1a75e42847f3715d67165a3",
     "brace_decoder_class_api:extend:ft_state": "f69a0d35d9478fc0aa9fffb62657623f151c877c90c04d1d78e9aafb825e432f",
@@ -637,7 +636,6 @@ def _fc_transport(method_name, **kwargs):
         ("theseus_vision_fc_whiten025", "theseus", {"whiten_power": 0.25}),
         ("theseus_vision_fc_centered", "theseus", {"center_acts": True}),
         ("bico_vision_fc", "bico", {}),
-        ("bico_gradin_vision_fc", "bico_gradin", {}),
     ],
 )
 def test_vision_transport_direct_method_api(case, method_name, kwargs):
@@ -778,9 +776,9 @@ def _build_vision_orchestration(method_name, source_depth, target_depth, *, pres
         grad_batch_size=None,
         grad_imgs_per_class=None,
         grad_num_batches=None,
-        theseus_like_method=method_name.startswith("theseus"),
+        theseus_mode=method_name.startswith("theseus"),
         bico_mode=method_name.startswith("bico"),
-        run_block_extension_prestep=prestep,
+        depth_aligned_source=prestep,
         clf_source=clf_source,
         clf_target=clf_target,
         classnames=[],
@@ -1167,7 +1165,6 @@ def _llm_orchestration(method_name, direction):
 
         shared["source_recipe"] = causal_lm_recipe(device="cpu")
         shared["target_recipe"] = causal_lm_recipe(device="cpu")
-        kwargs["curvature_dataloader"] = None
     transported = method.transport(
         source_base=prepared_task.source_base,
         target_base=target_base_sd,

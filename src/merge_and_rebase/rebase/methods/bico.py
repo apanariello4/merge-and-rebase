@@ -347,158 +347,6 @@ def collect_bilinear_statistics(
     return registry
 
 
-def collect_gradin_statistics(
-    source_model: torch.nn.Module,
-    target_model: torch.nn.Module,
-    source_dataloader: Iterable[Any],
-    target_dataloader: Iterable[Any],
-    source_recipe,
-    target_recipe,
-    *,
-    device: str | torch.device,
-    seq_align: str,
-    n_batches: int | None,
-    seed: int = 0,
-    batch_size: int | None = None,
-    store_grams: bool = False,
-    family_adapter: Any = None,
-    projection_mode: str = "gradient",
-    source_activation_plan: _shared.InterpolatedBlockActivations | None = None,
-    padding_stats: dict[str, int] | None = None,
-) -> dict[str, _shared.ActivationStore]:
-    """
-    Like collect_bilinear_statistics, but fills .in using input-side gradients
-    (grad_input[0]) instead of forward activations.
-
-    Falls back to forward activations for modules where grad_input[0] is None
-    (e.g. the first layer whose input does not carry gradient).
-
-    Returns a dict with keys:
-      {module_name}.in  -> ActivationStore (input gradients, or forward activations)
-      {module_name}.out -> ActivationStore (output gradients, dL/dy)
-    """
-    if family_adapter is not None:
-        source_scope = family_adapter.transport_scope(source_model)
-        target_scope = family_adapter.transport_scope(target_model)
-    else:
-        source_scope = None
-        target_scope = None
-
-    registry: dict[str, _shared.ActivationStore] = {}
-    source_hook = _BiCoHook(source_model, scope=source_scope)
-    target_hook = _BiCoHook(target_model, scope=target_scope)
-    dev = _shared._resolve_device(device)
-
-    cpu_device = torch.device("cpu")
-
-    source_model.to(cpu_device)
-    target_model.to(cpu_device)
-
-    try:
-        iterator = _shared._iter_random_dataset_batches(
-            source_dataloader,
-            target_dataloader,
-            n_batches=n_batches,
-            seed=seed,
-            batch_size=batch_size,
-        )
-        if iterator is None:
-            iterator = zip(source_dataloader, target_dataloader, strict=True)
-
-        for idx, (source_batch, target_batch) in enumerate(iterator):
-            if n_batches is not None and idx >= n_batches:
-                break
-
-            source_inputs = _calibration_primary_input(source_batch, family_adapter)
-            target_inputs = _calibration_primary_input(target_batch, family_adapter)
-            if source_inputs.shape[0] != target_inputs.shape[0]:
-                raise ValueError(
-                    "BiCo gradin calibration expects aligned batch sizes. "
-                    f"Got {source_inputs.shape[0]} and {target_inputs.shape[0]}."
-                )
-            del source_inputs, target_inputs
-
-            row_mask = _calibration_row_mask(source_batch, target_batch, family_adapter)
-            _attn = _calibration_attention_masks(source_batch, target_batch, family_adapter)
-            if _attn is not None:
-                _shared._note_padding_rows(padding_stats, _attn[0] if _attn[0] is not None else _attn[1], row_mask)
-            if row_mask is not None and not bool(row_mask.any()):
-                continue  # all-padding batch: contributes no rows (and its loss would be undefined)
-
-            # Source: forward + backward on GPU with inputs marked grad
-            source_hook.clear()
-            _collect_batch(
-                source_model, source_recipe, source_batch, source_hook,
-                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
-            )
-            source_model.to(cpu_device)
-            torch.cuda.empty_cache()
-
-            # Target: forward + backward on GPU with inputs marked grad
-            target_hook.clear()
-            _collect_batch(
-                target_model, target_recipe, target_batch, target_hook,
-                device=dev, mark_inputs_grad=True, family_adapter=family_adapter,
-            )
-            target_model.to(cpu_device)
-            torch.cuda.empty_cache()
-
-            if source_activation_plan is not None:
-                source_activation_plan.apply(source_hook.in_grads)
-                source_activation_plan.apply(source_hook.inputs)
-                source_activation_plan.apply(source_hook.out_grads)
-
-            # Collect .in from grad_input, fallback to forward inputs
-            all_keys = set(source_hook.in_grads.keys())
-            all_keys |= set(source_hook.inputs.keys())
-            all_keys &= set(target_hook.in_grads.keys()) | set(target_hook.inputs.keys())
-
-            for key in all_keys:
-                if key in source_hook.in_grads and key in target_hook.in_grads:
-                    src_rows, tgt_rows = _shared._align_features(
-                        source_hook.in_grads[key], target_hook.in_grads[key], mode=seq_align, content_mask=row_mask
-                    )
-                elif key in source_hook.inputs and key in target_hook.inputs:
-                    if not _shared._poolable(seq_align, source_hook.inputs[key], target_hook.inputs[key]):
-                        continue  # integer hook inputs (embedding input_ids) cannot be pooled
-                    src_rows, tgt_rows = _shared._align_features(
-                        source_hook.inputs[key], target_hook.inputs[key], mode=seq_align, content_mask=row_mask
-                    )
-                else:
-                    continue
-                src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
-                reg_key = f"{key}.in"
-                store = registry.setdefault(
-                    reg_key,
-                    _shared.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
-                )
-                store.update(src_rows, tgt_rows)
-
-            # Collect .out from output gradients (same as bico)
-            common_grads = set(source_hook.out_grads.keys()) & set(target_hook.out_grads.keys())
-            for key in common_grads:
-                src_rows, tgt_rows = _shared._align_features(
-                    source_hook.out_grads[key], target_hook.out_grads[key], mode=seq_align, content_mask=row_mask
-                )
-                src_rows, tgt_rows = _shared._drop_padding_rows(src_rows, tgt_rows, row_mask)
-                reg_key = f"{key}.out"
-                store = registry.setdefault(
-                    reg_key,
-                    _shared.ActivationStore(store_a_gram=store_grams, store_b_gram=store_grams),
-                )
-                store.update(src_rows, tgt_rows)
-
-        _shared._require_content_rows(padding_stats, method="BiCo")
-
-    finally:
-        source_hook.remove()
-        target_hook.remove()
-        source_model.to(cpu_device)
-        target_model.to(cpu_device)
-
-    return registry
-
-
 @dataclass(frozen=True)
 class BiCoRebase:
     """
@@ -512,7 +360,6 @@ class BiCoRebase:
     """
 
     name: str = "bico"
-    _collect_fn = staticmethod(collect_bilinear_statistics)  # class-level, override in subclasses
 
     def prepare(
         self,
@@ -534,16 +381,15 @@ class BiCoRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
-        patch_qkv: bool = True,
+        split_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
         source_activation_plan: _shared.InterpolatedBlockActivations | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        split_qkv = kwargs.pop("split_qkv", None)
-        if split_qkv is not None:
-            patch_qkv = bool(split_qkv)
+        legacy_patch_qkv = kwargs.pop("patch_qkv", None)  # legacy name of split_qkv (no config sets both)
+        split_qkv = bool(split_qkv if legacy_patch_qkv is None else legacy_patch_qkv)
         transform_granularity = str(kwargs.pop("transform_granularity", "param")).strip().lower()
         if transform_granularity not in {"param", "module_type", "block", "global"}:
             raise ValueError("transform_granularity must be one of: param, module_type, block, global")
@@ -556,6 +402,7 @@ class BiCoRebase:
         if device_transform not in {"cpu", "gpu"}:
             raise ValueError("device_transform must be one of: cpu, gpu")
         svd_device = device if device_transform == "gpu" else "cpu"
+        _shared.reject_unread_method_params(self.name, kwargs, read_by_apply=("zero_attention_delta",))
         del kwargs
 
         if n_batches is None:
@@ -579,7 +426,7 @@ class BiCoRebase:
 
         patched_source = 0
         patched_target = 0
-        if patch_qkv:
+        if split_qkv:
             if verbose:
                 print(f"{log_prefix} prepare: patching fused qkv blocks if needed")
             patched_source = _shared._split_fused_qkv_if_needed(source_model)
@@ -592,7 +439,7 @@ class BiCoRebase:
                     patched_target,
                 )
         elif verbose:
-            print(f"{log_prefix} prepare: patch_qkv disabled")
+            print(f"{log_prefix} prepare: split_qkv disabled")
 
         activation_registry: dict[str, _shared.ActivationStore] = {}
         padding_stats: dict[str, int] = {}
@@ -609,7 +456,7 @@ class BiCoRebase:
             shared_transform_count=0,
             shared_group_count=0,
         )
-        split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
+        split_fused_qkv = bool(split_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
 
@@ -617,7 +464,7 @@ class BiCoRebase:
             if verbose:
                 print(f"{log_prefix} prepare: collecting bilinear statistics (input activations + output gradients)")
 
-            activation_registry = self._collect_fn(
+            activation_registry = collect_bilinear_statistics(
                 source_model,
                 target_model,
                 source_dataloader,
@@ -688,7 +535,7 @@ class BiCoRebase:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
 
         finally:
-            if patch_qkv and (patched_source > 0 or patched_target > 0):
+            if split_qkv and (patched_source > 0 or patched_target > 0):
                 try:
                     unpatched_source = int(merge_openclip_vit_attn(_shared._visual_module(source_model)))
                     unpatched_target = int(merge_openclip_vit_attn(_shared._visual_module(target_model)))
@@ -746,116 +593,18 @@ class BiCoRebase:
         **kwargs,
     ) -> TensorDict:
         del kwargs
-        log_prefix = f"[{self.name}]"
-
-        if verbose:
-            print(f"{log_prefix} apply: start")
-
-        transforms_by_key = prepared.get("transforms_by_key", None)
-        if transforms_by_key is None:
-            raise ValueError("BiCo prepared payload is missing 'transforms_by_key'.")
-
-        if family_adapter is not None:
-            tp_keys = family_adapter.transportable_keys(target_base)
-            key_map = {k: k for k in delta if k in tp_keys}
-            target_scoped_base_work = {k: target_base[k] for k in key_map.values() if k in target_base}
-            scoped_delta_work = {k: delta[k] for k in key_map if k in target_scoped_base_work}
-            split_fused_qkv = False
-            out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
-            skipped_not_in_target_keys = tuple(k for k in key_map if k not in target_base)
-        else:
-            key_map = _shared._visual_delta_keys(delta)
-            target_scoped_base = _shared._visual_state_dict(target_base)
-
-            scoped_delta = {
-                stripped_key: delta[original_key]
-                for stripped_key, original_key in key_map.items()
-            }
-
-            split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
-            if split_fused_qkv:
-                target_scoped_base_work = _shared._split_fused_qkv_state(target_scoped_base)
-                scoped_delta_work = _shared._split_fused_qkv_state(
-                    {key: value for key, value in scoped_delta.items() if key in target_scoped_base}
-                )
-            else:
-                target_scoped_base_work = target_scoped_base
-                scoped_delta_work = {key: value for key, value in scoped_delta.items() if key in target_scoped_base}
-            has_prefixed_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
-            out_of_scope_keys = tuple(
-                key for key in delta
-                if has_prefixed_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
-            )
-            skipped_not_in_target_keys = tuple(
-                original_key
-                for stripped_key, original_key in key_map.items()
-                if stripped_key not in target_scoped_base and original_key not in out_of_scope_keys
-            )
-
-        if strict and not scoped_delta_work:
-            raise ValueError("BiCo did not find any visual delta keys to transport.")
-
-        compute_device = prepared.get("compute_device", "cpu")
-        aligned_scoped, apply_diag = _shared._apply_transforms_to_visual_delta(
-            target_visual_base=target_scoped_base_work,
-            visual_delta=scoped_delta_work,
-            transforms_by_key=transforms_by_key,
-            show_progress=bool(show_progress),
+        return _shared.apply_prepared_transforms(
             method_name=self.name,
-            device=compute_device,
-            strict=bool(strict),
-            out_of_scope_keys=out_of_scope_keys,
-            skipped_not_in_target_keys=skipped_not_in_target_keys,
+            method_label="BiCo",
+            prepared=prepared,
+            target_base=target_base,
+            delta=delta,
+            strict=strict,
+            verbose=verbose,
+            show_progress=show_progress,
+            family_adapter=family_adapter,
+            zero_attention_delta=zero_attention_delta,
         )
-
-        if split_fused_qkv:
-            aligned_scoped = _shared._merge_split_qkv_state(aligned_scoped, reference=target_scoped_base)
-
-        out: TensorDict = {}
-        processed: set[str] = set()
-
-        for stripped_key, original_key in key_map.items():
-            if original_key not in target_base:
-                continue
-            if stripped_key in aligned_scoped:
-                out[original_key] = aligned_scoped[stripped_key].to(
-                    dtype=target_base[original_key].dtype,
-                    device=target_base[original_key].device,
-                )
-            else:
-                out[original_key] = torch.zeros_like(target_base[original_key], device=target_base[original_key].device)
-            processed.add(original_key)
-
-        for key in delta:
-            if key in processed or key not in target_base:
-                continue
-            out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
-
-        if zero_attention_delta:
-            # Ablation: reproduce the transport coverage of the legacy
-            # InputAlignedBlock path, where the split-qkv patch landed on the
-            # wrapper while forward ran through the unhooked original block, so
-            # attention never produced calibration statistics and its delta was
-            # written as zeros.
-            zeroed = 0
-            for key in out:
-                if ".attn." in key:
-                    out[key] = torch.zeros_like(out[key])
-                    zeroed += 1
-            if verbose:
-                print(f"{log_prefix} apply: zero_attention_delta zeroed {zeroed} attention keys")
-
-        if strict:
-            expected_keys = {key for key in key_map.values() if key in target_base}
-            missing = sorted(expected_keys - set(out.keys()))
-            if missing:
-                raise KeyError(f"BiCo did not transport all delta keys. Example: {missing[:10]}")
-
-        if verbose:
-            _shared._report_apply_diagnostics(method_name=self.name, diagnostics=apply_diag, verbose=True)
-            print(f"{log_prefix} apply: done (transported_keys={len(out)})")
-
-        return out
 
     def transport(
         self,
@@ -880,7 +629,7 @@ class BiCoRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
-        patch_qkv: bool = True,
+        split_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
@@ -918,7 +667,7 @@ class BiCoRebase:
                 n_batches=n_batches,
                 seed=int(seed),
                 batch_size=batch_size,
-                patch_qkv=patch_qkv,
+                split_qkv=split_qkv,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 family_adapter=family_adapter,
@@ -942,20 +691,3 @@ class BiCoRebase:
 
 
 register(BiCoRebase())
-
-
-@dataclass(frozen=True)
-class BiCoGradInRebase(BiCoRebase):
-    """
-    Variant of BiCo where T_in is computed from input-side gradients
-    (grad_input[0]) instead of forward activations.
-
-    Falls back to forward activations for modules whose grad_input is None
-    (e.g. the first layer whose input has no gradient requirement).
-    """
-
-    name: str = "bico_gradin"
-    _collect_fn = staticmethod(collect_gradin_statistics)
-
-
-register(BiCoGradInRebase())

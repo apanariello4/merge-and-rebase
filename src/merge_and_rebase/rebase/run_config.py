@@ -24,8 +24,6 @@ Ariadne never reaches ``get_method`` or ``resolve_block_extension_config`` (see
 
 from __future__ import annotations
 
-import enum
-import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -42,36 +40,13 @@ from .block_extension.config import (
     resolve_block_extension_config,
     warn_brace_only_fields_under_discrete,
 )
-from .merge_modes import _SINGLE_TRANSPORT_MODES, _resolve_merge_mode_config
+from .capabilities import MethodFamily, default_depth_prestep, depth_prestep_methods, method_family
+from .config_schema import canonicalize
+from .merge_modes import _SINGLE_TRANSPORT_MODES, _TRANSPORT_THEN_MERGE_MODES, _resolve_merge_mode_config
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
-from .registry import canonical_method_name
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
 
-_THESEUS_LIKE = frozenset({"theseus", "theseus_reference"})
-_BICO_LIKE = frozenset({"bico", "bico_gradin"})
 _BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
-
-
-class MethodKind(enum.Enum):
-    """Coarse dispatch class of the configured rebase method (replaces five booleans)."""
-
-    THESEUS_LIKE = "theseus_like"
-    BICO_LIKE = "bico_like"
-    TRANSFUSION = "transfusion"
-    ARIADNE = "ariadne"
-    OTHER = "other"
-
-    @classmethod
-    def of(cls, method_name: str) -> MethodKind:
-        if canonical_method_name(method_name) == "ariadne":
-            return cls.ARIADNE
-        if method_name in _THESEUS_LIKE:
-            return cls.THESEUS_LIKE
-        if method_name in _BICO_LIKE:
-            return cls.BICO_LIKE
-        if method_name == "transfusion":
-            return cls.TRANSFUSION
-        return cls.OTHER
 
 
 @dataclass(frozen=True)
@@ -90,20 +65,43 @@ class DepthRule:
 
 
 @dataclass(frozen=True)
-class SourceLmcSpec:
+class PrestepEvalSpec:
+    """Source/target evaluation around the depth prestep (``eval_before_rebase``) and ``source_only`` runs."""
+
     block_extension_eval_requested: bool
     block_extension_eval_enabled: bool
     block_extension_eval_split: str
     block_extension_eval_first_n_batches: Any
-    eval: bool
-    eval_split: str
-    first_n_batches: int | None
-    alphas: list[float]
-    cross_task_pairs: list[tuple[str, str]]
-    cross_task_split: str
-    all_task_tasks: list[str]
-    all_task_split: str
     source_only: bool
+
+
+#: Source-model linear-mode-connectivity (LMC) evaluation was removed. Configs that ask for it fail loudly; keys left
+#: at their "off" value are ignored, since they never influenced a result.
+_REMOVED_LMC_KEYS = (
+    "source_lmc_eval",
+    "source_lmc_eval_split",
+    "source_lmc_first_n_batches",
+    "source_lmc_alpha_min",
+    "source_lmc_alpha_max",
+    "source_lmc_alpha_step",
+    "cross_task_lmc_pairs",
+    "cross_task_lmc_eval_split",
+    "all_task_lmc_tasks",
+    "all_task_lmc_eval_split",
+)
+
+
+def _reject_removed_lmc_keys(cfg: Mapping[str, Any]) -> None:
+    requested = [
+        key
+        for key in ("source_lmc_eval", "cross_task_lmc_pairs", "all_task_lmc_tasks")
+        if cfg.get(key)  # true / a non-empty list asks for an evaluation that no longer exists
+    ]
+    if requested:
+        raise ValueError(
+            f"source-model LMC evaluation was removed; drop {requested} (and the other "
+            "source_lmc_* / cross_task_lmc_* / all_task_lmc_* keys) from the config."
+        )
 
 
 @dataclass(frozen=True)
@@ -133,7 +131,7 @@ class ResolvedRunConfig:
     method_name: str
     method_params: dict
     method_label: str
-    method_kind: MethodKind
+    method_family: MethodFamily | None
     block_extension_enabled: bool
     block_extension_cfg: BlockExtensionConfig
     depth_rule: DepthRule
@@ -141,7 +139,7 @@ class ResolvedRunConfig:
     ariadne_preset: str | None
     merge: MergeSpec
     alpha: AlphaSpec
-    lmc: SourceLmcSpec
+    prestep_eval: PrestepEvalSpec
     strict_load: bool
     device: str
     grad_batch_size: int | None
@@ -153,25 +151,27 @@ class ResolvedRunConfig:
     # Additive summary record of the resolved depth rule, and the post-model guard (P5.12).
     depth_rule_resolved: dict = field(default_factory=dict)
     depth_guard: str | None = None
-    #: Methods that run the block-extension prestep. The LLM resolver overrides it (adds ``theseus_gqa``).
-    blockext_methods: frozenset[str] = _THESEUS_LIKE | _BICO_LIKE
+    #: Entrypoint that resolved this config; selects the methods that run the depth prestep there.
+    entrypoint: Literal["vision", "llm"] = "vision"
 
-    # -- method-kind predicates (exactly the legacy boolean sets) ----------------------------
+    # -- method dispatch predicates (from ``rebase.capabilities.METHOD_TRAITS``) ------------------
     @property
-    def direct_residual_like(self) -> bool:
-        return self.method_kind is MethodKind.ARIADNE
+    def direct_fit(self) -> bool:
+        """The method fits the target task vector itself (Ariadne) instead of transporting the source one."""
+        return self.method_family is MethodFamily.DIRECT_FIT
 
     @property
-    def theseus_like_method(self) -> bool:
-        return self.method_name in _THESEUS_LIKE
+    def theseus_mode(self) -> bool:
+        return self.method_name == "theseus"
 
     @property
     def bico_mode(self) -> bool:
-        return self.method_name in _BICO_LIKE
+        return self.method_name == "bico"
 
     @property
-    def blockext_like_method(self) -> bool:
-        return self.method_name in self.blockext_methods
+    def depth_prestep_method(self) -> bool:
+        """Depth-mismatched pairs of this method run the depth prestep (BRACE / discrete index match)."""
+        return self.method_name in depth_prestep_methods(self.entrypoint)
 
     @property
     def transfusion_mode(self) -> bool:
@@ -185,46 +185,68 @@ class ResolvedRunConfig:
         """Post-model guards and prestep flags (needs the real source/target depths)."""
         if self.depth_guard is not None and source_depth != target_depth:
             raise ConfigMeaningChangedError(self.depth_guard)
-        blockext_like_method = self.blockext_like_method
-        run_block_extension_prestep = bool(
-            blockext_like_method
-            and self.block_extension_enabled
-            and self.depth_rule.kind == "brace"
-            and source_depth != target_depth
-        )
-        run_discrete_layer_match_prestep = bool(
-            blockext_like_method and self.depth_rule.kind == "discrete_index_match" and source_depth != target_depth
-        )
-        if self.merge.mode == "merge_then_rebase" and run_block_extension_prestep:
+        rule = "none"
+        if self.depth_prestep_method and source_depth != target_depth:
+            if self.depth_rule.kind == "brace" and self.block_extension_enabled:
+                rule = "brace"
+            elif self.depth_rule.kind == "discrete_index_match":
+                rule = "discrete_index_match"
+        # merge_then_brace_then_transport merges deltas on the native source base first and only
+        # then runs its own once-only structural step, so the prestep never fires per task under it.
+        timing = "once_on_merged_source" if self.merge.mode == "merge_then_brace_then_transport" else "per_task"
+        if self.merge.mode == "merge_then_rebase" and rule == "brace":
             raise NotImplementedError(
                 "merge_then_rebase does not support the block-extension prestep yet: "
                 "per-task extended source bases live on different keyspaces and cannot be "
                 "merged without a consensus-base step (see transport_then_merge). "
                 "Use merge_mode='rebase_then_merge' for depth-mismatch pairs."
             )
-        # merge_then_brace_then_transport merges deltas on the native source base first and only
-        # then runs its own once-only structural step, so neither prestep fires per-task under it.
-        per_task_gate = self.merge.mode != "merge_then_brace_then_transport"
         return RunPlan(
             source_depth=int(source_depth),
             target_depth=int(target_depth),
-            run_block_extension_prestep=run_block_extension_prestep,
-            run_discrete_layer_match_prestep=run_discrete_layer_match_prestep,
-            task_block_extension_prestep=bool(run_block_extension_prestep and per_task_gate),
-            task_discrete_layer_match_prestep=bool(run_discrete_layer_match_prestep and per_task_gate),
+            depth_alignment=DepthAlignment(rule=rule, timing=timing),  # type: ignore[arg-type]
         )
 
 
 @dataclass(frozen=True)
+class DepthAlignment:
+    """How the source is brought to the target depth: decided once, in ``ResolvedRunConfig.bind``.
+
+    ``rule``: ``brace`` (block extension / shrink), ``discrete_index_match`` (reindexed stack) or ``none`` (equal
+    depths, a method that runs no depth prestep, or BRACE disabled). ``timing``: ``per_task`` (prestep before each
+    task's transport) or ``once_on_merged_source`` (``merge_then_brace_then_transport``: once, on the merged source).
+    """
+
+    rule: Literal["none", "brace", "discrete_index_match"]
+    timing: Literal["per_task", "once_on_merged_source"]
+
+
+@dataclass(frozen=True)
 class RunPlan:
-    """Post-model plan: which depth prestep runs, globally and per task."""
+    """Post-model plan: the source/target depths and the depth alignment they need."""
 
     source_depth: int
     target_depth: int
-    run_block_extension_prestep: bool
-    run_discrete_layer_match_prestep: bool
-    task_block_extension_prestep: bool
-    task_discrete_layer_match_prestep: bool
+    depth_alignment: DepthAlignment
+
+    # -- views of ``depth_alignment`` -----------------------------------------------------------
+    @property
+    def run_block_extension_prestep(self) -> bool:
+        """BRACE runs (per task or once on the merged source)."""
+        return self.depth_alignment.rule == "brace"
+
+    @property
+    def run_discrete_layer_match_prestep(self) -> bool:
+        return self.depth_alignment.rule == "discrete_index_match"
+
+    @property
+    def task_block_extension_prestep(self) -> bool:
+        """BRACE runs as the per-task prestep."""
+        return self.run_block_extension_prestep and self.depth_alignment.timing == "per_task"
+
+    @property
+    def task_discrete_layer_match_prestep(self) -> bool:
+        return self.run_discrete_layer_match_prestep and self.depth_alignment.timing == "per_task"
 
 
 class ConfigMeaningChangedError(ValueError):
@@ -252,8 +274,53 @@ def _meaning_changed_message(method_name: str, reason: str, old_fix: str) -> str
     )
 
 
+def check_native_target_tasks(merge_mode: str, *, transfusion: bool) -> None:
+    """Native target checkpoints (explicit or auto-detected) need a merge mode that merges on the target base."""
+    if merge_mode == "none":
+        raise ValueError(
+            "Native target checkpoints require a merge mode; merge_mode='none' evaluates "
+            "per-task transported deltas only. Use merge_mode='rebase_then_merge'."
+        )
+    if merge_mode in _SINGLE_TRANSPORT_MODES:
+        raise ValueError(
+            "Native target checkpoints cannot participate in merge_then_rebase: the merge "
+            "happens on the source base, where native target deltas do not exist."
+        )
+    if transfusion:
+        raise NotImplementedError(
+            "Native target checkpoints with transfusion are not supported: the permutation "
+            "prepare step swaps the target keyspace. Use a theseus/bico transport method."
+        )
+
+
+def reject_independent_endpoint_average(merge_mode: str, alpha_selection: str, *, has_native_tasks: bool) -> None:
+    """``base_construction='independent_endpoint_average'`` is never valid; raise the most specific reason."""
+    if merge_mode not in _TRANSPORT_THEN_MERGE_MODES:
+        raise ValueError(
+            "base_construction='independent_endpoint_average' requires merge_mode='brace_transport_then_merge'."
+        )
+    if alpha_selection != "shared":
+        raise ValueError(
+            "base_construction='independent_endpoint_average' requires "
+            "alpha_selection='shared'; per-task alpha search is not part of this baseline."
+        )
+    if has_native_tasks:
+        raise ValueError(
+            "base_construction='independent_endpoint_average' requires every task to be "
+            "an independently transformed source endpoint; native target tasks are not allowed."
+        )
+    # B6: in the accepted merge modes the independent base is computed for nobody -- it is consumed only by
+    # brace_merge_then_transport, which this option cannot be combined with -- so the run would silently be
+    # identical to base_construction='per_task'.
+    raise ValueError(
+        f"base_construction='independent_endpoint_average' has no effect with merge_mode='{merge_mode}': the "
+        "independent endpoint base is only consumed by merge_mode='brace_merge_then_transport', which does "
+        "not support it. Use base_construction='per_task' (the identical computation)."
+    )
+
+
 def resolve_depth_rule(
-    method_kind: MethodKind,
+    default_rule: str | None,
     method_name: str,
     cfg: Mapping[str, Any],
     block_extension_enabled: bool,
@@ -263,15 +330,16 @@ def resolve_depth_rule(
 
     ``depth_guard`` is a message that ``ResolvedRunConfig.bind`` raises as ``ConfigMeaningChangedError``
     when the source/target depths turn out to differ (the depths are unknown before the models exist).
+    ``default_rule`` is the method's default depth prestep (``rebase.capabilities.default_depth_prestep``).
     """
     mode = _parse_depth_defaults(cfg)
-    if mode == "legacy" or method_kind not in (MethodKind.THESEUS_LIKE, MethodKind.BICO_LIKE):
+    if mode == "legacy" or default_rule is None:
         return _resolve_depth_rule(cfg), block_extension_cfg, None
     schema = parse_depth_rule_schema(cfg, warn=False)
     raw_params = cfg.get("block_extension_params") or {}
     source = schema.source or "method_default"
     guard: str | None = None
-    if method_kind is MethodKind.BICO_LIKE:
+    if default_rule == "discrete_index_match":
         rule = "discrete_index_match" if schema.rule == "method_default" else schema.rule
         if rule == "discrete_index_match":
             warn_brace_only_fields_under_discrete(raw_params, stacklevel=3)
@@ -332,13 +400,13 @@ def resolve_depth_rule(
 
 
 def _depth_rule_record(
-    method_kind: MethodKind,
+    default_rule: str | None,
     depth_rule: DepthRule,
     block_extension_cfg: BlockExtensionConfig,
     ariadne_cfg: Any,
 ) -> dict:
     """Additive summary record ``depth_rule_resolved`` (rule, extension_strategy, skip_correction, ...)."""
-    blockext = method_kind in (MethodKind.THESEUS_LIKE, MethodKind.BICO_LIKE)
+    blockext = default_rule is not None
     brace = blockext and depth_rule.kind == "brace"
     return {
         "rule": depth_rule.kind if blockext else "none",
@@ -374,6 +442,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     """
     if suites is None:
         from ..eval.datasets.vision8_14_20 import SUITES as suites
+    cfg = canonicalize(cfg)  # canonical or legacy key names; see rebase/config_schema.py
 
     method_name, method_params = resolve_rebase_method_config(cfg)
     # Ariadne (formerly Direct Residual; "direct_residual" is a registry alias of "ariadne" and
@@ -385,9 +454,9 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     # a single BRACE code path. See tests/test_vision_rebase_direct_residual_dispatch.py.
     # `method_name` stays exactly what the config said (it is recorded verbatim in the run
     # summary); only the dispatch decision goes through the canonical name.
-    method_kind = MethodKind.of(method_name)
-    direct_residual_like = method_kind is MethodKind.ARIADNE
-    if direct_residual_like:
+    family = method_family(method_name)
+    direct_fit = family is MethodFamily.DIRECT_FIT
+    if direct_fit:
         method = SimpleNamespace(name=method_name)
         block_extension_enabled = False
         block_extension_cfg = BlockExtensionConfig()
@@ -418,13 +487,14 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         direct_residual_cfg = None
         direct_residual_preset = None
     method_label = format_rebase_method_label(method_name, method_params)
-    blockext_like_method = method_name in (_THESEUS_LIKE | _BICO_LIKE)
+    depth_prestep_method = method_name in depth_prestep_methods("vision")
+    default_rule = default_depth_prestep(method_name, "vision")
     depth_rule, block_extension_cfg, depth_guard = resolve_depth_rule(
-        method_kind, method_name, cfg, block_extension_enabled, block_extension_cfg
+        default_rule, method_name, cfg, block_extension_enabled, block_extension_cfg
     )
-    depth_rule_resolved = _depth_rule_record(method_kind, depth_rule, block_extension_cfg, direct_residual_cfg)
+    depth_rule_resolved = _depth_rule_record(default_rule, depth_rule, block_extension_cfg, direct_residual_cfg)
     if (
-        direct_residual_like
+        direct_fit
         and direct_residual_cfg.merge_mode == "merge_in_source_then_fit"
         and str(cfg.get("alpha_selection", "shared")).strip().lower() != "shared"
     ):
@@ -438,70 +508,17 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         )
     eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
     block_extension_eval_requested = bool(eval_before_rebase)
-    block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
+    block_extension_eval_enabled = bool(block_extension_eval_requested and depth_prestep_method)
     block_extension_eval_split = str(cfg.get("block_extension_eval_split", "test")).strip().lower()
     if block_extension_eval_split not in {"val", "test"}:
         raise ValueError("block_extension_eval_split must be one of: val, test")
     block_extension_eval_first_n_batches = block_extension_cfg.first_n_eval_batches
-    source_lmc_eval = bool(cfg.get("source_lmc_eval", False))
-    source_lmc_eval_split = str(cfg.get("source_lmc_eval_split", "val")).strip().lower()
-    if source_lmc_eval_split not in {"val", "test"}:
-        raise ValueError("source_lmc_eval_split must be one of: val, test")
-    source_lmc_first_n_batches_raw = cfg.get("source_lmc_first_n_batches", None)
-    source_lmc_first_n_batches = (
-        int(source_lmc_first_n_batches_raw) if source_lmc_first_n_batches_raw is not None else None
-    )
-    source_lmc_alpha_min = float(cfg.get("source_lmc_alpha_min", 0.0))
-    source_lmc_alpha_max = float(cfg.get("source_lmc_alpha_max", 1.0))
-    source_lmc_alpha_step = float(cfg.get("source_lmc_alpha_step", 0.05))
-    if source_lmc_alpha_step <= 0:
-        raise ValueError("source_lmc_alpha_step must be > 0")
-    source_lmc_alphas = torch.arange(
-        source_lmc_alpha_min,
-        source_lmc_alpha_max + source_lmc_alpha_step * 0.5,
-        source_lmc_alpha_step,
-    ).tolist()
-    cross_task_lmc_pairs_raw = cfg.get("cross_task_lmc_pairs", [])
-    if cross_task_lmc_pairs_raw is None:
-        cross_task_lmc_pairs_raw = []
-    if not isinstance(cross_task_lmc_pairs_raw, (list, tuple)):
-        raise ValueError("cross_task_lmc_pairs must be a list of two-task lists.")
-    cross_task_lmc_pairs: list[tuple[str, str]] = []
-    for pair in cross_task_lmc_pairs_raw:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise ValueError("Each cross_task_lmc_pairs item must contain exactly two task names.")
-        task_a, task_b = str(pair[0]), str(pair[1])
-        if task_a == task_b:
-            raise ValueError("cross_task_lmc_pairs cannot interpolate a task with itself.")
-        cross_task_lmc_pairs.append((task_a, task_b))
-    cross_task_lmc_split = str(cfg.get("cross_task_lmc_eval_split", source_lmc_eval_split)).strip().lower()
-    if cross_task_lmc_split not in {"val", "test"}:
-        raise ValueError("cross_task_lmc_eval_split must be one of: val, test")
-    all_task_lmc_tasks_raw = cfg.get("all_task_lmc_tasks", [])
-    if all_task_lmc_tasks_raw is None:
-        all_task_lmc_tasks_raw = []
-    if not isinstance(all_task_lmc_tasks_raw, (list, tuple)):
-        raise ValueError("all_task_lmc_tasks must be a list of task names.")
-    all_task_lmc_tasks = [str(task) for task in all_task_lmc_tasks_raw]
-    if all_task_lmc_tasks and (len(all_task_lmc_tasks) < 2 or len(set(all_task_lmc_tasks)) != len(all_task_lmc_tasks)):
-        raise ValueError("all_task_lmc_tasks must contain at least two distinct task names.")
-    all_task_lmc_split = str(cfg.get("all_task_lmc_eval_split", cross_task_lmc_split)).strip().lower()
-    if all_task_lmc_split not in {"val", "test"}:
-        raise ValueError("all_task_lmc_eval_split must be one of: val, test")
-    if cross_task_lmc_pairs or all_task_lmc_tasks:
-        # B5 / D-P5c: the cross-task and all-task LMC evaluators are never called, so these keys only ever
-        # produced empty summary entries. Keys are kept (deprecated) so old configs still load.
-        warnings.warn(
-            "cross_task_lmc_pairs / all_task_lmc_tasks are deprecated: the cross-task and all-task source-LMC "
-            "evaluations are not implemented and their summary entries are always empty.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    _reject_removed_lmc_keys(cfg)
     source_only = bool(cfg.get("source_only", False))
     strict_load = bool(cfg.get("strict_load", False))
     device = str(cfg.get("device", "cuda"))
 
-    if block_extension_eval_requested and not blockext_like_method:
+    if block_extension_eval_requested and not depth_prestep_method:
         print(
             "Block-extension target-dataset eval: requested but skipped "
             f"(method='{method_name}' does not support block-extension)."
@@ -538,7 +555,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         raise ValueError("alpha_selection must be one of: shared, per_task")
 
     merge_mode, merge_method_name, merge_params, global_alpha_search = _resolve_merge_mode_config(cfg, alpha_selection)
-    if direct_residual_like and merge_mode in _SINGLE_TRANSPORT_MODES:
+    if direct_fit and merge_mode in _SINGLE_TRANSPORT_MODES:
         # merge_then_rebase / brace_merge_then_transport / merge_then_brace_then_transport all end
         # by calling method.transport() once on a merged direction. Direct Residual has no such
         # method object to call, and its own once-only merge path is
@@ -574,13 +591,23 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         if bad:
             raise ValueError(f"Unknown tasks: {bad}. Allowed: {sorted(suite.tasks)}")
 
+    # Config-only checks of the vision pre-model pass: they fail before any model or checkpoint is loaded.
+    native_target_tasks = [str(t) for t in (cfg.get("native_target_tasks", []) or [])]
+    unknown_native_tasks = [t for t in native_target_tasks if t not in tasks]
+    if unknown_native_tasks:
+        raise ValueError(f"native_target_tasks contains tasks not in the task list: {unknown_native_tasks}")
+    if native_target_tasks:
+        check_native_target_tasks(merge_mode, transfusion=method_name == "transfusion")
+    if base_construction == "independent_endpoint_average":
+        reject_independent_endpoint_average(merge_mode, alpha_selection, has_native_tasks=bool(native_target_tasks))
+
     return ResolvedRunConfig(
         cfg=cfg,
         method=method,
         method_name=method_name,
         method_params=method_params,
         method_label=method_label,
-        method_kind=method_kind,
+        method_family=family,
         block_extension_enabled=block_extension_enabled,
         block_extension_cfg=block_extension_cfg,
         depth_rule=depth_rule,
@@ -600,19 +627,11 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
             alphas=alphas,
             selection=alpha_selection,
         ),
-        lmc=SourceLmcSpec(
+        prestep_eval=PrestepEvalSpec(
             block_extension_eval_requested=block_extension_eval_requested,
             block_extension_eval_enabled=block_extension_eval_enabled,
             block_extension_eval_split=block_extension_eval_split,
             block_extension_eval_first_n_batches=block_extension_eval_first_n_batches,
-            eval=source_lmc_eval,
-            eval_split=source_lmc_eval_split,
-            first_n_batches=source_lmc_first_n_batches,
-            alphas=source_lmc_alphas,
-            cross_task_pairs=cross_task_lmc_pairs,
-            cross_task_split=cross_task_lmc_split,
-            all_task_tasks=all_task_lmc_tasks,
-            all_task_split=all_task_lmc_split,
             source_only=source_only,
         ),
         strict_load=strict_load,

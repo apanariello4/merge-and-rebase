@@ -1,7 +1,7 @@
 """Method-stage records and protocols for the per-task rebase pipeline (Phase 5.9).
 
 Like ``rebase/prestep.py`` this module is model- and dataset-agnostic and must not import
-``merge_and_rebase.eval``: the concrete vision stages (``TransportMethodStage``, ``AriadneStage``)
+``merge_and_rebase.eval``: the concrete vision stages (``TransportStage``, ``DirectFitStage``)
 live in ``eval/vision_rebase/method_stages.py``.
 """
 
@@ -130,7 +130,7 @@ class TaskPipeline:
         # merges every task's native delta ONCE before the per-task loop and fits one shared correction; the
         # stage caches it and the loop reuses it for every task.
         # No method stage when the run stops after the before-rebase eval (LLM eval_before_rebase_only).
-        if resolved.direct_residual_like and self.method_stage is not None:
+        if resolved.direct_fit and self.method_stage is not None:
             self.method_stage.precompute(env)
 
         for task in tasks:
@@ -155,7 +155,7 @@ class TaskPipeline:
             if "alignment_calibration" in pre.timings:
                 out.alignment_calibration_timings[task] = pre.timings["alignment_calibration"]
 
-            if resolved.lmc.source_only:
+            if resolved.prestep_eval.source_only:
                 continue
 
             # TransFusion's once-only prepare rebinds run-level objects on ``env`` (see NoPrestep.load_delta).

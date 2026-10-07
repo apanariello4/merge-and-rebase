@@ -87,6 +87,8 @@ from ._shared import (  # noqa: F401
     _visual_module,  # noqa: F401
     _visual_state_dict,  # noqa: F401
     _WrongTransportShape,  # noqa: F401
+    apply_prepared_transforms,
+    reject_unread_method_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -487,7 +489,7 @@ class TheseusRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
-        patch_qkv: bool = True,
+        split_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
@@ -507,9 +509,8 @@ class TheseusRebase:
             raise ValueError("activation_cache_mode must be one of: off, auto, load, refresh")
         if activation_cache_mode != "off" and not activation_cache_dir:
             raise ValueError("activation_cache_dir is required when activation_cache_mode is enabled")
-        split_qkv = kwargs.pop("split_qkv", None)
-        if split_qkv is not None:
-            patch_qkv = bool(split_qkv)
+        legacy_patch_qkv = kwargs.pop("patch_qkv", None)  # legacy name of split_qkv (no config sets both)
+        split_qkv = bool(split_qkv if legacy_patch_qkv is None else legacy_patch_qkv)
         transform_granularity = str(kwargs.pop("transform_granularity", "param")).strip().lower()
         if transform_granularity not in {"param", "module_type", "block", "global"}:
             raise ValueError("transform_granularity must be one of: param, module_type, block, global")
@@ -517,6 +518,7 @@ class TheseusRebase:
         if device_transform not in {"cpu", "gpu"}:
             raise ValueError("device_transform must be one of: cpu, gpu")
         svd_device = device if device_transform == "gpu" else "cpu"
+        reject_unread_method_params(self.name, kwargs)
         del kwargs
         #Config fallbacks num_batches -> n_batches
         if n_batches is None:
@@ -574,7 +576,7 @@ class TheseusRebase:
 
         patched_source = 0
         patched_target = 0
-        if patch_qkv:
+        if split_qkv:
             if verbose:
                 print(f"{log_prefix} prepare: patching fused qkv blocks if needed")
             patched_source = _split_fused_qkv_if_needed(source_model)
@@ -589,7 +591,7 @@ class TheseusRebase:
                     patched_target,
                 )
         elif verbose:
-            print(f"{log_prefix} prepare: patch_qkv disabled")
+            print(f"{log_prefix} prepare: split_qkv disabled")
 
         activation_registry: dict[str, ActivationStore] = {}
         padding_stats: dict[str, int] = {}
@@ -606,7 +608,7 @@ class TheseusRebase:
             shared_transform_count=0,
             shared_group_count=0,
         )
-        split_fused_qkv = bool(patch_qkv and (patched_source > 0 or patched_target > 0))
+        split_fused_qkv = bool(split_qkv and (patched_source > 0 or patched_target > 0))
         unpatched_source = 0
         unpatched_target = 0
         try:
@@ -752,7 +754,7 @@ class TheseusRebase:
             elif verbose:
                 print(f"{log_prefix} prepare: target_base/delta missing, skipping transform precompute")
         finally:
-            if patch_qkv and (patched_source > 0 or patched_target > 0):
+            if split_qkv and (patched_source > 0 or patched_target > 0):
                 try:
                     unpatched_source = int(merge_openclip_vit_attn(_visual_module(source_model)))
                     unpatched_target = int(merge_openclip_vit_attn(_visual_module(target_model)))
@@ -811,103 +813,17 @@ class TheseusRebase:
         **kwargs,
     ) -> TensorDict:
         del kwargs
-        log_prefix = f"[{self.name}]"
-
-        if verbose:
-            print(f"{log_prefix} apply: start")
-
-        transforms_by_key = prepared.get("transforms_by_key", None)
-        if transforms_by_key is None:
-            raise ValueError("Theseus prepared payload is missing 'transforms_by_key'.")
-
-        if family_adapter is not None:
-            tp_keys = family_adapter.transportable_keys(target_base)
-            visual_key_map = {k: k for k in delta if k in tp_keys}
-            target_visual_base = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
-            visual_delta_work = {k: delta[k] for k in visual_key_map if k in target_visual_base}
-            target_visual_base_work = target_visual_base
-            split_fused_qkv = False
-            out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
-            skipped_not_in_target_keys = tuple(k for k in visual_key_map if k not in target_base)
-        else:
-            visual_key_map = _visual_delta_keys(delta)
-            target_visual_base = _visual_state_dict(target_base)
-
-            visual_delta = {
-                stripped_key: delta[original_key]
-                for stripped_key, original_key in visual_key_map.items()
-            }
-            has_visual_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
-            out_of_scope_keys = tuple(
-                key for key in delta
-                if has_visual_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
-            )
-            skipped_not_in_target_keys = tuple(
-                original_key
-                for stripped_key, original_key in visual_key_map.items()
-                if stripped_key not in target_visual_base and original_key not in out_of_scope_keys
-            )
-
-            split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
-            if split_fused_qkv:
-                target_visual_base_work = _split_fused_qkv_state(target_visual_base)
-                visual_delta_work = _split_fused_qkv_state(
-                    {key: value for key, value in visual_delta.items() if key in target_visual_base}
-                )
-            else:
-                target_visual_base_work = target_visual_base
-                visual_delta_work = {key: value for key, value in visual_delta.items() if key in target_visual_base}
-
-            if strict and not visual_delta_work:
-                raise ValueError("Theseus did not find any visual delta keys to transport.")
-
-        compute_device = prepared.get("compute_device", "cpu")
-        aligned_visual, apply_diag = _apply_transforms_to_visual_delta(
-            target_visual_base=target_visual_base_work,
-            visual_delta=visual_delta_work,
-            transforms_by_key=transforms_by_key,
-            show_progress=bool(show_progress),
+        return apply_prepared_transforms(
             method_name=self.name,
-            device=compute_device,
-            strict=bool(strict),
-            out_of_scope_keys=out_of_scope_keys,
-            skipped_not_in_target_keys=skipped_not_in_target_keys,
+            method_label="Theseus",
+            prepared=prepared,
+            target_base=target_base,
+            delta=delta,
+            strict=strict,
+            verbose=verbose,
+            show_progress=show_progress,
+            family_adapter=family_adapter,
         )
-
-        if not family_adapter and split_fused_qkv:
-            aligned_visual = _merge_split_qkv_state(aligned_visual, reference=target_visual_base)
-
-        out: TensorDict = {}
-        processed: set[str] = set()
-
-        for stripped_key, original_key in visual_key_map.items():
-            if original_key not in target_base:
-                continue
-            if stripped_key in aligned_visual:
-                out[original_key] = aligned_visual[stripped_key].to(
-                    dtype=target_base[original_key].dtype,
-                    device=target_base[original_key].device,
-                )
-            else:
-                out[original_key] = torch.zeros_like(target_base[original_key], device=target_base[original_key].device)
-            processed.add(original_key)
-
-        for key in delta:
-            if key in processed or key not in target_base:
-                continue
-            out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
-
-        if strict:
-            expected_keys = {key for key in visual_key_map.values() if key in target_base}
-            missing = sorted(expected_keys - set(out.keys()))
-            if missing:
-                raise KeyError(f"Theseus did not transport all delta keys. Example: {missing[:10]}")
-
-        if verbose:
-            _report_apply_diagnostics(method_name=self.name, diagnostics=apply_diag, verbose=True)
-            print(f"{log_prefix} apply: done (transported_keys={len(out)})")
-
-        return out
 
     def transport(
         self,
@@ -928,7 +844,7 @@ class TheseusRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
-        patch_qkv: bool = True,
+        split_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
         family_adapter: Any = None,
@@ -965,7 +881,7 @@ class TheseusRebase:
                 n_batches=n_batches,
                 seed=int(seed),
                 batch_size=batch_size,
-                patch_qkv=patch_qkv,
+                split_qkv=split_qkv,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 family_adapter=family_adapter,

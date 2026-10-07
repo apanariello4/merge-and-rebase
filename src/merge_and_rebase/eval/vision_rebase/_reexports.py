@@ -132,11 +132,8 @@ from .method_stages import (  # noqa: F401  (re-exported for tests)
     build_method_stage,
 )
 from .pipeline import VisionRuntime, run_rebase  # noqa: F401  (re-exported)
-from .source_lmc import (  # noqa: F401  (re-exported for tests)
+from .source_eval import (  # noqa: F401  (re-exported for tests)
     _ZERO_SHOT_CACHE_DIR,
-    _evaluate_all_task_star_lmc,
-    _evaluate_cross_task_source_lmc,
-    _evaluate_source_lmc,
     _evaluate_source_model_top1,
 )
 from .stages import (  # noqa: F401  (re-exported for tests)

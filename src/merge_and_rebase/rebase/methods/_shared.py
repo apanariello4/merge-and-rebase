@@ -44,6 +44,133 @@ _K_PROJ_BIAS = ".attn.k_proj.bias"
 _V_PROJ_BIAS = ".attn.v_proj.bias"
 
 
+def reject_unread_method_params(
+    method_name: str, leftover: Mapping[str, Any], *, read_by_apply: tuple[str, ...] = ()
+) -> None:
+    """Raise on ``method_params`` that ``prepare()`` received but nothing reads (a typo used to run with defaults).
+
+    ``read_by_apply`` lists keys that reach ``prepare`` through ``transport(**kwargs)`` but are consumed by ``apply``.
+    """
+    unread = sorted(set(leftover) - set(read_by_apply))
+    if unread:
+        raise ValueError(f"[{method_name}] unknown method_params (not read by this method): {unread}")
+
+
+def apply_prepared_transforms(
+    *,
+    method_name: str,
+    method_label: str,
+    prepared: Mapping[str, Any],
+    target_base: Mapping[str, torch.Tensor],
+    delta: Mapping[str, torch.Tensor],
+    strict: bool = False,
+    verbose: bool = True,
+    show_progress: bool = True,
+    family_adapter: Any = None,
+    zero_attention_delta: bool = False,
+) -> TensorDict:
+    """``apply`` of the activation-aligned transports (THESEUS, BiCo): push ``delta`` through the prepared maps.
+
+    With a ``family_adapter`` (decoders) the scope is its transportable keys; otherwise the visual tower, with fused
+    q/k/v split for the transform and merged back afterwards when ``prepare`` split them. ``zero_attention_delta``
+    (BiCo ablation) zeroes every transported attention delta.
+    """
+    log_prefix = f"[{method_name}]"
+    if verbose:
+        print(f"{log_prefix} apply: start")
+
+    transforms_by_key = prepared.get("transforms_by_key", None)
+    if transforms_by_key is None:
+        raise ValueError(f"{method_label} prepared payload is missing 'transforms_by_key'.")
+
+    if family_adapter is not None:
+        tp_keys = family_adapter.transportable_keys(target_base)
+        key_map = {k: k for k in delta if k in tp_keys}
+        target_scoped_base = {k: target_base[k] for k in key_map.values() if k in target_base}
+        target_scoped_base_work = target_scoped_base
+        scoped_delta_work = {k: delta[k] for k in key_map if k in target_scoped_base}
+        split_fused_qkv = False  # decoders have separate q/k/v projections
+        out_of_scope_keys = tuple(k for k in delta if k not in tp_keys and k in target_base)
+        skipped_not_in_target_keys = tuple(k for k in key_map if k not in target_base)
+    else:
+        key_map = _visual_delta_keys(delta)
+        target_scoped_base = _visual_state_dict(target_base)
+        scoped_delta = {stripped_key: delta[original_key] for stripped_key, original_key in key_map.items()}
+        has_prefixed_keys = any(key.startswith(_VISUAL_PREFIX) for key in delta)
+        out_of_scope_keys = tuple(
+            key for key in delta if has_prefixed_keys and not key.startswith(_VISUAL_PREFIX) and key in target_base
+        )
+        skipped_not_in_target_keys = tuple(
+            original_key
+            for stripped_key, original_key in key_map.items()
+            if stripped_key not in target_scoped_base and original_key not in out_of_scope_keys
+        )
+        split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
+        in_target = {key: value for key, value in scoped_delta.items() if key in target_scoped_base}
+        if split_fused_qkv:
+            target_scoped_base_work = _split_fused_qkv_state(target_scoped_base)
+            scoped_delta_work = _split_fused_qkv_state(in_target)
+        else:
+            target_scoped_base_work = target_scoped_base
+            scoped_delta_work = in_target
+
+    if strict and not scoped_delta_work:
+        raise ValueError(f"{method_label} did not find any visual delta keys to transport.")
+
+    aligned, apply_diag = _apply_transforms_to_visual_delta(
+        target_visual_base=target_scoped_base_work,
+        visual_delta=scoped_delta_work,
+        transforms_by_key=transforms_by_key,
+        show_progress=bool(show_progress),
+        method_name=method_name,
+        device=prepared.get("compute_device", "cpu"),
+        strict=bool(strict),
+        out_of_scope_keys=out_of_scope_keys,
+        skipped_not_in_target_keys=skipped_not_in_target_keys,
+    )
+    if split_fused_qkv:
+        aligned = _merge_split_qkv_state(aligned, reference=target_scoped_base)
+
+    out: TensorDict = {}
+    processed: set[str] = set()
+    for stripped_key, original_key in key_map.items():
+        if original_key not in target_base:
+            continue
+        reference = target_base[original_key]
+        if stripped_key in aligned:
+            out[original_key] = aligned[stripped_key].to(dtype=reference.dtype, device=reference.device)
+        else:
+            out[original_key] = torch.zeros_like(reference, device=reference.device)
+        processed.add(original_key)
+    for key in delta:
+        if key in processed or key not in target_base:
+            continue
+        out[key] = torch.zeros_like(target_base[key], device=target_base[key].device)
+
+    if zero_attention_delta:
+        # Ablation: reproduce the transport coverage of the legacy InputAlignedBlock path, where the split-qkv
+        # patch landed on the wrapper while forward ran through the unhooked original block, so attention never
+        # produced calibration statistics and its delta was written as zeros.
+        zeroed = 0
+        for key in out:
+            if ".attn." in key:
+                out[key] = torch.zeros_like(out[key])
+                zeroed += 1
+        if verbose:
+            print(f"{log_prefix} apply: zero_attention_delta zeroed {zeroed} attention keys")
+
+    if strict:
+        expected_keys = {key for key in key_map.values() if key in target_base}
+        missing = sorted(expected_keys - set(out.keys()))
+        if missing:
+            raise KeyError(f"{method_label} did not transport all delta keys. Example: {missing[:10]}")
+
+    if verbose:
+        _report_apply_diagnostics(method_name=method_name, diagnostics=apply_diag, verbose=True)
+        print(f"{log_prefix} apply: done (transported_keys={len(out)})")
+    return out
+
+
 def _resolve_device(device: str | torch.device) -> torch.device:
     dev = torch.device(device)
     if dev.type == "cuda" and not torch.cuda.is_available():

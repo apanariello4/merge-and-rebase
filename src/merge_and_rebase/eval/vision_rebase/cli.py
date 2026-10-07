@@ -19,10 +19,12 @@ from ...cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ...data.vision_loaders import DEFAULT_SEED
 from ...io.ckpt import resolve_ckpt_path
 from ...merge.registry import list_methods as list_merge_methods
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
+from ...rebase.config_schema import load_run_config
 from ...rebase.run_config import resolve_run_config
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
@@ -142,8 +144,9 @@ def main() -> None:
         )
 
         cfg: dict[str, Any] = {}
+        legacy_config_keys: list[str] = []
         if args.config is not None:
-            cfg = load_json(args.config)
+            cfg, legacy_config_keys = load_run_config(load_json(args.config))
 
         cli: dict[str, Any] = {
             "source_clip_model": args.source_clip_model,
@@ -189,7 +192,7 @@ def main() -> None:
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
         cfg["logging"] = logging_cfg
-        _set_deterministic_seed(int(cfg.get("seed", 42)))
+        _set_deterministic_seed(int(cfg.get("seed", DEFAULT_SEED)))
 
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
@@ -214,6 +217,7 @@ def main() -> None:
                 "suite": suite_name,
                 "tasks": tasks,
                 "summary_path": str(run_summary_path),
+                **({"legacy_config_keys": legacy_config_keys} if legacy_config_keys else {}),
             },
         )
 

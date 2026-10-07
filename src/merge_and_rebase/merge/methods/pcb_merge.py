@@ -8,11 +8,11 @@ import torch
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class PCBMerge:
+class PCBMerge(DirectionMerge):
     """Balance flattened task vectors through intra- and inter-task signals.
 
     PCB clamps absolute deltas by the `clamp_min_ratio` and
@@ -63,29 +63,6 @@ class PCBMerge:
             lam=lam,
         )
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(
-            base=base,
-            tuned=tuned,
-            weights=weights,
-            strict=strict,
-            **kwargs,
-        )
-        return self.apply(prepared, alpha=float(alpha))
 
     @staticmethod
     def _validate_ratios(*, clamp_min_ratio: float, clamp_max_ratio: float, att_ratio: float) -> None:

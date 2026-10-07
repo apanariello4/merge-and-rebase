@@ -1,8 +1,8 @@
 """Method stages of the per-task vision rebase pipeline (Phase 5.9).
 
-``TransportMethodStage`` is the ordinary per-task path: ``_build_rebase_prepared`` followed by
+``TransportStage`` is the ordinary per-task path: ``_build_rebase_prepared`` followed by
 ``method.transport`` under one ``PhaseCostRecorder`` (THESEUS, BiCo, TransFusion, gradfix and the
-other state-dict transports). ``AriadneStage`` is the Ariadne path: it never calls
+other state-dict transports). ``DirectFitStage`` is the Ariadne path: it never calls
 ``_build_rebase_prepared``/``method.transport`` for a result, owns the ``merge_in_source_then_fit``
 precompute and the saved-vector loader, and computes the depth pairing once per run. Bodies are the
 former inline blocks of ``main()``, moved verbatim.
@@ -11,11 +11,13 @@ former inline blocks of ``main()``, moved verbatim.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
 import torch
 
+from ...data.vision_loaders import DEFAULT_NUM_WORKERS, DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
@@ -34,6 +36,33 @@ from .merge import _merge_direction
 from .stages import _visual_only_filter
 
 
+def _calibration_model_pair(
+    method_label: str,
+    depth_aligned_source: bool,
+    source_base_model_task: torch.nn.Module | None,
+    task_source_base_sd: Mapping[str, torch.Tensor],
+    clf_source: Any,
+    clf_target: Any,
+    target_base_sd: Mapping[str, torch.Tensor],
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    """Fresh strict-loaded (source, target) copies for activation calibration.
+
+    With a depth-aligned source (BRACE or discrete index match) the source copy is taken from the aligned model:
+    loading its state into the raw source architecture non-strictly would drop every inserted block. Copies keep the
+    task's aligned endpoint immutable while calibration moves models across devices / runs backward passes.
+    """
+    if depth_aligned_source:
+        if source_base_model_task is None:
+            raise RuntimeError(f"{method_label} block-extension preprocess requires the corrected source base model.")
+        source_model = deepcopy(source_base_model_task)
+    else:
+        source_model = deepcopy(clf_source.model)
+    load_into_model(source_model, task_source_base_sd, strict=True)
+    target_model = deepcopy(clf_target.model)
+    load_into_model(target_model, target_base_sd, strict=True)
+    return source_model, target_model
+
+
 def _build_rebase_prepared(
     *,
     method_name: str,
@@ -44,9 +73,9 @@ def _build_rebase_prepared(
     grad_batch_size: int | None,
     grad_imgs_per_class: int | None,
     grad_num_batches: int | None,
-    theseus_like_method: bool,
+    theseus_mode: bool,
     bico_mode: bool,
-    run_block_extension_prestep: bool,
+    depth_aligned_source: bool,
     clf_source: OpenClipClassifier,
     clf_target: OpenClipClassifier,
     classnames: list[str],
@@ -86,8 +115,8 @@ def _build_rebase_prepared(
             grad_batch_size=grad_batch_size,
             grad_imgs_per_class=grad_imgs_per_class,
             grad_num_batches=grad_num_batches,
-            num_workers=int(cfg.get("num_workers", 6)),
-            seed=int(cfg.get("seed", 42)),
+            num_workers=int(cfg.get("num_workers", DEFAULT_NUM_WORKERS)),
+            seed=int(cfg.get("seed", DEFAULT_SEED)),
         )
         recipe = clip_contrastive_recipe(
             clf_target,
@@ -104,27 +133,24 @@ def _build_rebase_prepared(
             **method_params,
         )
 
-    if source_activation_plan is not None and not (theseus_like_method or bico_mode):
+    if source_activation_plan is not None and not (theseus_mode or bico_mode):
         raise ValueError(
             "The interpolated-activation baseline only applies to the activation-aligned "
             f"transport methods; method '{method_name}' does not consume activations."
         )
 
-    if theseus_like_method:
+    if theseus_mode:
         theseus_params = dict(method_params)
-        transport_seed = int(theseus_params.pop("seed", cfg.get("seed", 42)))
-        if run_block_extension_prestep:
-            if source_base_model_task is None:
-                raise RuntimeError("Theseus block-extension preprocess requires the corrected source base model.")
-            # BRACE changes the source depth.  Loading this state into the raw
-            # source architecture non-strictly drops every inserted block.
-            source_model_for_theseus = deepcopy(source_base_model_task)
-            load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
-        else:
-            source_model_for_theseus = deepcopy(clf_source.model)
-            load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
-        target_model_for_theseus = deepcopy(clf_target.model)
-        load_into_model(target_model_for_theseus, target_base_sd, strict=True)
+        transport_seed = int(theseus_params.pop("seed", cfg.get("seed", DEFAULT_SEED)))
+        source_model_for_theseus, target_model_for_theseus = _calibration_model_pair(
+            "Theseus",
+            depth_aligned_source,
+            source_base_model_task,
+            task_source_base_sd,
+            clf_source,
+            clf_target,
+            target_base_sd,
+        )
 
         source_depth = len(source_model_for_theseus.visual.transformer.resblocks)
         target_depth = len(target_model_for_theseus.visual.transformer.resblocks)
@@ -180,21 +206,17 @@ def _build_rebase_prepared(
         from ...models.grad_recipes import clip_contrastive_recipe
 
         bico_params = dict(method_params)
-        transport_seed = int(bico_params.pop("seed", cfg.get("seed", 42)))
+        transport_seed = int(bico_params.pop("seed", cfg.get("seed", DEFAULT_SEED)))
 
-        if run_block_extension_prestep:
-            if source_base_model_task is None:
-                raise RuntimeError("BiCo block-extension preprocess requires the corrected source base model.")
-            # BiCo moves models across devices and performs backward passes
-            # while collecting statistics; use a strict-loaded copy so the
-            # task's corrected endpoint remains immutable for later steps.
-            source_model_for_bico = deepcopy(source_base_model_task)
-            load_into_model(source_model_for_bico, task_source_base_sd, strict=True)
-        else:
-            source_model_for_bico = deepcopy(clf_source.model)
-            load_into_model(source_model_for_bico, task_source_base_sd, strict=True)
-        target_model_for_bico = deepcopy(clf_target.model)
-        load_into_model(target_model_for_bico, target_base_sd, strict=True)
+        source_model_for_bico, target_model_for_bico = _calibration_model_pair(
+            "BiCo",
+            depth_aligned_source,
+            source_base_model_task,
+            task_source_base_sd,
+            clf_source,
+            clf_target,
+            target_base_sd,
+        )
 
         source_depth = len(source_model_for_bico.visual.transformer.resblocks)
         target_depth = len(target_model_for_bico.visual.transformer.resblocks)
@@ -260,7 +282,7 @@ def _direct_residual_fit_body(recorder: PhaseCostRecorder, **kwargs: Any):
     return prepared.task_vector, prepared.timing, prepared.diagnostics, prepared.extra
 
 
-class TransportMethodStage:
+class TransportStage:
     """``_build_rebase_prepared`` + ``method.transport`` for one task, timed under one recorder."""
 
     def __init__(self, *, bypass_ordinary_transport: bool, transport_calibration_ctx: _TaskContext | None) -> None:
@@ -268,7 +290,7 @@ class TransportMethodStage:
         # question this arm asks is whether the desired functional effect can be written into the
         # target at all without parameter transport, so invoking the transport fit and then
         # discarding its output would only burn GPU hours and blur the claim. Ariadne bypasses it
-        # too (its fit is the ``AriadneStage`` body).
+        # too (its fit is the ``DirectFitStage`` body).
         self.bypass_ordinary_transport = bypass_ordinary_transport
         self.transport_calibration_ctx = transport_calibration_ctx
 
@@ -298,10 +320,10 @@ class TransportMethodStage:
                     grad_batch_size=resolved.grad_batch_size,
                     grad_imgs_per_class=resolved.grad_imgs_per_class,
                     grad_num_batches=resolved.grad_num_batches,
-                    theseus_like_method=resolved.theseus_like_method,
+                    theseus_mode=resolved.theseus_mode,
                     bico_mode=resolved.bico_mode,
-                    run_block_extension_prestep=plan.task_block_extension_prestep
-                    or plan.task_discrete_layer_match_prestep,
+                    depth_aligned_source=plan.depth_alignment.rule != "none"
+                    and plan.depth_alignment.timing == "per_task",
                     clf_source=env.clf_source,
                     clf_target=env.clf_target,
                     classnames=(
@@ -365,7 +387,7 @@ class TransportMethodStage:
         )
 
 
-class AriadneStage:
+class DirectFitStage:
     """Ariadne (formerly Direct Residual): paired capture + fit, merged-fit precompute, saved-vector loading."""
 
     def __init__(
@@ -385,7 +407,7 @@ class AriadneStage:
         self.calibration_ctx = calibration_ctx
         self.record = AriadneRunRecord(calibration_meta=calibration_meta)
         # Bypassed ordinary transport: only the shared timing bracket (prepare ~ 0, empty transport).
-        self._transport = TransportMethodStage(bypass_ordinary_transport=True, transport_calibration_ctx=None)
+        self._transport = TransportStage(bypass_ordinary_transport=True, transport_calibration_ctx=None)
         self._pairing_cache: DiscreteLayerPairing | None = None
         self._merged_correction: dict[str, torch.Tensor] | None = None
         self._merged_timing: dict[str, dict[str, float]] | None = None
@@ -452,13 +474,8 @@ class AriadneStage:
             axpy_state_dict(source_base_sd, merged_direction, alpha=1.0),
             strict=True,
         )
-        # Direct Residual has no dedicated calibration-dataset config
-        # field of its own (unlike block_extension_cfg's calibration_dataset):
-        # the once-only merged fit has no single "task" to draw loaders
-        # from, so it falls back to the first contributing task's train
-        # loaders, mirroring the existing calibration-loader fallback
-        # pattern (`calibration_loader = ...; if None: select_loader(...)`)
-        # used elsewhere in this function when no dedicated loader is set.
+        # The once-only merged fit has no single task to draw loaders from: it uses the shared Ariadne
+        # calibration context when one is configured, else the first contributing task's train loaders.
         merged_calibration_task_ctx = (
             self.calibration_ctx if self.calibration_ctx is not None else self.task_contexts[merge_in_source_tasks[0]]
         )
@@ -494,15 +511,8 @@ class AriadneStage:
         cfg = env.cfg
         direct_residual_cfg = self.cfg
         t = task.task
-        # Direct Residual never resizes anything: capture must run
-        # against the NATIVE, un-resized source models, never a
-        # block-extended reference from elsewhere in this function
-        # (source_base_model_task/source_ft_model_task are only
-        # ever populated when blockext_like_method is True, which
-        # is never the case for direct_residual_like -- see the
-        # method-dispatch resolution above -- so freshly building
-        # native copies here, rather than reusing those variables,
-        # is both correct and the only option).
+        # Ariadne never resizes: capture runs on freshly built native (un-resized) source models. The
+        # block-extension prestep never runs for Ariadne (it is not a depth_prestep_method).
         pairing = self.pairing(env)
         if cfg.get("load_direct_residual_tvs_dir"):
             transported_delta, loaded_meta = _load_saved_sequential_tv(
@@ -583,10 +593,10 @@ def build_method_stage(
     merge_weights: list[float],
     ariadne_calibration_ctx: _TaskContext | None,
     ariadne_calibration_meta: dict[str, Any],
-) -> TransportMethodStage | AriadneStage:
+) -> TransportStage | DirectFitStage:
     """Select the method stage once from the resolved config (Ariadne vs every state-dict transport)."""
-    if env.resolved.direct_residual_like:
-        return AriadneStage(
+    if env.resolved.direct_fit:
+        return DirectFitStage(
             env,
             task_contexts=task_contexts,
             tasks=tasks,
@@ -594,7 +604,7 @@ def build_method_stage(
             calibration_ctx=ariadne_calibration_ctx,
             calibration_meta=ariadne_calibration_meta,
         )
-    return TransportMethodStage(
+    return TransportStage(
         bypass_ordinary_transport=False,
         transport_calibration_ctx=transport_calibration_ctx,
     )

@@ -2,7 +2,7 @@
 TransFusion rebase method: permutation-based task vector transport.
 
 Implements the TransFusion workflow from repro_transfusion_main.py as a
-RebaseMethod that can be used with vision_rebase --method transfusion.
+TransportMethod that can be used with vision_rebase --method transfusion.
 
 Follows the prepare/apply/transport pattern used by GradFix and Theseus:
   - prepare(): one-time expensive setup (model patching, permutation compute, sanity check)
@@ -21,6 +21,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ...models.openclip_classifier import ZERO_SHOT_CACHE_DIR
 from ..base import TensorDict
 from ..permutations import (
     CLIP_Visual_PermutationSpecBuilder,
@@ -335,7 +336,7 @@ def _evaluate_source_zeroshot(
     eval_clf.build_zeroshot_text_features(
         classnames_task,
         source_build_cfg_task,
-        cache_dir="src/.cache/zs_cache",
+        cache_dir=ZERO_SHOT_CACHE_DIR,
         force_rebuild=False,
     )
     return float(eval_clf.top1(eval_loader, device=device))

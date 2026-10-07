@@ -15,7 +15,6 @@ from ...merge.base import PreparedMergeMethod
 from ...merge.methods._common import axpy_state_dict
 from ...merge.registry import get_method as get_merge_method
 from ...merge.task_vectors import TaskVector
-from ...rebase.block_extension.vision import run_block_extension
 from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
     _SINGLE_TRANSPORT_MODES,
     _TRANSPORT_THEN_MERGE_MODES,
@@ -25,12 +24,16 @@ from ...rebase.merge_modes import (  # noqa: F401  (re-exported: same objects)
 from ...rebase.prestep import StageEnv
 from ..utils import to_cpu_fp32
 from .context import (
+    DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
     _build_balanced_calibration_context,
     _build_direct_paired_calibration_context,
     _select_dedicated_brace_loader,
     _TaskContext,
 )
-from .stages import _resolve_source_activation_plan, _visual_only_filter
+from .stages import _resolve_source_activation_plan, _visual_only_filter, apply_brace
+
+#: Key prefix of the vision tower in an OpenCLIP state dict.
+_VISUAL_PREFIX = "visual."
 
 
 def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
@@ -75,7 +78,7 @@ def _average_visual_state_dicts(
     usable_keys: list[str] = []
     for key in sorted(common_keys):
         values = [state[key] for _, state in task_items]
-        if not key.startswith("visual.") or any(not value.is_floating_point() for value in values):
+        if not key.startswith(_VISUAL_PREFIX) or any(not value.is_floating_point() for value in values):
             continue
         shape = tuple(values[0].shape)
         if any(tuple(value.shape) != shape for value in values[1:]):
@@ -140,9 +143,9 @@ def _visual_key_fingerprint(sd: Mapping[str, torch.Tensor]) -> dict[str, Any]:
     """Compact shape fingerprint of a checkpoint's visual backbone for diagnostics."""
     depths = [k for k in sd if ".resblocks." in k]
     block_ids = {int(k.split(".resblocks.")[1].split(".")[0]) for k in depths if ".resblocks." in k}
-    visual_widths = sorted({int(v.shape[0]) for k, v in sd.items() if k.startswith("visual.") and v.dim() >= 1})
+    visual_widths = sorted({int(v.shape[0]) for k, v in sd.items() if k.startswith(_VISUAL_PREFIX) and v.dim() >= 1})
     return {
-        "n_visual_keys": sum(1 for k in sd if k.startswith("visual.")),
+        "n_visual_keys": sum(1 for k in sd if k.startswith(_VISUAL_PREFIX)),
         "max_block_id": max(block_ids) if block_ids else None,
         "n_blocks": len(block_ids),
         "visual_out_dims_sample": visual_widths[:4],
@@ -154,7 +157,7 @@ def _ckpt_visual_base_coverage(
     base_sd: Mapping[str, torch.Tensor],
 ) -> float:
     """Fraction of the base's visual keys covered (key + shape) by sd after conservative alignment."""
-    visual_base_keys = [k for k, v in base_sd.items() if k.startswith("visual.") and isinstance(v, torch.Tensor)]
+    visual_base_keys = [k for k, v in base_sd.items() if k.startswith(_VISUAL_PREFIX) and isinstance(v, torch.Tensor)]
     if not visual_base_keys:
         return 0.0
     aligned = align_to_base_keys(sd, base_sd)
@@ -265,7 +268,7 @@ def compose_rebased_deltas(
     grad_batch_size = resolved.grad_batch_size
     grad_imgs_per_class = resolved.grad_imgs_per_class
     grad_num_batches = resolved.grad_num_batches
-    theseus_like_method = resolved.theseus_like_method
+    theseus_mode = resolved.theseus_mode
     bico_mode = resolved.bico_mode
     device = env.device
     clf_source = env.clf_source
@@ -374,8 +377,7 @@ def compose_rebased_deltas(
         single_transport_calibration_metadata = calibration_metadata
         if transport_protocol.startswith("tiny"):
             direct_spec = {
-                "path": "zh-plus/tiny-imagenet",
-                "split": "valid",
+                **DIRECT_RESIDUAL_TINY_IMAGENET_SPEC,
                 "max_samples": int(cfg.get("transport_calibration_max_samples", 2048)),
             }
             transport_ctx = _build_direct_paired_calibration_context(
@@ -478,33 +480,22 @@ def compose_rebased_deltas(
                 transport_loader=transport_ctx.source_loaders.train,
                 correction_enabled=not block_extension_cfg.skip_correction,
             )
-            merged_extension_layout = {}
-            final_depth = run_block_extension(
-                source_base_model=source_base_model_once,
-                source_ft_model=source_ft_model_once,
+            brace = apply_brace(
+                source_base_model_once,
+                source_ft_model_once,
                 calibration_loader=brace_loader,
-                target_layers_total=target_depth,
+                target_depth=target_depth,
                 config=block_extension_cfg,
                 device=device,
-                layout_out=merged_extension_layout,
             )
-            if final_depth != target_depth:
+            if brace.final_depth != target_depth:
                 raise RuntimeError(
-                    f"Merged-pair BRACE depth mismatch: final_depth={final_depth}, target_depth={target_depth}."
+                    f"Merged-pair BRACE depth mismatch: final_depth={brace.final_depth}, target_depth={target_depth}."
                 )
-            merged_source_base = to_cpu_fp32(dict(source_base_model_once.state_dict()))
-            merged_source_ft = to_cpu_fp32(dict(source_ft_model_once.state_dict()))
-            merged_source_direction = TaskVector.from_checkpoints(
-                merged_source_base,
-                merged_source_ft,
-                strict=True,
-                key_filter=_visual_only_filter,
-            ).delta
+            merged_source_base, merged_source_direction = brace.base_sd, brace.delta
             source_template_once = deepcopy(source_base_model_once).cpu()
             prepared_has_brace = True
-            merged_source_activation_plan = _resolve_source_activation_plan(
-                block_extension_cfg, merged_extension_layout
-            )
+            merged_source_activation_plan = brace.activation_plan
         else:  # pragma: no cover - validated by _resolve_merge_mode_config
             raise AssertionError(f"Unhandled merge mode: {merge_mode}")
 
@@ -517,9 +508,9 @@ def compose_rebased_deltas(
             grad_batch_size=grad_batch_size,
             grad_imgs_per_class=grad_imgs_per_class,
             grad_num_batches=grad_num_batches,
-            theseus_like_method=theseus_like_method,
+            theseus_mode=theseus_mode,
             bico_mode=bico_mode,
-            run_block_extension_prestep=prepared_has_brace,
+            depth_aligned_source=prepared_has_brace,
             clf_source=clf_source,
             clf_target=clf_target,
             classnames=list(transport_ctx.classnames),

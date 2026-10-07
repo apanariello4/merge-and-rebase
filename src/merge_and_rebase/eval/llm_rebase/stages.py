@@ -21,7 +21,6 @@ from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.decoder import run_block_extension_llm
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_decoder
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs, TaskModels, select_prestep_kind
-from ...rebase.run_config import MethodKind
 
 
 @dataclass
@@ -41,8 +40,6 @@ class _PreparedTaskDelta:
     # Realized block chain from the resize, needed by residual completion to
     # address inserted positions by ancestry instead of a depth pattern.
     extension_layout: dict[str, Any] | None = None
-    # Proposal-1 native reference banks, captured before the resize.
-
 
 
 # Calibration batches used by theseus/bico when a config names neither
@@ -134,8 +131,6 @@ def _prepare_resized_task_delta(
     )
 
 
-
-
 @dataclass
 class LlmTaskContext:
     """What the LLM stages need to know about one task: the tuned checkpoint reference (and its position)."""
@@ -150,8 +145,7 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     Built for the block-extension and discrete-index presteps and for Ariadne (which fits from the native pair).
     """
     plan = env.plan
-    is_ariadne = env.resolved.method_kind is MethodKind.ARIADNE
-    if not (plan.task_block_extension_prestep or plan.task_discrete_layer_match_prestep or is_ariadne):
+    if not (plan.task_block_extension_prestep or plan.task_discrete_layer_match_prestep or env.resolved.direct_fit):
         return None
     rt = env.runtime
     ckpt_ref = rt.task_contexts[task].ckpt_ref

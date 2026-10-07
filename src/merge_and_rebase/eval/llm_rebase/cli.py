@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from merge_and_rebase.rebase.config_schema import load_run_config
 from merge_and_rebase.utils.helpers import load_json
 
 from ...cli_args import (
@@ -143,8 +144,9 @@ def main() -> None:
         )
 
         cfg: dict[str, Any] = {}
+        legacy_config_keys: list[str] = []
         if args.config is not None:
-            cfg = load_json(args.config)
+            cfg, legacy_config_keys = load_run_config(load_json(args.config))
 
         cli_overrides = {
             "source_model_name_or_path": args.source_model_name_or_path,
@@ -247,7 +249,11 @@ def main() -> None:
                     Path(str(cfg["save_merged"])).parent if cfg.get("save_merged") else None
                 ),
             ),
-            metadata={"config_path": args.config, "resolved_config": cfg},
+            metadata={
+                "config_path": args.config,
+                "resolved_config": cfg,
+                **({"legacy_config_keys": legacy_config_keys} if legacy_config_keys else {}),
+            },
         )
 
         rt = build_runtime(

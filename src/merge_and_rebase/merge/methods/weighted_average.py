@@ -2,17 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
 from ..base import TensorDict
 from ..registry import register
 from ..task_vectors import TaskVector
-from ._common import axpy_state_dict, default_weights, get_method_params
+from ._common import DirectionMerge, default_weights, get_method_params
 
 
 @dataclass(frozen=True)
-class WeightedAverageMerge:
+class WeightedAverageMerge(DirectionMerge):
     """Interpolate the base model toward a weighted average of checkpoints.
 
     The prepared direction is ``avg(tuned) - base`` and ``apply`` returns
@@ -20,6 +21,8 @@ class WeightedAverageMerge:
     weight-sum normalization (``"sumw"``, default) or task-count
     normalization (``"n"``).
     """
+
+    forward_merge_kwargs: ClassVar[bool] = False  # merge() never passed its **kwargs to prepare()
 
     name: str = "weighted_average"
 
@@ -58,23 +61,6 @@ class WeightedAverageMerge:
             direction[k] = avg - b
 
         return base, direction
-
-    def apply(self, prepared: tuple[TensorDict, TensorDict], *, alpha: float, **kwargs) -> TensorDict:
-        base, direction = prepared
-        return axpy_state_dict(base, direction, alpha=float(alpha))
-
-    def merge(
-        self,
-        *,
-        base: TensorDict,
-        tuned: Sequence[TensorDict],
-        weights: Sequence[float] | None = None,
-        alpha: float = 1.0,
-        strict: bool = False,
-        **kwargs,
-    ) -> TensorDict:
-        prepared = self.prepare(base=base, tuned=tuned, weights=weights, strict=strict)
-        return self.apply(prepared, alpha=float(alpha))
 
 
 register(WeightedAverageMerge())

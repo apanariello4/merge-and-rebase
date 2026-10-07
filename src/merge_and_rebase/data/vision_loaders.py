@@ -197,6 +197,12 @@ class HFVisionDataset(Dataset):
 # HF loading helpers
 # ---------------------------
 
+#: Defaults of the vision loaders and the vision run seed, shared by every vision entrypoint.
+DEFAULT_BATCH_SIZE = 128
+DEFAULT_NUM_WORKERS = 6
+DEFAULT_VAL_FRACTION = 0.1
+DEFAULT_SEED = 42
+
 _ALLOWED_SPLITS = ("train", "test", "val", "validation", "valid")
 
 
@@ -386,11 +392,11 @@ def build_vision_loaders(
     train_preprocess: Transform = None,
     ft_epochs: int,
     split_map: dict[str, str] | None = None,
-    batch_size: int = 128,
-    num_workers: int = 6,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = DEFAULT_NUM_WORKERS,
     pin_memory: bool = True,
-    val_fraction: float = 0.1,
-    seed: int = 42,
+    val_fraction: float = DEFAULT_VAL_FRACTION,
+    seed: int = DEFAULT_SEED,
     image_key: str = "image",
     label_key: str = "label",
     label_remap: LabelRemap = None,
@@ -533,11 +539,11 @@ def build_vision_calibration_loader(
     resolver: Callable[[str], tuple[str, str | None, dict[str, str]]],
     preprocess: Callable[[Any], torch.Tensor],
     calibration_split: str = "test",
-    batch_size: int = 128,
-    num_workers: int = 6,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = DEFAULT_NUM_WORKERS,
     pin_memory: bool = True,
-    val_fraction: float = 0.1,
-    seed: int = 42,
+    val_fraction: float = DEFAULT_VAL_FRACTION,
+    seed: int = DEFAULT_SEED,
 ) -> DataLoader:
     """Build a deterministic, task-independent vision calibration loader.
 

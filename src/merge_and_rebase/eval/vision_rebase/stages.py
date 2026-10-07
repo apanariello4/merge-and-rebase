@@ -11,10 +11,12 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from ...data.vision_loaders import DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.config import select_loader
@@ -33,7 +35,7 @@ from ...rebase.prestep import (
 )
 from ..utils import to_cpu_fp32
 from .artifacts import _state_dict_sha256
-from .source_lmc import _evaluate_source_lmc, _evaluate_source_model_top1
+from .source_eval import _evaluate_source_model_top1
 
 
 def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
@@ -68,11 +70,11 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     """Per-task source base / fine-tuned copies, only when a prestep or the target-dataset eval needs them."""
     plan = env.plan
     if not (
-        env.resolved.blockext_like_method
+        env.resolved.depth_prestep_method
         and (
             plan.task_block_extension_prestep
             or plan.task_discrete_layer_match_prestep
-            or env.resolved.lmc.block_extension_eval_enabled
+            or env.resolved.prestep_eval.block_extension_eval_enabled
         )
     ):
         return None
@@ -106,7 +108,7 @@ class _NativeDeltaMixin:
                     classnames=task.classnames,
                     source_build_cfg=task.source_build_cfg_task,
                     device=device,
-                    seed=int(cfg.get("seed", 42)),
+                    seed=int(cfg.get("seed", DEFAULT_SEED)),
                     **resolved.method_params,
                 )
                 transfusion_prepared = env.transfusion_prepared
@@ -175,6 +177,56 @@ class NoPrestep(_NativeDeltaMixin):
         )
 
 
+@dataclass
+class BraceOutcome:
+    """Depth-aligned (base, fine-tuned) source endpoints produced by one BRACE run."""
+
+    final_depth: int
+    layout: dict[str, Any]
+    activation_plan: Any
+    base_sd: dict[str, torch.Tensor]
+    ft_sd: dict[str, torch.Tensor]
+    delta: dict[str, torch.Tensor]
+
+
+def apply_brace(
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    *,
+    calibration_loader: Any,
+    target_depth: int,
+    config: Any,
+    device: Any,
+    target_model: torch.nn.Module | None = None,
+) -> BraceOutcome:
+    """Run BRACE in place on a source (base, fine-tuned) pair; return the aligned endpoints and their visual delta.
+
+    The single BRACE call site: the per-task prestep and the once-only ``merge_then_brace_then_transport`` path
+    (on the merged pair) both go through it. Callers check ``final_depth`` against the target depth.
+    """
+    layout: dict[str, Any] = {}
+    final_depth = run_block_extension(
+        source_base_model=source_base_model,
+        source_ft_model=source_ft_model,
+        calibration_loader=calibration_loader,
+        target_layers_total=target_depth,
+        config=config,
+        device=device,
+        layout_out=layout,
+        target_model=target_model,
+    )
+    base_sd = to_cpu_fp32(dict(source_base_model.state_dict()))
+    ft_sd = to_cpu_fp32(dict(source_ft_model.state_dict()))
+    return BraceOutcome(
+        final_depth=final_depth,
+        layout=layout,
+        activation_plan=_resolve_source_activation_plan(config, layout),
+        base_sd=base_sd,
+        ft_sd=ft_sd,
+        delta=TaskVector.from_checkpoints(base_sd, ft_sd, strict=True, key_filter=_visual_only_filter).delta,
+    )
+
+
 class BracePrestep:
     """BRACE/ARIADNE block-extension prestep: reference capture, resize, layout, delta, bookkeeping."""
 
@@ -205,33 +257,26 @@ class BracePrestep:
                 val_loader=source_loaders.val,
             )
         references.source_calibration_loader = calibration_loader
-        task_extension_layout: dict[str, Any] = {}
-        final_depth = run_block_extension(
-            source_base_model=source_base_model_task,
-            source_ft_model=source_ft_model_task,
+        brace = apply_brace(
+            source_base_model_task,
+            source_ft_model_task,
             calibration_loader=calibration_loader,
-            target_layers_total=target_depth,
+            target_depth=target_depth,
             config=block_extension_cfg,
             device=device,
-            layout_out=task_extension_layout,
             # Only the target-informed correction option reads this; every
             # standard ARIADNE path leaves the target backbone untouched.
             target_model=(env.clf_target.model if block_extension_cfg.target_shared_correction is not None else None),
         )
-        env.recorded_extension_layout = dict(task_extension_layout)
-        task_source_activation_plan = _resolve_source_activation_plan(block_extension_cfg, task_extension_layout)
-        if final_depth != target_depth:
+        env.recorded_extension_layout = dict(brace.layout)
+        if brace.final_depth != target_depth:
             raise RuntimeError(
-                f"Block extension preprocess failed for task '{t}': final_depth={final_depth}, expected={target_depth}."
+                f"Block extension preprocess failed for task '{t}': final_depth={brace.final_depth}, "
+                f"expected={target_depth}."
             )
-        task_source_base_sd = to_cpu_fp32({k: v for k, v in source_base_model_task.state_dict().items()})
-        task_source_ft_sd = to_cpu_fp32({k: v for k, v in source_ft_model_task.state_dict().items()})
-        task_delta = TaskVector.from_checkpoints(
-            task_source_base_sd,
-            task_source_ft_sd,
-            strict=True,
-            key_filter=_visual_only_filter,
-        ).delta
+        task_extension_layout, task_source_activation_plan = brace.layout, brace.activation_plan
+        task_source_base_sd, task_source_ft_sd, task_delta = brace.base_sd, brace.ft_sd, brace.delta
+        final_depth = brace.final_depth
         endpoints = env.endpoints
         merge_mode = resolved.merge.mode
         base_construction = resolved.merge.base_construction
@@ -331,18 +376,18 @@ class BraceTargetEvalObserver:
 
     def before(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> None:
         resolved = env.resolved
-        lmc = resolved.lmc
-        if not (lmc.block_extension_eval_enabled and task.source_loaders is not None):
+        prestep_eval = resolved.prestep_eval
+        if not (prestep_eval.block_extension_eval_enabled and task.source_loaders is not None):
             return
         device = env.device
         source_base_model_task = None if models is None else models.source_base
         source_ft_model_task = None if models is None else models.source_ft
         eval_row: dict[str, Any] = {
             "task": task.task,
-            "split": lmc.block_extension_eval_split,
+            "split": prestep_eval.block_extension_eval_split,
             "first_n_batches": (
-                int(lmc.block_extension_eval_first_n_batches)
-                if lmc.block_extension_eval_first_n_batches is not None
+                int(prestep_eval.block_extension_eval_first_n_batches)
+                if prestep_eval.block_extension_eval_first_n_batches is not None
                 else None
             ),
             "extension_applied": bool(env.plan.task_block_extension_prestep),
@@ -358,8 +403,8 @@ class BraceTargetEvalObserver:
                     loaders_obj=task.source_loaders,
                     classnames_task=task.classnames,
                     source_build_cfg_task=task.source_build_cfg_task,
-                    split=lmc.block_extension_eval_split,
-                    first_n_batches=lmc.block_extension_eval_first_n_batches,
+                    split=prestep_eval.block_extension_eval_split,
+                    first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                     device=device,
                 )
             )
@@ -373,10 +418,10 @@ class BraceTargetEvalObserver:
         self.rows.append(eval_row)
 
     def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
-        lmc = env.resolved.lmc
+        prestep_eval = env.resolved.prestep_eval
         t = task.task
         if result.kind is PrestepKind.BRACE:
-            if not lmc.block_extension_eval_enabled:
+            if not prestep_eval.block_extension_eval_enabled:
                 return
             device = env.device
             zero_post = _evaluate_source_model_top1(
@@ -385,8 +430,8 @@ class BraceTargetEvalObserver:
                 loaders_obj=task.source_loaders,
                 classnames_task=task.classnames,
                 source_build_cfg_task=task.source_build_cfg_task,
-                split=lmc.block_extension_eval_split,
-                first_n_batches=lmc.block_extension_eval_first_n_batches,
+                split=prestep_eval.block_extension_eval_split,
+                first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                 device=device,
             )
             ft_post = _evaluate_source_model_top1(
@@ -395,8 +440,8 @@ class BraceTargetEvalObserver:
                 loaders_obj=task.source_loaders,
                 classnames_task=task.classnames,
                 source_build_cfg_task=task.source_build_cfg_task,
-                split=lmc.block_extension_eval_split,
-                first_n_batches=lmc.block_extension_eval_first_n_batches,
+                split=prestep_eval.block_extension_eval_split,
+                first_n_batches=prestep_eval.block_extension_eval_first_n_batches,
                 device=device,
             )
             last_row = self.rows[-1]
@@ -417,7 +462,7 @@ class BraceTargetEvalObserver:
                 },
                 context=last_row,
             )
-        elif result.kind is PrestepKind.NONE and lmc.block_extension_eval_enabled and self.rows:
+        elif result.kind is PrestepKind.NONE and prestep_eval.block_extension_eval_enabled and self.rows:
             last_row = self.rows[-1]
             print(f"  {t}: source target-dataset eval zero_shot={last_row['zero_shot']:.6f} ft={last_row['ft']:.6f}")
             env.run_logger.log_event(
@@ -430,80 +475,6 @@ class BraceTargetEvalObserver:
             )
 
 
-class SourceLmcObserver:
-    """Source-endpoint LMC barrier before and after BRACE, one row per BRACE task."""
-
-    def __init__(self) -> None:
-        self.rows: list[dict[str, Any]] = []
-        self._row: dict[str, Any] | None = None
-
-    def before(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> None:
-        self._row = None
-        lmc = env.resolved.lmc
-        if not (lmc.eval and env.plan.task_block_extension_prestep):
-            return
-        t = task.task
-        source_base_model_task = None if models is None else models.source_base
-        source_ft_model_task = None if models is None else models.source_ft
-        if task.source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
-            raise RuntimeError("Source LMC evaluation requires initialized source models and loaders.")
-        source_lmc_row: dict[str, Any] = {
-            "task": t,
-            "lmc_mode": env.resolved.block_extension_cfg.lmc_mode,
-        }
-        source_pre_base_sd = to_cpu_fp32({key: value for key, value in source_base_model_task.state_dict().items()})
-        source_pre_ft_sd = to_cpu_fp32({key: value for key, value in source_ft_model_task.state_dict().items()})
-        print(f"  {t}: evaluating source LMC before block extension")
-        source_lmc_row["before_brace"] = _evaluate_source_lmc(
-            model=source_base_model_task,
-            restore_sd=source_pre_base_sd,
-            endpoint_a_sd=source_pre_base_sd,
-            endpoint_b_sd=source_pre_ft_sd,
-            clf_source=env.clf_source,
-            loaders_obj=task.source_loaders,
-            classnames_task=task.classnames,
-            source_build_cfg_task=task.source_build_cfg_task,
-            split=lmc.eval_split,
-            first_n_batches=lmc.first_n_batches,
-            alphas=lmc.alphas,
-            device=env.device,
-        )
-        self._row = source_lmc_row
-
-    def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
-        source_lmc_row = self._row
-        if source_lmc_row is None or result.kind is not PrestepKind.BRACE:
-            return
-        lmc = env.resolved.lmc
-        t = task.task
-        print(f"  {t}: evaluating source LMC after block extension")
-        source_lmc_row["after_brace"] = _evaluate_source_lmc(
-            model=result.source_base_model,
-            restore_sd=result.source_base_sd,
-            endpoint_a_sd=result.source_base_sd,
-            endpoint_b_sd=result.source_ft_sd,
-            clf_source=env.clf_source,
-            loaders_obj=task.source_loaders,
-            classnames_task=task.classnames,
-            source_build_cfg_task=task.source_build_cfg_task,
-            split=lmc.eval_split,
-            first_n_batches=lmc.first_n_batches,
-            alphas=lmc.alphas,
-            device=env.device,
-        )
-        self.rows.append(source_lmc_row)
-        env.run_logger.log_event(
-            "source_lmc",
-            metrics={
-                f"source_lmc/{t}/before/max_loss_barrier": source_lmc_row["before_brace"]["max_loss_barrier"],
-                f"source_lmc/{t}/after/max_loss_barrier": source_lmc_row["after_brace"]["max_loss_barrier"],
-                f"source_lmc/{t}/before/max_error_barrier": source_lmc_row["before_brace"]["max_error_barrier"],
-                f"source_lmc/{t}/after/max_error_barrier": source_lmc_row["after_brace"]["max_error_barrier"],
-            },
-            context={"task": t, "lmc_mode": env.resolved.block_extension_cfg.lmc_mode},
-        )
-
-
-def build_prestep_observers() -> tuple[BraceTargetEvalObserver, SourceLmcObserver]:
-    """Observers in ``before`` order; ``after`` runs them in reverse (LMC after, then eval post)."""
-    return BraceTargetEvalObserver(), SourceLmcObserver()
+def build_prestep_observers() -> tuple[BraceTargetEvalObserver]:
+    """Observers around the per-task prestep (``eval_before_rebase``: source models before / after it)."""
+    return (BraceTargetEvalObserver(),)

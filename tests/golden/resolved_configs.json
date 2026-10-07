@@ -1,0 +1,1856 @@
+{
+ "qwen2.5_0.5b_to_1.5b_ariadne.json": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "none",
+    "skip_correction": null,
+    "source": "legacy_defaults"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "ariadne",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "ariadne"
+   },
+   "method_family": "direct_fit",
+   "method_label": "ariadne",
+   "method_name": "ariadne",
+   "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "qwen2.5_0.5b_to_1.5b_bico.json": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "bico",
+    "mode": "none",
+    "params": {
+     "num_batches": 100,
+     "seed": 0,
+     "seq_align": "interpolate"
+    }
+   },
+   "method": {
+    "name": "bico"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "bico",
+   "method_name": "bico",
+   "method_params": {
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "qwen2.5_0.5b_to_1.5b_theseus.json": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": true,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": "interpolate_per_weight",
+    "kind": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "theseus",
+    "mode": "none",
+    "params": {
+     "device_transform": "gpu",
+     "num_batches": 100,
+     "seed": 0,
+     "seq_align": "interpolate"
+    }
+   },
+   "method": {
+    "name": "theseus"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "theseus",
+   "method_name": "theseus",
+   "method_params": {
+    "device_transform": "gpu",
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "reference/llm/ariadne.yaml": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "none",
+    "skip_correction": null,
+    "source": "legacy_defaults"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "ariadne",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "ariadne"
+   },
+   "method_family": "direct_fit",
+   "method_label": "ariadne",
+   "method_name": "ariadne",
+   "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "reference/llm/bico.yaml": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "bico",
+    "mode": "none",
+    "params": {
+     "num_batches": 100,
+     "seed": 0,
+     "seq_align": "interpolate"
+    }
+   },
+   "method": {
+    "name": "bico"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "bico",
+   "method_name": "bico",
+   "method_params": {
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "reference/llm/theseus.yaml": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": true,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": "interpolate_per_weight",
+    "kind": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "theseus",
+    "mode": "none",
+    "params": {
+     "device_transform": "gpu",
+     "num_batches": 100,
+     "seed": 0,
+     "seq_align": "interpolate"
+    }
+   },
+   "method": {
+    "name": "theseus"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "theseus",
+   "method_name": "theseus",
+   "method_params": {
+    "device_transform": "gpu",
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "reference/llm/theseus_gqa.yaml": {
+  "modality": "llm",
+  "plans": {
+   "24->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 24
+   },
+   "24->28": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 28
+   },
+   "28->24": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 28,
+    "target_depth": 24
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [],
+    "patience": 0,
+    "search": false,
+    "search_split": "val",
+    "selection": "shared"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 100,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": true,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": "interpolate_per_weight",
+    "kind": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {},
+   "device": "cpu",
+   "entrypoint": "llm",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": null,
+    "method_name": "theseus_gqa",
+    "mode": "none",
+    "params": {
+     "device_transform": "gpu",
+     "num_batches": 100,
+     "seed": 0,
+     "seq_align": "interpolate"
+    }
+   },
+   "method": {
+    "name": "theseus_gqa"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "theseus_gqa",
+   "method_name": "theseus_gqa",
+   "method_params": {
+    "device_transform": "gpu",
+    "num_batches": 100,
+    "seed": 0,
+    "seq_align": "interpolate"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": null,
+   "suite_name": "",
+   "tasks": []
+  }
+ },
+ "reference/vision/ariadne.yaml": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": {
+    "activation_storage": "streaming",
+    "alignment_map": "polar",
+    "alignment_row_weighting": "uniform",
+    "alignment_seed": 0,
+    "backfit_max_iters": 20,
+    "backfit_tol": 0.0001,
+    "block_split": "none",
+    "calibration_data": "task_local",
+    "cascade_order": "independent",
+    "component_target": "block_boundary",
+    "components": [
+     "mlp.c_proj"
+    ],
+    "copy_shape_matching_source_deltas": false,
+    "depth_pairing": "relative",
+    "endpoint_construction": "native_delta",
+    "exact_form": true,
+    "fidelity_holdout": false,
+    "fidelity_holdout_batches": 10,
+    "merge_mode": "per_task_then_merge",
+    "missing_bias": "error",
+    "num_batches": 10,
+    "procrustes_source": "activation",
+    "realization_diagnostics": false,
+    "residual_target": "transported_delta",
+    "ridge_estimator": "empirical_bayes",
+    "ridge_relative": 0.01,
+    "seed": 89,
+    "streaming_fingerprint_tol": 1e-09,
+    "streaming_position_chunk": null,
+    "strength": 1.0,
+    "tv_scaling": "none",
+    "tv_scaling_iters": 3
+   },
+   "ariadne_preset": "ariadne",
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": false,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "brace",
+    "skip_correction": null,
+    "source": "legacy_defaults"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": "relative",
+    "extension_strategy": null,
+    "rule": "none",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": "<types.SimpleNamespace>",
+   "method_family": "direct_fit",
+   "method_label": "Ariadne",
+   "method_name": "ariadne",
+   "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ },
+ "reference/vision/bico.yaml": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": null,
+    "extension_strategy": null,
+    "rule": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "bico"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "bico(batches=10, align=interpolate2d)",
+   "method_name": "bico",
+   "method_params": {
+    "num_batches": 10,
+    "seed": 89
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ },
+ "reference/vision/theseus.yaml": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": true,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": "interpolate_per_weight",
+    "kind": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": null,
+    "extension_strategy": "interpolate_per_weight",
+    "rule": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "theseus"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "theseus(batches=10, align=interpolate2d, cov=activations, whiten=0)",
+   "method_name": "theseus",
+   "method_params": {
+    "num_batches": 10,
+    "seed": 89,
+    "seq_align": "interpolate2d"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ },
+ "vision8_ariadne_b16_to_l14.json": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": {
+    "activation_storage": "streaming",
+    "alignment_map": "polar",
+    "alignment_row_weighting": "uniform",
+    "alignment_seed": 0,
+    "backfit_max_iters": 20,
+    "backfit_tol": 0.0001,
+    "block_split": "none",
+    "calibration_data": "task_local",
+    "cascade_order": "independent",
+    "component_target": "block_boundary",
+    "components": [
+     "mlp.c_proj"
+    ],
+    "copy_shape_matching_source_deltas": false,
+    "depth_pairing": "relative",
+    "endpoint_construction": "native_delta",
+    "exact_form": true,
+    "fidelity_holdout": false,
+    "fidelity_holdout_batches": 10,
+    "merge_mode": "per_task_then_merge",
+    "missing_bias": "error",
+    "num_batches": 10,
+    "procrustes_source": "activation",
+    "realization_diagnostics": false,
+    "residual_target": "transported_delta",
+    "ridge_estimator": "empirical_bayes",
+    "ridge_relative": 0.01,
+    "seed": 89,
+    "streaming_fingerprint_tol": 1e-09,
+    "streaming_position_chunk": null,
+    "strength": 1.0,
+    "tv_scaling": "none",
+    "tv_scaling_iters": 3
+   },
+   "ariadne_preset": "ariadne",
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": false,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "brace",
+    "skip_correction": null,
+    "source": "legacy_defaults"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": "relative",
+    "extension_strategy": null,
+    "rule": "none",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": "<types.SimpleNamespace>",
+   "method_family": "direct_fit",
+   "method_label": "Ariadne",
+   "method_name": "ariadne",
+   "method_params": {},
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ },
+ "vision8_bico_b16_to_l14.json": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "discrete_index_match",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": false,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": null,
+    "kind": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": null,
+    "extension_strategy": null,
+    "rule": "discrete_index_match",
+    "skip_correction": null,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "bico"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "bico(batches=10, align=interpolate2d)",
+   "method_name": "bico",
+   "method_params": {
+    "num_batches": 10,
+    "seed": 89
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ },
+ "vision8_theseus_b16_to_l14.json": {
+  "modality": "vision",
+  "plans": {
+   "12->12": {
+    "depth_alignment": {
+     "rule": "none",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 12
+   },
+   "12->24": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 12,
+    "target_depth": 24
+   },
+   "24->12": {
+    "depth_alignment": {
+     "rule": "brace",
+     "timing": "per_task"
+    },
+    "source_depth": 24,
+    "target_depth": 12
+   }
+  },
+  "resolved": {
+   "alpha": {
+    "alphas": [
+     0.0,
+     0.05000000074505806,
+     0.10000000149011612,
+     0.15000000596046448,
+     0.20000000298023224,
+     0.25,
+     0.30000001192092896,
+     0.3499999940395355,
+     0.4000000059604645,
+     0.45000001788139343,
+     0.5,
+     0.550000011920929,
+     0.6000000238418579,
+     0.6499999761581421,
+     0.699999988079071,
+     0.75,
+     0.800000011920929,
+     0.8500000238418579,
+     0.8999999761581421,
+     0.949999988079071,
+     1.0
+    ],
+    "patience": 0,
+    "search": true,
+    "search_split": "val",
+    "selection": "per_task"
+   },
+   "ariadne_cfg": null,
+   "ariadne_preset": null,
+   "block_extension_cfg": {
+    "blocks_to_add": null,
+    "calibration_dataset": null,
+    "calibration_split": "test",
+    "calibration_task": null,
+    "collapse_schedule": "cascade",
+    "component_ridge": null,
+    "correction_scope": "inserted",
+    "dampening_factor": 1.0,
+    "eval_before_extension": false,
+    "extension_density": "spread",
+    "extension_strategy": "interpolate_per_weight",
+    "first_n_eval_batches": null,
+    "inserted_block_mode": "ariadne",
+    "insertion_order": "bottom-top",
+    "insertion_target_mode": "direct",
+    "lmc_mode": "independent",
+    "n_batches_act": 2,
+    "n_cascade_iters": 1,
+    "reference_capture": "lazy",
+    "ridge_identity": 0.0,
+    "ridge_weight": 1e-06,
+    "share_ft_refs": false,
+    "show_progress": true,
+    "skip_correction": true,
+    "skip_final_ln": false,
+    "target_layers_total": null,
+    "target_shared_correction": null,
+    "transport_activation_mode": "model",
+    "verbose": true
+   },
+   "block_extension_enabled": true,
+   "depth_guard": null,
+   "depth_rule": {
+    "extension_strategy": "interpolate_per_weight",
+    "kind": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "depth_rule_resolved": {
+    "depth_pairing": null,
+    "extension_strategy": "interpolate_per_weight",
+    "rule": "brace",
+    "skip_correction": true,
+    "source": "method_default"
+   },
+   "device": "cuda",
+   "entrypoint": "vision",
+   "grad_batch_size": null,
+   "grad_imgs_per_class": null,
+   "grad_num_batches": null,
+   "merge": {
+    "base_construction": "per_task",
+    "global_alpha_search": true,
+    "method_name": "task_arithmetic",
+    "mode": "none",
+    "params": {}
+   },
+   "method": {
+    "name": "theseus"
+   },
+   "method_family": "activation_aligned",
+   "method_label": "theseus(batches=10, align=interpolate2d, cov=activations, whiten=0)",
+   "method_name": "theseus",
+   "method_params": {
+    "num_batches": 10,
+    "seed": 89,
+    "seq_align": "interpolate2d"
+   },
+   "prestep_eval": {
+    "block_extension_eval_enabled": false,
+    "block_extension_eval_first_n_batches": null,
+    "block_extension_eval_requested": false,
+    "block_extension_eval_split": "test",
+    "source_only": false
+   },
+   "strict_load": false,
+   "suite": {
+    "name": "vision8",
+    "resolver": "<builtins.function>",
+    "tasks": [
+     "Cars",
+     "DTD",
+     "EuroSAT",
+     "GTSRB",
+     "MNIST",
+     "RESISC45",
+     "SUN397",
+     "SVHN"
+    ]
+   },
+   "suite_name": "vision8",
+   "tasks": [
+    "Cars",
+    "DTD",
+    "EuroSAT",
+    "GTSRB",
+    "MNIST",
+    "RESISC45",
+    "SUN397",
+    "SVHN"
+   ]
+  }
+ }
+}
