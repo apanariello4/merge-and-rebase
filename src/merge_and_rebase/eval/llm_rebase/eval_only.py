@@ -141,6 +141,7 @@ def main() -> None:
             apply_chat_template=bool(cfg.get("harness_apply_chat_template", False)),
             system_instruction=cfg.get("harness_system_instruction", None),
             dump_generations_dir=cfg.get("harness_dump_generations_dir", None),
+            decoding=str(cfg.get("harness_decoding", "model")),
         )
         print("\n=== Harness results ===")
         for name, value in harness_results.items():
