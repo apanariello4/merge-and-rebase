@@ -21,9 +21,9 @@ from ...rebase.run_config import (
     AlphaSpec,
     DepthRule,
     MergeSpec,
+    PrestepEvalSpec,
     ResolvedRunConfig,
     RunPlan,
-    SourceLmcSpec,
     resolve_depth_rule,
 )
 
@@ -86,19 +86,11 @@ def resolve_llm_run_config(
         ),
         alpha=AlphaSpec(search=bool(cfg.get("alpha_search", False)), patience=0, search_split="val", alphas=[],
                         selection="shared"),
-        lmc=SourceLmcSpec(
+        prestep_eval=PrestepEvalSpec(
             block_extension_eval_requested=False,
             block_extension_eval_enabled=False,
             block_extension_eval_split="test",
             block_extension_eval_first_n_batches=None,
-            eval=False,
-            eval_split="val",
-            first_n_batches=None,
-            alphas=[],
-            cross_task_pairs=[],
-            cross_task_split="val",
-            all_task_tasks=[],
-            all_task_split="val",
             # eval_before_rebase_only stops each task after its prestep: the one thing ``source_only`` means.
             source_only=eval_before_rebase_only,
         ),

@@ -24,6 +24,7 @@ import yaml
 import merge_and_rebase
 from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method, resolve_llm_run_config
 from merge_and_rebase.rebase.block_extension import config as be_config
+from merge_and_rebase.rebase.config_schema import canonicalize, legacy_location, legacy_value
 from merge_and_rebase.rebase.methods import bico as bico_module
 from merge_and_rebase.rebase.methods import theseus as theseus_module
 from merge_and_rebase.rebase.methods._ariadne import config as ariadne_config
@@ -77,6 +78,7 @@ INJECTED = {
     "source_activation_plan",
 }
 
+_CANONICAL_BLOCKS = {"models", "method", "depth_alignment", "merge", "alpha", "save", "load"}
 _KEY_LINE = re.compile(r"^(?P<ind> *)(?P<hash># )?(?P<key>[a-z_][a-z0-9_]*):(?P<rest>.*)$")
 
 
@@ -123,8 +125,26 @@ def _cases():
 
 
 def _load(case: str) -> tuple[str, dict, list[Entry]]:
+    """The file as written: canonical config and canonical entry paths."""
     path = REFERENCE / f"{case}.yaml"
     return path.read_text(), load_json(path), parse_entries(path.read_text())
+
+
+def _legacy_entries(case: str) -> list[Entry]:
+    """The file's entries at their legacy flat paths (where the code's dataclasses and keyword names live)."""
+    direct_fit = case.endswith("ariadne")
+    out = []
+    for e in _load(case)[2]:
+        if e.is_header and e.path[-1] in ("data", "gradient") and len(e.path) == 3:
+            continue  # canonical-only sub-blocks: their leaves map to flat legacy keys
+        path = legacy_location(e.path, direct_fit=direct_fit)
+        raw = e.raw_value
+        if not e.is_header:
+            value = legacy_value(e.path, e.value)
+            if value != e.value:
+                raw = json.dumps(value)
+        out.append(Entry(path, e.commented, raw, e.comment))
+    return out
 
 
 def _group(entries: list[Entry], *prefix: str) -> dict[str, Entry]:
@@ -157,14 +177,15 @@ def _method_params_contract(method: str, modality: str) -> dict[str, object]:
     for name, default in _kwargs_defaults(module).items():
         if name not in INJECTED:
             accepted.setdefault(name, default)
-    if modality == "llm":
-        accepted.pop("n_batches")  # rejected by resolve_llm_method
+    for legacy in ("n_batches", "patch_qkv"):  # legacy aliases of num_batches / split_qkv (rebase/config_schema.py)
+        accepted.pop(legacy, None)
     return accepted
 
 
 # ---------------------------------------------------------------- (1) real resolvers, no warnings
 def _resolve_and_check(case: str, cfg: dict, *, allow_brace_only_warning: bool = False) -> None:
     modality, method = case.split("/")
+    cfg = dict(canonicalize(cfg))
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         if allow_brace_only_warning:
@@ -237,14 +258,14 @@ def test_reference_config_matches_example(case):
     _, cfg, _ = _load(case)
     twin = json.loads((ROOT / "configs" / "examples" / TWINS[case]).read_text())
     if case == "llm/theseus_gqa":
-        twin["method"] = "theseus_gqa"
+        twin["method"]["name"] = "theseus_gqa"
     assert cfg == twin
 
 
 # ---------------------------------------------------------------- (3) complete, (4) true defaults
 @pytest.mark.parametrize("case", [c for c in _cases() if not c.endswith("ariadne")])
 def test_block_extension_params_complete_and_defaults(case):
-    _, _, entries = _load(case)
+    entries = _legacy_entries(case)
     group = _group(entries, "block_extension_params")
     fields = {f.name: f for f in dataclasses.fields(be_config.BlockExtensionConfig)}
     assert set(fields) | {"depth_rule"} <= set(group), sorted(set(fields) - set(group))
@@ -271,7 +292,7 @@ def test_block_extension_params_complete_and_defaults(case):
 
 @pytest.mark.parametrize("case", ["vision/ariadne", "llm/ariadne"])
 def test_ariadne_params_complete_and_defaults(case):
-    _, _, entries = _load(case)
+    entries = _legacy_entries(case)
     group = _group(entries, "ariadne_params")
     fields = {f.name: f for f in dataclasses.fields(ariadne_config.DirectResidualConfig)}
     assert set(group) == set(fields) | {"preset"}, sorted((set(fields) | {"preset"}) ^ set(group))
@@ -294,7 +315,7 @@ def test_ariadne_params_complete_and_defaults(case):
 @pytest.mark.parametrize("case", [c for c in _cases() if not c.endswith("ariadne")])
 def test_method_params_complete_and_defaults(case):
     modality, method = case.split("/")
-    _, _, entries = _load(case)
+    entries = _legacy_entries(case)
     group = _group(entries, "method_params")
     contract = _method_params_contract(method, modality)
     assert set(group) == set(contract), sorted(set(group) ^ set(contract))
@@ -307,13 +328,13 @@ def test_method_params_complete_and_defaults(case):
 @pytest.mark.parametrize("case", _cases())
 def test_top_level_keys_are_read_by_the_entrypoint(case):
     modality = case.split("/")[0]
-    _, _, entries = _load(case)
+    entries = _legacy_entries(case)
     text = "\n".join(
         p.read_text()
         for rel in TOP_LEVEL_SOURCES[modality]
         for p in ((SRC / rel).glob("*.py") if (SRC / rel).is_dir() else [SRC / rel])
     )
-    keys = {e.path[0] for e in entries if len(e.path) == 1}
+    keys = {e.path[0] for e in entries if len(e.path) == 1 and not (e.is_header and e.path[0] in _CANONICAL_BLOCKS)}
     missing = sorted(k for k in keys if f'"{k}"' not in text and f"'{k}'" not in text)
     assert not missing, missing
 
@@ -328,7 +349,7 @@ def test_logging_defaults():
 # ---------------------------------------------------------------- (5) status tags
 @pytest.mark.parametrize("case", [c for c in _cases() if not c.endswith("ariadne")])
 def test_status_tags(case):
-    _, _, entries = _load(case)
+    entries = _legacy_entries(case)
     group = _group(entries, "block_extension_params")
     for key in be_config._BRACE_ONLY_FIELDS:
         assert "[BRACE-only]" in group[key].comment, key

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method
+from merge_and_rebase.rebase.config_schema import canonicalize
 from merge_and_rebase.rebase.methods._ariadne.config import parse_direct_residual_config
 from merge_and_rebase.rebase.run_config import resolve_run_config
 
@@ -20,7 +21,7 @@ def test_examples_exist():
 
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
 def test_example_config_parses(path):
-    cfg = json.loads(path.read_text())
+    cfg = dict(canonicalize(json.loads(path.read_text())))  # the examples use the canonical names
     params = cfg.get("ariadne_params") or cfg.get("method_params") or {}
     # Per-experiment budget fields are never implied: every example states num_batches and seed.
     assert "num_batches" in params and "seed" in params, path.name

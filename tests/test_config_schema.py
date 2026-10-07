@@ -58,19 +58,18 @@ def _resolve(cfg: dict, modality: str) -> dict:
 
 @pytest.mark.parametrize("rel", _configs())
 def test_canonical_spelling_resolves_like_the_legacy_one(rel):
-    legacy = dict(load_json(EXAMPLES / rel))
-    modality = _modality(rel, legacy)
-    canonical = to_canonical(legacy)
+    canonical = dict(load_json(EXAMPLES / rel))  # the example configs are written with the canonical names
+    modality = _modality(rel, canonical)
     assert not legacy_keys_used(canonical), legacy_keys_used(canonical)
+    legacy = dict(canonicalize(canonical))
+    assert legacy_keys_used(legacy)  # the flat spelling really is the legacy one
     assert _resolve(canonical, modality) == _resolve(legacy, modality)
 
 
 @pytest.mark.parametrize("rel", _configs())
 def test_round_trip_is_exact(rel):
-    legacy = dict(load_json(EXAMPLES / rel))
-    if isinstance(legacy.get("depth_alignment"), str):
-        pytest.skip("the legacy depth_alignment alias becomes block_extension_params.depth_rule")
-    assert dict(canonicalize(to_canonical(legacy))) == legacy
+    canonical = dict(load_json(EXAMPLES / rel))
+    assert to_canonical(dict(canonicalize(canonical))) == canonical
 
 
 def test_flat_config_is_returned_unchanged():

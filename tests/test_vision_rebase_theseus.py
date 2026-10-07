@@ -230,7 +230,6 @@ def test_bico_uses_an_isolated_depth_matched_source_after_block_extension(source
 
 def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> None:
     from merge_and_rebase.eval.vision_rebase import pipeline as vision_rebase_pipeline
-    from merge_and_rebase.eval.vision_rebase.summary import RunRecord
 
     tree = ast.parse(inspect.getsource(vision_rebase_pipeline.run_rebase))
     run_fn = tree.body[0]
@@ -248,10 +247,7 @@ def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> 
         and node.value.func.value.id == "pipeline"
     )
     before_loop = run_fn.body[:loop_index]
-    # The cross-task / all-task LMC rows are never populated: the record owns them as empty-list defaults.
-    for name in ("cross_task_lmc_rows", "all_task_lmc_rows"):
-        assert RunRecord.__dataclass_fields__[name].default_factory is list
-    # The per-task BRACE collectors live in the stage objects (P5.8): the source-LMC rows on the observer and the
+    # The per-task BRACE collectors live in the stage objects (P5.8): the prestep-eval rows on the observer and the
     # corrected/independent endpoint books on StageEnv.endpoints; all of them must exist before the first task runs.
     assigned = {
         name.id
@@ -261,7 +257,7 @@ def test_main_initializes_brace_diagnostic_collectors_before_the_task_loop() -> 
         for name in (target.elts if isinstance(target, ast.Tuple) else [target])
         if isinstance(name, ast.Name)
     }
-    assert {"env", "pipeline", "eval_observer", "lmc_observer", "calibration"} <= assigned
+    assert {"env", "pipeline", "eval_observer", "calibration"} <= assigned
     from merge_and_rebase.rebase.prestep import IndependentEndpoints
 
     assert {

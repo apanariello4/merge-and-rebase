@@ -31,9 +31,6 @@ class RunRecord:
     selected_validation_results: Any
     baseline_label: Any
     block_extension_eval_rows: Any
-    source_lmc_rows: Any
-    cross_task_lmc_rows: Any = field(default_factory=list)
-    all_task_lmc_rows: Any = field(default_factory=list)
     transported_artifacts: Any
     transport_timings: Any
     transport_calibration_meta: Any
@@ -102,7 +99,6 @@ class RunRecord:
         alpha: Any,
         ariadne: Any,
         block_extension_eval_rows: Any,
-        source_lmc_rows: Any,
         transported_artifacts: Any,
         target_hash_before: Any,
         target_hash_after: Any,
@@ -126,7 +122,6 @@ class RunRecord:
             selected_validation_results=alpha.selected_validation_results,
             baseline_label=alpha.baseline_label,
             block_extension_eval_rows=block_extension_eval_rows,
-            source_lmc_rows=source_lmc_rows,
             transported_artifacts=transported_artifacts,
             transport_timings=loop_outputs.transport_timings,
             transport_calibration_meta=calibration.transport_calibration_meta,
@@ -298,9 +293,6 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
             item["task"]: float(record.selected_baseline_alpha_by_task[i]) for i, item in enumerate(record.per_task)
         },
         "block_extension_target_dataset_eval": record.block_extension_eval_rows,
-        "source_lmc": record.source_lmc_rows,
-        "cross_task_source_lmc": record.cross_task_lmc_rows,
-        "all_task_source_lmc": record.all_task_lmc_rows,
         "transported_artifacts": record.transported_artifacts,
         "transport_timings": record.transport_timings,
         "transport_calibration": record.transport_calibration_meta,

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from merge_and_rebase.rebase.config_schema import canonicalize
 from merge_and_rebase.rebase.merge_modes import _VALID_MERGE_MODES
 from merge_and_rebase.rebase.run_config import DepthRule, resolve_run_config
 from merge_and_rebase.utils.helpers import load_json
@@ -28,7 +29,7 @@ def _legacy_flags(depth_prestep_method, block_extension_enabled, rule, merge_mod
 
 @pytest.fixture(scope="module")
 def base():
-    cfg = dict(load_json(ROOT / "configs" / "examples" / "vision8_theseus_b16_to_l14.json"))
+    cfg = dict(canonicalize(load_json(ROOT / "configs" / "examples" / "vision8_theseus_b16_to_l14.json")))
     cfg["block_extension_enabled"] = True
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

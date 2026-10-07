@@ -1,36 +1,50 @@
 {
   "suite": "vision8",
   "tasks": "all",
-  "source_clip_model": "ViT-B-16",
-  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
-  "target_clip_model": "ViT-L-14",
-  "target_clip_pretrained": "datacomp_xl_s13b_b90k",
-  "method": "theseus",
-  "method_params": {
-    "num_batches": 10,
-    "seed": 89,
-    "seq_align": "interpolate2d"
+  "models": {
+    "source": {
+      "model": "ViT-B-16",
+      "pretrained": "datacomp_xl_s13b_b90k"
+    },
+    "target": {
+      "model": "ViT-L-14",
+      "pretrained": "datacomp_xl_s13b_b90k"
+    },
+    "tuned_checkpoints": {
+      "Cars": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/best.pt",
+      "DTD": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/best.pt",
+      "EuroSAT": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/best.pt",
+      "GTSRB": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/best.pt",
+      "MNIST": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/best.pt",
+      "RESISC45": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/best.pt",
+      "SUN397": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/best.pt",
+      "SVHN": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt"
+    }
   },
-  "depth_defaults": "method",
-  "alpha_search": true,
-  "alpha_min": 0.0,
-  "alpha_max": 1.0,
-  "alpha_step": 0.05,
-  "alpha_selection": "per_task",
-  "alpha_search_split": "val",
+  "method": {
+    "name": "theseus",
+    "params": {
+      "num_batches": 10,
+      "seed": 89,
+      "seq_align": "interpolate2d"
+    }
+  },
+  "depth_alignment": {
+    "defaults": "method"
+  },
+  "alpha": {
+    "search": true,
+    "min": 0.0,
+    "max": 1.0,
+    "step": 0.05,
+    "selection": "per_task",
+    "split": "val"
+  },
+  "save": {
+    "transported_task_vectors_policy": "auto"
+  },
   "batch_size": 32,
   "num_workers": 0,
   "val_fraction": 0.1,
-  "seed": 89,
-  "save_transported_tvs": "auto",
-  "tuned_ckpts": {
-    "Cars": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/best.pt",
-    "DTD": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/best.pt",
-    "EuroSAT": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/best.pt",
-    "GTSRB": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/best.pt",
-    "MNIST": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/best.pt",
-    "RESISC45": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/best.pt",
-    "SUN397": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/best.pt",
-    "SVHN": "checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt"
-  }
+  "seed": 89
 }
