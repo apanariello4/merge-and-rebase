@@ -43,6 +43,7 @@ from .block_extension.config import (
 from .capabilities import MethodFamily, default_depth_prestep, depth_prestep_methods, method_family
 from .config_schema import canonicalize
 from .merge_modes import _SINGLE_TRANSPORT_MODES, _TRANSPORT_THEN_MERGE_MODES, _resolve_merge_mode_config
+from .methods._ariadne.config import reject_decoder_only_options
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
 
@@ -269,7 +270,7 @@ def _parse_depth_defaults(cfg: Mapping[str, Any]) -> str | None:
 def _meaning_changed_message(method_name: str, reason: str, old_fix: str) -> str:
     return (
         f"{method_name}: {reason}. The per-method depth defaults would change this run's result. "
-        f"Either keep the previous behaviour with {old_fix} (or \"depth_defaults\": \"legacy\"), "
+        f'Either keep the previous behaviour with {old_fix} (or "depth_defaults": "legacy"), '
         'or accept the new method default with "depth_defaults": "method".'
     )
 
@@ -470,6 +471,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
             cfg["ariadne_params"] if cfg.get("ariadne_params") is not None else cfg.get("direct_residual_params")
         )
         direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
+        reject_decoder_only_options(direct_residual_cfg)
         direct_residual_preset = resolve_direct_residual_preset(direct_residual_raw_params)
         sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
         if (

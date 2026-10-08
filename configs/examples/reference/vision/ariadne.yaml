@@ -95,6 +95,7 @@ method:
     #                                       #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
     # procrustes_energy: null               # [ablation] smallest k whose PLAIN singular values hold this share of their sum,
     #                                       #   in (0, 1]; exclusive with procrustes_rank; null = full map.
+    # exclude_first_token: false            # [decoder-only] the vision path rejects true (text attention-sink exclusion).
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:

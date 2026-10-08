@@ -66,6 +66,8 @@ method:
     #                                       #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
     # procrustes_energy: null               # [ablation] smallest k whose PLAIN singular values hold this share of their sum,
     #                                       #   in (0, 1]; exclusive with procrustes_rank; null = full map.
+    # exclude_first_token: false            # [ablation] also drop the first real token of every sequence (attention sink,
+    #                                       #   massive activations) from every fit statistic, source and target alike.
     # procrustes_source: "activation"       # [vision-only] the decoder rejects gradient.
     # tv_scaling: "none"                    # [vision-only] the decoder rejects global | per_block.
     # tv_scaling_iters: 3                   # [vision-only]

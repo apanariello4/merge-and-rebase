@@ -129,6 +129,10 @@ class DirectResidualConfig:
     # centered cross-covariance (NOT squared); 1.0 is the full map. Serialized only when set.
     procrustes_rank: int | None = None
     procrustes_energy: float | None = None
+    # Decoder-only ablation (default off): besides padding, drop the first non-padded position of every sequence (the
+    # attention sink, massive activations) from every statistic the fit consumes, for source and target alike.
+    # Serialized only when True; rejected on the vision path (reject_decoder_only_options).
+    exclude_first_token: bool = False
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
@@ -139,6 +143,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "depth_fit": "independent",
     "procrustes_rank": None,
     "procrustes_energy": None,
+    "exclude_first_token": False,
 }
 
 
@@ -232,6 +237,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "depth_fit",
         "procrustes_rank",
         "procrustes_energy",
+        "exclude_first_token",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -439,6 +445,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
         if bad:
             raise ValueError(f"procrustes_rank/procrustes_energy require {need}; got incompatible {bad}")
+    if not isinstance(cfg.exclude_first_token, bool):
+        raise TypeError("exclude_first_token must be bool")
     if cfg.depth_fit not in {"independent", "sequential"}:
         raise ValueError("depth_fit must be 'independent' or 'sequential'")
     if cfg.depth_fit == "sequential":
@@ -482,6 +490,15 @@ _DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("endpoint_construction", "native_delta"),
     ("calibration_data", "task_local"),
 )
+
+
+def reject_decoder_only_options(cfg: DirectResidualConfig) -> None:
+    """Vision path guard: refuse options that are only defined on decoder (text) calibration."""
+    if cfg.exclude_first_token:
+        raise ValueError(
+            "Ariadne option exclude_first_token=true is decoder-only (it needs the attention mask of text "
+            "calibration); the vision path does not support it"
+        )
 
 
 def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapter: Any) -> DirectResidualConfig:

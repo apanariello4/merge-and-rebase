@@ -197,6 +197,7 @@ def _fit_body(
             fidelity_alignment_diagnostics=bool(config.fidelity_holdout),
             procrustes_rank=config.procrustes_rank,
             procrustes_energy=config.procrustes_energy,
+            exclude_first_token=config.exclude_first_token,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )
@@ -216,6 +217,7 @@ def _fit_body(
             procrustes_source=config.procrustes_source,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
+            exclude_first_token=config.exclude_first_token,
         )
         if config.endpoint_construction == "native_delta":
             desired = compute_desired_effects(

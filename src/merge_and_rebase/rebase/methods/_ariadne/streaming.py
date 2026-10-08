@@ -138,6 +138,7 @@ def prepare_direct_residual_streaming(
     fidelity_alignment_diagnostics: bool = False,
     procrustes_rank: int | None = None,
     procrustes_energy: float | None = None,
+    exclude_first_token: bool = False,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` + ``compute_desired_effects``.
 
@@ -182,7 +183,12 @@ def prepare_direct_residual_streaming(
     if gradient_mode and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
-        source_loader, target_loader, num_batches=num_batches, seed=seed, family_adapter=family_adapter
+        source_loader,
+        target_loader,
+        num_batches=num_batches,
+        seed=seed,
+        family_adapter=family_adapter,
+        exclude_first_token=exclude_first_token,
     )
     distinct_source_indices = sorted(set(pairing.pairing))
     src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}

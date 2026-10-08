@@ -67,8 +67,26 @@ def _batch_row_mask(batch):
     return None
 
 
-def _attach_row_masks(source_batch, target_batch, family_adapter):
-    """Combine each model's own ``content_mask`` (``ms & mt``) once and attach it to BOTH batches."""
+def _first_content_position(mask):
+    """Bool ``[B, T]`` marking the first ``True`` of every row (all ``False`` for a row without content).
+
+    Taken from the mask itself, so it is the first non-padded position for left AND right padding.
+    """
+    first = torch.zeros_like(mask)
+    has_content = mask.any(dim=1)
+    idx = mask.to(torch.uint8).argmax(dim=1)  # first maximum = first True
+    rows = torch.nonzero(has_content).squeeze(1)
+    first[rows, idx[rows]] = True
+    return first
+
+
+def _attach_row_masks(source_batch, target_batch, family_adapter, exclude_first_token=False):
+    """Combine each model's own ``content_mask`` (``ms & mt``) once and attach it to BOTH batches.
+
+    ``exclude_first_token`` additionally drops the first non-padded position of every sequence (the attention
+    sink) of EACH model, from the one combined mask, so source and target keep identical row sets. Returns
+    ``(source, target, n_total, n_content, n_excluded)``; ``n_content`` is the count before the exclusion.
+    """
     ms = family_adapter.content_mask(source_batch)
     mt = family_adapter.content_mask(target_batch)
     if ms.shape != mt.shape:
@@ -77,22 +95,34 @@ def _attach_row_masks(source_batch, target_batch, family_adapter):
             "rows cannot be paired after padding removal (tokenizer or max_length mismatch)"
         )
     mask = ms & mt
+    n_content = int(mask.sum())
+    if exclude_first_token:
+        mask = mask & ~_first_content_position(ms) & ~_first_content_position(mt)
     if not bool(mask.any()):
-        raise ValueError("Calibration batch has no content rows after padding removal")
+        raise ValueError(
+            "Calibration batch has no content rows after padding removal"
+            + (" and first-token exclusion" if exclude_first_token else "")
+        )
     out = []
     for batch in (source_batch, target_batch):
         wrapped = dict(family_adapter.extract_calibration_batch(batch))
         wrapped[ROW_MASK_KEY] = mask
         out.append(wrapped)
-    return out[0], out[1], int(mask.numel()), int(mask.sum())
+    return out[0], out[1], int(mask.numel()), n_content, n_content - int(mask.sum())
 
 
-def paired_calibration(source_loader, target_loader, *, num_batches, seed=None, family_adapter=None):
+def paired_calibration(
+    source_loader, target_loader, *, num_batches, seed=None, family_adapter=None, exclude_first_token=False
+):
     """Replay identical dataset indices under the two model preprocessors.
 
     ``family_adapter`` (HF decoders only) attaches the combined padding mask to every batch pair; the vision path
-    (``None``) returns its batches untouched.
+    (``None``) returns its batches untouched. ``exclude_first_token`` (decoder only) also drops the first non-padded
+    position of every sequence from the attached mask; the metadata then carries ``n_rows_excluded_first_token``
+    and ``n_rows_content`` counts the rows that remain.
     """
+    if exclude_first_token and family_adapter is None:
+        raise ValueError("exclude_first_token is decoder-only (needs the family adapter's attention mask)")
     if not isinstance(source_loader, DataLoader) or not isinstance(target_loader, DataLoader):
         raise ValueError("Paired calibration requires indexed DataLoaders")
     if _dataset_identity(source_loader.dataset) != _dataset_identity(target_loader.dataset):
@@ -112,7 +142,7 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None, 
     source = DataLoader(Subset(source_loader.dataset, order), collate_fn=source_loader.collate_fn, **kwargs)
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
     source_batches, target_batches = [], []
-    n_rows_total = n_rows_content = 0
+    n_rows_total = n_rows_content = n_rows_excluded = 0
     for a, b in zip(source, target, strict=True):
         # Vision batches are (images, labels); labels are model-agnostic and must match example for example.
         # Text batches are tokenizer-specific mappings (ids differ by construction), so nothing is comparable;
@@ -121,9 +151,10 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None, 
             if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
                 raise ValueError("Calibration labels disagree for supposedly identical images")
         if family_adapter is not None:
-            a, b, total, content = _attach_row_masks(a, b, family_adapter)
+            a, b, total, content, excluded = _attach_row_masks(a, b, family_adapter, exclude_first_token)
             n_rows_total += total
             n_rows_content += content
+            n_rows_excluded += excluded
         source_batches.append(a)
         target_batches.append(b)
     metadata = {
@@ -137,8 +168,11 @@ def paired_calibration(source_loader, target_loader, *, num_batches, seed=None, 
     }
     if family_adapter is not None:
         metadata["n_rows_total"] = n_rows_total
-        metadata["n_rows_content"] = n_rows_content
+        metadata["n_rows_content"] = n_rows_content - n_rows_excluded
+        # pad_row_fraction counts padding only (n_rows_content here is before first-token exclusion).
         metadata["pad_row_fraction"] = 1.0 - n_rows_content / max(n_rows_total, 1)
+        if exclude_first_token:
+            metadata["n_rows_excluded_first_token"] = n_rows_excluded
     return source_batches, target_batches, metadata
 
 
@@ -531,6 +565,7 @@ def capture_paired_boundary_activations(
     procrustes_source: str = "activation",
     source_recipe=None,
     target_recipe=None,
+    exclude_first_token: bool = False,
 ) -> dict[str, Any]:
     """Capture native boundary activations for every position Ariadne fits.
 
@@ -557,7 +592,12 @@ def capture_paired_boundary_activations(
     if procrustes_source == "gradient" and (source_recipe is None or target_recipe is None):
         raise ValueError("procrustes_source='gradient' requires both source_recipe and target_recipe")
     source_batches, target_batches, metadata = paired_calibration(
-        source_loader, target_loader, num_batches=num_batches, seed=seed, family_adapter=family_adapter
+        source_loader,
+        target_loader,
+        num_batches=num_batches,
+        seed=seed,
+        family_adapter=family_adapter,
+        exclude_first_token=exclude_first_token,
     )
     # Deduplicate: under extend many target positions share one source index; capturing it twice would waste
     # compute and risk a second, non-identical bank for the same index if anything upstream were nondeterministic.
