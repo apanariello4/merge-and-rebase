@@ -133,6 +133,7 @@ def _fit_pair(
     exact_form=False,
     pairing=None,
     same_object=False,
+    exclude_first_token=False,
 ):
     src, ft, tgt, fam, base_sd = _setup(
         source_layers, target_layers, dtype=dtype, missing_bias=missing_bias, same_object=same_object
@@ -149,7 +150,7 @@ def _fit_pair(
     loader = _text_loader(padding_side)
     prepared = prepare_direct_residual_streaming(
         src, tgt, loader, loader, pairing, num_batches=cfg_ref.num_batches, seed=cfg_ref.seed, device="cpu",
-        family_adapter=fam,
+        family_adapter=fam, exclude_first_token=exclude_first_token,
     )  # fmt: skip
     assert prepared["calibration"]["pad_row_fraction"] > 0.2  # padded batches
     args = (tgt, base_sd, src, ft, prepared, pairing)
@@ -215,6 +216,24 @@ def test_block_carry_bitwise_equals_reference(source_layers, target_layers, miss
     expected_new = n_batches * (3 * target_layers - 1 + 2 * source_layers)
     assert runner.executed_blocks == new_blocks == expected_new
     assert new_blocks < ref_blocks
+
+
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+@pytest.mark.parametrize(
+    "missing_bias, exact_form", [("skip", False), ("materialize", True)], ids=["skip", "materialize"]
+)
+def test_block_carry_with_exclude_first_token_equals_reference(missing_bias, exact_form, padding_side):
+    """The row mask (padding + first token) reaches the replayed target batches: block_carry stays bit-identical."""
+    ref, new, _, _, _, prepared = _fit_pair(
+        2, 4, padding_side=padding_side, missing_bias=missing_bias, exact_form=exact_form, exclude_first_token=True
+    )
+    _assert_identical(ref, new)
+    assert prepared["calibration"]["n_rows_excluded_first_token"] == len(TEXTS)
+    off, _, _, _, _, prepared_off = _fit_pair(
+        2, 4, padding_side=padding_side, missing_bias=missing_bias, exact_form=exact_form
+    )
+    assert "n_rows_excluded_first_token" not in prepared_off["calibration"]
+    assert _sha(off[0]) != _sha(ref[0])  # the exclusion is not a no-op for the fit
 
 
 def test_block_carry_bitwise_float32():
