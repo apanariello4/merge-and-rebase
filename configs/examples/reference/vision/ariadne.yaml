@@ -91,6 +91,8 @@ method:
     #                                       #   parameters (default: the task vector is only the fit).
     # depth_fit: "independent"              # [ablation] independent (each block fitted on the untouched target) | sequential
     #                                       #   (block j fitted against D_j minus what blocks < j already realize; streaming, one component).
+    # sequential_impl: "reference"          # compute-only switch for depth_fit=sequential; block_carry is decoder-only (the
+    #                                       #   vision path always runs reference).
     # procrustes_rank: null                 # [ablation] keep only the top-k singular pairs of each block's cross-covariance
     #                                       #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
     # procrustes_energy: null               # [ablation] smallest k whose PLAIN singular values hold this share of their sum,

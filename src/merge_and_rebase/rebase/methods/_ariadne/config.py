@@ -122,6 +122,11 @@ class DirectResidualConfig:
     # carrying the fitted updates of blocks < j (residual target D_j - U_j); streaming path only (see
     # streaming.fit_direct_residual_sequential_streaming). Serialized only when non-default.
     depth_fit: str = "independent"
+    # How depth_fit='sequential' is computed (same estimator, same fitted task vector). 'reference' (default): the
+    # original streaming code, four full forwards per position and batch. 'block_carry' (decoders only): every model
+    # stream carries its exact block input forward, so each position runs only its own block (see
+    # sequential_carry.py). Serialized only when non-default.
+    sequential_impl: str = "reference"
     # Ablation (polar map, procrustes_source='activation', streaming only; mutually exclusive, default None = full
     # map): rank-truncate the Procrustes map Q_j = U V^T to its top-k singular pairs, Q_j^k = U[:, :k] Vh[:k].
     # 'procrustes_rank': fixed k >= 1 (k >= min(d_source, d_target) is the full map). 'procrustes_energy': in (0, 1],
@@ -141,6 +146,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "streaming_fingerprint_tol": 1e-9,
     "copy_shape_matching_source_deltas": False,
     "depth_fit": "independent",
+    "sequential_impl": "reference",
     "procrustes_rank": None,
     "procrustes_energy": None,
     "exclude_first_token": False,
@@ -235,6 +241,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "streaming_fingerprint_tol",
         "copy_shape_matching_source_deltas",
         "depth_fit",
+        "sequential_impl",
         "procrustes_rank",
         "procrustes_energy",
         "exclude_first_token",
@@ -449,6 +456,10 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise TypeError("exclude_first_token must be bool")
     if cfg.depth_fit not in {"independent", "sequential"}:
         raise ValueError("depth_fit must be 'independent' or 'sequential'")
+    if cfg.sequential_impl not in {"reference", "block_carry"}:
+        raise ValueError("sequential_impl must be 'reference' or 'block_carry'")
+    if cfg.sequential_impl != "reference" and cfg.depth_fit != "sequential":
+        raise ValueError(f"sequential_impl={cfg.sequential_impl!r} requires depth_fit='sequential'")
     if cfg.depth_fit == "sequential":
         required = {
             "activation_storage": "streaming",
