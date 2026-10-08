@@ -194,11 +194,13 @@ class CalibrationTexts:
         self.notes = list(notes or [])
         #: True when the corpus was chosen independently of the evaluated task (so no eval hold-out exists).
         self.decoupled = bool(decoupled)
+        #: Generated-answer calibration record (None = off); set by ``TextCalibrationCache`` after it replaced the texts.
+        self.generated_answer: dict[str, Any] | None = None
 
     def provenance(self) -> dict[str, Any]:
         """Additive run-summary record: corpus fingerprint, size, hold-out hash and any recorded deviations."""
         holdout = json.dumps({k: list(v) for k, v in sorted(self.eval_samples.items())}, sort_keys=True)
-        return {
+        record = {
             "source": self.source,
             "n_sequences": len(self.texts),
             "corpus_sha256": hashlib.sha256("\x00".join(self.texts).encode()).hexdigest(),
@@ -211,6 +213,9 @@ class CalibrationTexts:
             "chat_template": {k: v for k, v in (self.chat_template or {}).items() if k != "sha256"} or None,
             "rendered_texts_sha256": hashlib.sha256(json.dumps(list(self.texts)).encode()).hexdigest(),
         }
+        if self.generated_answer is not None:  # only present when the opt-in feature ran
+            record["generated_answer"] = dict(self.generated_answer)
+        return record
 
     def __len__(self) -> int:
         return len(self.texts)

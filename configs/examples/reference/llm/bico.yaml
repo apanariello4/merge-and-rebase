@@ -135,6 +135,11 @@ calibration_max_length: 192                 # calibration token length (default 
 #                                           #   {path, name|config, split, text_column | text_columns + text_template}
 #                                           #   (text_columns + text_template build question/answer texts).
 # calibration_include_target: false         # [ablation] append the gold target to harness calibration prompts.
+# calibration_generated_answer: null        # [ablation] mapping {max_new_tokens: 256, batch_size: 16, model: null,
+#                                           #   cache_path: null}: each calibration text becomes prompt + the source
+#                                           #   fine-tune's own greedy answer (model: tuned ref, default the single
+#                                           #   tuned body; cache_path: json reused when its identity matches).
+#                                           #   Not combinable with calibration_include_target.
 # hyperparam_search: null                   # alpha and method_params sweep: {strategy: sequential | sobol,
 #                                           #   num_samples: 16, refine_factor: 0.5, refinement_steps, refinement_samples,
 #                                           #   alpha: <dim>, method_params: {key: <dim>}}; <dim> = list | {values: [...]} |

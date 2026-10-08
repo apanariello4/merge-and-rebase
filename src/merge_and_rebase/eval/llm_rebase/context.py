@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import warnings
+from collections.abc import Callable, Sequence
 from copy import deepcopy  # noqa: F401
 from dataclasses import replace
 from typing import Any
@@ -12,11 +15,24 @@ import torch
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
 from ...data.llm_calibration import (
+    CalibrationTextList,
+    check_calibration_tokenizers,
+    resolve_calibration_texts,
+    tokenization_stats,
+    tokenizer_chat_template_sha256,
+)
+from ...data.llm_calibration import (
     build_text_calibration_loader as _build_text_calibration_loader,
 )
-from ...data.llm_calibration import check_calibration_tokenizers, resolve_calibration_texts, tokenization_stats
+from ...data.llm_calibration_generate import (
+    GeneratedAnswerConfig,
+    build_generated_texts,
+    parse_generated_answer_cfg,
+    select_generator_ref,
+    truncated_count,
+)
 from ...io.ckpt import load_ckpt, load_into_model
-from ...io.text_checkpoints import load_aligned_tuned_from_ref, tuned_config_mismatch
+from ...io.text_checkpoints import build_model_with_tuned_config, load_aligned_tuned_from_ref, tuned_config_mismatch
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
@@ -52,7 +68,25 @@ class TextCalibrationCache:
         system_instruction: str | None = None,
         num_fewshot: Any = 0,
         target_tokenizer: Any = None,
+        generated_answer: GeneratedAnswerConfig | None = None,
+        tuned_refs: Sequence[str] = (),
+        generator_factory: Callable[[str], Any] | None = None,
+        dtype: str = "fp32",
+        device: str = "cpu",
     ) -> None:
+        if generated_answer is not None:
+            if include_target:
+                raise ValueError(
+                    "calibration_generated_answer cannot be combined with calibration_include_target: the gold "
+                    "target and the model's own answer would both be appended to the prompt."
+                )
+            if generator_factory is None:
+                raise ValueError("calibration_generated_answer needs a generator_factory.")
+            self._generator_ref = select_generator_ref(generated_answer, tuned_refs)
+        self._generated_answer = generated_answer
+        self._generator_factory = generator_factory
+        self._dtype = dtype
+        self._device = device
         self._prompts = prompts
         self._calibration_dataset_cfg = calibration_dataset_cfg
         self._block_extension_cfg = block_extension_cfg
@@ -94,6 +128,8 @@ class TextCalibrationCache:
                 tokenizer=self._tokenizer,
                 num_fewshot=self._num_fewshot,
             )
+            if self._generated_answer is not None:
+                self._append_generated_answers(resolved)
             if self._apply_chat_template:
                 # Source and target tokenize the same texts separately: they must yield identical ids.
                 resolved.chat_template["sha256"] = check_calibration_tokenizers(
@@ -109,6 +145,42 @@ class TextCalibrationCache:
             self._cache.append(resolved)
         return self._cache[0]
 
+    def _append_generated_answers(self, resolved: Any) -> None:
+        """Replace every text by prompt + the source fine-tune's greedy answer (once, so every consumer, and both
+        the source and the target tokenisation, see the same corpus). Hold-out ids are untouched."""
+        cfg = self._generated_answer
+        prompts = list(resolved.texts)
+        add_special_tokens = getattr(resolved.texts, "add_special_tokens", True)
+        texts, record = build_generated_texts(
+            prompts,
+            cfg=cfg,
+            ref=self._generator_ref,
+            generator_factory=self._generator_factory,
+            tokenizer=self._tokenizer,
+            dtype=self._dtype,
+            device=self._device,
+            apply_chat_template=self._apply_chat_template,
+            system_instruction=self._system_instruction,
+            chat_template_sha256=tokenizer_chat_template_sha256(self._tokenizer) if self._apply_chat_template else None,
+        )
+        if isinstance(resolved.texts, CalibrationTextList):
+            texts = CalibrationTextList(texts, add_special_tokens=add_special_tokens)
+        resolved.texts = texts
+        resolved.source += " + generated answers"
+        resolved.generated_answer = {
+            "model": self._generator_ref,
+            "max_new_tokens": cfg.max_new_tokens,
+            "n": record["n"],
+            "mean_response_tokens": record["mean_response_tokens"],
+            "n_hit_max_new_tokens": record["n_hit_max_new_tokens"],
+            "cached": record["cached"],
+            "texts_sha256": hashlib.sha256(json.dumps(list(texts)).encode()).hexdigest(),
+            "n_truncated_at_max_length": truncated_count(
+                self._tokenizer, texts, self._calib_max_length, add_special_tokens=add_special_tokens
+            ),
+            "max_length": self._calib_max_length,
+        }
+
     def provenance(self) -> dict[str, Any] | None:
         """Additive summary record (None when no calibration corpus was ever resolved)."""
         if not self._cache:
@@ -121,6 +193,34 @@ class TextCalibrationCache:
         except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
             record["tokenization"] = {"error": f"{type(exc).__name__}: {exc}"}
         return record
+
+
+def tuned_generator_factory(
+    source_model: Any, source_base_sd: Any, build_cfg: TextBuildConfig, *, load_tuned: Any = load_aligned_tuned_from_ref
+) -> Callable[[str], Any]:
+    """ref -> the source fine-tuned model for that tuned ref, under the ref's OWN config when it differs.
+
+    Same rule as ``stages.build_task_models``: equal config -> a source-model copy carrying the tuned weights;
+    otherwise (RoPE, window, ... differ) the model is built from the ref's config with exactly the aligned tuned
+    weights, so it is the model the fine-tune actually is.
+    """
+
+    def build(ref: str) -> Any:
+        overrides = tuned_config_mismatch(
+            ref, getattr(source_model, "config", None), trust_remote_code=bool(build_cfg.trust_remote_code)
+        )
+        template = deepcopy(source_model)
+        aligned = load_tuned(ckpt_ref=ref, base_sd=source_base_sd, build_cfg=build_cfg, model=template)
+        tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
+        if overrides:
+            changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
+            print(f"  calibration generator built from the tuned ref's own config ({changed})")
+            del template
+            return build_model_with_tuned_config(ref, build_cfg, tuned_sd)
+        load_into_model(template, tuned_sd, strict=False)
+        return template
+
+    return build
 
 
 def build_runtime(
@@ -425,6 +525,9 @@ def build_runtime(
         raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
     calibration_dataset_cfg = cfg.get("calibration_dataset", None)
     calibration_include_target = bool(cfg.get("calibration_include_target", False))
+    #   calibration_generated_answer {max_new_tokens, batch_size, model, cache_path}: each text becomes prompt + the
+    #                                source fine-tune's own greedy answer (default off; see data/llm_calibration_generate)
+    calibration_generated_answer = parse_generated_answer_cfg(cfg.get("calibration_generated_answer", None))
     #   harness_apply_chat_template  render calibration text with the tokenizer's chat template (same prompt format
     #                                as the chat-template evaluation); harness_system_instruction is its system turn
     calibration_apply_chat_template = bool(cfg.get("harness_apply_chat_template", False))
@@ -444,6 +547,11 @@ def build_runtime(
         system_instruction=cfg.get("harness_system_instruction", None),
         num_fewshot=cfg.get("harness_num_fewshot", 0),
         target_tokenizer=target_llm.tokenizer,
+        generated_answer=calibration_generated_answer,
+        tuned_refs=tuned_ref_list,
+        generator_factory=tuned_generator_factory(source_llm.model, source_base_sd, source_build_cfg),
+        dtype=str(source_build_cfg.dtype),
+        device=str(source_build_cfg.device),
     )
     _calibration = _calibration_cache.get
     _calibration_provenance = _calibration_cache.provenance
