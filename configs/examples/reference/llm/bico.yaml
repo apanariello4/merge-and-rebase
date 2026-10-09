@@ -140,6 +140,12 @@ calibration_max_length: 192                 # calibration token length (default 
 #                                           #   fine-tune's own greedy answer (model: tuned ref, default the single
 #                                           #   tuned body; cache_path: json reused when its identity matches).
 #                                           #   Not combinable with calibration_include_target.
+#                                           #   generation_chat_template (false): prompt the generator with the chat-
+#                                           #     template rendering, text stays plain (needs harness_apply_chat_template
+#                                           #     false); generation_system_instruction (null): its system turn;
+#                                           #   separator (""): text = prompt + separator + answer;
+#                                           #   shuffle_answers_seed (null): CONTROL, pair each prompt with another
+#                                           #     prompt's answer (seeded derangement). The last two are not cache identity.
 # hyperparam_search: null                   # alpha and method_params sweep: {strategy: sequential | sobol,
 #                                           #   num_samples: 16, refine_factor: 0.5, refinement_steps, refinement_samples,
 #                                           #   alpha: <dim>, method_params: {key: <dim>}}; <dim> = list | {values: [...]} |

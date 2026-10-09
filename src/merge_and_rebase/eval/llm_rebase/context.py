@@ -82,6 +82,12 @@ class TextCalibrationCache:
                 )
             if generator_factory is None:
                 raise ValueError("calibration_generated_answer needs a generator_factory.")
+            if generated_answer.generation_chat_template and apply_chat_template:
+                raise ValueError(
+                    "calibration_generated_answer.generation_chat_template cannot be combined with "
+                    "harness_apply_chat_template: the corpus is already chat-rendered; use the existing coupled mode "
+                    "(drop generation_chat_template)."
+                )
             self._generator_ref = select_generator_ref(generated_answer, tuned_refs)
         self._generated_answer = generated_answer
         self._generator_factory = generator_factory
@@ -161,8 +167,13 @@ class TextCalibrationCache:
             device=self._device,
             apply_chat_template=self._apply_chat_template,
             system_instruction=self._system_instruction,
-            chat_template_sha256=tokenizer_chat_template_sha256(self._tokenizer) if self._apply_chat_template else None,
+            chat_template_sha256=(
+                tokenizer_chat_template_sha256(self._tokenizer)
+                if self._apply_chat_template or cfg.generation_chat_template
+                else None
+            ),
         )
+        answers = record.get("answers")
         if isinstance(resolved.texts, CalibrationTextList):
             texts = CalibrationTextList(texts, add_special_tokens=add_special_tokens)
         resolved.texts = texts
@@ -180,6 +191,18 @@ class TextCalibrationCache:
             ),
             "max_length": self._calib_max_length,
         }
+        if cfg.uses_extensions:  # additive keys only when a new option is used: defaults stay byte-identical
+            resolved.generated_answer.update(
+                {
+                    "generation_chat_template": cfg.generation_chat_template,
+                    "generation_system_instruction": cfg.generation_system_instruction,
+                    "separator": repr(cfg.separator),
+                    "shuffle_answers_seed": cfg.shuffle_answers_seed,
+                    "answers_sha256": (
+                        None if answers is None else hashlib.sha256(json.dumps(answers).encode()).hexdigest()
+                    ),
+                }
+            )
 
     def provenance(self) -> dict[str, Any] | None:
         """Additive summary record (None when no calibration corpus was ever resolved)."""
@@ -525,7 +548,8 @@ def build_runtime(
         raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
     calibration_dataset_cfg = cfg.get("calibration_dataset", None)
     calibration_include_target = bool(cfg.get("calibration_include_target", False))
-    #   calibration_generated_answer {max_new_tokens, batch_size, model, cache_path}: each text becomes prompt + the
+    #   calibration_generated_answer {max_new_tokens, batch_size, model, cache_path, generation_chat_template,
+    #                                generation_system_instruction, separator, shuffle_answers_seed}: each text becomes prompt + the
     #                                source fine-tune's own greedy answer (default off; see data/llm_calibration_generate)
     calibration_generated_answer = parse_generated_answer_cfg(cfg.get("calibration_generated_answer", None))
     #   harness_apply_chat_template  render calibration text with the tokenizer's chat template (same prompt format
