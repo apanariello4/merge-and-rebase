@@ -219,13 +219,16 @@ class DirectFitStage:
                 )
             )
         texts = rt._calibration().texts
+        # Opt-in calibration_fit_mask: the loaders add a per-token ``fit_mask`` (message contents only); None = off.
+        fit_mask = rt.cfg.get("calibration_fit_mask")
+        mask_kwargs = {} if fit_mask is None else {"fit_mask": fit_mask}
         source_loader = _build_text_calibration_loader(
             tokenizer=rt.source_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
-            max_length=rt.calib_max_length,
+            max_length=rt.calib_max_length, **mask_kwargs,
         )
         target_loader = _build_text_calibration_loader(
             tokenizer=rt.target_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
-            max_length=rt.calib_max_length,
+            max_length=rt.calib_max_length, **mask_kwargs,
         )
         pairing = apply_depth_pairing_override(
             DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth)), config.depth_pairing
@@ -252,6 +255,8 @@ class DirectFitStage:
                 RuntimeWarning,
                 stacklevel=2,
             )
+        if fit_mask is not None and "n_rows_excluded_fit_mask" not in calibration:
+            raise RuntimeError("calibration_fit_mask is set but the Ariadne fit did not apply a fit mask.")
         fitted = dict(prepared.task_vector)
         if config.copy_shape_matching_source_deltas and pre.task_delta:
             for key, value in pre.task_delta.items():

@@ -56,9 +56,19 @@ class CalibrationTextList(list):
     keep the historical ``tokenizer(...)`` defaults.
     """
 
-    def __init__(self, items: Sequence[str] = (), *, add_special_tokens: bool = True) -> None:
+    def __init__(
+        self,
+        items: Sequence[str] = (),
+        *,
+        add_special_tokens: bool = True,
+        content_spans: Sequence[Sequence[tuple[int, int]]] | None = None,
+    ) -> None:
         super().__init__(items)
         self.add_special_tokens = bool(add_special_tokens)
+        #: Per text, the character spans of its message contents (opt-in ``calibration_fit_mask``; None = not recorded).
+        self.content_spans = None if content_spans is None else [[(int(a), int(b)) for a, b in sp] for sp in content_spans]
+        if self.content_spans is not None and len(self.content_spans) != len(self):
+            raise ValueError(f"{len(self.content_spans)} content span lists for {len(self)} calibration texts.")
 
 
 def tokenizer_chat_template_sha256(tokenizer: Any) -> str:
@@ -81,6 +91,7 @@ def make_chat_template_fn(tokenizer: Any) -> Any:
     import jinja2
 
     def apply(chat_history: list[dict[str, str]], add_generation_prompt: bool = True) -> str:
+        apply.last_messages = chat_history  # the messages actually rendered (after the system-turn fallback below)
         kwargs = {
             "tokenize": False,
             "add_generation_prompt": add_generation_prompt,
@@ -90,8 +101,10 @@ def make_chat_template_fn(tokenizer: Any) -> Any:
             return tokenizer.apply_chat_template(chat_history, **kwargs)
         except jinja2.exceptions.TemplateError:
             chat_history = [m for m in chat_history if m["role"] != "system"]
+            apply.last_messages = chat_history
             return tokenizer.apply_chat_template(chat_history, **kwargs)
 
+    apply.last_messages = []
     return apply
 
 
@@ -100,6 +113,149 @@ def _render_user_text(chat_template_fn: Any, text: str, system_instruction: str 
         {"role": "user", "content": text}
     ]
     return chat_template_fn(messages, add_generation_prompt=True)
+
+
+def resolve_calibration_apply_chat_template(cfg: Mapping[str, Any]) -> bool:
+    """Whether calibration text is chat-rendered: ``calibration_apply_chat_template`` when set (bool), else it follows
+    ``harness_apply_chat_template`` (the historical coupling). Evaluation always follows ``harness_apply_chat_template``."""
+    raw = cfg.get("calibration_apply_chat_template", None)
+    if raw is None:
+        return bool(cfg.get("harness_apply_chat_template", False))
+    if not isinstance(raw, bool):
+        raise ValueError(f"calibration_apply_chat_template must be a bool or null, got {raw!r}.")
+    return raw
+
+
+FIT_MASK_MODES = ("user_content",)
+
+
+def resolve_calibration_fit_mask(cfg: Mapping[str, Any], *, chat_rendered: bool, method_is_ariadne: bool) -> str | None:
+    """``calibration_fit_mask`` (null | "user_content"); every incompatible combination is a ``ValueError``."""
+    mode = cfg.get("calibration_fit_mask", None)
+    if mode is None:
+        return None
+    if mode not in FIT_MASK_MODES:
+        raise ValueError(f"calibration_fit_mask must be null or one of {list(FIT_MASK_MODES)}, got {mode!r}.")
+    if not chat_rendered:
+        raise ValueError(
+            "calibration_fit_mask needs chat-rendered calibration text (harness_apply_chat_template or "
+            "calibration_apply_chat_template true): the mask separates message contents from template tokens."
+        )
+    if not method_is_ariadne:
+        raise ValueError(
+            "calibration_fit_mask is implemented for the ARIADNE fit only; THESEUS / BiCo / BRACE would silently "
+            "ignore it, so it is refused."
+        )
+    return str(mode)
+
+
+def locate_content_spans(rendered: str, messages: Sequence[Mapping[str, Any]]) -> list[tuple[int, int]]:
+    """Character spans of every non-system message content inside ``rendered``.
+
+    The chat template inserts each content verbatim, in message order, so the spans are found by a left-to-right
+    search with a cursor: each content is looked up after the end of the previous one (the system turn first, which
+    only moves the cursor; it may be absent when the template rejected the system role). User AND assistant contents
+    (few-shot multi-turn examples) are all spans: only template markers, role names, the system turn, template
+    newlines and the generation header lie outside. Raises ``ValueError`` when a content is not found verbatim (a
+    template that rewrites it, e.g. ``| trim``) and, for a single-message conversation, when it occurs more than once
+    after the system turn (the locator would be ambiguous).
+    """
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    contents = [m for m in messages if str(m.get("role")) != "system"]
+    for message in messages:
+        content = str(message.get("content", ""))
+        if not content:
+            continue
+        idx = rendered.find(content, cursor)
+        if str(message.get("role")) == "system":
+            if idx >= 0:
+                cursor = idx + len(content)
+            continue
+        if idx < 0:
+            raise ValueError(
+                f"calibration_fit_mask: the {message.get('role')!r} message content {content[:60]!r} is not found "
+                "verbatim in the rendered chat text (the chat template rewrites it)."
+            )
+        if len(contents) == 1 and rendered.find(content, idx + 1) >= 0:
+            raise ValueError(
+                f"calibration_fit_mask: the user content {content[:60]!r} occurs more than once in the rendered text "
+                "after the system turn, so its span is ambiguous."
+            )
+        spans.append((idx, idx + len(content)))
+        cursor = idx + len(content)
+    return spans
+
+
+class _RecordingChatFn:
+    """Chat-template callable that remembers, per rendered string, the messages the template received."""
+
+    def __init__(self, fn: Any) -> None:
+        self.fn = fn
+        self.calls: dict[str, list[dict[str, Any]]] = {}
+
+    def __call__(self, chat_history: Any, *args: Any, **kwargs: Any) -> str:
+        out = self.fn(chat_history, *args, **kwargs)
+        self.calls[out] = [dict(m) for m in getattr(self.fn, "last_messages", chat_history)]
+        return out
+
+    def spans(self, rendered: str) -> list[tuple[int, int]]:
+        if rendered not in self.calls:
+            raise ValueError("calibration_fit_mask: a calibration text was not produced by the chat template callable.")
+        return locate_content_spans(rendered, self.calls[rendered])
+
+
+def _content_token_masks(
+    enc: Mapping[str, Any], spans: Sequence[Sequence[tuple[int, int]]]
+) -> list[list[int]]:
+    """Per sequence, 1 for every real token whose character offsets overlap a content span (token-boundary overlap
+    counts: a token that straddles a content edge is kept), 0 for template tokens and padding."""
+    out: list[list[int]] = []
+    for offsets, attention, sp in zip(enc["offset_mapping"], enc["attention_mask"], spans, strict=True):
+        out.append(
+            [
+                int(bool(att) and e > s and any(s < b and e > a for a, b in sp))
+                for (s, e), att in zip(offsets, attention, strict=True)
+            ]
+        )
+    return out
+
+
+def fit_mask_provenance(
+    tokenizer: Any, texts: Sequence[str], *, mode: str, max_length: int, tokenizer_name: str = "source"
+) -> dict[str, Any]:
+    """Run-summary record of ``calibration_fit_mask``: mode, total / kept real tokens and sha256 of the masks."""
+    masks, attention = tokenize_fit_masks(tokenizer, texts, max_length=max_length)
+    total = int(sum(sum(int(a) for a in row) for row in attention))
+    kept = int(sum(sum(row) for row in masks))
+    flat = bytes(v for row in masks for v in row)
+    return {
+        "calibration_fit_mask": mode,
+        "n_tokens_total": total,
+        "n_tokens_kept": kept,
+        "kept_share": (kept / total) if total else 0.0,
+        "mask_sha256": hashlib.sha256(flat).hexdigest(),
+    }
+
+
+def tokenize_fit_masks(tokenizer: Any, texts: Sequence[str], *, max_length: int) -> tuple[list[list[int]], Any]:
+    """``(fit masks, attention masks)`` of ``texts`` tokenized exactly as ``build_text_calibration_loader`` does."""
+    spans = getattr(texts, "content_spans", None)
+    if spans is None:
+        raise ValueError("calibration_fit_mask needs content spans recorded while the calibration text was rendered.")
+    enc = _tokenize_for_loader(tokenizer, list(texts), max_length, getattr(texts, "add_special_tokens", True), True)
+    return _content_token_masks(enc, spans), enc["attention_mask"]
+
+
+def _tokenize_for_loader(tokenizer: Any, prompt_list: list[str], max_length: int, add_special_tokens: bool, offsets: bool):
+    special_kwargs = {} if add_special_tokens else {"add_special_tokens": False}
+    if offsets:
+        if not getattr(tokenizer, "is_fast", False):
+            raise ValueError("calibration_fit_mask needs a fast tokenizer (character offsets); got a slow one.")
+        special_kwargs["return_offsets_mapping"] = True
+    return tokenizer(
+        prompt_list, truncation=True, max_length=int(max_length), padding="max_length", **special_kwargs
+    )
 
 
 #: Probe conversations rendered under both templates when they differ (single turn, and multi-turn few-shot).
@@ -179,14 +335,17 @@ class CalibrationTexts:
         notes: list[str] | None = None,
         decoupled: bool = False,
         chat_template: Mapping[str, Any] | None = None,
+        content_spans: Sequence[Sequence[tuple[int, int]]] | None = None,
     ) -> None:
         if not texts:
             raise ValueError(f"Calibration source {source!r} produced no text.")
+        if content_spans is not None and chat_template is None:
+            raise ValueError("content spans exist only for chat-rendered calibration text.")
         #: Chat-template rendering record (None = off, historical plain text). ``sha256`` is filled by
         #: ``check_calibration_tokenizers`` once the source/target tokenizers have been compared.
         self.chat_template = dict(chat_template) if chat_template is not None else None
         if self.chat_template is not None:
-            texts = CalibrationTextList(texts, add_special_tokens=False)
+            texts = CalibrationTextList(texts, add_special_tokens=False, content_spans=content_spans)
         self.texts = texts
         self.source = source
         self.eval_samples = dict(eval_samples or {})
@@ -242,6 +401,7 @@ def resolve_calibration_texts(
     tokenizer: Any = None,
     num_fewshot: int | Sequence[int] | Mapping[str, int] = 0,
     fewshot_seed: int = _LM_EVAL_FEWSHOT_SEED,
+    record_content_spans: bool = False,
 ) -> CalibrationTexts:
     """Resolve the calibration corpus for an LLM run.
 
@@ -272,16 +432,22 @@ def resolve_calibration_texts(
     system_instruction : System turn used with ``apply_chat_template`` (lm-eval's ``system_instruction``).
     num_fewshot : Harness source with ``apply_chat_template`` only; same shapes as ``harness_num_fewshot``.
     fewshot_seed : Seed of lm-eval's few-shot sampler for the calibration docs (default = lm-eval's evaluation seed).
+    record_content_spans : Opt-in (needs ``apply_chat_template``; ``calibration_fit_mask``): record, per rendered text,
+        the character spans of its message contents (``CalibrationTextList.content_spans``). Texts are unchanged.
     """
     if n_sequences <= 0:
         raise ValueError("n_sequences must be > 0.")
     chat_fn = None
+    if record_content_spans and not apply_chat_template:
+        raise ValueError("record_content_spans needs apply_chat_template (content spans exist only in chat-rendered text).")
     if apply_chat_template:
         if include_target:
             raise NotImplementedError("calibration_include_target is not supported with harness_apply_chat_template.")
         if tokenizer is None:
             raise ValueError("apply_chat_template calibration needs the source tokenizer (tokenizer=...).")
         chat_fn = make_chat_template_fn(tokenizer)
+        if record_content_spans:
+            chat_fn = _RecordingChatFn(chat_fn)
         # Fails early (clear message) when the tokenizer has no template.
         tokenizer_chat_template_sha256(tokenizer)
 
@@ -293,6 +459,7 @@ def resolve_calibration_texts(
             CalibrationTexts([str(p) for p in prompts], source="config['calibration_prompts']", decoupled=True),
             chat_fn,
             system_instruction,
+            record_content_spans,
         )
 
     if calibration_dataset is not None:
@@ -304,6 +471,7 @@ def resolve_calibration_texts(
             ),
             chat_fn,
             system_instruction,
+            record_content_spans,
         )
 
     if harness_tasks:
@@ -317,6 +485,7 @@ def resolve_calibration_texts(
             system_instruction=system_instruction,
             num_fewshot=num_fewshot,
             fewshot_seed=fewshot_seed,
+            record_content_spans=record_content_spans,
         )
 
     raise ValueError(
@@ -327,12 +496,16 @@ def resolve_calibration_texts(
     )
 
 
-def _finalize_rendered(resolved: CalibrationTexts, chat_fn: Any, system_instruction: str | None) -> CalibrationTexts:
+def _finalize_rendered(
+    resolved: CalibrationTexts, chat_fn: Any, system_instruction: str | None, record_content_spans: bool = False
+) -> CalibrationTexts:
     """Chat-template flag on: one rendered user turn per raw text (flag off: ``resolved`` unchanged)."""
     if chat_fn is None:
         return resolved
+    rendered = [_render_user_text(chat_fn, t, system_instruction) for t in resolved.texts]
     return CalibrationTexts(
-        [_render_user_text(chat_fn, t, system_instruction) for t in resolved.texts],
+        rendered,
+        content_spans=[chat_fn.spans(r) for r in rendered] if record_content_spans else None,
         source=resolved.source,
         eval_samples=resolved.eval_samples,
         notes=resolved.notes,
@@ -424,6 +597,7 @@ def _from_harness_tasks(
     system_instruction: str | None = None,
     num_fewshot: int | Sequence[int] | Mapping[str, int] = 0,
     fewshot_seed: int = _LM_EVAL_FEWSHOT_SEED,
+    record_content_spans: bool = False,
 ) -> CalibrationTexts:
     from lm_eval.tasks import TaskManager
 
@@ -433,6 +607,7 @@ def _from_harness_tasks(
     del calibration_split
 
     texts: list[str] = []
+    content_spans: list[list[tuple[int, int]]] = []
     notes: list[str] = []
     eval_samples: dict[str, list[int]] = {}
     fewshot_by_task: dict[str, int] = {}
@@ -483,6 +658,8 @@ def _from_harness_tasks(
                 for text in ctx if isinstance(ctx, list) else [ctx]:
                     if isinstance(text, str) and text.strip():
                         texts.append(text)
+                        if record_content_spans:
+                            content_spans.append(chat_template_fn.spans(text))
             continue
         for i in calib_idx:
             rendered = task.doc_to_text(docs[i])
@@ -511,6 +688,7 @@ def _from_harness_tasks(
         source=f"lm-harness {'+'.join(tasks)}[holdout]",
         eval_samples=eval_samples,
         notes=notes,
+        content_spans=content_spans if record_content_spans else None,
         chat_template=(
             {
                 "system_instruction": system_instruction,
@@ -588,6 +766,7 @@ def build_text_calibration_loader(
     batch_size: int = 2,
     max_length: int = 128,
     add_special_tokens: bool | None = None,
+    fit_mask: str | None = None,
 ) -> DataLoader:
     # None: follow the corpus (``CalibrationTextList``: False for chat-template-rendered text, else True).
     if add_special_tokens is None:
@@ -596,17 +775,32 @@ def build_text_calibration_loader(
     if not prompt_list:
         raise ValueError("Calibration loader needs at least one text sequence.")
     # Default (True) keeps the historical call (tokenizer's own default add_special_tokens) untouched.
-    special_kwargs = {} if add_special_tokens else {"add_special_tokens": False}
-    enc = tokenizer(
-        prompt_list,
-        truncation=True,
-        max_length=int(max_length),
-        padding="max_length",
-        **special_kwargs,
-    )
+    if fit_mask is not None:
+        # Opt-in ``calibration_fit_mask``: one extra per-token ``fit_mask`` (1 = inside a message content).
+        if fit_mask not in FIT_MASK_MODES:
+            raise ValueError(f"fit_mask must be one of {list(FIT_MASK_MODES)} or None, got {fit_mask!r}.")
+        spans = getattr(texts, "content_spans", None)
+        if spans is None:
+            raise ValueError("fit_mask needs chat-rendered texts with recorded content spans (record_content_spans).")
+        enc = _tokenize_for_loader(tokenizer, prompt_list, max_length, add_special_tokens, True)
+        fit_masks = _content_token_masks(enc, spans)
+        enc.pop("offset_mapping")
+    else:
+        fit_masks = None
+        special_kwargs = {} if add_special_tokens else {"add_special_tokens": False}
+        enc = tokenizer(
+            prompt_list,
+            truncation=True,
+            max_length=int(max_length),
+            padding="max_length",
+            **special_kwargs,
+        )
     features: list[dict[str, Any]] = []
     for i in range(len(prompt_list)):
-        features.append({k: v[i] for k, v in enc.items()})
+        feat = {k: v[i] for k, v in enc.items()}
+        if fit_masks is not None:
+            feat["fit_mask"] = fit_masks[i]
+        features.append(feat)
 
     # Stable across processes: str.__hash__ is salted per interpreter, which
     # would make these ids non-reproducible if they were ever persisted.
@@ -614,11 +808,13 @@ def build_text_calibration_loader(
     dataset = TokenizedPromptDataset(features, sample_ids=sample_ids)
 
     def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        feats = [{k: v for k, v in row.items() if k != "labels"} for row in batch]
+        feats = [{k: v for k, v in row.items() if k not in ("labels", "fit_mask")} for row in batch]
         padded = tokenizer.pad(feats, return_tensors="pt", padding="max_length", max_length=int(max_length))
         padded["labels"] = padded["input_ids"].clone()
         if "attention_mask" in padded:
             padded["labels"][padded["attention_mask"] == 0] = -100
+        if fit_masks is not None:  # same length as input_ids (tokenized to max_length), padding already 0
+            padded["fit_mask"] = torch.tensor([row["fit_mask"] for row in batch], dtype=torch.bool)
         return padded
 
     return DataLoader(

@@ -58,6 +58,19 @@ def _stable_dataset_identity(dataset) -> str:
 #: ``extract_calibration_batch`` ignores it, so model forwards never see it; capture reads it to drop padding rows.
 ROW_MASK_KEY = "_ariadne_row_mask"
 
+#: Optional calibration-batch key (opt-in ``calibration_fit_mask``): bool ``[B, T]``, True = token inside a message
+#: content. It is NOT in ``extract_calibration_batch``'s whitelist, so no model forward ever receives it;
+#: ``_attach_row_masks`` ANDs it into the row mask, which every capture path (independent, streaming, block_carry) reads.
+FIT_MASK_KEY = "fit_mask"
+
+
+def _batch_fit_mask(batch):
+    if isinstance(batch, Mapping):
+        mask = batch.get(FIT_MASK_KEY)
+        if isinstance(mask, torch.Tensor):
+            return mask.bool()
+    return None
+
 
 def _batch_row_mask(batch):
     if isinstance(batch, Mapping):
@@ -80,12 +93,16 @@ def _first_content_position(mask):
     return first
 
 
-def _attach_row_masks(source_batch, target_batch, family_adapter, exclude_first_token=False):
+def _attach_row_masks(source_batch, target_batch, family_adapter, exclude_first_token=False, fit_stats=None):
     """Combine each model's own ``content_mask`` (``ms & mt``) once and attach it to BOTH batches.
 
     ``exclude_first_token`` additionally drops the first non-padded position of every sequence (the attention
     sink) of EACH model, from the one combined mask, so source and target keep identical row sets. Returns
     ``(source, target, n_total, n_content, n_excluded)``; ``n_content`` is the count before the exclusion.
+
+    A ``fit_mask`` (``calibration_fit_mask``) present on the batches is ANDed into the mask (identical on source and
+    target, whose token ids are paired); the rows it removes (relative to the padding mask) are added to
+    ``fit_stats["n_fit_masked"]`` when a dict is given, and ``n_excluded`` then counts the first-token exclusion only.
     """
     ms = family_adapter.content_mask(source_batch)
     mt = family_adapter.content_mask(target_batch)
@@ -96,19 +113,32 @@ def _attach_row_masks(source_batch, target_batch, family_adapter, exclude_first_
         )
     mask = ms & mt
     n_content = int(mask.sum())
+    fs, ft = _batch_fit_mask(source_batch), _batch_fit_mask(target_batch)
+    if (fs is None) != (ft is None):
+        raise ValueError("calibration_fit_mask: only one of the source/target batches carries a fit_mask")
+    if fs is not None:
+        if fs.shape != mask.shape or not torch.equal(fs, ft):
+            raise ValueError(
+                "calibration_fit_mask: source and target fit masks differ (the paired token ids must be identical)"
+            )
+        mask = mask & fs
+        if fit_stats is not None:
+            fit_stats["n_fit_masked"] = fit_stats.get("n_fit_masked", 0) + n_content - int(mask.sum())
+    n_after_fit = int(mask.sum())
     if exclude_first_token:
         mask = mask & ~_first_content_position(ms) & ~_first_content_position(mt)
     if not bool(mask.any()):
         raise ValueError(
             "Calibration batch has no content rows after padding removal"
             + (" and first-token exclusion" if exclude_first_token else "")
+            + (" and the calibration fit mask" if fs is not None else "")
         )
     out = []
     for batch in (source_batch, target_batch):
         wrapped = dict(family_adapter.extract_calibration_batch(batch))
         wrapped[ROW_MASK_KEY] = mask
         out.append(wrapped)
-    return out[0], out[1], int(mask.numel()), n_content, n_content - int(mask.sum())
+    return out[0], out[1], int(mask.numel()), n_content, n_after_fit - int(mask.sum())
 
 
 def paired_calibration(
@@ -143,6 +173,7 @@ def paired_calibration(
     target = DataLoader(Subset(target_loader.dataset, order), collate_fn=target_loader.collate_fn, **kwargs)
     source_batches, target_batches = [], []
     n_rows_total = n_rows_content = n_rows_excluded = 0
+    fit_stats: dict[str, int] = {}
     for a, b in zip(source, target, strict=True):
         # Vision batches are (images, labels); labels are model-agnostic and must match example for example.
         # Text batches are tokenizer-specific mappings (ids differ by construction), so nothing is comparable;
@@ -151,7 +182,9 @@ def paired_calibration(
             if not torch.equal(torch.as_tensor(a[1]), torch.as_tensor(b[1])):
                 raise ValueError("Calibration labels disagree for supposedly identical images")
         if family_adapter is not None:
-            a, b, total, content, excluded = _attach_row_masks(a, b, family_adapter, exclude_first_token)
+            a, b, total, content, excluded = _attach_row_masks(
+                a, b, family_adapter, exclude_first_token, fit_stats
+            )
             n_rows_total += total
             n_rows_content += content
             n_rows_excluded += excluded
@@ -168,11 +201,13 @@ def paired_calibration(
     }
     if family_adapter is not None:
         metadata["n_rows_total"] = n_rows_total
-        metadata["n_rows_content"] = n_rows_content - n_rows_excluded
+        metadata["n_rows_content"] = n_rows_content - n_rows_excluded - fit_stats.get("n_fit_masked", 0)
         # pad_row_fraction counts padding only (n_rows_content here is before first-token exclusion).
         metadata["pad_row_fraction"] = 1.0 - n_rows_content / max(n_rows_total, 1)
         if exclude_first_token:
             metadata["n_rows_excluded_first_token"] = n_rows_excluded
+        if "n_fit_masked" in fit_stats:  # only when calibration_fit_mask is on: default metadata is unchanged
+            metadata["n_rows_excluded_fit_mask"] = fit_stats["n_fit_masked"]
     return source_batches, target_batches, metadata
 
 

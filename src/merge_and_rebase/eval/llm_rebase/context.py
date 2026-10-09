@@ -17,6 +17,9 @@ from merge_and_rebase.utils.helpers import load_json, parse_csv
 from ...data.llm_calibration import (
     CalibrationTextList,
     check_calibration_tokenizers,
+    fit_mask_provenance,
+    resolve_calibration_apply_chat_template,
+    resolve_calibration_fit_mask,
     resolve_calibration_texts,
     tokenization_stats,
     tokenizer_chat_template_sha256,
@@ -37,7 +40,7 @@ from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
-from ...rebase.capabilities import check_pair, depth_prestep_methods, uses_calibration
+from ...rebase.capabilities import MethodFamily, check_pair, depth_prestep_methods, method_family, uses_calibration
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
@@ -73,7 +76,12 @@ class TextCalibrationCache:
         generator_factory: Callable[[str], Any] | None = None,
         dtype: str = "fp32",
         device: str = "cpu",
+        fit_mask: str | None = None,
+        record_calibration_format: bool = False,
     ) -> None:
+        if fit_mask is not None and not apply_chat_template:
+            raise ValueError("calibration_fit_mask needs chat-rendered calibration text.")
+        self._fit_mask = fit_mask
         if generated_answer is not None:
             if include_target:
                 raise ValueError(
@@ -85,7 +93,8 @@ class TextCalibrationCache:
             if generated_answer.generation_chat_template and apply_chat_template:
                 raise ValueError(
                     "calibration_generated_answer.generation_chat_template cannot be combined with "
-                    "harness_apply_chat_template: the corpus is already chat-rendered; use the existing coupled mode "
+                    "the chat-rendered calibration (harness_apply_chat_template / calibration_apply_chat_template): "
+                    "the corpus is already chat-rendered; use the existing coupled mode "
                     "(drop generation_chat_template)."
                 )
             self._generator_ref = select_generator_ref(generated_answer, tuned_refs)
@@ -105,6 +114,8 @@ class TextCalibrationCache:
         self._include_target = include_target
         self._tokenizer = tokenizer
         self._apply_chat_template = bool(apply_chat_template)
+        #: True when ``calibration_apply_chat_template`` is set in the config (recorded in the provenance then).
+        self._calibration_format_recorded = bool(record_calibration_format)
         self._system_instruction = system_instruction
         self._num_fewshot = num_fewshot
         self._target_tokenizer = target_tokenizer
@@ -133,9 +144,15 @@ class TextCalibrationCache:
                 system_instruction=self._system_instruction,
                 tokenizer=self._tokenizer,
                 num_fewshot=self._num_fewshot,
+                record_content_spans=self._fit_mask is not None,
             )
             if self._generated_answer is not None:
                 self._append_generated_answers(resolved)
+            if self._fit_mask is not None:
+                bad = [n for n, t in (("source", self._tokenizer), ("target", self._target_tokenizer or self._tokenizer))
+                       if not getattr(t, "is_fast", False)]
+                if bad:
+                    raise ValueError(f"calibration_fit_mask needs fast tokenizers (offsets); slow: {bad}.")
             if self._apply_chat_template:
                 # Source and target tokenize the same texts separately: they must yield identical ids.
                 resolved.chat_template["sha256"] = check_calibration_tokenizers(
@@ -175,7 +192,11 @@ class TextCalibrationCache:
         )
         answers = record.get("answers")
         if isinstance(resolved.texts, CalibrationTextList):
-            texts = CalibrationTextList(texts, add_special_tokens=add_special_tokens)
+            spans = getattr(resolved.texts, "content_spans", None)
+            if spans is not None:
+                # The appended separator + answer is content: a span from the end of the prompt to the end of the text.
+                spans = [[*sp, (len(p), len(t))] if len(t) > len(p) else list(sp) for sp, p, t in zip(spans, prompts, texts, strict=True)]
+            texts = CalibrationTextList(texts, add_special_tokens=add_special_tokens, content_spans=spans)
         resolved.texts = texts
         resolved.source += " + generated answers"
         resolved.generated_answer = {
@@ -215,6 +236,17 @@ class TextCalibrationCache:
             record["tokenization"] = tokenization_stats(self._tokenizer, self._cache[0].texts, self._calib_max_length)
         except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
             record["tokenization"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if self._calibration_format_recorded:  # additive keys only when a new option is set
+            record["calibration_apply_chat_template"] = self._apply_chat_template
+        if self._fit_mask is not None:
+            try:
+                record.update(
+                    fit_mask_provenance(
+                        self._tokenizer, self._cache[0].texts, mode=self._fit_mask, max_length=self._calib_max_length
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
+                record["calibration_fit_mask"] = {"mode": self._fit_mask, "error": f"{type(exc).__name__}: {exc}"}
         return record
 
 
@@ -258,6 +290,13 @@ def build_runtime(
     num_labels: int,
 ) -> LlmRuntime:
     """Build both models, resolve block extension / harness / tuned-body / calibration settings (former main body)."""
+    # Calibration text format / fit mask: validated before any model is built (a bad combination is a config error).
+    calibration_apply_chat_template = resolve_calibration_apply_chat_template(cfg)
+    calibration_fit_mask = resolve_calibration_fit_mask(
+        cfg,
+        chat_rendered=calibration_apply_chat_template,
+        method_is_ariadne=method_family(method_name) is MethodFamily.DIRECT_FIT,
+    )
     source_model_name = cfg.get("source_model_name_or_path")
     target_model_name = cfg.get("target_model_name_or_path")
     print(f"Source model: {source_model_name}")
@@ -554,7 +593,9 @@ def build_runtime(
     calibration_generated_answer = parse_generated_answer_cfg(cfg.get("calibration_generated_answer", None))
     #   harness_apply_chat_template  render calibration text with the tokenizer's chat template (same prompt format
     #                                as the chat-template evaluation); harness_system_instruction is its system turn
-    calibration_apply_chat_template = bool(cfg.get("harness_apply_chat_template", False))
+    #   calibration_apply_chat_template  (bool | null = follow harness_apply_chat_template) decouples the calibration
+    #                                format from the evaluation format; calibration_fit_mask "user_content" (ARIADNE only,
+    #                                needs chat-rendered calibration text) restricts the fit to message-content tokens
     _calibration_cache = TextCalibrationCache(
         prompts=calibration_prompts_cfg,
         calibration_dataset_cfg=calibration_dataset_cfg,
@@ -576,6 +617,8 @@ def build_runtime(
         generator_factory=tuned_generator_factory(source_llm.model, source_base_sd, source_build_cfg),
         dtype=str(source_build_cfg.dtype),
         device=str(source_build_cfg.device),
+        fit_mask=calibration_fit_mask,
+        record_calibration_format=cfg.get("calibration_apply_chat_template") is not None,
     )
     _calibration = _calibration_cache.get
     _calibration_provenance = _calibration_cache.provenance

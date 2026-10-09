@@ -163,6 +163,14 @@ harness_batch_size: 4                       # int or "auto".
 # harness_limit: null                       # doc limit; exclusive with a held-out calibration slice.
 # harness_apply_chat_template: false       # render eval prompts (and calibration texts) with the chat template;
 #                                           #   few-shot examples become multi-turn. Off = plain prompts.
+# calibration_apply_chat_template: null     # bool | null: chat-render the CALIBRATION text independently of the evaluation
+#                                           #   format; null = follow harness_apply_chat_template. The calibration system turn
+#                                           #   stays harness_system_instruction.
+# calibration_fit_mask: null                # [ablation] null | "user_content" (ARIADNE only; needs chat-rendered calibration):
+#                                           #   fit only on tokens inside message contents (user, and few-shot assistant,
+#                                           #   turns; with calibration_generated_answer also the appended answer); template
+#                                           #   markers, role names, system turn and generation header are dropped.
+#                                           #   Needs a fast tokenizer; ANDed with padding and exclude_first_token.
 # harness_system_instruction: null          # system prompt for the chat template; required when source and target
 #                                           #   templates differ only in their default system prompt (Qwen2.5 families).
 # harness_dump_generations_dir: null        # dir: one jsonl per generate_until task (prompt, response, metrics).
