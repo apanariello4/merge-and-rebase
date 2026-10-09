@@ -54,9 +54,10 @@ depth_alignment:
   # Source and target depth differ (24 -> 28 layers). BiCo's default rule (discrete_index_match) re-indexes the source
   # layers onto the target depth; every [BRACE-only] key below is then inert and warns when set (it takes effect only
   # with depth_rule: brace). On LLMs n_batches_act still sizes the shared calibration pool (see calibration below).
-  brace:
-    data:
-      num_batches: 100                      # calibration-pool sizing (BRACE capture batches under depth_rule: brace).
+  # brace:
+    # data:
+      # num_batches: 2                      # calibration batches the BRACE correction captures (read only with depth_rule:
+      #                                     #   brace and skip_correction: false); on LLMs it also enters the calibration-pool size.
       # split: "test"                       # split of a calibration_dataset; a harness source ignores it and always
       #                                     #   holds its calibration docs out of the evaluation.
       # dataset: null                       # BRACE calibration corpus; the top-level calibration_dataset wins over it.
