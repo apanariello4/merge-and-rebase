@@ -75,11 +75,12 @@ method:
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
   defaults: method                          # no effect on Ariadne (no depth rule); kept identical across examples.
-  # Ariadne runs no BRACE prestep. On LLMs n_batches_act still enters the shared calibration-pool size, together
-  # with ariadne_params.num_batches (the larger wins); a fit that still gets fewer batches than requested warns.
-  brace:
-    data:
-      num_batches: 100                      # calibration-pool sizing (see the calibration section).
+  # Ariadne runs no depth step, so nothing under depth_alignment.brace applies. ariadne_params.num_batches sizes the
+  # LLM calibration pool; a fit that still gets fewer batches than requested warns.
+  # brace:
+    # data:
+      # num_batches: 2                      # legacy n_batches_act: enters the calibration-pool size only if larger than
+      #                                     #   ariadne_params.num_batches; BRACE itself does not run for Ariadne.
 
 # ---------------------------------------------------------------- merge
 # merge:
