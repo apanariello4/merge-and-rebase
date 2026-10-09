@@ -356,7 +356,18 @@ def resolve_depth_rule(
     if rule == "discrete_index_match":
         return DepthRule(kind=rule, source=source), block_extension_cfg, None  # type: ignore[arg-type]
     if schema.skip_correction is not None:
-        return DepthRule(kind="brace", source=source), block_extension_cfg, None
+        # Explicit choice (skip_correction given, or the plain name interpolate_layers): record the effective values,
+        # so an explicit config and the method default show the same depth rule.
+        return (
+            DepthRule(
+                kind="brace",
+                extension_strategy=block_extension_cfg.extension_strategy,
+                skip_correction=bool(block_extension_cfg.skip_correction),
+                source=source,
+            ),
+            block_extension_cfg,
+            None,
+        )
     # skip_correction absent: the THESEUS default pair (interpolate_per_weight + skip_correction=True).
     old_fix = '"block_extension_params": {"skip_correction": false}'
     if mode is None and block_extension_enabled:

@@ -74,11 +74,13 @@ method:
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
-  defaults: method                          # method: THESEUS -> BRACE prestep with interpolate_per_weight and
-                                            #   skip_correction=true (the default); legacy: pre-release depth rule. Absent: a depth
-                                            #   mismatch whose meaning changed raises ConfigMeaningChangedError.
+  rule: interpolate_layers                  # THESEUS depth handling: insert blended copies of source layers until the source
+                                            #   has the target's depth (the run prints which layers). interpolate_layers |
+                                            #   index_match | method_default; the internal name brace also reaches the
+                                            #   experimental ridge correction. Absent rule: a depth mismatch raises
+                                            #   ConfigMeaningChangedError.
+  # defaults: method                        # [legacy] let the method pick (THESEUS -> interpolate_layers, BiCo -> index_match).
   # enabled: true                           # run the depth prestep on a depth mismatch (the CLI sets true when absent).
-  # rule: "method_default"                  # method_default | brace | discrete_index_match (THESEUS default: brace).
   # Source and target depth differ (12 -> 24 blocks): BRACE inserts blocks into the source so THESEUS can
   # transport layer by layer. Not read when the depths match.
   # brace:

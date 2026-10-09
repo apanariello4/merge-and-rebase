@@ -21,6 +21,7 @@ from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
 from ...rebase.capabilities import check_pair, depth_prestep_methods, uses_calibration
+from ...rebase.depth_report import describe_depth_handling
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
@@ -206,6 +207,7 @@ def build_runtime(
         source_depth=source_depth,
         target_depth=target_depth,
     )
+    print(describe_depth_handling(resolved, plan, source_depth, target_depth))
     run_block_extension_prestep = plan.run_block_extension_prestep
     if depth_prestep_method:
         if run_block_extension_prestep:

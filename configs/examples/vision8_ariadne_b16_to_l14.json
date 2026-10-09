@@ -25,12 +25,10 @@
     "name": "ariadne",
     "params": {
       "preset": "ariadne",
+      "depth_pairing": "relative",
       "num_batches": 10,
       "seed": 89
     }
-  },
-  "depth_alignment": {
-    "defaults": "method"
   },
   "alpha": {
     "search": true,

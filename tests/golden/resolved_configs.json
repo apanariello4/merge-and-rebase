@@ -184,7 +184,7 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -302,7 +302,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -532,7 +532,7 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -650,7 +650,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -770,7 +770,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -1107,14 +1107,14 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": null,
     "rule": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1270,14 +1270,14 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": "interpolate_per_weight",
     "rule": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1629,14 +1629,14 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": null,
     "rule": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1792,14 +1792,14 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": "interpolate_per_weight",
     "rule": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
