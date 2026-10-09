@@ -93,6 +93,9 @@ method:
     #                                       #   (block j fitted against D_j minus what blocks < j already realize; streaming, one component).
     # sequential_impl: "reference"          # compute-only switch for depth_fit=sequential; block_carry is decoder-only (the
     #                                       #   vision path always runs reference).
+    # sequential_points: "single"           # [ablation] single | end_end | mid_end (depth_fit=sequential, components=[attn.out_proj, mlp.c_proj]):
+    #                                       #   per block O then D; end_end: both against D_j at the block end; mid_end: O against a
+    #                                       #   mid-block target (own polar map, after the attention add), D against D_j.
     # procrustes_rank: null                 # [ablation] keep only the top-k singular pairs of each block's cross-covariance
     #                                       #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
     # procrustes_energy: null               # [ablation] smallest k whose PLAIN singular values hold this share of their sum,

@@ -22,7 +22,12 @@ from .alignment import (
     _validate_alignment_options,
     procrustes_rank_diagnostics,
 )
-from .capture import iter_capture_block_gradients, iter_capture_tokens, paired_calibration
+from .capture import (
+    _assert_layerscale_identity,
+    iter_capture_block_gradients,
+    iter_capture_tokens,
+    paired_calibration,
+)
 from .config import DirectResidualConfig, order_components
 from .diagnostics import measure_direct_residual_realization_streaming
 from .fit import ResidualSufficientStatistics, _finalize_independent_component
@@ -139,6 +144,7 @@ def prepare_direct_residual_streaming(
     procrustes_rank: int | None = None,
     procrustes_energy: float | None = None,
     exclude_first_token: bool = False,
+    mid_alignment: bool = False,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` + ``compute_desired_effects``.
 
@@ -163,7 +169,26 @@ def prepare_direct_residual_streaming(
     value share) and add ``procrustes_rank_used`` / ``procrustes_kept_singular_mass`` /
     ``procrustes_kept_singular_energy`` to the rows. The q/mu_s/mu_t tensors are not duplicated into rows (unlike the resident path); they stay in
     ``q_by_position`` / ``source_mean_by_position`` / ``target_mean_by_position``.
+
+    ``mid_alignment`` (opt-in, vision only, polar + activation + no truncation; for ``sequential_points="mid_end"``)
+    additionally accumulates, per target position ``j``, the centered cross-covariance of the source MID-block residual
+    at ``pairing[j]`` against the target mid residual at ``j`` (``x_mid = block_input + attention branch output``, both
+    captured on the same block; LayerScale ``ls_1`` must be the identity) and solves it with the same polar map. It adds
+    ``q_mid_by_position`` (float32) and ``mid_fingerprints`` (per-(batch, position) ``(sum, sumsq)`` of the target mid
+    residual); with ``mid_alignment=False`` nothing else is requested or returned.
     """
+    if mid_alignment:
+        if family_adapter is not None:
+            # HF decoder layers receive hidden_states as a keyword argument, which the block_input capture (positional
+            # inputs[0]) does not see; the mid residual is therefore only defined on the vision layout.
+            raise NotImplementedError("mid_end is vision-only")
+        if alignment_map != "polar" or alignment_row_weighting != "uniform" or procrustes_source != "activation":
+            raise ValueError(
+                "mid_alignment requires alignment_map='polar', alignment_row_weighting='uniform' and "
+                "procrustes_source='activation'"
+            )
+        if procrustes_rank is not None or procrustes_energy is not None:
+            raise ValueError("mid_alignment does not support procrustes_rank/procrustes_energy")
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
     if pairing.source_depth < 1:
@@ -193,6 +218,29 @@ def prepare_direct_residual_streaming(
     distinct_source_indices = sorted(set(pairing.pairing))
     src_requests = {str(i): (i, "boundary") for i in distinct_source_indices}
     tgt_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
+    if mid_alignment:
+        for i in distinct_source_indices:
+            _assert_layerscale_identity(
+                _layout_for(None),
+                _layout_for(None).blocks(source_base_model)[i],
+                context=f"source block {i}",
+                requirement="mid_alignment",
+            )
+            src_requests[f"{i}.mid_in"] = (i, "block_input")
+            src_requests[f"{i}.mid_attn"] = (i, "attn_proj")
+        for j in range(pairing.target_depth):
+            _assert_layerscale_identity(
+                _layout_for(None),
+                _layout_for(None).blocks(target_base_model)[j],
+                context=f"target block {j}",
+                requirement="mid_alignment",
+            )
+            tgt_requests[f"{j}.mid_in"] = (j, "block_input")
+            tgt_requests[f"{j}.mid_attn"] = (j, "attn_proj")
+    mid_accumulators = (
+        {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)} if mid_alignment else {}
+    )
+    mid_fingerprints: dict[tuple[int, int], tuple[float, float]] = {}
     accumulators = {
         j: _StreamingCrossCovariance(device=device, track_source_gram=alignment_map == "ridge")
         for j in range(pairing.target_depth)
@@ -267,6 +315,14 @@ def prepare_direct_residual_streaming(
                 accumulators[j].update(x_rows, y_rows, None if row_weights is None else row_weights.reshape(-1))
                 t64 = t.double()
                 fingerprints[(k, j)] = (float(t64.sum().item()), float((t64**2).sum().item()))
+                if mid_alignment:
+                    t_mid = _mid_residual(tgt, f"{j}.mid_in", f"{j}.mid_attn")
+                    x_mid = _aligned([_mid_residual(src, f"{i}.mid_in", f"{i}.mid_attn")], [t_mid])[0]
+                    mid_accumulators[j].update(
+                        x_mid.reshape(-1, x_mid.shape[-1]).double(), t_mid.reshape(-1, t_mid.shape[-1]).double()
+                    )
+                    t_mid64 = t_mid.double()
+                    mid_fingerprints[(k, j)] = (float(t_mid64.sum().item()), float((t_mid64**2).sum().item()))
                 if gradient_mode:
                     g_t = by_name["tgt_grad"][str(j)]
                     g_s = _aligned([by_name["src_grad"][str(i)]], [g_t])[0]
@@ -357,7 +413,7 @@ def prepare_direct_residual_streaming(
             }
     else:
         q_by_position = {j: q.float() for j, q in activation_q64.items()}
-    return {
+    prepared = {
         "q_by_position": q_by_position,
         "procrustes_source": procrustes_source,
         "alignment_map": alignment_map,
@@ -373,6 +429,23 @@ def prepare_direct_residual_streaming(
         "calibration": metadata,
         "distinct_source_indices": distinct_source_indices,
     }
+    if mid_alignment:
+        prepared["q_mid_by_position"] = {
+            j: _procrustes_from_cross(acc.cross()).cpu().float() for j, acc in mid_accumulators.items()
+        }
+        prepared["mid_fingerprints"] = mid_fingerprints
+    return prepared
+
+
+def _mid_residual(captured, in_key: str, attn_key: str) -> Tensor:
+    """``x_mid = block_input + attention branch output`` (identity ``ls_1``) from two captures of one block."""
+    block_input, attn_out = captured[in_key], captured[attn_key]
+    if block_input.shape != attn_out.shape:
+        raise ValueError(
+            f"mid residual needs matching block-input and attention-output shapes; got {tuple(block_input.shape)} "
+            f"and {tuple(attn_out.shape)}"
+        )
+    return block_input + attn_out
 
 
 def _check_boundary_fingerprint(out, expected, config, pos, k) -> None:
@@ -614,6 +687,18 @@ def fit_direct_residual_sequential_streaming(
         raise ValueError("pairing.target_depth must be positive")
     if config.depth_fit != "sequential":
         raise ValueError("fit_direct_residual_sequential_streaming requires depth_fit='sequential'")
+    if config.sequential_points != "single":
+        return _fit_sequential_two_points_streaming(
+            target_model,
+            target_base_state,
+            source_base_model,
+            source_ft_model,
+            prepared,
+            pairing,
+            config=config,
+            device=device,
+            family_adapter=family_adapter,
+        )
     components = order_components(config.components)
     if len(components) != 1:
         raise ValueError("depth_fit='sequential' requires exactly one component")
@@ -722,6 +807,211 @@ def fit_direct_residual_sequential_streaming(
                 diagnostics.append(row)
             # Mount this block's update (weight and bias, as updated in current_state) before the next block.
             target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+        for mid, m in unique_models.items():
+            orig_device, orig_training = originals[mid]
+            m.to(orig_device).train(orig_training)
+        del pristine_model
+    return target_corrections, diagnostics
+
+
+def _check_mid_fingerprint(mid, expected, config, pos, k) -> None:
+    """Raise if the captured pristine mid residual ``mid`` does not match Pass A's ``(sum, sumsq)`` fingerprint."""
+    try:
+        _check_boundary_fingerprint(mid, expected, config, pos, k)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc).replace("target boundary fingerprint", "target mid-block fingerprint")) from None
+
+
+@torch.no_grad()
+def _fit_sequential_two_points_streaming(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    source_base_model,
+    source_ft_model,
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
+    """``depth_fit="sequential"`` with two correction points per block (``sequential_points`` ``end_end`` / ``mid_end``).
+
+    Same machinery as `fit_direct_residual_sequential_streaming` (blocks fitted in order, blocks ``< j`` mounted, source
+    base / source FT / current target / pristine target swept in lockstep), but block ``j`` runs two calibration passes:
+
+    1. component ``attn.out_proj`` (O), then mounted. ``end_end``: against the block-end target ``D_j = (f - b) Q_j``
+       with upstream ``U_j = out_current - out_pristine`` at the block boundary. ``mid_end``: against the mid-block
+       target ``M_j = (f_mid - b_mid) Q^mid_j`` (``x_mid = block_input + attention branch output``, ``Q^mid_j`` the polar
+       map of Pass A's mid cross-covariance) with upstream ``x_mid_current - x_mid_pristine``.
+    2. component ``mlp.c_proj`` (D) with O_j mounted: against ``D_j`` at the block end, upstream ``out_current -
+       out_pristine``, features the current target's ``c_proj`` input.
+
+    Each solve is an exact linear least squares because the component writes straight into the residual stream, so
+    after the full fit the block-end error at boundary ``j`` equals D's fit residual and, for ``mid_end``, the mid error
+    after O_j (and blocks ``< j``) equals O's fit residual. For ``end_end`` the O substep is the same least squares
+    with O's own write as the only unknown, but the MLP reacts to O's change of ``x_mid``, so its realized end error is
+    not the O residual; D then fits what is left at the block end on the current (O-mounted) target.
+
+    Rows follow the single-point schema plus ``sequential_points``, ``correction_point`` (``"mid"`` / ``"end"``) and
+    ``upstream_effect_norm`` per substep, O's row first. The target model's entry state is restored in a ``finally``.
+    """
+    mid_end = config.sequential_points == "mid_end"
+    substeps = [
+        ("attn.out_proj", "mid" if mid_end else "end"),
+        ("mlp.c_proj", "end"),
+    ]
+    if set(order_components(config.components)) != {"attn.out_proj", "mlp.c_proj"}:
+        raise ValueError(
+            f"sequential_points={config.sequential_points!r} requires components attn.out_proj and mlp.c_proj"
+        )
+    if mid_end and family_adapter is not None:
+        raise NotImplementedError("mid_end is vision-only")
+    batches = prepared["target_batches"]
+    source_batches = prepared["source_batches"]
+    q_by_position = prepared["q_by_position"]
+    fingerprints = prepared["fingerprints"]
+    q_mid_by_position = prepared.get("q_mid_by_position")
+    mid_fingerprints = prepared.get("mid_fingerprints")
+    positions = list(range(pairing.target_depth))
+    for j in positions:
+        if j not in q_by_position:
+            raise ValueError(f"Missing prepared Procrustes map for position {j}")
+        if mid_end and (q_mid_by_position is None or j not in q_mid_by_position or mid_fingerprints is None):
+            raise ValueError(f"Missing prepared mid-block Procrustes map for position {j} (prepare with mid_alignment)")
+    source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
+    shim = _layout_for(family_adapter)
+
+    unique_models: dict[int, Any] = {}
+    for m in (target_model, source_base_model, source_ft_model):
+        unique_models.setdefault(id(m), m)
+    originals = {mid: (next(m.parameters()).device, m.training) for mid, m in unique_models.items()}
+
+    original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    target_corrections: dict[str, Tensor] = {}
+    diagnostics: list[dict[str, Any]] = []
+    pristine_model = None
+    try:
+        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        target_model.load_state_dict(current_state, strict=True)
+        pristine_model = deepcopy(target_model)
+        pristine_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
+        sb_model = pristine_model if source_base_model is target_model else source_base_model
+        sf_model = pristine_model if source_ft_model is target_model else source_ft_model
+        for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
+            m.to(device).eval()
+        if mid_end:
+            for pos in positions:
+                _assert_layerscale_identity(
+                    shim, shim.blocks(target_model)[pos], context=f"target block {pos}", requirement="mid_end"
+                )
+
+        for pos in positions:
+            i = pairing.pairing[pos]
+            for component, point in substeps:
+                key = shim.component_key(pos, component, prefixed=True)
+                width = int(current_state[key].shape[0])
+                effective_out = _component_effective_out(shim, target_model, pos, component, width)
+                stats = ResidualSufficientStatistics(device=device)
+                desired_sq = 0.0
+                upstream_sq = 0.0
+                out_key, h_key = f"{pos}.out", f"{pos}.{component}.h"
+                in_key, attn_key = f"{pos}.mid_in", f"{pos}.mid_attn"
+                src_requests = {str(i): (i, "boundary")}
+                tgt_requests = {out_key: (pos, "boundary"), h_key: (pos, COMPONENT_INPUT_KIND[component])}
+                ref_requests = {out_key: (pos, "boundary")}
+                if point == "mid":
+                    src_requests = {f"{i}.mid_in": (i, "block_input"), f"{i}.mid_attn": (i, "attn_proj")}
+                    mid_requests = {in_key: (pos, "block_input"), attn_key: (pos, "attn_proj")}
+                    tgt_requests.update(mid_requests)
+                    ref_requests.update(mid_requests)
+                gens = (
+                    iter_capture_tokens(
+                        sb_model,
+                        source_batches,
+                        src_requests,
+                        device,
+                        family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                    iter_capture_tokens(
+                        sf_model,
+                        source_batches,
+                        src_requests,
+                        device,
+                        family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                    iter_capture_tokens(
+                        target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+                    ),
+                    iter_capture_tokens(
+                        pristine_model,
+                        batches,
+                        ref_requests,
+                        device,
+                        family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                )
+                with contextlib.ExitStack() as stack:
+                    for gen in gens:
+                        stack.enter_context(contextlib.closing(gen))
+                    for k, (sb, sf, tgt, ref) in enumerate(zip(*gens, strict=True)):
+                        # The pristine copy must match Pass A's fingerprints (detects a mutated base).
+                        _check_boundary_fingerprint(ref[out_key], fingerprints[(k, pos)], config, pos, k)
+                        if point == "mid":
+                            ref_mid = _mid_residual(ref, in_key, attn_key)
+                            _check_mid_fingerprint(ref_mid, mid_fingerprints[(k, pos)], config, pos, k)
+                            cur = _mid_residual(tgt, in_key, attn_key).cpu()
+                            b = _aligned([_mid_residual(sb, f"{i}.mid_in", f"{i}.mid_attn").cpu()], [cur])[0]
+                            f = _aligned([_mid_residual(sf, f"{i}.mid_in", f"{i}.mid_attn").cpu()], [cur])[0]
+                            desired = (f - b) @ q_mid_by_position[pos]
+                            upstream = cur - ref_mid.cpu()
+                        else:
+                            cur = tgt[out_key].cpu()
+                            b = _aligned([sb[str(i)].cpu()], [cur])[0]
+                            f = _aligned([sf[str(i)].cpu()], [cur])[0]
+                            desired = (f - b) @ q_by_position[pos]
+                            upstream = cur - ref[out_key].cpu()
+                        error = desired - upstream
+                        desired_sq += float((desired.double() ** 2).sum().item())
+                        upstream_sq += float((upstream.double() ** 2).sum().item())
+                        h = tgt[h_key].cpu()
+                        stats.update(
+                            h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out
+                        )
+
+                position_corrections: dict[str, Tensor] = {}
+                block_rows: list[dict[str, Any]] = []
+                _finalize_independent_component(
+                    stats,
+                    desired_sq,
+                    0.0,
+                    pos,
+                    component,
+                    key,
+                    current_state,
+                    effective_out,
+                    config,
+                    source_coordinates,
+                    position_corrections,
+                    block_rows,
+                    h_batches=None,
+                )
+                target_corrections.update(position_corrections)
+                for row in block_rows:
+                    row["source_position"] = row.pop("source_coordinate")
+                    row["procrustes_source"] = prepared.get("procrustes_source", "activation")
+                    row["depth_fit"] = "sequential"
+                    row["sequential_points"] = config.sequential_points
+                    row["correction_point"] = point
+                    row["upstream_effect_norm"] = upstream_sq**0.5
+                    diagnostics.append(row)
+                # Mount this substep (weight and bias) before the next one sees the target.
+                target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)
     finally:
         target_model.load_state_dict(original_state, strict=True)
         for mid, m in unique_models.items():

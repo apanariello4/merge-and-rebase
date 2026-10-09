@@ -65,6 +65,8 @@ method:
     # sequential_impl: "reference"          # compute-only switch for depth_fit=sequential (same task vector): reference (4 full
     #                                       #   forwards per block and batch) | block_carry (each model's block input carried
     #                                       #   forward, one block run per position; decoders only).
+    # sequential_points: "single"           # [ablation] single | end_end (depth_fit=sequential, components=[attn.out_proj, mlp.c_proj]):
+    #                                       #   per block O then D, both against D_j at the block end. mid_end is vision-only.
     # procrustes_rank: null                 # [ablation] keep only the top-k singular pairs of each block's cross-covariance
     #                                       #   (polar, activation, streaming); exclusive with procrustes_energy; null = full map.
     # procrustes_energy: null               # [ablation] smallest k whose PLAIN singular values hold this share of their sum,

@@ -199,6 +199,7 @@ def _fit_body(
             procrustes_rank=config.procrustes_rank,
             procrustes_energy=config.procrustes_energy,
             exclude_first_token=config.exclude_first_token,
+            mid_alignment=config.sequential_points == "mid_end",
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )

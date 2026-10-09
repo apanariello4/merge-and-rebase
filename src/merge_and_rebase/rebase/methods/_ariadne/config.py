@@ -127,6 +127,12 @@ class DirectResidualConfig:
     # stream carries its exact block input forward, so each position runs only its own block (see
     # sequential_carry.py). Serialized only when non-default.
     sequential_impl: str = "reference"
+    # Ablation (depth_fit='sequential', sequential_impl='reference', components attn.out_proj + mlp.c_proj): how many
+    # correction points each block gets. 'single' (default): the one component fit as before. 'end_end': O
+    # (attn.out_proj) is fitted first, then D (mlp.c_proj), both against the block-end target D_j (D fits what O left
+    # missing at the block end). 'mid_end': O is fitted against a mid-block target M_j (residual stream after the
+    # attention add) through its own polar Procrustes map, D against D_j (vision only). Serialized only when non-default.
+    sequential_points: str = "single"
     # Ablation (polar map, procrustes_source='activation', streaming only; mutually exclusive, default None = full
     # map): rank-truncate the Procrustes map Q_j = U V^T to its top-k singular pairs, Q_j^k = U[:, :k] Vh[:k].
     # 'procrustes_rank': fixed k >= 1 (k >= min(d_source, d_target) is the full map). 'procrustes_energy': in (0, 1],
@@ -147,6 +153,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "copy_shape_matching_source_deltas": False,
     "depth_fit": "independent",
     "sequential_impl": "reference",
+    "sequential_points": "single",
     "procrustes_rank": None,
     "procrustes_energy": None,
     "exclude_first_token": False,
@@ -242,6 +249,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "copy_shape_matching_source_deltas",
         "depth_fit",
         "sequential_impl",
+        "sequential_points",
         "procrustes_rank",
         "procrustes_energy",
         "exclude_first_token",
@@ -460,6 +468,10 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("sequential_impl must be 'reference' or 'block_carry'")
     if cfg.sequential_impl != "reference" and cfg.depth_fit != "sequential":
         raise ValueError(f"sequential_impl={cfg.sequential_impl!r} requires depth_fit='sequential'")
+    if cfg.sequential_points not in {"single", "end_end", "mid_end"}:
+        raise ValueError("sequential_points must be 'single', 'end_end' or 'mid_end'")
+    if cfg.sequential_points != "single" and cfg.depth_fit != "sequential":
+        raise ValueError(f"sequential_points={cfg.sequential_points!r} requires depth_fit='sequential'")
     if cfg.depth_fit == "sequential":
         required = {
             "activation_storage": "streaming",
@@ -473,12 +485,29 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "realization_diagnostics": False,
         }
         bad = {name: getattr(cfg, name) for name, want in required.items() if getattr(cfg, name) != want}
-        if len(components) != 1:
+        two_points = cfg.sequential_points != "single"
+        if two_points:
+            if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
+                bad["components"] = components
+        elif len(components) != 1:
             bad["components"] = components
         if bad:
-            raise ValueError(
-                f"depth_fit='sequential' requires {required} and exactly one component; got incompatible {bad}"
-            )
+            what = "exactly the components attn.out_proj and mlp.c_proj" if two_points else "exactly one component"
+            raise ValueError(f"depth_fit='sequential' requires {required} and {what}; got incompatible {bad}")
+        if two_points:
+            if cfg.sequential_impl != "reference":
+                raise ValueError(f"sequential_points={cfg.sequential_points!r} requires sequential_impl='reference'")
+            if cfg.sequential_points == "mid_end":
+                need = {
+                    "alignment_map": "polar",
+                    "alignment_row_weighting": "uniform",
+                    "procrustes_source": "activation",
+                    "procrustes_rank": None,
+                    "procrustes_energy": None,
+                }
+                bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+                if bad:
+                    raise ValueError(f"sequential_points='mid_end' requires {need}; got incompatible {bad}")
     return cfg
 
 
@@ -532,4 +561,8 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
                 f"Ariadne on decoder models does not support {name}={got!r} (must be {required!r}): "
                 "this option is vision-only"
             )
+    if cfg.sequential_points == "mid_end":
+        # HF decoder layers receive hidden_states as a keyword argument, so the block_input capture (positional
+        # inputs[0]) does not see the block input there.
+        raise NotImplementedError("mid_end is vision-only")
     return cfg
