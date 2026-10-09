@@ -301,7 +301,8 @@ def test_resolve_depth_strategy_and_check_pair_depth():
     assert rds("theseus", None, s, s).rule == "none"
     assert rds("bico", None, s, t).rule == "discrete_index_match"
     leg = rds("theseus", {"extension_strategy": "per_weight"}, s, t)
-    assert (leg.legacy, leg.skip_correction, leg.extension_strategy) == (True, False, "per_weight")
+    # An unset skip_correction is the default (True since 2026-10-09; it meant False before).
+    assert (leg.legacy, leg.skip_correction, leg.extension_strategy) == (True, True, "per_weight")
     assert rds("bico", {"skip_correction": False}, s, t).rule == "brace"
     capabilities.check_pair("ariadne", s, t)
     capabilities.check_pair("bico", s, t)

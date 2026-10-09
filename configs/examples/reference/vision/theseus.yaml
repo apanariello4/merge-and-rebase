@@ -75,7 +75,7 @@ method:
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
   defaults: method                          # method: THESEUS -> BRACE prestep with interpolate_per_weight and
-                                            #   skip_correction=true; legacy: pre-release behaviour. Absent: a depth
+                                            #   skip_correction=true (the default); legacy: pre-release depth rule. Absent: a depth
                                             #   mismatch whose meaning changed raises ConfigMeaningChangedError.
   # enabled: true                           # run the depth prestep on a depth mismatch (the CLI sets true when absent).
   # rule: "method_default"                  # method_default | brace | discrete_index_match (THESEUS default: brace).
@@ -95,8 +95,8 @@ depth_alignment:
       # split: "test"                       # split the BRACE calibration batches come from.
       # dataset: null                       # task-independent calibration set (str or dict); exclusive with data.task.
       # task: null                          # shorthand: calibrate every task on this one named task.
-    # skip_correction: true                 # [BRACE-only] [default: method] skip the ridge correction of inserted blocks;
-    #                                       #   false = corrected BRACE arm (needs much more memory).
+    # skip_correction: true                 # [BRACE-only] [main] default: no ridge correction of inserted blocks. false is the
+    #                                       #   EXPERIMENTAL corrected BRACE arm (warns; needs much more memory).
     # skip_final_ln: false                  # [BRACE-only] leave the final LayerNorm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # ridge_weight: 1.0e-6                  # [BRACE-only] ridge weight of the correction (paper Eq. 9, >= 0).

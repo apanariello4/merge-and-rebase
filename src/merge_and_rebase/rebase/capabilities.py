@@ -241,7 +241,7 @@ def resolve_depth_strategy(
     Defaults: THESEUS-like -> BRACE ``interpolate_per_weight`` + ``skip_correction=True``; BiCo -> discrete index
     match on the reindexed stack; Ariadne -> none (it pairs blocks itself). Equal depths -> ``none``.
     Any legacy key in ``block_extension_params`` (depth_rule / extension_strategy / skip_correction) keeps the
-    legacy semantics: the given values verbatim, unset ``skip_correction`` meaning False.
+    legacy semantics: the given values verbatim (unset ``skip_correction`` is the default, True).
     """
     traits = method_traits(method_name)
     params = block_extension_params or {}
@@ -262,7 +262,7 @@ def resolve_depth_strategy(
         ext = params.get("extension_strategy")
         return DepthStrategy(
             rule=rule,
-            skip_correction=bool(params.get("skip_correction", False)),
+            skip_correction=bool(params.get("skip_correction", True)),
             extension_strategy=None if ext is None else str(ext),
             legacy=True,
         )

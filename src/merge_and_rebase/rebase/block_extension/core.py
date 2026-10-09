@@ -609,7 +609,7 @@ class BlockExtenderCore:
         per_weight_mode: str = "cascade",
         n_cascade_iters: int = 1,
         share_ft_refs: bool = False,
-        skip_correction: bool = False,
+        skip_correction: bool = True,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
         inserted_block_mode: str = "ariadne",
@@ -748,7 +748,7 @@ class BlockExtenderCore:
         per_weight_mode: str = "cascade",
         n_cascade_iters: int = 1,
         share_ft_refs: bool = False,
-        skip_correction: bool = False,
+        skip_correction: bool = True,
         component_ridge: dict[str, float] | None = None,
         lmc_mode: str = "independent",
     ) -> int:

@@ -28,14 +28,27 @@ When source and target depths differ, each method uses its own rule, configured 
 
 | Method | Default rule (`"depth_defaults": "method"`) |
 |---|---|
-| THESEUS (`theseus`, `theseus_gqa`) | BRACE block extension, `extension_strategy="interpolate_per_weight"`, `skip_correction=true` (`false` selectable) |
+| THESEUS (`theseus`, `theseus_gqa`) | BRACE block extension, `extension_strategy="interpolate_per_weight"`, `skip_correction=true` (the default everywhere; `false` is the experimental ridge correction, see below) |
 | BiCo | BiCo-paper discrete index match `i(j) = round(j (D_s-1)/(D_t-1))`; source base and fine-tuned models are reindexed and BiCo's statistics are collected on the reindexed stack |
 | Ariadne | no prestep; blocks are paired by `ariadne_params.depth_pairing` (`relative` default, `spread_duplicate`) |
 
 `block_extension_params.depth_rule` (`method_default` / `brace` / `discrete_index_match`) overrides the rule; the
-legacy top-level `depth_alignment` is an alias. `"depth_defaults": "legacy"` reproduces the behaviour before the
-per-method defaults. A depth-changing THESEUS/BiCo config that sets neither `depth_defaults` nor an explicit
+legacy top-level `depth_alignment` is an alias. `"depth_defaults": "legacy"` reproduces the depth rule from before
+the per-method defaults (BRACE for BiCo); it does not bring back the ridge correction, which is off by default for
+every method (see below). A depth-changing THESEUS/BiCo config that sets neither `depth_defaults` nor an explicit
 choice stops with an error naming both fixes, so old configs never silently change meaning.
+
+### BRACE correction (experimental)
+
+`skip_correction` defaults to `true` on every path: BRACE then only inserts or merges layers and reads no calibration
+data. `skip_correction: false` enables a ridge regression per inserted layer that makes its output match the original
+layer's activations (the keys `ridge_identity`, `ridge_weight`, `n_cascade_iters`, `correction_scope`,
+`target_shared_correction` and the other correction-only keys configure it). This correction is experimental: it needs
+several times the memory of the default (about 175 GiB against 56 GiB host memory on Qwen2.5 0.5B to 1.5B) and logs
+a warning when enabled. On the Qwen2.5 0.5B to 1.5B IFEval runs it never beat skipping it (one-seed results on 141
+documents). The example and reference configs therefore do
+not set any BRACE key. Configs from before the release that relied on the old default (correction on) must now set
+`skip_correction: false` explicitly.
 
 ## Core fields
 

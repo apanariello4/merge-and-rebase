@@ -33,7 +33,8 @@ def test_theseus_method_default_is_brace_skip_correction():
 
 def test_legacy_is_byte_identical_to_old_defaults():
     r = _resolve(depth_defaults="legacy", block_extension_params=dict(BE))
-    assert r.block_extension_cfg.skip_correction is False
+    # The legacy depth rule is kept; an unset skip_correction is the default (true since 2026-10-09).
+    assert r.block_extension_cfg.skip_correction is True
     assert r.depth_rule.source == "legacy_defaults"
     r.bind(4, 6)
     b = _resolve(method="bico", depth_defaults="legacy")
@@ -56,7 +57,8 @@ def test_explicit_skip_correction_is_never_guarded_nor_overridden():
 
 
 def test_theseus_option_requiring_correction_without_skip_value_raises_at_resolve():
-    with pytest.raises(ConfigMeaningChangedError, match="correction_scope"):
+    # skip_correction defaults to true, so a correction-only option needs an explicit skip_correction: false.
+    with pytest.raises(ValueError, match="correction_scope.*requires skip_correction=false"):
         _resolve(block_extension_params={**BE, "correction_scope": "interleaved_once"})
 
 

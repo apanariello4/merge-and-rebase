@@ -87,7 +87,8 @@ def _check_table(name: str, actual) -> None:
 def _resolve(params: dict):
     from merge_and_rebase.rebase.block_extension.config import resolve_block_extension_config
 
-    full = {"n_batches_act": 2, "verbose": False, "show_progress": False, **params}
+    # skip_correction=False: these cases pin the corrected arm (the default is true since 2026-10-09).
+    full = {"n_batches_act": 2, "verbose": False, "show_progress": False, "skip_correction": False, **params}
     _, config = resolve_block_extension_config({"block_extension_params": full})
     return config
 
@@ -125,6 +126,8 @@ _VISION_BASE = {
     "ridge_identity": 1.0,
     "ridge_weight": 1e-6,
     "lmc_mode": "independent",
+    # These cases pin the corrected arm (the default flipped to skip_correction=true on 2026-10-09).
+    "skip_correction": False,
 }
 
 _VCOMP_RIDGE = {"q": 0.25, "out_proj": 0.5, "c_proj": 2.0}
@@ -292,7 +295,8 @@ def test_brace_vision_eager_equals_lazy():
 
 _DCOMP_RIDGE = {"q_proj": 0.25, "o_proj": 0.5, "down_proj": 2.0}
 
-_DECODER_BASE = {"extension_strategy": "interpolate_per_weight", "lmc_mode": "independent"}
+# Pins the corrected arm (the default flipped to skip_correction=true on 2026-10-09); cases may override it.
+_DECODER_BASE = {"extension_strategy": "interpolate_per_weight", "lmc_mode": "independent", "skip_correction": False}
 
 
 def _run_decoder(params: dict, source_depth: int, target_depth: int):
