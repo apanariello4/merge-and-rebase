@@ -3,13 +3,11 @@
     "name": "ariadne",
     "params": {
       "preset": "ariadne",
+      "depth_pairing": "relative",
       "num_batches": 100,
       "seed": 0,
       "streaming_position_chunk": 14
     }
-  },
-  "depth_alignment": {
-    "defaults": "method"
   },
   "alpha": {
     "value": 1.0,

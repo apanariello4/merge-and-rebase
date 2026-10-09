@@ -9,7 +9,7 @@
     }
   },
   "depth_alignment": {
-    "defaults": "method"
+    "rule": "interpolate_layers"
   },
   "alpha": {
     "value": 1.0,

@@ -171,7 +171,12 @@ def _warn_unknown_block_extension_params(params: Mapping[str, Any]) -> None:
 # ``rebase.run_config.resolve_depth_rule``; nothing here changes ``BlockExtensionConfig``.
 # ---------------------------------------------------------------------------------------------
 
-DEPTH_RULES: tuple[str, ...] = ("method_default", "brace", "discrete_index_match")
+#: Plain-language rule names for the config. ``interpolate_layers`` is BRACE inserting blended copies of source layers
+#: with no correction (THESEUS's default); ``index_match`` is the discrete index match (BiCo's default). The
+#: internal names ``brace`` / ``discrete_index_match`` stay accepted (``brace`` is also the only way to reach the
+#: experimental ridge correction or the other extension strategies).
+PUBLIC_DEPTH_RULES: dict[str, str] = {"interpolate_layers": "brace", "index_match": "discrete_index_match"}
+DEPTH_RULES: tuple[str, ...] = ("method_default", "brace", "discrete_index_match", *PUBLIC_DEPTH_RULES)
 # top-level legacy ``depth_alignment`` value -> depth rule
 _DEPTH_ALIGNMENT_ALIAS: dict[str, str] = {"ariadne": "brace", "discrete_index_match": "discrete_index_match"}
 
@@ -295,10 +300,13 @@ def parse_depth_rule_schema(cfg: Mapping[str, Any], *, warn: bool = True) -> Dep
         alias_rule = _DEPTH_ALIGNMENT_ALIAS[mode]
 
     explicit_rule: str | None = None
+    public_rule: str | None = None
     if "depth_rule" in raw_params:
         explicit_rule = str(raw_params["depth_rule"]).strip().lower()
         if explicit_rule not in DEPTH_RULES:
             raise ValueError(f"block_extension_params.depth_rule must be one of: {', '.join(DEPTH_RULES)}.")
+        if explicit_rule in PUBLIC_DEPTH_RULES:
+            public_rule, explicit_rule = explicit_rule, PUBLIC_DEPTH_RULES[explicit_rule]
     if explicit_rule is not None and alias_rule is not None and explicit_rule != "method_default":
         if explicit_rule != alias_rule:
             raise ValueError(
@@ -319,6 +327,19 @@ def parse_depth_rule_schema(cfg: Mapping[str, Any], *, warn: bool = True) -> Dep
         # Value validity stays with the extender (its messages are pinned); only presence matters here.
         strategy = str(raw_params["extension_strategy"])
     skip = raw_params.get("skip_correction", None)
+    if public_rule == "interpolate_layers":
+        # The plain name means exactly "insert interpolated layers, no correction"; anything else is the BRACE rule.
+        if skip is not None and not bool(skip):
+            raise ValueError(
+                "depth_rule='interpolate_layers' inserts interpolated layers without a correction, but "
+                "skip_correction=false was given. Use depth_rule='brace' for the experimental ridge correction."
+            )
+        if strategy is not None and strategy != "interpolate_per_weight":
+            raise ValueError(
+                f"depth_rule='interpolate_layers' means extension_strategy='interpolate_per_weight', got {strategy!r}. "
+                "Use depth_rule='brace' to choose another extension_strategy."
+            )
+        skip, strategy = True, "interpolate_per_weight"
     if warn and rule == "discrete_index_match":
         warn_brace_only_fields_under_discrete(raw_params, stacklevel=4)
     return DepthRuleSchema(

@@ -252,7 +252,10 @@ def resolve_depth_strategy(
         if source_meta.num_hidden_layers == target_meta.num_hidden_layers:
             return DepthStrategy(rule="none")
     if any(k in params for k in _LEGACY_DEPTH_KEYS):
+        from .block_extension.config import PUBLIC_DEPTH_RULES
+
         rule = str(params.get("depth_rule") or "")
+        rule = PUBLIC_DEPTH_RULES.get(rule, rule)
         if rule in ("", "method_default"):
             rule = (
                 "discrete_index_match"

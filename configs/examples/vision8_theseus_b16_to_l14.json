@@ -30,7 +30,7 @@
     }
   },
   "depth_alignment": {
-    "defaults": "method"
+    "rule": "interpolate_layers"
   },
   "alpha": {
     "search": true,
