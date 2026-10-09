@@ -69,7 +69,7 @@ depth_alignment:
     # extension_strategy: "interpolate_per_weight" # [BRACE-only] [main] new-layer init: interpolate_per_weight |
     #                                       #   duplicate_per_weight (a shrink needs a per-weight strategy).
     # dampening_factor: 1.0                 # [BRACE-only] scale on the inserted layer's output (biases included).
-    # skip_correction: false                # [BRACE-only] skip the ridge correction of inserted layers.
+    # skip_correction: true                 # [BRACE-only] default; false is the EXPERIMENTAL ridge correction (warns).
     # skip_final_ln: false                  # [BRACE-only] leave the final norm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # n_cascade_iters: 1                    # [BRACE-only] cascade iterations (floored at 1).

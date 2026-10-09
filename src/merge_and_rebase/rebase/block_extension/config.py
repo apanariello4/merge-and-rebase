@@ -58,7 +58,7 @@ class BlockExtensionConfig:
     calibration_dataset: str | dict[str, Any] | None = None
     # Backward-compatible/ergonomic alias for a named calibration dataset.
     calibration_task: str | None = None
-    skip_correction: bool = False
+    skip_correction: bool = True
     skip_final_ln: bool = False
     eval_before_extension: bool = False
     first_n_eval_batches: int | None = None
@@ -385,7 +385,15 @@ def resolve_block_extension_config(cfg: Mapping[str, Any]) -> tuple[bool, BlockE
     if ridge_weight < 0.0:
         raise ValueError("block_extension_params.ridge_weight must be >= 0.")
 
-    skip_correction = bool(params.get("skip_correction", False))
+    skip_correction = bool(params.get("skip_correction", True))
+    if not skip_correction:
+        warnings.warn(
+            "block_extension_params.skip_correction=false enables the BRACE ridge correction, which is "
+            "experimental (it needs several times the memory of the default; see docs/rebasin.md). "
+            "The default is skip_correction=true.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     inserted_block_mode = _as_inserted_block_mode(params.get("inserted_block_mode", "ariadne"))
     correction_scope = _as_correction_scope(params.get("correction_scope", "inserted"))
     if correction_scope != "inserted":

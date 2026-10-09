@@ -431,9 +431,18 @@ _LEGACY_DEPTH_CASES = (
     "theseus_extend_eval_before_rebase",
     "theseus_shrink_per_weight",
 )
+
+
+def _pin_legacy_depth(cfg):
+    """Legacy depth rule and the corrected arm (skip_correction defaults to true since 2026-10-09), both explicit."""
+    params = {**_BE, **cfg.get("block_extension_params", {})}
+    params.setdefault("skip_correction", False)
+    return {**cfg, "depth_defaults": "legacy", "block_extension_params": params}
+
+
 for _name in _LEGACY_DEPTH_CASES:
     _sizes, _make = CASES[_name]
-    CASES[_name] = (_sizes, lambda r, _make=_make: {**_make(r), "depth_defaults": "legacy"})
+    CASES[_name] = (_sizes, lambda r, _make=_make: _pin_legacy_depth(_make(r)))
 _ARIADNE = {"preset": "ariadne", "num_batches": 2, "seed": 0}
 CASES["theseus_extend_depth_defaults_method"] = (_EXT, lambda r: {"depth_defaults": "method"})
 CASES["bico_extend_discrete_index_match"] = (
@@ -470,7 +479,7 @@ EXPECTED: dict[str, str] = {
     "ariadne_same_depth:tuned_loads": "8823381edc53b384c1713eb184d37b087cb1c45c8edbde9b015d07d18f65f6ff",
     "bico_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "bico_extend:harness_calls": "64544190ae69c1319bd790596b9a055a3c164d25d4505e2dce7236118d02eff4",
-    "bico_extend:resolved_config": "17cb46ac0f81d1f4b78ed8f1014ec5ff6684c9f0bdf4f92e237167144ebf16c9",
+"bico_extend:resolved_config": "17cb46ac0f81d1f4b78ed8f1014ec5ff6684c9f0bdf4f92e237167144ebf16c9",
     "bico_extend:summary": "66b43c9915b6cbe9d433d543b8be9aa98b1e62640bd2aa2c35a9553b65435a48",
     "bico_extend:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "bico_extend_discrete_index_match:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -510,7 +519,7 @@ EXPECTED: dict[str, str] = {
     "dnm_uncorrected_same_depth:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "eval_before_rebase_only_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "eval_before_rebase_only_extend:harness_calls": "223046c5d23c59639535adf8f0a5e7cb32c483849943f68b7f322aefd6954bd7",
-    "eval_before_rebase_only_extend:resolved_config": "e871a5a2eb8ea494e7b13259fc7090a933687bcb32b20280cabeb7f3dd59abdb",
+"eval_before_rebase_only_extend:resolved_config": "e871a5a2eb8ea494e7b13259fc7090a933687bcb32b20280cabeb7f3dd59abdb",
     "eval_before_rebase_only_extend:summary": "c159ffabb3087998b817e27a09a783689c037f963c7990d8aeeed50896a139b8",
     "eval_before_rebase_only_extend:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "eval_before_rebase_only_same_depth:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -542,7 +551,7 @@ EXPECTED: dict[str, str] = {
     "theseus_extend_brace_skip_correction_true:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_extend_defaults_alpha_search:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_extend_defaults_alpha_search:harness_calls": "8eedb83aa039f9c765b7ea9ce55f53b41b7f6e9a4b50b9939eca8cca0a933b1b",
-    "theseus_extend_defaults_alpha_search:resolved_config": "89c8491afd1bbcc81a70c8c0ec424bec7aa6d43f09eea7904dbfa14f1d93bcb6",
+"theseus_extend_defaults_alpha_search:resolved_config": "89c8491afd1bbcc81a70c8c0ec424bec7aa6d43f09eea7904dbfa14f1d93bcb6",
     "theseus_extend_defaults_alpha_search:summary": "ae4b65827bdadf515eac50b7448fbaeb5ce89838dcc5ed6e35a3bb797493a698",
     "theseus_extend_defaults_alpha_search:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_extend_depth_defaults_method:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -552,7 +561,7 @@ EXPECTED: dict[str, str] = {
     "theseus_extend_depth_defaults_method:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_extend_eval_before_rebase:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_extend_eval_before_rebase:harness_calls": "ba07e46f2425169faf6d2e1e8088c7f8cd4f11e60829dfd974ff29869a07f23c",
-    "theseus_extend_eval_before_rebase:resolved_config": "1820cb76f65eb850ffa8aa5d7b95445a87347a57d6077e82c0a78137ba8c424c",
+"theseus_extend_eval_before_rebase:resolved_config": "1820cb76f65eb850ffa8aa5d7b95445a87347a57d6077e82c0a78137ba8c424c",
     "theseus_extend_eval_before_rebase:summary": "f2bd3158355549ea3659d025156a1d0d73c739cf987bb4fff5820ff8a81d4e95",
     "theseus_extend_eval_before_rebase:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_gqa_extend:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -593,7 +602,7 @@ EXPECTED: dict[str, str] = {
     "theseus_same_depth_weights_and_limit:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_shrink_per_weight:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_shrink_per_weight:harness_calls": "ebc92af2e9b8edf1e82fd77e0f4d0329139cf162d2de48ef6bf9fbe16b783542",
-    "theseus_shrink_per_weight:resolved_config": "a9884dc5a30c103f478dca3063e11d33d63a94be56439b73c295661a3a97eb36",
+"theseus_shrink_per_weight:resolved_config": "a9884dc5a30c103f478dca3063e11d33d63a94be56439b73c295661a3a97eb36",
     "theseus_shrink_per_weight:summary": "089790e2c77f6222aac5da19cce6a984c7fa289d0dfa78f92341c4d52f678ca5",
     "theseus_shrink_per_weight:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
 }

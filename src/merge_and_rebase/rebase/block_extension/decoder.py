@@ -192,7 +192,7 @@ class DecoderBlockExtender(BlockExtenderCore):
         target_layers_total: int | None = None,
         insertion_order: str = "bottom-top",
         extension_density: str = "spread",
-        skip_correction: bool = False,
+        skip_correction: bool = True,
         skip_final_ln: bool = False,
         ridge_identity: float = 0.0,
         n_cascade_iters: int = 1,

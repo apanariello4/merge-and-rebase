@@ -511,3 +511,21 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   `task_vectors.ariadne` (depth pairing; per task the task-vector sha256, calibration record, fit diagnostics and
   timings). Additive: with that one key removed, each summary hashes to its previous value (verified case by case).
   Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.
+
+### Declared changes — 2026-10-09, `skip_correction` defaults to true (tests/golden/)
+- `BlockExtensionConfig.skip_correction` (and every code path that defaulted it) flipped from `false` to `true`. The
+  golden cases that pin the corrected arm now state `skip_correction: false` explicitly, so their behaviour is unchanged:
+  - `test_brace_extra_golden.py`: the shared bases `_VISION_BASE`, `_DECODER_BASE` and the `_resolve` helper carry
+    `skip_correction: false`; all 173 hashes are unchanged.
+  - `test_main_golden.py`: 7 cases (`bico_extend_depth_alignment_absent`, `theseus_shrink_brace`,
+    `theseus_brace_merge_then_transport`, `theseus_merge_then_brace_then_transport_correction`,
+    `theseus_native_target_explicit`, `theseus_native_target_auto_detected_per_task`,
+    `theseus_extend_eval_before_rebase`) and the error row `block_extension_identity_block_needs_skip_correction`.
+  - `test_llm_main_golden.py`: the 5 legacy-depth cases (`bico_extend`, `eval_before_rebase_only_extend`,
+    `theseus_extend_defaults_alpha_search`, `theseus_extend_eval_before_rebase`, `theseus_shrink_per_weight`).
+  - In those 12 `main()` cases only the `resolved_config` digest changed (it echoes the added explicit key); summary,
+    events, harness calls, builds, saved files and evaluated weights are identical (pytest listed no other differing
+    item). The new `resolved_config` hashes replace the old ones.
+- New pins for the default itself: `tests/test_skip_correction_default_20261009.py`; the legacy depth strategy in
+  `tests/test_ariadne_method.py` now expects an unset `skip_correction` to mean `true`.
+

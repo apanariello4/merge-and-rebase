@@ -160,10 +160,15 @@ def _extend(
 @pytest.mark.parametrize("params", list(_BASELINE_PARAMS.values()), ids=list(_BASELINE_PARAMS))
 def test_depth_baselines_require_skip_correction(params: dict) -> None:
     """A fitted correction and a baseline inserted block are mutually exclusive."""
-    with pytest.raises(ValueError, match="skip_correction"):
+    with pytest.warns(RuntimeWarning, match="experimental"), pytest.raises(ValueError, match="skip_correction"):
         resolve_block_extension_config(
-            {"block_extension_enabled": True, "block_extension_params": dict(params)}
+            {"block_extension_enabled": True, "block_extension_params": {**params, "skip_correction": False}}
         )
+    # An absent skip_correction is the default (true since 2026-10-09), so the baseline needs no explicit key.
+    _, default_cfg = resolve_block_extension_config(
+        {"block_extension_enabled": True, "block_extension_params": dict(params)}
+    )
+    assert default_cfg.skip_correction is True
 
     _, cfg = resolve_block_extension_config(
         {

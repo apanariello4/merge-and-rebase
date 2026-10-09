@@ -82,5 +82,5 @@ def test_defaults_and_brace_rule_do_not_warn():
 
 
 def test_brace_only_fields_set_ignores_defaults():
-    assert brace_only_fields_set({"skip_correction": False, "insertion_order": "bottom-top"}) == []
-    assert brace_only_fields_set({"skip_correction": True}) == ["skip_correction"]
+    assert brace_only_fields_set({"skip_correction": True, "insertion_order": "bottom-top"}) == []
+    assert brace_only_fields_set({"skip_correction": False}) == ["skip_correction"]

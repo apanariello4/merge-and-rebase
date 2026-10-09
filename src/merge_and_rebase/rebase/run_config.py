@@ -359,29 +359,12 @@ def resolve_depth_rule(
         return DepthRule(kind="brace", source=source), block_extension_cfg, None
     # skip_correction absent: the THESEUS default pair (interpolate_per_weight + skip_correction=True).
     old_fix = '"block_extension_params": {"skip_correction": false}'
-    if mode is None:
-        blocking = [
-            name
-            for name, active in (
-                (
-                    "target_shared_correction",
-                    block_extension_cfg.target_shared_correction is not None
-                    and block_extension_cfg.target_shared_correction.active,
-                ),
-                ("correction_scope!='inserted'", block_extension_cfg.correction_scope != "inserted"),
-            )
-            if active
-        ]
-        if blocking:
-            raise ConfigMeaningChangedError(
-                _meaning_changed_message(
-                    method_name, f"{', '.join(blocking)} requires skip_correction=false but it is not given", old_fix
-                )
-            )
-        if block_extension_enabled:
-            guard = _meaning_changed_message(
-                method_name, "depth-mismatched pair without an explicit skip_correction", old_fix
-            )
+    if mode is None and block_extension_enabled:
+        # Options that need the correction (correction_scope, target_shared_correction) now fail at parse time:
+        # an absent skip_correction means true, so they require an explicit skip_correction: false.
+        guard = _meaning_changed_message(
+            method_name, "depth-mismatched pair without an explicit skip_correction", old_fix
+        )
     injected = dict(raw_params)
     injected["skip_correction"] = True
     new_cfg_raw = dict(cfg)
