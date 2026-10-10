@@ -21,6 +21,9 @@ Opt-in extensions (all default to the behaviour above; sub-keys of ``calibration
 * ``separator``: inserted between prompt and answer. Composition-time option: not part of the cache identity.
 * ``shuffle_answers_seed``: CONTROL, pairs every prompt with another prompt's answer (seeded derangement, n >= 2).
   Composition-time option: not part of the cache identity.
+* ``include_prompt`` (default true): false makes each calibration text the answer alone (``text = answer``); the prompt
+  is still what the answer is generated from. Composition-time option: not part of the cache identity. An old-format
+  cache (texts only) is reused by recovering each answer as ``text[len(prompt):]`` (its texts are ``prompt + answer``).
 
 The cache keeps the raw ``answers`` next to ``texts``, so separator / shuffle cells reuse one generation.
 """
@@ -52,6 +55,7 @@ _KEYS = frozenset(
         "generation_system_instruction",
         "separator",
         "shuffle_answers_seed",
+        "include_prompt",
     }
 )
 
@@ -66,6 +70,7 @@ class GeneratedAnswerConfig:
     generation_system_instruction: str | None = None
     separator: str = ""
     shuffle_answers_seed: int | None = None
+    include_prompt: bool = True
 
     @property
     def uses_extensions(self) -> bool:
@@ -75,6 +80,7 @@ class GeneratedAnswerConfig:
             or self.generation_system_instruction is not None
             or self.separator != ""
             or self.shuffle_answers_seed is not None
+            or not self.include_prompt
         )
 
 
@@ -100,7 +106,10 @@ def parse_generated_answer_cfg(raw: Any) -> GeneratedAnswerConfig | None:
         ),
         separator=str(raw.get("separator", "")),
         shuffle_answers_seed=None if raw.get("shuffle_answers_seed") is None else int(raw["shuffle_answers_seed"]),
+        include_prompt=bool(raw.get("include_prompt", True)),
     )
+    if not cfg.include_prompt and cfg.separator != "":
+        raise ValueError("calibration_generated_answer: separator has no meaning with include_prompt=false.")
     if cfg.generation_system_instruction is not None and not cfg.generation_chat_template:
         raise ValueError("calibration_generated_answer: generation_system_instruction needs generation_chat_template.")
     if cfg.max_new_tokens <= 0 or cfg.batch_size <= 0:
@@ -222,6 +231,11 @@ def derange(answers: Sequence[str], seed: int) -> list[str]:
 def _compose(prompts: Sequence[str], answers: Sequence[str], cfg: GeneratedAnswerConfig) -> list[str]:
     if cfg.shuffle_answers_seed is not None:
         answers = derange(answers, cfg.shuffle_answers_seed)
+    if not cfg.include_prompt:
+        empty = sum(1 for a in answers if a == "")
+        if empty:
+            raise ValueError(f"calibration_generated_answer: include_prompt=false with {empty} empty answers.")
+        return list(answers)
     return [p + cfg.separator + a for p, a in zip(prompts, answers, strict=True)]
 
 
@@ -248,7 +262,7 @@ def build_generated_texts(
         )
     if cfg.shuffle_answers_seed is not None and len(prompts) < 2:
         raise ValueError("calibration_generated_answer: shuffle_answers_seed needs at least 2 calibration texts.")
-    needs_answers = cfg.separator != "" or cfg.shuffle_answers_seed is not None
+    needs_answers = cfg.separator != "" or cfg.shuffle_answers_seed is not None or not cfg.include_prompt
     identity = _identity(
         ref=ref,
         dtype=dtype,
@@ -272,6 +286,11 @@ def build_generated_texts(
             if not needs_answers:  # old-format file: its texts are exactly prompt + answer
                 print(f"  calibration answers loaded from {path}")
                 return list(cached["texts"]), {**cached["stats"], "cached": True, "answers": None}
+            texts_c = list(cached["texts"])
+            if not cfg.include_prompt and all(t.startswith(p) for p, t in zip(prompts, texts_c, strict=True)):
+                answers_c = [t[len(p) :] for p, t in zip(prompts, texts_c, strict=True)]
+                print(f"  calibration answers recovered from the old-format cache {path}")
+                return _compose(prompts, answers_c, cfg), {**cached["stats"], "cached": True, "answers": answers_c}
             print(f"  calibration answer cache at {path} has no raw answers; regenerating")
         else:
             print(f"  calibration answer cache at {path} does not match this run; regenerating")

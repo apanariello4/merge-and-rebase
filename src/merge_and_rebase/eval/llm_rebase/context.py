@@ -194,6 +194,8 @@ class TextCalibrationCache:
         answers = record.get("answers")
         if isinstance(resolved.texts, CalibrationTextList):
             spans = getattr(resolved.texts, "content_spans", None)
+            if spans is not None and not cfg.include_prompt:
+                raise ValueError("calibration_generated_answer.include_prompt=false cannot be combined with a fit mask.")
             if spans is not None:
                 # The appended separator + answer is content: a span from the end of the prompt to the end of the text.
                 spans = [[*sp, (len(p), len(t))] if len(t) > len(p) else list(sp) for sp, p, t in zip(spans, prompts, texts, strict=True)]
@@ -220,6 +222,7 @@ class TextCalibrationCache:
                     "generation_system_instruction": cfg.generation_system_instruction,
                     "separator": repr(cfg.separator),
                     "shuffle_answers_seed": cfg.shuffle_answers_seed,
+                    "include_prompt": cfg.include_prompt,
                     "answers_sha256": (
                         None if answers is None else hashlib.sha256(json.dumps(answers).encode()).hexdigest()
                     ),
