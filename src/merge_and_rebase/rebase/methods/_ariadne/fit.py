@@ -14,7 +14,7 @@ from ....utils.cost_accounting import cost_phase_decorator
 from ...discrete_layer_match import DiscreteLayerPairing
 from .alignment import _check_rows, centered_rectangular_procrustes
 from .capture import capture_tokens
-from .config import DirectResidualConfig, order_components
+from .config import DirectResidualConfig, annotate_target_split, order_components, resolve_fit_blocks
 from .layouts import COMPONENT_INPUT_KIND, _aligned, _component_effective_out, _layout_for, _rows
 
 Tensor = torch.Tensor
@@ -63,7 +63,7 @@ def fit_direct_residual(
     try:
         current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
         target_model.load_state_dict(current_state, strict=True)
-        positions = list(range(pairing.target_depth))
+        positions = resolve_fit_blocks(config, pairing.target_depth)
         for j in positions:
             if j not in target_outputs_by_position:
                 raise ValueError(f"Captured target reference is missing for position {j}")
@@ -124,6 +124,7 @@ def fit_direct_residual(
                 diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)
+    annotate_target_split(diagnostics, config, pairing)
     return target_corrections, diagnostics
 
 

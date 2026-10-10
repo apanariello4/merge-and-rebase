@@ -26,6 +26,7 @@ from ...io.ckpt import load_ckpt
 from ...io.peft_helpers import normalize_attn_patch_cfg
 from ...merge.methods._common import axpy_state_dict
 from ...rebase.block_extension.config import calibration_dataset_spec
+from ...rebase.methods._ariadne.config import direct_residual_config_dict
 from ...rebase.orchestration import AriadneRunRecord, TaskPipeline
 from ...rebase.prestep import StageEnv
 from ...rebase.run_config import check_native_target_tasks
@@ -299,6 +300,29 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
             "target_hash_after": source_only_hash_after,
             "block_extension_target_dataset_eval": eval_observer.rows,
             "depth_alignment": resolved.depth_alignment_mode,
+            "depth_rule_resolved": resolved.depth_rule_resolved,
+        }
+
+    if cfg.get("fit_only"):
+        # Opt-in cheap screen (default off): stop after the per-task fit stage (task vectors are saved by the saver as
+        # configured); no merge, alpha search or target evaluation. The summary carries the fit diagnostics only.
+        if not resolved.direct_fit:
+            raise ValueError("fit_only=true is only defined for the Ariadne (direct fit) method")
+        fit_only_hash_after = _assert_target_base_unmutated(env, "fit-only run")
+        return {
+            "suite": resolved.suite_name,
+            "tasks": resolved.tasks,
+            "method": method.name,
+            "method_label": method_label,
+            "fit_only": True,
+            "target_hash_before": env.target_hash_before,
+            "target_hash_after": fit_only_hash_after,
+            "direct_residual_cfg": direct_residual_config_dict(resolved.ariadne_cfg),
+            "direct_residual_diagnostics": ariadne_record.diagnostics,
+            "direct_residual_calibration_meta": ariadne_record.calibration_meta,
+            "direct_residual_calibration_by_task": ariadne_record.calibration_by_task,
+            "direct_residual_pairing_record": ariadne_record.pairing,
+            "transported_artifacts": saver.artifacts,
             "depth_rule_resolved": resolved.depth_rule_resolved,
         }
 

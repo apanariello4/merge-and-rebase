@@ -28,7 +28,7 @@ from .capture import (
     iter_capture_tokens,
     paired_calibration,
 )
-from .config import DirectResidualConfig, order_components
+from .config import DirectResidualConfig, annotate_target_split, order_components, resolve_fit_blocks, target_groups
 from .diagnostics import measure_direct_residual_realization_streaming
 from .fit import ResidualSufficientStatistics, _finalize_independent_component
 from .layouts import COMPONENT_INPUT_KIND, _aligned, _component_effective_out, _layout_for
@@ -448,6 +448,12 @@ def _mid_residual(captured, in_key: str, attn_key: str) -> Tensor:
     return block_input + attn_out
 
 
+def _none_stream(n: int):
+    """``n`` Nones: a stand-in generator for a capture stream the current target does not need."""
+    for _ in range(n):
+        yield None
+
+
 def _check_boundary_fingerprint(out, expected, config, pos, k) -> None:
     """Raise if the captured target boundary ``out`` does not match Pass A's ``(sum, sumsq)`` fingerprint."""
     out64 = out.double()
@@ -483,6 +489,7 @@ def fit_direct_residual_streaming(
     device,
     family_adapter=None,
     stats_factory=None,
+    native_model=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Streaming (Pass B) equivalent of ``fit_direct_residual``.
 
@@ -501,10 +508,18 @@ def fit_direct_residual_streaming(
     ``stats_factory(position, component, device)`` (analysis only, default ``None``) builds the per-(position,
     component) accumulator in place of ``ResidualSufficientStatistics(device=device)``; it must return a subclass
     that leaves ``update``/``solve`` numerically unchanged, so the fit and its hash do not depend on it.
+
+    ``residual_target="native_oracle"`` (diagnostic) replaces ``D_j`` by ``D*_j = T^ft_j - T^base_j``: the block-``j``
+    output change of ``native_model`` (the NATIVE fine-tuned target, its own full forward) against the target base on the
+    same target calibration batches. No source model and no Procrustes map enter that target. ``config.fit_blocks``
+    restricts the fit to those target blocks (every other block gets no update).
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
     components = order_components(config.components)
+    oracle = config.residual_target == "native_oracle"
+    if oracle and native_model is None:
+        raise ValueError("residual_target='native_oracle' needs native_model (the native fine-tuned target)")
     batches = prepared["target_batches"]
     source_batches = prepared["source_batches"]
     q_by_position = prepared["q_by_position"]
@@ -519,6 +534,9 @@ def fit_direct_residual_streaming(
     for j in positions:
         if j not in q_by_position:
             raise ValueError(f"Missing prepared Procrustes map for position {j}")
+    positions = resolve_fit_blocks(config, pairing.target_depth)
+    groups = target_groups(pairing.pairing)
+    share = config.pair_target_split == "per_block_share"
     source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
     solver_config = replace(config, cascade_order="independent") if config.cascade_order != "independent" else config
     shim = _layout_for(family_adapter)
@@ -567,41 +585,65 @@ def fit_direct_residual_streaming(
                     desired_sq[pair] = 0.0
                     effect_sq[pair] = 0.0
 
-            sb_gen = iter_capture_tokens(
-                source_base_model,
-                source_batches,
-                src_requests,
-                device,
-                family_adapter=family_adapter,
-                store_device=device,
-            )
-            sf_gen = iter_capture_tokens(
-                source_ft_model,
-                source_batches,
-                src_requests,
-                device,
-                family_adapter=family_adapter,
-                store_device=device,
-            )
+            if oracle:
+                # The oracle target needs no source model (no D_j, no Procrustes map): only the native fine-tuned target.
+                sb_gen, sf_gen = _none_stream(len(batches)), _none_stream(len(batches))
+                nat_gen = iter_capture_tokens(
+                    native_model,
+                    batches,
+                    {f"{pos}.out": (pos, "boundary") for pos in chunk},
+                    device,
+                    family_adapter=family_adapter,
+                    store_device=device,
+                )
+            else:
+                sb_gen = iter_capture_tokens(
+                    source_base_model,
+                    source_batches,
+                    src_requests,
+                    device,
+                    family_adapter=family_adapter,
+                    store_device=device,
+                )
+                sf_gen = iter_capture_tokens(
+                    source_ft_model,
+                    source_batches,
+                    src_requests,
+                    device,
+                    family_adapter=family_adapter,
+                    store_device=device,
+                )
+                nat_gen = _none_stream(len(batches))
             tgt_gen = iter_capture_tokens(
                 target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
             )
-            with contextlib.closing(sb_gen), contextlib.closing(sf_gen), contextlib.closing(tgt_gen):
-                for k, (sb, sf, tgt) in enumerate(zip(sb_gen, sf_gen, tgt_gen, strict=True)):
+            with (
+                contextlib.closing(sb_gen),
+                contextlib.closing(sf_gen),
+                contextlib.closing(tgt_gen),
+                contextlib.closing(nat_gen),
+            ):
+                for k, (sb, sf, tgt, nat) in enumerate(zip(sb_gen, sf_gen, tgt_gen, nat_gen, strict=True)):
                     for pos in chunk:
                         i = pairing.pairing[pos]
                         out = tgt[f"{pos}.out"]
                         _check_boundary_fingerprint(out, fingerprints[(k, pos)], config, pos, k)
                         # Align on CPU, as the resident path does on its CPU banks, so D_j stays bit-comparable.
                         out_cpu = out.cpu()
-                        b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
-                        f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
                         base_out = out_cpu
-                        q = q_by_position[pos]
-                        if residual_target == "transported_delta":
-                            desired = (f - b) @ q
+                        if oracle:
+                            # Same images, same architecture: no alignment, no Q_j. D*_j = T^ft_j - T^base_j.
+                            desired = nat[f"{pos}.out"].cpu() - out_cpu
                         else:
-                            desired = (f - mu_s_by_position[pos]) @ q + mu_t_by_position[pos] - out_cpu
+                            b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
+                            f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
+                            q = q_by_position[pos]
+                            if residual_target == "transported_delta":
+                                desired = (f - b) @ q
+                                if share and groups[pos][0] > 1:
+                                    desired = desired / groups[pos][0]
+                            else:
+                                desired = (f - mu_s_by_position[pos]) @ q + mu_t_by_position[pos] - out_cpu
                         effect = out_cpu - base_out
                         error = desired - effect
                         desired_sq_val = float((desired.double() ** 2).sum().item())
@@ -644,12 +686,16 @@ def fit_direct_residual_streaming(
                     row["source_position"] = row.pop("source_coordinate")
                     # Same analysis-only tag the resident path sets in fit_direct_residual.
                     row["procrustes_source"] = prepared.get("procrustes_source", "activation")
+                    if oracle:
+                        row["residual_target"] = "native_oracle"
+                        row["procrustes_used"] = False
                     diagnostics.append(row)
     finally:
         target_model.load_state_dict(original_state, strict=True)
         for mid, m in unique_models.items():
             orig_device, orig_training = originals[mid]
             m.to(orig_device).train(orig_training)
+    annotate_target_split(diagnostics, config, pairing)
     return target_corrections, diagnostics
 
 
@@ -700,6 +746,7 @@ def fit_direct_residual_sequential_streaming(
             family_adapter=family_adapter,
         )
     components = order_components(config.components)
+    groups = target_groups(pairing.pairing)
     if len(components) != 1:
         raise ValueError("depth_fit='sequential' requires exactly one component")
     component = components[0]
@@ -735,7 +782,10 @@ def fit_direct_residual_sequential_streaming(
         for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
             m.to(device).eval()
 
+        fit_set = set(resolve_fit_blocks(config, pairing.target_depth))
         for pos in positions:
+            if pos not in fit_set:
+                continue  # unfitted block: nothing mounted, later blocks see the true drift U_j
             i = pairing.pairing[pos]
             q = q_by_position[pos]
             key = shim.component_key(pos, component, prefixed=True)
@@ -745,6 +795,15 @@ def fit_direct_residual_sequential_streaming(
             desired_sq = 0.0
             upstream_sq = 0.0
             src_requests = {str(i): (i, "boundary")}
+            group_size, group_index, group_start = groups[pos]
+            # pair_target_split='interpolate': the last block of a group keeps D_j; earlier ones move from D_prev (the
+            # unsplit change of block group_start - 1, own Q; zero before block 0) towards D_j.
+            interp = config.pair_target_split == "interpolate" and group_index < group_size - 1
+            interp_weight = (group_index + 1) / group_size
+            if interp and group_start > 0:
+                i_prev = pairing.pairing[group_start - 1]
+                q_prev = q_by_position[group_start - 1]
+                src_requests[str(i_prev)] = (i_prev, "boundary")
             out_key, h_key = f"{pos}.out", f"{pos}.{component}.h"
             tgt_requests = {out_key: (pos, "boundary"), h_key: (pos, COMPONENT_INPUT_KIND[component])}
             ref_requests = {out_key: (pos, "boundary")}
@@ -772,6 +831,14 @@ def fit_direct_residual_sequential_streaming(
                     b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
                     f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
                     desired = (f - b) @ q
+                    if interp:
+                        if group_start > 0:
+                            b_prev = _aligned([sb[str(i_prev)].cpu()], [out_cpu])[0]
+                            f_prev = _aligned([sf[str(i_prev)].cpu()], [out_cpu])[0]
+                            d_prev = (f_prev - b_prev) @ q_prev
+                        else:
+                            d_prev = torch.zeros_like(desired)
+                        desired = d_prev + interp_weight * (desired - d_prev)
                     upstream = out_cpu - ref[out_key].cpu()
                     error = desired - upstream
                     desired_sq += float((desired.double() ** 2).sum().item())
@@ -813,6 +880,7 @@ def fit_direct_residual_sequential_streaming(
             orig_device, orig_training = originals[mid]
             m.to(orig_device).train(orig_training)
         del pristine_model
+    annotate_target_split(diagnostics, config, pairing)
     return target_corrections, diagnostics
 
 

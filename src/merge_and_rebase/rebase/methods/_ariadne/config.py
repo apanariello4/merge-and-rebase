@@ -144,6 +144,38 @@ class DirectResidualConfig:
     # attention sink, massive activations) from every statistic the fit consumes, for source and target alike.
     # Serialized only when True; rejected on the vision path (reject_decoder_only_options).
     exclude_first_token: bool = False
+    # Diagnostic (vision only): with residual_target='native_oracle' the target is D*_j = T^ft_j - T^base_j, the block-j
+    # output change of the NATIVE fine-tuned target model (own full forward) against the target base on the same target
+    # calibration images; no Procrustes map is used. 'native_target_ckpt_template' ("...{task}...") names that checkpoint
+    # (same loader as eval.diagnostics.ariadne_norm.readout). Streaming, depth_fit='independent', per-task fits only.
+    native_target_ckpt_template: str | None = None
+    # Ablation: target blocks to fit (sorted unique indices, None = all); every other block gets no update. Works for
+    # depth_fit='independent' and depth_fit='sequential' (sequential_impl='reference', sequential_points='single'): in a
+    # sequential fit an unfitted block is skipped (nothing mounted), later blocks still see the true drift U_j.
+    fit_blocks: tuple[int, ...] | None = None
+    # Ablation for extend (several target blocks share one source block pi(j)); target groups are the maximal runs of
+    # consecutive target blocks with the same pi(j) (size 1 under shrink / same depth: no-op). 'none' (default).
+    # 'per_block_share' (depth_fit='independent'): block j of a group of size m is fitted to D_j / m (each block's change
+    # persists in the residual stream, so the group delivers D once, not m times). 'interpolate' (depth_fit='sequential',
+    # reference, single point): the i-th block (i = 0..m-1) of a group starting at block j0 is fitted to
+    # D_prev + (i + 1) / m * (D_j - D_prev), D_prev the unsplit transported change of block j0 - 1 (0 for j0 = 0), so the last
+    # block of a group keeps D_j; the sequential error stays desired - U_j.
+    pair_target_split: str = "none"
+    # Ablation (vision only, depth_fit='independent', block_boundary, block_split='none'): how a component is fitted.
+    # 'closed_form' (default): the ridge solve on the component's input features. 'gradient_exact': minimise
+    # sum ||T_j(W + dW; x_j) - T_j(W; x_j) - D_j||^2 + lam ||dW||_F^2 (bias unpenalised) with the EXACT block forward T_j by
+    # full-batch L-BFGS from 0. 'gradient_linearized': the same with T_j replaced by its first-order expansion (a convex
+    # ridge problem, conjugate gradients on the normal equations, J never formed). Component groups (one per run):
+    # attn.v_proj; attn.q_proj + attn.k_proj; attn.q_proj + attn.k_proj + attn.v_proj; mlp.c_fc; attn.out_proj; mlp.c_proj.
+    # For mlp.c_proj both gradient arms equal the closed form; for attn.out_proj they include the MLP's reaction downstream.
+    component_fit: str = "closed_form"
+    gradient_fit_max_iters: int = 500
+    # Stop when the relative decrease of the (scaled) objective between iterations is below this.
+    gradient_fit_tol: float = 1e-9
+    # 'eb_input': lam = empirical-Bayes value of the component's own centred input features (as the closed form).
+    # 'match_norm': per block, lam found by bisection on log lam so ||dW_j||_F equals (1 %) that of the closed-form
+    # mlp.c_proj fit of the same block and task (computed internally).
+    gradient_ridge: str = "eb_input"
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
@@ -157,6 +189,13 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "procrustes_rank": None,
     "procrustes_energy": None,
     "exclude_first_token": False,
+    "native_target_ckpt_template": None,
+    "fit_blocks": None,
+    "pair_target_split": "none",
+    "component_fit": "closed_form",
+    "gradient_fit_max_iters": 500,
+    "gradient_fit_tol": 1e-9,
+    "gradient_ridge": "eb_input",
 }
 
 
@@ -253,6 +292,13 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "procrustes_rank",
         "procrustes_energy",
         "exclude_first_token",
+        "native_target_ckpt_template",
+        "fit_blocks",
+        "pair_target_split",
+        "component_fit",
+        "gradient_fit_max_iters",
+        "gradient_fit_tol",
+        "gradient_ridge",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -260,6 +306,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     payload = {**(_PRESETS[preset] if preset is not None else {}), **value}
     if "components" in payload and isinstance(payload["components"], list):
         payload["components"] = tuple(payload["components"])
+    if isinstance(payload.get("fit_blocks"), list):
+        payload["fit_blocks"] = tuple(payload["fit_blocks"])
     cfg = DirectResidualConfig(**payload)
     if isinstance(cfg.num_batches, bool) or not isinstance(cfg.num_batches, int) or cfg.num_batches <= 0:
         raise ValueError("num_batches must be a positive integer")
@@ -298,9 +346,12 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("components must not be empty")
     if len(set(components)) != len(components):
         raise ValueError("components must not repeat a projection")
-    unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
+    if cfg.component_fit not in {"closed_form", "gradient_exact", "gradient_linearized"}:
+        raise ValueError("component_fit must be 'closed_form', 'gradient_exact' or 'gradient_linearized'")
+    supported = CANONICAL_COMPONENT_ORDER if cfg.component_fit != "closed_form" else COMPONENT_FORWARD_ORDER
+    unsupported = set(components) - set(supported)
     if unsupported:
-        raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}")
+        raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(supported)}")
     # Unlike parse_residual_completion_config (which needs 'mlp.c_proj' to anchor its cascade), nothing cascades
     # here (every position is fit independently against the pristine target base), so any non-empty,
     # repeat-free subset of COMPONENT_FORWARD_ORDER is legal, including {'attn.out_proj'} alone.
@@ -355,8 +406,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("backfit_tol must be a finite real number")
     if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
         raise ValueError("backfit_tol must be finite and > 0")
-    if cfg.residual_target not in {"transported_delta", "transported_endpoint"}:
-        raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
+    if cfg.residual_target not in {"transported_delta", "transported_endpoint", "native_oracle"}:
+        raise ValueError("residual_target must be 'transported_delta', 'transported_endpoint' or 'native_oracle'")
     if cfg.residual_target == "transported_endpoint" and cfg.component_target != "block_boundary":
         raise ValueError("residual_target='transported_endpoint' requires component_target='block_boundary'")
     if cfg.procrustes_source not in {"activation", "gradient"}:
@@ -508,7 +559,124 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
                 bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
                 if bad:
                     raise ValueError(f"sequential_points='mid_end' requires {need}; got incompatible {bad}")
+    _validate_component_ablations(cfg, components)
     return cfg
+
+
+#: Component groups a gradient fit takes as ONE joint fit (the q/k/v slices share the packed in_proj and the ln_1 input).
+_GRADIENT_FIT_GROUPS: frozenset[frozenset[str]] = frozenset(
+    frozenset(g)
+    for g in (
+        ("attn.v_proj",),
+        ("attn.q_proj", "attn.k_proj"),
+        ("attn.q_proj", "attn.k_proj", "attn.v_proj"),
+        ("mlp.c_fc",),
+        ("attn.out_proj",),
+        ("mlp.c_proj",),
+    )
+)
+
+
+def _validate_component_ablations(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of ``native_oracle`` / ``fit_blocks`` (all opt-in, default off)."""
+    if cfg.gradient_ridge not in {"eb_input", "match_norm"}:
+        raise ValueError("gradient_ridge must be 'eb_input' or 'match_norm'")
+    iters = cfg.gradient_fit_max_iters
+    if isinstance(iters, bool) or not isinstance(iters, int) or iters <= 0:
+        raise ValueError("gradient_fit_max_iters must be a positive integer")
+    gtol = cfg.gradient_fit_tol
+    if isinstance(gtol, bool) or not isinstance(gtol, (int, float)) or not math.isfinite(float(gtol)) or gtol <= 0:
+        raise ValueError("gradient_fit_tol must be a positive finite number")
+    if cfg.component_fit != "closed_form":
+        if frozenset(components) not in _GRADIENT_FIT_GROUPS:
+            raise ValueError(
+                "component_fit gradient arms fit one component group per run: attn.v_proj; attn.q_proj + attn.k_proj; "
+                "attn.q_proj + attn.k_proj + attn.v_proj; mlp.c_fc; attn.out_proj; or mlp.c_proj; "
+                f"got {sorted(components)}"
+            )
+        need = {
+            "depth_fit": "independent",
+            "component_target": "block_boundary",
+            "block_split": "none",
+            "ridge_estimator": "empirical_bayes",
+            "exact_form": True,
+            "endpoint_construction": "native_delta",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+            "procrustes_source": "activation",
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if cfg.residual_target == "transported_endpoint":
+            bad["residual_target"] = cfg.residual_target
+        if bad:
+            raise ValueError(f"component_fit={cfg.component_fit!r} requires {need}; got incompatible {bad}")
+    elif cfg.gradient_ridge != "eb_input":
+        raise ValueError("gradient_ridge='match_norm' needs component_fit='gradient_exact' or 'gradient_linearized'")
+    template = cfg.native_target_ckpt_template
+    if cfg.residual_target == "native_oracle":
+        if not isinstance(template, str) or "{task}" not in template:
+            raise ValueError("residual_target='native_oracle' requires native_target_ckpt_template containing '{task}'")
+        need = {
+            "depth_fit": "independent",
+            "component_target": "block_boundary",
+            "block_split": "none",
+            "procrustes_source": "activation",
+            "endpoint_construction": "native_delta",
+            "merge_mode": "per_task_then_merge",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"residual_target='native_oracle' requires {need}; got incompatible {bad}")
+    elif template is not None:
+        raise ValueError("native_target_ckpt_template is only used with residual_target='native_oracle'")
+    if cfg.pair_target_split not in {"none", "per_block_share", "interpolate"}:
+        raise ValueError("pair_target_split must be 'none', 'per_block_share' or 'interpolate'")
+    if cfg.pair_target_split != "none":
+        need = {
+            "depth_fit": "independent" if cfg.pair_target_split == "per_block_share" else "sequential",
+            "sequential_impl": "reference",
+            "sequential_points": "single",
+            "residual_target": "transported_delta",
+            "endpoint_construction": "native_delta",
+            "block_split": "none",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"pair_target_split={cfg.pair_target_split!r} requires {need}; got incompatible {bad}")
+    blocks = cfg.fit_blocks
+    if blocks is not None:
+        if isinstance(blocks, str) or not isinstance(blocks, (list, tuple)) or not blocks:
+            raise ValueError("fit_blocks must be None or a non-empty list of block indices")
+        if any(isinstance(b, bool) or not isinstance(b, int) or b < 0 for b in blocks):
+            raise ValueError("fit_blocks must hold non-negative integers")
+        if any(b >= c for b, c in zip(blocks, blocks[1:], strict=False)):
+            raise ValueError("fit_blocks must be sorted and unique")
+        need = {
+            "endpoint_construction": "native_delta",
+            "tv_scaling": "none",
+            "sequential_impl": "reference",
+            "sequential_points": "single",
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"fit_blocks requires {need}; got incompatible {bad}")
+
+
+def resolve_fit_blocks(config: DirectResidualConfig, depth: int) -> list[int]:
+    """Target blocks a fit covers: ``config.fit_blocks`` (range-checked against ``depth``) or every block."""
+    if config.fit_blocks is None:
+        return list(range(depth))
+    blocks = [int(b) for b in config.fit_blocks]
+    if blocks and blocks[-1] >= depth:
+        raise ValueError(f"fit_blocks {blocks} out of range for a target with {depth} blocks")
+    return blocks
 
 
 #: Defaults applied to decoder (LLM) runs when the key is absent (dataclass defaults are unchanged).
@@ -561,8 +729,44 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
                 f"Ariadne on decoder models does not support {name}={got!r} (must be {required!r}): "
                 "this option is vision-only"
             )
+    if cfg.residual_target == "native_oracle":
+        raise NotImplementedError("residual_target=native_oracle is vision-only")
+    if cfg.component_fit != "closed_form":
+        raise NotImplementedError("component_fit=gradient is vision-only")
     if cfg.sequential_points == "mid_end":
         # HF decoder layers receive hidden_states as a keyword argument, so the block_input capture (positional
         # inputs[0]) does not see the block input there.
         raise NotImplementedError("mid_end is vision-only")
     return cfg
+
+
+def target_groups(pairing) -> dict[int, tuple[int, int, int]]:
+    """``{j: (group_size, index_in_group, group_start)}``: groups are the maximal runs of consecutive target blocks
+    sharing one source block ``pairing[j]`` (size 1 when every target block has its own source block)."""
+    out: dict[int, tuple[int, int, int]] = {}
+    j = 0
+    n = len(pairing)
+    while j < n:
+        k = j
+        while k + 1 < n and pairing[k + 1] == pairing[j]:
+            k += 1
+        for t in range(j, k + 1):
+            out[t] = (k - j + 1, t - j, j)
+        j = k + 1
+    return out
+
+
+def annotate_target_split(rows, config: DirectResidualConfig, pairing) -> None:
+    """Record the per-block target scale / interpolation weight of ``pair_target_split`` in the diagnostics rows."""
+    if config.pair_target_split == "none":
+        return
+    groups = target_groups(pairing.pairing)
+    for row in rows:
+        size, index, _start = groups[int(row["position"])]
+        row["pair_target_split"] = config.pair_target_split
+        row["target_group_size"] = size
+        row["target_group_index"] = index
+        if config.pair_target_split == "per_block_share":
+            row["target_scale"] = 1.0 / size
+        else:
+            row["target_interp_weight"] = (index + 1) / size

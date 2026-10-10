@@ -72,7 +72,17 @@ method:
     # block_split: "none"                   # [ablation] intra-block solve: none | backfit | joint (resident only).
     # backfit_max_iters: 20                 # [ablation] backfit sweeps (> 0).
     # backfit_tol: 1.0e-4                   # [ablation] backfit tolerance (> 0).
-    # residual_target: "transported_delta"  # [ablation] transported_delta | transported_endpoint.
+    # residual_target: "transported_delta"  # [ablation] transported_delta | transported_endpoint | native_oracle (diagnostic,
+    #                                       #   vision-only: D*_j = native fine-tuned target minus target base at block j, no Procrustes map).
+    # native_target_ckpt_template: null    # [vision-only] "...{task}..." native fine-tuned target checkpoint for native_oracle.
+    # fit_blocks: null                      # [ablation] sorted unique target block indices to fit (null = all); the others get no update.
+    # pair_target_split: "none"             # [ablation] none | per_block_share (independent: block of a same-source group of m fits D_j/m) |
+    #                                       #   interpolate (sequential, single point: D_prev + (i+1)/m (D_j - D_prev); last block keeps D_j).
+    # component_fit: "closed_form"          # [ablation, vision-only] closed_form | gradient_exact | gradient_linearized (block-input fit of
+    #                                       #   q+k, v, q+k+v, mlp.c_fc, attn.out_proj or mlp.c_proj with the exact / first-order block forward).
+    # gradient_fit_max_iters: 500           # [ablation, vision-only] L-BFGS / conjugate-gradient iteration cap of the gradient fits.
+    # gradient_fit_tol: 1.0e-9              # [ablation, vision-only] stop at this relative change of the objective between iterations.
+    # gradient_ridge: "eb_input"            # [ablation, vision-only] eb_input | match_norm (||dW|| matched to the closed-form mlp.c_proj fit).
     # procrustes_source: "activation"       # [ablation] statistic for the alignment: activation | gradient (gradient Q is
     #                                       #   not unique under rank-deficient cross-covariance; flagged in diagnostics).
     # alignment_map: "polar"                # [ablation] polar | ridge | random_isometry.

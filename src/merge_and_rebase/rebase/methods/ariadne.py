@@ -46,6 +46,8 @@ from ._ariadne.config import (
     order_components,
     parse_direct_residual_config,
     resolve_direct_residual_preset,
+    resolve_fit_blocks,
+    target_groups,
 )
 from ._ariadne.diagnostics import (
     compute_direct_residual_task_vector_stats,
@@ -59,6 +61,7 @@ from ._ariadne.fit import (
     fit_direct_residual,
     fit_sequential_source_endpoints,
 )
+from ._ariadne.gradient_fit import fit_direct_residual_gradient_streaming
 from ._ariadne.sequential_carry import fit_direct_residual_sequential_block_carry
 from ._ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
@@ -108,6 +111,8 @@ def _fit_body(
     build_cfg_task: Any = None,
     source_text_features: torch.Tensor | None = None,
     target_text_features: torch.Tensor | None = None,
+    task_name: str | None = None,
+    native_target_model: torch.nn.Module | None = None,
 ) -> tuple[
     dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]], dict[str, Any], dict[str, torch.Tensor]
 ]:
@@ -138,6 +143,31 @@ def _fit_body(
     ``config.activation_storage`` selects the resident path (full per-batch banks) or the streaming path
     (O(1)-in-``num_batches`` host RAM); ``realization_diagnostics`` is supported under both.
     """
+    if config.component_fit != "closed_form":
+        if family_adapter is not None:
+            raise NotImplementedError("component_fit=gradient is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("component_fit=gradient needs activation_storage='streaming'")
+    native_model = None
+    if config.residual_target == "native_oracle":
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("residual_target='native_oracle' needs activation_storage='streaming'")
+        if family_adapter is not None:
+            raise NotImplementedError("residual_target='native_oracle' is vision-only")
+        native_model = native_target_model
+        if native_model is None:
+            if task_name is None:
+                raise ValueError(
+                    "residual_target='native_oracle' needs task_name (to fill {task}) or native_target_model"
+                )
+            from ._ariadne.native_target import build_native_target_model
+
+            native_model = build_native_target_model(
+                target_model,
+                target_base_sd,
+                source_base_model.state_dict(),
+                config.native_target_ckpt_template.format(task=task_name),
+            ).to(device)
     alignment_mark = recorder.mark()
     alignment_started = time.perf_counter()
     streaming = config.activation_storage == "streaming"
@@ -235,6 +265,12 @@ def _fit_body(
                 diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
                 rank_out=rank_diagnostics,
             )
+            if config.pair_target_split == "per_block_share":
+                sizes = target_groups(pairing.pairing)
+                desired = {
+                    j: [d / sizes[j][0] for d in batches] if sizes[j][0] > 1 else batches
+                    for j, batches in desired.items()
+                }
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
@@ -299,7 +335,9 @@ def _fit_body(
             family_adapter=family_adapter,
         )
     elif streaming:
-        if config.depth_fit != "sequential":
+        if config.component_fit != "closed_form":
+            fit_streaming = fit_direct_residual_gradient_streaming
+        elif config.depth_fit != "sequential":
             fit_streaming = fit_direct_residual_streaming
         elif config.sequential_impl == "block_carry":
             fit_streaming = fit_direct_residual_sequential_block_carry
@@ -315,7 +353,9 @@ def _fit_body(
             config=config,
             device=device,
             family_adapter=family_adapter,
+            **({"native_model": native_model} if native_model is not None else {}),
         )
+        del native_model
     else:
         target_corrections, diagnostics = fit_direct_residual(
             target_model,
@@ -390,7 +430,7 @@ def _fit_body(
     task_vector_stats = None
     with cost_excluded():
         if bool(config.realization_diagnostics):
-            positions = list(range(pairing.target_depth))
+            positions = resolve_fit_blocks(config, pairing.target_depth)
             # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed q/k/v share ONE state-dict key
             # (attn.in_proj_weight), so key presence cannot tell which of q/k/v were fit. Passing exactly
             # order_components(config.components) checks only the components actually requested.
@@ -505,6 +545,8 @@ class AriadneRebase:
         build_cfg_task: Any = None,
         source_text_features: torch.Tensor | None = None,
         target_text_features: torch.Tensor | None = None,
+        task_name: str | None = None,
+        native_target_model: torch.nn.Module | None = None,
     ) -> AriadnePrepared:
         """Fit Ariadne once; see ``_fit_body`` for the pipeline and its brackets.
 
@@ -532,6 +574,10 @@ class AriadneRebase:
             source_text_features=source_text_features,
             target_text_features=target_text_features,
         )
+        if task_name is not None:
+            kwargs["task_name"] = task_name
+        if native_target_model is not None:
+            kwargs["native_target_model"] = native_target_model
         if recorder is not None:
             scaled, timing, diagnostics, extra, unit = _fit_body(recorder, **kwargs)
         else:
