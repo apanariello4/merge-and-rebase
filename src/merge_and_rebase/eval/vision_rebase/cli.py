@@ -25,6 +25,7 @@ from ...merge.registry import list_methods as list_merge_methods
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase import list_methods
 from ...rebase.config_schema import load_run_config
+from ...rebase.depth_report import describe_depth_handling
 from ...rebase.run_config import resolve_run_config
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
@@ -256,9 +257,11 @@ def main() -> None:
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
+        plan = resolved.bind(source_depth, target_depth)
+        print(describe_depth_handling(resolved, plan, source_depth, target_depth))
         runtime = VisionRuntime(
             cfg=cfg,
-            plan=resolved.bind(source_depth, target_depth),
+            plan=plan,
             clf_source=clf_source,
             clf_target=clf_target,
             source_cfg=source_cfg,

@@ -50,16 +50,19 @@ method:
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
-  defaults: method                          # method: THESEUS -> BRACE prestep with interpolate_per_weight and
-                                            #   skip_correction=true; legacy: pre-release behaviour. Absent: a depth
-                                            #   mismatch whose meaning changed raises ConfigMeaningChangedError.
+  rule: interpolate_layers                  # THESEUS depth handling: insert blended copies of source layers until the source
+                                            #   has the target's depth (the run prints which layers). interpolate_layers |
+                                            #   index_match | method_default; the internal name brace also reaches the
+                                            #   experimental ridge correction. Absent rule: a depth mismatch raises
+                                            #   ConfigMeaningChangedError.
+  # defaults: method                        # [legacy] let the method pick (THESEUS -> interpolate_layers, BiCo -> index_match).
   # enabled: true                           # run the depth prestep on a depth mismatch (true when absent).
-  # rule: "method_default"                  # method_default | brace | discrete_index_match (THESEUS default: brace).
   # Source and target depth differ (24 -> 28 layers): BRACE inserts decoder layers into the source so THESEUS can
   # transport layer by layer. On LLMs n_batches_act also sizes the shared calibration pool (see calibration below).
-  brace:
-    data:
-      num_batches: 100                      # [main] calibration batches captured by BRACE (int > 0).
+  # brace:
+    # data:
+      # num_batches: 2                      # calibration batches the BRACE correction captures (read only with
+      #                                     #   skip_correction: false); on LLMs it also enters the calibration-pool size.
       # split: "test"                       # split of a calibration_dataset; a harness source ignores it and always
       #                                     #   holds its calibration docs out of the evaluation.
       # dataset: null                       # BRACE calibration corpus; the top-level calibration_dataset wins over it.
@@ -71,8 +74,8 @@ depth_alignment:
     # extension_strategy: "interpolate_per_weight" # [BRACE-only] [main] new-layer init: interpolate_per_weight |
     #                                       #   duplicate_per_weight (a shrink needs a per-weight strategy).
     # dampening_factor: 1.0                 # [BRACE-only] scale on the inserted layer's output (biases included).
-    # skip_correction: true                 # [BRACE-only] [default: method] skip the ridge correction of inserted layers;
-    #                                       #   false = corrected arm (~175 GiB host RAM on this pair vs ~56 GiB).
+    # skip_correction: true                 # [BRACE-only] [main] default: no ridge correction of inserted layers. false is the
+    #                                       #   EXPERIMENTAL corrected arm (warns; ~175 GiB host RAM on this pair vs ~56 GiB).
     # skip_final_ln: false                  # [BRACE-only] leave the final norm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # n_cascade_iters: 1                    # [BRACE-only] cascade iterations (floored at 1).

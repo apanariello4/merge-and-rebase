@@ -69,12 +69,12 @@ method:
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
-  defaults: method                          # method: BiCo -> depth_rule=discrete_index_match (paper-native: the
-                                            #   source is re-indexed onto the target depth, statistics are taken on the
-                                            #   re-indexed source); legacy: pre-release behaviour (BRACE). Absent: a
-                                            #   depth mismatch raises ConfigMeaningChangedError.
+  rule: index_match                         # BiCo depth handling: target layer j copies source layer round(j*(Ds-1)/(Dt-1)), no
+                                            #   blending and no fit; statistics are taken on the re-indexed source. index_match |
+                                            #   interpolate_layers | method_default. Absent rule: a depth mismatch raises
+                                            #   ConfigMeaningChangedError.
+  # defaults: method                        # [legacy] let the method pick (THESEUS -> interpolate_layers, BiCo -> index_match).
   # enabled: true                           # run the depth prestep on a depth mismatch (the CLI sets true when absent).
-  # rule: "method_default"                  # method_default | brace | discrete_index_match (BiCo default: discrete_index_match).
   # Source and target depth differ (12 -> 24 blocks). BiCo's default rule (discrete_index_match) re-indexes the source
   # blocks onto the target depth; every [BRACE-only] key below is then inert and warns when set. They take effect
   # only with depth_rule: brace (the legacy BiCo behaviour). Not read when the depths match.
@@ -92,7 +92,7 @@ depth_alignment:
       # split: "test"                       # split the BRACE calibration batches come from.
       # dataset: null                       # task-independent calibration set (str or dict); exclusive with data.task.
       # task: null                          # shorthand: calibrate every task on this one named task.
-    # skip_correction: false                # [BRACE-only] skip the ridge correction of inserted blocks.
+    # skip_correction: true                 # [BRACE-only] default; false is the EXPERIMENTAL ridge correction (warns).
     # skip_final_ln: false                  # [BRACE-only] leave the final LayerNorm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # ridge_weight: 1.0e-6                  # [BRACE-only] ridge weight of the correction (paper Eq. 9, >= 0).

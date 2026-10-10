@@ -45,18 +45,19 @@ method:
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
-  defaults: method                          # method: BiCo -> depth_rule=discrete_index_match (paper-native: the
-                                            #   source decoder is re-indexed onto the target depth, statistics are taken
-                                            #   on the re-indexed source); legacy: pre-release behaviour (BRACE).
-                                            #   Absent: a depth mismatch raises ConfigMeaningChangedError.
+  rule: index_match                         # BiCo depth handling: target layer j copies source layer round(j*(Ds-1)/(Dt-1)), no
+                                            #   blending and no fit; statistics are taken on the re-indexed source. index_match |
+                                            #   interpolate_layers | method_default. Absent rule: a depth mismatch raises
+                                            #   ConfigMeaningChangedError.
+  # defaults: method                        # [legacy] let the method pick (THESEUS -> interpolate_layers, BiCo -> index_match).
   # enabled: true                           # run the depth prestep on a depth mismatch (true when absent).
-  # rule: "method_default"                  # method_default | brace | discrete_index_match (BiCo default: discrete_index_match).
   # Source and target depth differ (24 -> 28 layers). BiCo's default rule (discrete_index_match) re-indexes the source
   # layers onto the target depth; every [BRACE-only] key below is then inert and warns when set (it takes effect only
   # with depth_rule: brace). On LLMs n_batches_act still sizes the shared calibration pool (see calibration below).
-  brace:
-    data:
-      num_batches: 100                      # calibration-pool sizing (BRACE capture batches under depth_rule: brace).
+  # brace:
+    # data:
+      # num_batches: 2                      # calibration batches the BRACE correction captures (read only with depth_rule:
+      #                                     #   brace and skip_correction: false); on LLMs it also enters the calibration-pool size.
       # split: "test"                       # split of a calibration_dataset; a harness source ignores it and always
       #                                     #   holds its calibration docs out of the evaluation.
       # dataset: null                       # BRACE calibration corpus; the top-level calibration_dataset wins over it.
@@ -68,7 +69,7 @@ depth_alignment:
     # extension_strategy: "interpolate_per_weight" # [BRACE-only] [main] new-layer init: interpolate_per_weight |
     #                                       #   duplicate_per_weight (a shrink needs a per-weight strategy).
     # dampening_factor: 1.0                 # [BRACE-only] scale on the inserted layer's output (biases included).
-    # skip_correction: false                # [BRACE-only] skip the ridge correction of inserted layers.
+    # skip_correction: true                 # [BRACE-only] default; false is the EXPERIMENTAL ridge correction (warns).
     # skip_final_ln: false                  # [BRACE-only] leave the final norm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # n_cascade_iters: 1                    # [BRACE-only] cascade iterations (floored at 1).

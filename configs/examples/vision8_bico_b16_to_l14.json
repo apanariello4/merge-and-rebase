@@ -29,7 +29,7 @@
     }
   },
   "depth_alignment": {
-    "defaults": "method"
+    "rule": "index_match"
   },
   "alpha": {
     "search": true,

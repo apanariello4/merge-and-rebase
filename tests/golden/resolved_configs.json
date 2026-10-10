@@ -54,14 +54,14 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -164,14 +164,14 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -184,7 +184,7 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -282,7 +282,7 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
@@ -302,7 +302,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -402,14 +402,14 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -512,14 +512,14 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -532,7 +532,7 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -630,7 +630,7 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
@@ -650,7 +650,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -750,7 +750,7 @@
     "insertion_order": "bottom-top",
     "insertion_target_mode": "direct",
     "lmc_mode": "independent",
-    "n_batches_act": 100,
+    "n_batches_act": 2,
     "n_cascade_iters": 1,
     "reference_capture": "lazy",
     "ridge_identity": 0.0,
@@ -770,7 +770,7 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {},
    "device": "cpu",
@@ -933,7 +933,7 @@
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -1091,7 +1091,7 @@
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -1104,14 +1104,14 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": null,
     "rule": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1267,14 +1267,14 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": "interpolate_per_weight",
     "rule": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1452,7 +1452,7 @@
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -1610,7 +1610,7 @@
     "ridge_weight": 1e-06,
     "share_ft_refs": false,
     "show_progress": true,
-    "skip_correction": false,
+    "skip_correction": true,
     "skip_final_ln": false,
     "target_layers_total": null,
     "target_shared_correction": null,
@@ -1623,14 +1623,14 @@
     "extension_strategy": null,
     "kind": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": null,
     "rule": "discrete_index_match",
     "skip_correction": null,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",
@@ -1786,14 +1786,14 @@
     "extension_strategy": "interpolate_per_weight",
     "kind": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "depth_rule_resolved": {
     "depth_pairing": null,
     "extension_strategy": "interpolate_per_weight",
     "rule": "brace",
     "skip_correction": true,
-    "source": "method_default"
+    "source": "config"
    },
    "device": "cuda",
    "entrypoint": "vision",

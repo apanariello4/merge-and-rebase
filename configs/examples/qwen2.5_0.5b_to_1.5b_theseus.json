@@ -9,12 +9,7 @@
     }
   },
   "depth_alignment": {
-    "defaults": "method",
-    "brace": {
-      "data": {
-        "num_batches": 100
-      }
-    }
+    "rule": "interpolate_layers"
   },
   "alpha": {
     "value": 1.0,

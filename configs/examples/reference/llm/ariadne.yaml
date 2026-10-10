@@ -55,8 +55,9 @@ method:
     # residual_target: "transported_delta"  # [ablation] transported_delta | transported_endpoint.
     # alignment_map: "polar"                # [ablation] polar | ridge | random_isometry.
     # alignment_seed: 0                     # [ablation] seed of random_isometry.
-    # depth_pairing: "relative"             # [main] source/target layer pairing: relative (uniform nearest index) |
-    #                                       #   spread_duplicate | [ablation] reversed | shift_plus1 | shift_minus1.
+    depth_pairing: relative                 # [main] source/target layer pairing: relative (target layer j <- source layer
+                                            #   round(j*(Ds-1)/(Dt-1))) | spread_duplicate | [ablation] reversed | shift_plus1 |
+                                            #   shift_minus1.
     # streaming_fingerprint_tol: 1.0e-9     # streaming consistency check tolerance (> 0); bf16 drift is reported.
     # copy_shape_matching_source_deltas: false # [ablation] also copy shape-matching source deltas of non-fitted
     #                                       #   parameters (embeddings, norms, ...); default: the task vector is only the fit.
@@ -73,13 +74,14 @@ method:
     # calibration_data: "task_local"        # [vision-only] calibration images; text calibration is set below.
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
-depth_alignment:
-  defaults: method                          # no effect on Ariadne (no depth rule); kept identical across examples.
-  # Ariadne runs no BRACE prestep. On LLMs n_batches_act still enters the shared calibration-pool size, together
-  # with ariadne_params.num_batches (the larger wins); a fit that still gets fewer batches than requested warns.
-  brace:
-    data:
-      num_batches: 100                      # calibration-pool sizing (see the calibration section).
+# depth_alignment:                          # Ariadne adds no layers, so there is no depth rule: ariadne_params.depth_pairing
+                                            #   (below) is its depth handling. Nothing here is read for Ariadne.
+  # Ariadne runs no depth step, so nothing under depth_alignment.brace applies. ariadne_params.num_batches sizes the
+  # LLM calibration pool; a fit that still gets fewer batches than requested warns.
+  # brace:
+    # data:
+      # num_batches: 2                      # legacy n_batches_act: enters the calibration-pool size only if larger than
+      #                                     #   ariadne_params.num_batches; BRACE itself does not run for Ariadne.
 
 # ---------------------------------------------------------------- merge
 # merge:

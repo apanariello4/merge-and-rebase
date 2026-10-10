@@ -8,12 +8,7 @@
     }
   },
   "depth_alignment": {
-    "defaults": "method",
-    "brace": {
-      "data": {
-        "num_batches": 100
-      }
-    }
+    "rule": "index_match"
   },
   "alpha": {
     "value": 1.0,

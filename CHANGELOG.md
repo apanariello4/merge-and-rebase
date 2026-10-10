@@ -38,6 +38,16 @@ unless a change below says otherwise.
 ### Behaviour changes (declared)
 - A depth-changing THESEUS/BiCo config without `depth_defaults` or an explicit `skip_correction` /
   `depth_alignment` / `depth_rule` raises `ConfigMeaningChangedError` naming both fixes.
+- `block_extension_params.skip_correction` now defaults to `true` on every path (the dataclass, the decoder and vision
+  extenders, the legacy depth rule): the BRACE ridge correction is off unless `skip_correction: false` is set, it is
+  documented as experimental and warns when enabled. Configs that relied on the old default (correction on) now set
+  `skip_correction: false` explicitly; golden cases that pin the corrected arm do so explicitly.
+- The depth handling is stated in the config in plain words: `depth_alignment.rule` (`block_extension_params.depth_rule`)
+  accepts `interpolate_layers` (THESEUS: blended inserted layers, no correction) and `index_match` (BiCo: copy layers by
+  index) next to the internal `brace` / `discrete_index_match`; Ariadne states `ariadne_params.depth_pairing`. The
+  examples and reference configs use these instead of `depth_alignment.defaults: method`, which stays accepted. Every
+  run prints one `Depth handling: ...` line naming what it executes. An explicit rule resolves to the same executed
+  depth rule as the method default (`tests/test_depth_rule_plain_names_20261009.py`).
 - Padding rows are removed from BRACE decoder correction statistics (changes decoder BRACE results).
 - THESEUS/BiCo padding hardening: all-pad batches contribute no rows, mask mismatches raise, mean/cls pooling is
   masked; `seq_align="mean"` no longer crashes on decoders.

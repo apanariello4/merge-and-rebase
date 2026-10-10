@@ -47,10 +47,19 @@ EXPECTED = {
 # fmt: on
 
 
+def _method_default_depth(cfg: dict) -> dict:
+    """The base example states THESEUS's explicit depth rule; this pin swaps the method, so use the per-method default."""
+    params = dict(cfg.get("block_extension_params") or {})
+    params.pop("depth_rule", None)
+    cfg["block_extension_params"] = params
+    cfg["depth_defaults"] = "method"
+    return cfg
+
+
 def _vision(method: str) -> dict:
     from merge_and_rebase.rebase.run_config import resolve_run_config
 
-    cfg = dict(canonicalize(load_json(VISION_BASE)))
+    cfg = _method_default_depth(dict(canonicalize(load_json(VISION_BASE))))
     cfg.update(method=method, method_params={}, block_extension_enabled=True)
     resolved = resolve_run_config(cfg)
     plan = resolved.bind(*DEPTHS["vision"])
@@ -61,7 +70,7 @@ def _llm(method: str) -> dict:
     from merge_and_rebase.eval.llm_rebase.run_config import resolve_llm_method, resolve_llm_run_config
     from merge_and_rebase.rebase.block_extension import config as be_config
 
-    cfg = dict(canonicalize(load_json(LLM_BASE)))
+    cfg = _method_default_depth(dict(canonicalize(load_json(LLM_BASE))))
     cfg.update(method=method, method_params={}, block_extension_enabled=True)
     method_name, method_obj, method_params = resolve_llm_method(cfg)
     enabled, be_cfg = be_config.resolve_block_extension_config(cfg)

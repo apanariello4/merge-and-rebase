@@ -81,7 +81,7 @@ def _prepare_resized_task_delta(
     # it never captures reference or component activations.
     uncorrected_delta: dict[str, torch.Tensor] | None = None
     reference_config = _config_with_correction_disabled(config)
-    if reference_config is not None and not bool(getattr(config, "skip_correction", False)):
+    if reference_config is not None and not bool(getattr(config, "skip_correction", True)):
         ref_base = deepcopy(source_base_model)
         ref_ft = deepcopy(source_ft_model)
         run_block_extension_llm(

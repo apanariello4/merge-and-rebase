@@ -83,16 +83,17 @@ method:
     # streaming_position_chunk: null        # block positions per capture sweep (bounds host RAM); null = all at once.
     # streaming_fingerprint_tol: 1.0e-9     # streaming consistency check tolerance (> 0).
     # calibration_data: "task_local"        # [ablation] calibration images: task_local | tiny_imagenet | vision8_mix.
-    # depth_pairing: "relative"             # [main] source/target block pairing: relative (uniform nearest index) |
-    #                                       #   spread_duplicate | [ablation] reversed | shift_plus1 | shift_minus1.
+    depth_pairing: relative                 # [main] source/target block pairing: relative (target block j <- source block
+                                            #   round(j*(Ds-1)/(Dt-1))) | spread_duplicate | [ablation] reversed | shift_plus1 |
+                                            #   shift_minus1.
     # fidelity_holdout: false               # [diagnostic] held-out fidelity measurement (never read by the fit).
     # fidelity_holdout_batches: 10          # [diagnostic] held-out batches (> 0).
     # copy_shape_matching_source_deltas: false # [ablation] also copy shape-matching source deltas of non-fitted
     #                                       #   parameters (default: the task vector is only the fit).
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
-depth_alignment:
-  defaults: method                          # no effect on Ariadne (no depth rule); kept identical across examples.
+# depth_alignment:                          # Ariadne adds no layers, so there is no depth rule: ariadne_params.depth_pairing
+                                            #   (below) is its depth handling. Nothing here is read for Ariadne.
 
 # ---------------------------------------------------------------- merge
 # merge:

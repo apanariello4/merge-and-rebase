@@ -74,11 +74,13 @@ method:
 
 # ---------------------------------------------------------------- depth alignment (source depth -> target depth)
 depth_alignment:
-  defaults: method                          # method: THESEUS -> BRACE prestep with interpolate_per_weight and
-                                            #   skip_correction=true; legacy: pre-release behaviour. Absent: a depth
-                                            #   mismatch whose meaning changed raises ConfigMeaningChangedError.
+  rule: interpolate_layers                  # THESEUS depth handling: insert blended copies of source layers until the source
+                                            #   has the target's depth (the run prints which layers). interpolate_layers |
+                                            #   index_match | method_default; the internal name brace also reaches the
+                                            #   experimental ridge correction. Absent rule: a depth mismatch raises
+                                            #   ConfigMeaningChangedError.
+  # defaults: method                        # [legacy] let the method pick (THESEUS -> interpolate_layers, BiCo -> index_match).
   # enabled: true                           # run the depth prestep on a depth mismatch (the CLI sets true when absent).
-  # rule: "method_default"                  # method_default | brace | discrete_index_match (THESEUS default: brace).
   # Source and target depth differ (12 -> 24 blocks): BRACE inserts blocks into the source so THESEUS can
   # transport layer by layer. Not read when the depths match.
   # brace:
@@ -95,8 +97,8 @@ depth_alignment:
       # split: "test"                       # split the BRACE calibration batches come from.
       # dataset: null                       # task-independent calibration set (str or dict); exclusive with data.task.
       # task: null                          # shorthand: calibrate every task on this one named task.
-    # skip_correction: true                 # [BRACE-only] [default: method] skip the ridge correction of inserted blocks;
-    #                                       #   false = corrected BRACE arm (needs much more memory).
+    # skip_correction: true                 # [BRACE-only] [main] default: no ridge correction of inserted blocks. false is the
+    #                                       #   EXPERIMENTAL corrected BRACE arm (warns; needs much more memory).
     # skip_final_ln: false                  # [BRACE-only] leave the final LayerNorm out of the correction.
     # ridge_identity: 0.0                   # [BRACE-only] ridge pull towards identity (>= 0).
     # ridge_weight: 1.0e-6                  # [BRACE-only] ridge weight of the correction (paper Eq. 9, >= 0).

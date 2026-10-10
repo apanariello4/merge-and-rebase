@@ -260,8 +260,11 @@ def test_config_requires_shared_mode_and_a_real_correction() -> None:
             {"block_extension_enabled": True, "block_extension_params": params}
         )
 
+    # skip_correction defaults to true (since 2026-10-09), so the correction-only options need an explicit false.
+    with pytest.raises(ValueError, match="skip_correction=false"):
+        resolve({"lmc_mode": "shared", "target_shared_correction": {"target_weight": 0.3}})
     with pytest.raises(ValueError, match="lmc_mode='shared'"):
-        resolve({"target_shared_correction": {"target_weight": 0.3}})
+        resolve({"skip_correction": False, "target_shared_correction": {"target_weight": 0.3}})
     with pytest.raises(ValueError, match="skip_correction=false"):
         resolve({
             "lmc_mode": "shared",
@@ -279,9 +282,9 @@ def test_config_requires_shared_mode_and_a_real_correction() -> None:
             "target_shared_correction": {"target_weight": 0.3},
         })
     with pytest.raises(ValueError, match="component"):
-        resolve({"lmc_mode": "shared", "target_shared_correction": {"component": "c_fc"}})
+        resolve({"lmc_mode": "shared", "skip_correction": False, "target_shared_correction": {"component": "c_fc"}})
     with pytest.raises(ValueError, match="Unknown"):
-        resolve({"lmc_mode": "shared", "target_shared_correction": {"nonsense": 1}})
+        resolve({"lmc_mode": "shared", "skip_correction": False, "target_shared_correction": {"nonsense": 1}})
 
     _, cfg = resolve({"lmc_mode": "shared", "target_shared_correction": {"enabled": False}})
     assert cfg.target_shared_correction is None

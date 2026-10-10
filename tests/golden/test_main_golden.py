@@ -89,7 +89,7 @@ EXPECTED: dict[str, str] = {
     "ariadne_spelling_direct_residual:resolved_config": "37492df2cb806d9d46ad224ec71febb60b6e7081c79eeae57d62f3e6b30d6412",
     "ariadne_spelling_direct_residual:summary": "d600514739394479f5c8af00a43a1f67abb0d5475eca17ab9e9ea2f5013f55a3",
     "bico_extend_depth_alignment_absent:events": "2951ff3e64243888e29519fe102b43f475b518b670531d8efb71e70c7691266d",
-    "bico_extend_depth_alignment_absent:resolved_config": "1cc8de73ef3df725f04a51f15dc29104eccce03f77cab8f8af50eceea9fafa28",
+    "bico_extend_depth_alignment_absent:resolved_config": "857c7ca46cd5b0c154e898a52763ebe5ef09a079b88d8add4e097287afb6f93d",
     "bico_extend_depth_alignment_absent:summary": "3b6078b19369f02720e46091dc1c176be41a1dac672e6d737f2045d81a3aa8b0",
     "bico_extend_depth_defaults_method:events": "76e14d3a2f64cb79c72bada854eb6e4d744788907a8603b1fa09a1892effaf8c",
     "bico_extend_depth_defaults_method:resolved_config": "562634f183fa57a07af0b338b392df616303ea1d42d028efee84421d150dfee2",
@@ -117,7 +117,7 @@ EXPECTED: dict[str, str] = {
     "theseus_alpha_patience_shared:resolved_config": "40461ceb706dd5957ed2127c293402d4af84a44c6486f272a4a03a3ac5440497",
     "theseus_alpha_patience_shared:summary": "071e0b172eb640543a670101c1082bc3d812b3aba94234434d342827c9e73b0d",
     "theseus_brace_merge_then_transport:events": "d7c196e1874ada01e3a8f2d303b63a7b99ccf5f1476120652951bba8d70b0c5c",
-    "theseus_brace_merge_then_transport:resolved_config": "9641014779be7127e747c89af3122e646c2c7a00cbdd2ab0d1671ad83f7c8489",
+    "theseus_brace_merge_then_transport:resolved_config": "8e46faa4326bf2ddded9791b56da344a6670c806b4edcf2a8edfe69d71f1fd7a",
     "theseus_brace_merge_then_transport:summary": "5461253574b3e9bd91d835ad83a1550e10a3e64311a8bbd9f28aace795da5ec8",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:events": "770993575bb34821bd491cf840365d33698cd7ae31d35478f427023f278f2c34",
     "theseus_equal_depth_none_fixed_alpha_save_tvs:file:tvs/DTD_theseus_transported_legacy_visual.pt": "2b2f8a33258f9b626bc98ad9096c084b30caf5f1d8f1e856c34e8f4070fe9592",
@@ -138,7 +138,7 @@ EXPECTED: dict[str, str] = {
     "theseus_extend_depth_defaults_method:resolved_config": "b421f8e9b43121622c0f79d27bf09975c59ea00fa1d07b0e5ddb2c49def2d0cb",
     "theseus_extend_depth_defaults_method:summary": "1eb109a0d6ebf897c377785dca4463de1f0ad0a222f5a2afbc056f833e8035d5",
     "theseus_merge_then_brace_then_transport_correction:events": "781544f517b2ba512ea1697c9d58115dfadac20b1b7a0204403f6e8a0307428d",
-    "theseus_merge_then_brace_then_transport_correction:resolved_config": "4ca7dce6ff0a9b5262edb18688b55b9ec71e8fde885ff9c99c05203bf168d0b7",
+    "theseus_merge_then_brace_then_transport_correction:resolved_config": "593ba0650d03db8a06f47867b3329f159687b83b4a58bc9d903af67085cf82dd",
     "theseus_merge_then_brace_then_transport_correction:summary": "0ce12778bf21394b8c65b99cb40e9bacea15f0f6e0a85a38bddc66ba52bb37dc",
     "theseus_merge_then_brace_then_transport_skip_correction:events": "a1aa7dae60d1ca1568f590a7307f1e0bc2e5c315f499d7de85f651bf2b2c2946",
     "theseus_merge_then_brace_then_transport_skip_correction:resolved_config": "5ab34a672ef40da2114a0a20f3475f4981870025e95427c28a69a19b2f540c70",
@@ -150,10 +150,10 @@ EXPECTED: dict[str, str] = {
     "theseus_merge_then_rebase_tiny_protocol:resolved_config": "a604f1007cc4d329527a702b72313441afb2f288a4bd3c85274ba6f752e51cde",
     "theseus_merge_then_rebase_tiny_protocol:summary": "bf2c1a2c261a5d5a4e4dd90cf0efe6df7295270ddefe6971e47ad084f958f6be",
     "theseus_native_target_auto_detected_per_task:events": "a905c680f869e7087bd2aa0fc353928a4bec6d96c8f1f30e0d85d5f41612eecf",
-    "theseus_native_target_auto_detected_per_task:resolved_config": "38ea5fa0a04bd9dc5668a9e75c69ef7169ae3e9caf58ade2ecde22b26eb01f46",
+    "theseus_native_target_auto_detected_per_task:resolved_config": "6c5c94a8142b24674420e61fa08bcda764f9381eb0cc865f8c61ef5ed715aee4",
     "theseus_native_target_auto_detected_per_task:summary": "653d1400dfb96a384597a316809c8ff7b57e588f259741e7e30a2d13c05dd90f",
     "theseus_native_target_explicit:events": "07e139c8ba220ebf927705756b5c3315c498f017ea48c53acef0720a4e6764aa",
-    "theseus_native_target_explicit:resolved_config": "9a8a82ecbc021c294c82cc76762276d99e8596baa31fa245c5f5ee0bac7b6173",
+    "theseus_native_target_explicit:resolved_config": "86ae9c314eff1009e14831956f3de4c103833e3789fd866ea0b60ff3664a16e9",
     "theseus_native_target_explicit:summary": "3439c56103f8ebe5f4307f1f98a27afc8e3805f75d6b0d9ffede8298587ac55d",
     "theseus_rebase_then_merge_per_task_hierarchical:events": "03465f70d0ecd7ae22fb9b0a830e0c7f821fbde6bf383c149cfa4d8a6963db6a",
     "theseus_rebase_then_merge_per_task_hierarchical:resolved_config": "1353eeec7eaf5e4e4c815118f2fa527b82e8e8558187296bf180360a68a6c487",
@@ -175,7 +175,7 @@ EXPECTED: dict[str, str] = {
     "theseus_samedepth_eval_before_rebase:resolved_config": "c6c470d2cd9539809f274b146fb6c4a0a839415c7f165a4f87b50075b8ada306",
     "theseus_samedepth_eval_before_rebase:summary": "f510943f7d40c8124db0fa7559d44ee8bf35a908700c15d7f82d9af4453aadc3",
     "theseus_shrink_brace:events": "0370b172ea2a3d7c13dec63092774919e047a89f43e3106ef4f275429a8b7b40",
-    "theseus_shrink_brace:resolved_config": "60ca4c7c30730404763a1a3f2e04687480ca58d04c1e447907732afb0a488d88",
+    "theseus_shrink_brace:resolved_config": "2ac1aea803a8f5e70dad296dbd45e4db3c447bc39e74fb648e79c113eed30b5c",
     "theseus_shrink_brace:summary": "b44392f93f0852dae0b62ac2fdf834067c32d44bc859272502088387d28cd948",
     "theseus_shrink_depth_defaults_method:events": "f5a2c6855e824ccd1767b9bf23dc9e2c02652965546ac3c069d9818929e19b79",
     "theseus_shrink_depth_defaults_method:resolved_config": "b421f8e9b43121622c0f79d27bf09975c59ea00fa1d07b0e5ddb2c49def2d0cb",
@@ -184,7 +184,7 @@ EXPECTED: dict[str, str] = {
     "theseus_transport_calibration_tiny_imagenet:resolved_config": "90d671f2c3f5ed16b1d11d9a0eabfe6a4ff2e2a17d28839569793228500d63a3",
     "theseus_transport_calibration_tiny_imagenet:summary": "c8365cb0564364a4e302db0aff773ae6fa1927ddb5e4ba434fd93029a17ff057",
     "theseus_extend_eval_before_rebase:summary": "e0cd484bbf91c650aa7af2dbe61ca9b2a55f5490b89fe93595b00980cba6e7f2",
-    "theseus_extend_eval_before_rebase:resolved_config": "afd0e3fa396d1a83fc0e082352de46b7ae00c276c2e61b04229056cf88a30207",
+    "theseus_extend_eval_before_rebase:resolved_config": "93630415efed87992c54a22caa99a9f960ac55e570c033b458b12b52c5197258",
     "theseus_extend_eval_before_rebase:events": "04c3e15a491dd61bdc7acb80d79d346d99972215916043a0ecb63eccd03aa58d",
 }
 
@@ -660,9 +660,9 @@ CASES: dict[str, Case] = {
     ),
     # 4 / 5: BiCo with a depth mismatch
     "bico_extend_discrete_index_match": Case(_EXT, {"method": "bico", "depth_alignment": "discrete_index_match"}),
-    "bico_extend_depth_alignment_absent": Case(_EXT, {"method": "bico"}),
+    "bico_extend_depth_alignment_absent": Case(_EXT, {"method": "bico", "block_extension_params": {**_BE, "skip_correction": False}}),
     # 6: THESEUS shrink
-    "theseus_shrink_brace": Case(_SHR, {}),
+    "theseus_shrink_brace": Case(_SHR, {"block_extension_params": {**_BE, "skip_correction": False}}),
     # 7: Ariadne (both registry spellings) plus the once-only merged fit
     "ariadne_spelling_ariadne": Case(
         _EXT, {"method": "ariadne", "method_params": {}, "ariadne_params": _ARIADNE}, save_tvs=True
@@ -715,7 +715,9 @@ CASES: dict[str, Case] = {
     "theseus_merge_then_rebase_tiny_protocol": Case(
         _EQ, {"merge_mode": "merge_then_rebase", "transport_calibration_protocol": "tiny", **_SEARCH}
     ),
-    "theseus_brace_merge_then_transport": Case(_EXT, {"merge_mode": "brace_merge_then_transport", **_CAL, **_SEARCH}),
+    "theseus_brace_merge_then_transport": Case(
+        _EXT, {"merge_mode": "brace_merge_then_transport", **_CAL, **_SEARCH, "block_extension_params": {**_BE, "skip_correction": False}}
+    ),
     "theseus_merge_then_brace_then_transport_skip_correction": Case(
         _EXT,
         {
@@ -733,6 +735,7 @@ CASES: dict[str, Case] = {
             **_SEARCH,
             "block_extension_params": {
                 **_BE,
+                "skip_correction": False,
                 "calibration_dataset": {"path": "zh-plus/tiny-imagenet", "split": "valid"},
             },
         },
@@ -740,11 +743,11 @@ CASES: dict[str, Case] = {
     # 10: native target tasks
     "theseus_native_target_explicit": Case(
         {**_EXT, "native": ("DTD",)},
-        {"merge_mode": "rebase_then_merge", "native_target_tasks": ["DTD"], **_SEARCH},
+        {"merge_mode": "rebase_then_merge", "native_target_tasks": ["DTD"], **_SEARCH, "block_extension_params": {**_BE, "skip_correction": False}},
     ),
     "theseus_native_target_auto_detected_per_task": Case(
         {**_EXT, "native": ("DTD",)},
-        {"merge_mode": "brace_transport_then_merge", "alpha_selection": "per_task", **_SEARCH},
+        {"merge_mode": "brace_transport_then_merge", "alpha_selection": "per_task", **_SEARCH, "block_extension_params": {**_BE, "skip_correction": False}},
     ),
     # 11: same-depth direct_target completion (transport-free)
     # 12: alpha early stopping
@@ -776,7 +779,7 @@ CASES: dict[str, Case] = {
     ),
     # 14: independent endpoint average base construction
     # eval_before_rebase around the BRACE prestep (source models before / after it)
-    "theseus_extend_eval_before_rebase": Case(_EXT, {"eval_before_rebase": True}),
+    "theseus_extend_eval_before_rebase": Case(_EXT, {"eval_before_rebase": True, "block_extension_params": {**_BE, "skip_correction": False}}),
     "theseus_samedepth_eval_before_rebase": Case(_EQ, {"eval_before_rebase": True}),
     # target-informed BRACE protocols (all need a depth-mismatched pair + lmc_mode=shared)
     # task-independent transport calibration
@@ -1162,7 +1165,7 @@ ERRORS: dict[str, Err] = {
         E("block_extension_params.ridge_identity must be >= 0."),
     ),
     "block_extension_identity_block_needs_skip_correction": Err(
-        {"block_extension_params": {"inserted_block_mode": "residual_identity"}},
+        {"block_extension_params": {"inserted_block_mode": "residual_identity", "skip_correction": False}},
         ValueError,
         P("block_extension_params.inserted_block_mode='residual_identity' requires skip_correction=true: "),
     ),
