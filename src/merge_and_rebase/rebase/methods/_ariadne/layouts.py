@@ -169,6 +169,7 @@ _CAPTURE_KINDS = frozenset(
         "c_proj_input",
         "attn_proj",
         "attn_proj_input",
+        "attn_mixed_input",
         "attn_input",
         "mlp_input",
         "block_input",
@@ -179,7 +180,7 @@ _CAPTURE_KINDS = frozenset(
 _INPUT_CAPTURE_KINDS = frozenset({"c_proj_input", "attn_proj_input", "attn_input", "mlp_input", "block_input"})
 
 
-_ATTN_CAPTURE_KINDS = frozenset({"attn_proj", "attn_proj_input"})
+_ATTN_CAPTURE_KINDS = frozenset({"attn_proj", "attn_proj_input", "attn_mixed_input"})
 
 
 _ATTN_QUERY_KINDS = frozenset({"attn_input"})

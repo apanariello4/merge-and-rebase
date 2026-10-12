@@ -296,6 +296,81 @@ def _stock_mha_out_proj_input(module, args, kwargs):
     return rows.transpose(1, 0) if batch_first else rows
 
 
+def _stock_mha_head_mixed_input(module, args, kwargs):
+    """Per-head attention-mixed inputs ``Z_h = A_h X`` of a stock ``nn.MultiheadAttention`` (self-attention), ``[B, T, H*d]``.
+
+    ``A_h`` are the softmax probabilities (rows sum to 1, ``need_weights=True`` / ``average_attn_weights=False``, i.e. the
+    explicit math path) and ``X`` the attention input (ln_1 output). Head ``h`` occupies columns ``h*d:(h+1)*d``. Because the
+    rows of ``A_h`` sum to 1, a change ``(dV_h, db_h)`` of head ``h``'s V slice moves the pre-``out_proj`` rows exactly by
+    ``Z_h dV_h^T + 1 db_h^T``. The result is ALWAYS batch-first ``[B, T, H*d]``.
+
+    Verified by the hook (`_verify_mixed_input`) against the module's own output and the out-proj-input recomputation.
+    """
+    query, key, value = _mha_query_key_value(args, kwargs)
+    if not (query is key and query is value):
+        raise ValueError(
+            "attn_mixed_input capture requires self-attention (query, key and value must be the same tensor)"
+        )
+    if not module._qkv_same_embed_dim or module.bias_k is not None or module.add_zero_attn:
+        raise NotImplementedError(
+            "attn_mixed_input capture needs a packed-in_proj nn.MultiheadAttention without bias_k"
+        )
+    if bool(getattr(module, "batch_first", False)):
+        query = query.transpose(1, 0)
+    identity = torch.eye(module.embed_dim, dtype=query.dtype, device=query.device)
+    _, weights = F.multi_head_attention_forward(
+        query,
+        query,
+        query,
+        module.embed_dim,
+        module.num_heads,
+        module.in_proj_weight,
+        module.in_proj_bias,
+        None,
+        None,
+        False,
+        module.dropout,
+        identity,
+        None,
+        training=module.training,
+        key_padding_mask=kwargs.get("key_padding_mask"),
+        need_weights=True,
+        attn_mask=kwargs.get("attn_mask"),
+        average_attn_weights=False,
+    )  # weights: [B, H, T, T]
+    x = query.transpose(1, 0)  # [B, T, d]
+    z = torch.einsum("bhts,bsd->bthd", weights, x)
+    return z.reshape(z.shape[0], z.shape[1], -1)
+
+
+def _v_apply_mixed(module, z):
+    """Pre-``out_proj`` rows ``concat_h(Z_h W_V,h^T + b_V,h)`` implied by mixed inputs ``z`` ``[B, T, H*d]``."""
+    d = module.embed_dim
+    heads = module.num_heads
+    wv = module.in_proj_weight[2 * d :].reshape(heads, d // heads, d)
+    bv = module.in_proj_bias[2 * d :].reshape(heads, d // heads) if module.in_proj_bias is not None else None
+    zh = z.reshape(z.shape[0], z.shape[1], heads, d)
+    rows = torch.einsum("bthd,hed->bthe", zh, wv)
+    if bv is not None:
+        rows = rows + bv
+    return rows.reshape(z.shape[0], z.shape[1], -1)
+
+
+def _verify_mixed_input(module, args, kwargs, mixed, module_output):
+    """The V-slice image of the mixed inputs must equal the recomputed out-proj input (and hence the module output)."""
+    rows = _v_apply_mixed(module, mixed)
+    reference = _stock_mha_out_proj_input(module, args, kwargs)
+    batch_first = bool(getattr(module, "batch_first", False))
+    if not batch_first:
+        reference = reference.transpose(1, 0)
+    if rows.shape != reference.shape or not torch.allclose(rows, reference, atol=1e-4, rtol=1e-4):
+        raise RuntimeError(
+            "Per-head mixed attention inputs do not reproduce the out_proj input: the captured Z_h are not "
+            "the features the V projection acts on"
+        )
+    _verify_recomputed_attention_input(module, rows if batch_first else rows.transpose(1, 0), module_output)
+
+
 def _verify_recomputed_attention_input(module, rows, module_output):
     """Push the recomputed rows back through the real ``out_proj`` and compare (atol/rtol 1e-4).
 
@@ -332,6 +407,8 @@ def _register_capture_hooks(
             # fires (and the "once per batch" check would reject the capture): hook the attention itself and
             # recover the projection's rows exactly.
             recompute = isinstance(attention, nn.MultiheadAttention)
+            if kind == "attn_mixed_input" and not recompute:
+                raise NotImplementedError("attn_mixed_input capture requires a stock nn.MultiheadAttention (vision)")
             module = attention if recompute else layout.attn_proj_module(blocks[index])
         elif query_capture:
             if family_adapter is not None:
@@ -349,6 +426,10 @@ def _register_capture_hooks(
                     rows = _stock_mha_out_proj_input(mod, args, kwargs)
                     _verify_recomputed_attention_input(mod, rows, value)
                     store(name, rows)
+                elif capture_kind == "attn_mixed_input":
+                    mixed = _stock_mha_head_mixed_input(mod, args, kwargs)
+                    _verify_mixed_input(mod, args, kwargs, mixed, value)
+                    store(name, mixed)
                 else:
                     store(name, value)
 

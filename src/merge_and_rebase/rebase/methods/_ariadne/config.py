@@ -176,6 +176,13 @@ class DirectResidualConfig:
     # 'match_norm': per block, lam found by bisection on log lam so ||dW_j||_F equals (1 %) that of the closed-form
     # mlp.c_proj fit of the same block and task (computed internally).
     gradient_ridge: str = "eb_input"
+    # Ablation (vision only): closed-form correction of the attention V projection instead of the usual out_proj / c_proj
+    # fits. None (default): off. 'preimage': per block and head h, with Z_h = A_h X (the attention-weighted ln_1 output), the
+    # V slice change (dV_h, db_h) moves the pre-out_proj rows EXACTLY by Z_h dV_h^T + 1 db_h^T (rows of A_h sum to 1); the
+    # block-end target D_j is pulled back through the (square) write map L = W_O^T diag(ls_1 gamma): T = D_j L^+, and each head
+    # solves its own ridge regression Z_h -> T_h with unpenalised intercept and the empirical-Bayes ridge of the O/D path.
+    # First order: the MLP is assumed not to react (as in the closed-form attn.out_proj fit). Requires components=['attn.v_proj'].
+    v_fit: str | None = None
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
@@ -196,6 +203,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "gradient_fit_max_iters": 500,
     "gradient_fit_tol": 1e-9,
     "gradient_ridge": "eb_input",
+    "v_fit": None,
 }
 
 
@@ -299,6 +307,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "gradient_fit_max_iters",
         "gradient_fit_tol",
         "gradient_ridge",
+        "v_fit",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -348,7 +357,11 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("components must not repeat a projection")
     if cfg.component_fit not in {"closed_form", "gradient_exact", "gradient_linearized"}:
         raise ValueError("component_fit must be 'closed_form', 'gradient_exact' or 'gradient_linearized'")
-    supported = CANONICAL_COMPONENT_ORDER if cfg.component_fit != "closed_form" else COMPONENT_FORWARD_ORDER
+    supported = (
+        CANONICAL_COMPONENT_ORDER
+        if cfg.component_fit != "closed_form" or cfg.v_fit is not None
+        else COMPONENT_FORWARD_ORDER
+    )
     unsupported = set(components) - set(supported)
     if unsupported:
         raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(supported)}")
@@ -578,7 +591,29 @@ _GRADIENT_FIT_GROUPS: frozenset[frozenset[str]] = frozenset(
 
 
 def _validate_component_ablations(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
-    """Validation of ``native_oracle`` / ``fit_blocks`` (all opt-in, default off)."""
+    """Validation of ``native_oracle`` / ``fit_blocks`` / ``v_fit`` (all opt-in, default off)."""
+    if cfg.v_fit is not None:
+        if cfg.v_fit != "preimage":
+            raise ValueError("v_fit must be None or 'preimage'")
+        need = {
+            "components": ("attn.v_proj",),
+            "component_fit": "closed_form",
+            "component_target": "block_boundary",
+            "depth_fit": "independent",
+            "block_split": "none",
+            "activation_storage": "streaming",
+            "residual_target": "transported_delta",
+            "pair_target_split": "none",
+            "fit_blocks": None,
+            "tv_scaling": "none",
+            "fidelity_holdout": False,
+            "exact_form": True,
+            "endpoint_construction": "native_delta",
+        }
+        got = {name: (tuple(components) if name == "components" else getattr(cfg, name)) for name in need}
+        bad = {name: got[name] for name, want in need.items() if got[name] != want}
+        if bad:
+            raise ValueError(f"v_fit='preimage' requires {need}; got incompatible {bad}")
     if cfg.gradient_ridge not in {"eb_input", "match_norm"}:
         raise ValueError("gradient_ridge must be 'eb_input' or 'match_norm'")
     iters = cfg.gradient_fit_max_iters
@@ -733,6 +768,9 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
         raise NotImplementedError("residual_target=native_oracle is vision-only")
     if cfg.component_fit != "closed_form":
         raise NotImplementedError("component_fit=gradient is vision-only")
+    if cfg.v_fit is not None:
+        # GQA later: stack the Z_h rows of the query heads that share a key/value head.
+        raise NotImplementedError("v_fit='preimage' is vision-only")
     if cfg.sequential_points == "mid_end":
         # HF decoder layers receive hidden_states as a keyword argument, so the block_input capture (positional
         # inputs[0]) does not see the block input there.

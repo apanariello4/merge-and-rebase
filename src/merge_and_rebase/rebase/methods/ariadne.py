@@ -71,6 +71,7 @@ from ._ariadne.streaming import (
     measure_streaming_realization_for,
     prepare_direct_residual_streaming,
 )
+from ._ariadne.v_fit import fit_direct_residual_vfit_streaming
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,12 @@ def _fit_body(
     ``config.activation_storage`` selects the resident path (full per-batch banks) or the streaming path
     (O(1)-in-``num_batches`` host RAM); ``realization_diagnostics`` is supported under both.
     """
+    if config.v_fit is not None:
+        if family_adapter is not None:
+            # GQA later: stack the Z_h rows of the query heads that share a key/value head.
+            raise NotImplementedError("v_fit='preimage' is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("v_fit='preimage' needs activation_storage='streaming'")
     if config.component_fit != "closed_form":
         if family_adapter is not None:
             raise NotImplementedError("component_fit=gradient is vision-only")
@@ -337,6 +344,8 @@ def _fit_body(
     elif streaming:
         if config.component_fit != "closed_form":
             fit_streaming = fit_direct_residual_gradient_streaming
+        elif config.v_fit is not None:
+            fit_streaming = fit_direct_residual_vfit_streaming
         elif config.depth_fit != "sequential":
             fit_streaming = fit_direct_residual_streaming
         elif config.sequential_impl == "block_carry":

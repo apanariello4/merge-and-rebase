@@ -919,7 +919,8 @@
     "streaming_position_chunk": null,
     "strength": 1.0,
     "tv_scaling": "none",
-    "tv_scaling_iters": 3
+    "tv_scaling_iters": 3,
+    "v_fit": null
    },
    "ariadne_preset": "ariadne",
    "block_extension_cfg": {
@@ -1451,7 +1452,8 @@
     "streaming_position_chunk": null,
     "strength": 1.0,
     "tv_scaling": "none",
-    "tv_scaling_iters": 3
+    "tv_scaling_iters": 3,
+    "v_fit": null
    },
    "ariadne_preset": "ariadne",
    "block_extension_cfg": {

@@ -63,6 +63,8 @@ method:
     # gradient_fit_max_iters: 500           # [ablation, vision-only] L-BFGS / conjugate-gradient iteration cap of the gradient fits.
     # gradient_fit_tol: 1.0e-9              # [ablation, vision-only] stop at this relative change of the objective between iterations.
     # gradient_ridge: "eb_input"            # [ablation, vision-only] eb_input | match_norm (||dW|| matched to the closed-form mlp.c_proj fit).
+    # v_fit: null                           # [ablation, vision-only] null | preimage: closed-form attn.v_proj fit (components: [attn.v_proj]); the
+    #                                       #   block-end target is pulled back through W_O^T diag(ls_1 gamma) and fitted per head on Z_h = A_h X.
     # alignment_map: "polar"                # [ablation] polar | ridge | random_isometry.
     # alignment_seed: 0                     # [ablation] seed of random_isometry.
     depth_pairing: relative                 # [main] source/target layer pairing: relative (target layer j <- source layer
