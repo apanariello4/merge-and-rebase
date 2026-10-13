@@ -30,6 +30,15 @@ from .run_config import bind_llm_plan, resolve_llm_run_config
 from .stages import LlmTaskContext
 
 
+def _owned_cpu_fp32(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Keep base snapshots independent of later loads into a CPU fp32 model."""
+    out = to_cpu_fp32(sd)
+    return {
+        key: value.clone() if value.data_ptr() == sd[key].data_ptr() else value
+        for key, value in out.items()
+    }
+
+
 class TextCalibrationCache:
     """Resolved on first use: building it from an lm-harness task has to index the task registry, which is far
     too expensive to pay for on a run that never collects activations at all."""
@@ -126,21 +135,21 @@ def build_runtime(
     target_llm = TextLM.build(target_build_cfg)
     print("Built source and target models.")
 
-    source_base_sd = to_cpu_fp32(source_llm.model.state_dict())
-    target_base_sd = to_cpu_fp32(target_llm.model.state_dict())
+    source_base_sd = _owned_cpu_fp32(source_llm.model.state_dict())
+    target_base_sd = _owned_cpu_fp32(target_llm.model.state_dict())
 
     source_base_ckpt = cfg.get("source_base_ckpt", None)
     if source_base_ckpt:
         sd0 = load_ckpt(str(source_base_ckpt))
         load_into_model(source_llm.model, sd0, strict=False)
-        source_base_sd = to_cpu_fp32(source_llm.model.state_dict())
+        source_base_sd = _owned_cpu_fp32(source_llm.model.state_dict())
         print(f"Loaded source base checkpoint from {source_base_ckpt}")
 
     target_base_ckpt = cfg.get("target_base_ckpt", None)
     if target_base_ckpt:
         sd0 = load_ckpt(str(target_base_ckpt))
         load_into_model(target_llm.model, sd0, strict=False)
-        target_base_sd = to_cpu_fp32(target_llm.model.state_dict())
+        target_base_sd = _owned_cpu_fp32(target_llm.model.state_dict())
         print(f"Loaded target base checkpoint from {target_base_ckpt}")
 
     source_family = infer_family(source_llm.model)

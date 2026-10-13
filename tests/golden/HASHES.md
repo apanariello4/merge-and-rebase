@@ -529,3 +529,17 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
 - New pins for the default itself: `tests/test_skip_correction_default_20261009.py`; the legacy depth strategy in
   `tests/test_ariadne_method.py` now expects an unset `skip_correction` to mean `true`.
 
+### Declared changes — 2026-10-13, immutable LLM bases and explicit weight lists
+
+- CPU fp32 LLM base snapshots now own their storage. Search evaluates each alpha relative to the original base;
+  saving writes the evaluated winning model instead of applying the winning update to the last evaluated model.
+- LLM weight lists must have one entry per checkpoint; scalars still broadcast. Invalid lists fail before transport.
+- The same-environment before/after capture changes 13 of 148 LLM main pins: `summary` and `harness_calls` for
+  `alpha_search_discrete_values`, `alpha_search_sobol`, `theseus_extend_defaults_alpha_search`,
+  `theseus_holdout_samples_and_test_slice`, `theseus_same_depth_alpha_search_save_merged_base_ckpts`; saved-model pins
+  for `nli_prompt_search_save_merged`, `save_merged_extend`, and `theseus_same_depth_alpha_search_save_merged_base_ckpts`.
+  The other 135 pins are unchanged. Local experiment results: `artifacts/llm_rebase_fix_comparison/golden_comparison.json`.
+- Committed pins are not regenerated here: the original implementation already disagrees with 58 pins in this
+  Python 3.14 / PyTorch 2.11 environment. The regression tests independently pin candidate equality, immutable
+  snapshots, saved-winner equality and weight validation; reference-environment hash regeneration remains necessary.
+

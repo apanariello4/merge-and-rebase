@@ -84,6 +84,20 @@ class RebaseOutputs:
     task_vector_report: dict[str, Any]
 
 
+def _resolve_task_weights(raw: Any, count: int) -> list[float]:
+    """Broadcast a scalar, but require an explicit list to name every task."""
+    if raw is None:
+        return [1.0] * count
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != count:
+            raise ValueError(
+                f"weights length must match tuned checkpoints: got {len(raw)} weights for {count} checkpoints. "
+                "Use a scalar to apply the same weight to every checkpoint."
+            )
+        return [float(value) for value in raw]
+    return [float(raw)] * count
+
+
 def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
     """Returns None when the run stops after the before-rebase eval (eval_before_rebase_only)."""
     cfg = rt.cfg
@@ -103,6 +117,7 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
     _calibration_provenance = rt._calibration_provenance
     _eval_before_rebase = rt._eval_before_rebase
     _baseline_summary = rt._baseline_summary
+    weights = _resolve_task_weights(cfg.get("weights"), len(tuned_ref_list))
 
     if run_before_rebase_eval and not run_block_extension_prestep:
         # No depth change: the model transport starts from is the plain
@@ -119,15 +134,6 @@ def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
         load_into_model(source_llm.model, source_base_sd, strict=False)
         _eval_before_rebase(source_llm.model, "source_base_unextended")
         source_llm.model.to("cpu")
-    weights_raw = cfg.get("weights", None)
-    if weights_raw is None:
-        weights = [1.0] * len(tuned_ref_list)
-    else:
-        w = weights_raw if isinstance(weights_raw, (list, tuple)) else [float(weights_raw)]
-        if len(w) < len(tuned_ref_list):
-            w = w * len(tuned_ref_list)
-        weights = [float(x) for x in w[: len(tuned_ref_list)]]
-
     # Per task: prepare the depth-matched delta, transport it, free the task-local models.
     if not eval_before_rebase_only:
         print(f"\n=== Transporting {len(tasks) if tasks else 1} task vectors with {method_name} ===")

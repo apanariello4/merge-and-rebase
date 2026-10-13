@@ -288,3 +288,4 @@ docs/*.aux
 /direct_target_p1_implementation_and_config_plan.md
 /docs/proposal_1_method.tex
 /.vscode/
+artifacts/
