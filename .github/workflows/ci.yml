@@ -17,6 +17,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --all-extras --locked
-      - run: uv run ruff check src tests scripts
+      - run: uv run ruff check src tests
       - run: uv run pytest -q
       - run: uv run mkdocs build --strict

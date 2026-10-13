@@ -24,8 +24,8 @@ Install only the package with `uv pip install -e .`. The `data` extra adds Huggi
 ## Common Commands
 
 ```bash
-# Run source, test, and script quality checks.
-uv run ruff check src tests scripts
+# Run source and test quality checks.
+uv run ruff check src tests
 
 # Run the test suite.
 uv run pytest -q
