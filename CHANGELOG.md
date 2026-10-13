@@ -36,6 +36,9 @@ unless a change below says otherwise.
   `materialized_bias_keys` (LLM Ariadne).
 
 ### Behaviour changes (declared)
+- LLM source/target base snapshots now own their CPU fp32 storage: alpha-search candidates and saved checkpoints
+  are computed from the original base instead of accumulating earlier candidates. LLM weight lists must match
+  the number of tuned checkpoints; scalar weights still broadcast. Local experiment: `artifacts/llm_rebase_fix_comparison/`.
 - A depth-changing THESEUS/BiCo config without `depth_defaults` or an explicit `skip_correction` /
   `depth_alignment` / `depth_rule` raises `ConfigMeaningChangedError` naming both fixes.
 - `block_extension_params.skip_correction` now defaults to `true` on every path (the dataclass, the decoder and vision
