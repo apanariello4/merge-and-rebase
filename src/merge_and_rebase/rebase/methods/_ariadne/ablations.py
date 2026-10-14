@@ -131,6 +131,249 @@ def _backfit_objective(shim, local_block64, device, x_batches, d_batches, t0_bat
 
 
 @torch.no_grad()
+def _backfit_one_block(
+    shim,
+    local_block,
+    x_batches: list,
+    d_batches: list,
+    t0_batches: list,
+    pos: int,
+    source_coordinate: float,
+    order: tuple,
+    current_state: dict[str, torch.Tensor],
+    config,
+    device,
+) -> tuple[dict, list]:
+    """Intra-block Gauss-Seidel backfit of ONE block (the per-position body of ``_fit_block_boundary_backfit``).
+
+    ``local_block`` is a private (deep-copied, on ``device``, eval) block module holding the weights the fit starts
+    from; it is mutated by the replays. ``x_batches``/``t0_batches`` are the block input and the block output on it
+    (CPU float32), ``d_batches`` the target the block-output change must realise. Returns
+    ``(position_corrections, rows)`` exactly as ``_fit_block_boundary_backfit`` stores per position.
+    """
+
+    # Device convention: base/deltas (and everything derived) live on CPU float32, like
+    # ResidualSufficientStatistics.solve() output and _fit_all_positions_independent's current_state.
+    # base[c] needs the explicit .cpu(): otherwise it inherits local_block's device and
+    # `base[c2][0] + w2` (CPU delta) would raise on CUDA, which a CPU-only run never surfaces.
+    # _mount_component is the only place tensors move back onto `device`.
+    base: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {}
+    for c in order:
+        w, b, row_slice = _component_weight_bias(shim, local_block, c)
+        if row_slice is not None:
+            raise RuntimeError("block_split='backfit' components must not be packed (row_slice must be None)")
+        base[c] = (w.detach().cpu().clone(), None if b is None else b.detach().cpu().clone())
+    scale_modules = {c: shim.component_scale_module(local_block, c) for c in order}
+    # Float64 replica for the J(Delta) measurement only (see _backfit_data_fit_sq); copied
+    # while local_block is still pristine.
+    local_block64 = copy.deepcopy(local_block).double().eval()
+
+    def reset_all(local_block=local_block, order=order, base=base):
+        for c in order:
+            w, b = base[c]
+            _mount_component(shim, local_block, c, w, b)
+
+    # Pristine-replay check: X_j^0 through the untouched local copy must
+    # reproduce the captured boundary output T_j^0.
+    reset_all()
+    t_replayed = []
+    for x in x_batches:
+        t_replayed.append(local_block(x.to(device)).detach().float().cpu().clone())
+    block_replay_bitwise = all(torch.equal(rep, ref) for rep, ref in zip(t_replayed, t0_batches, strict=True))
+    for rep, ref in zip(t_replayed, t0_batches, strict=True):
+        if not torch.allclose(rep, ref, atol=1e-4, rtol=1e-4):
+            raise RuntimeError(
+                f"Block replay at position {pos} does not reproduce the pristine boundary "
+                "output within tolerance; X_j^0/local-block-copy mismatch"
+            )
+
+    deltas: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {
+        c: (torch.zeros_like(base[c][0]), None if base[c][1] is None else torch.zeros_like(base[c][1])) for c in order
+    }
+    d_sq_total = sum(float((d.double() ** 2).sum().item()) for d in d_batches)
+    desired_norm = d_sq_total**0.5
+    residual_trace: list[float] = []
+    j_trace: list[float] = []
+    converged = False
+    n_sweeps = 0
+    j_prev = None
+    round1_j: float | None = None
+    round1_r: float | None = None
+    # J(Delta=0) = ||D_j - (T_j^0 - T_j^0)||^2 + 0 = ||D_j||^2 (no ridge penalty
+    # at the all-zero start).
+    lambdas: dict[str, float] = {}
+    per_component_diag: dict[str, dict] = {}
+    per_component_h: dict[str, list] = {}
+    per_component_effective_out: dict[str, torch.Tensor] = {}
+    per_component_eta_history: dict[str, list[float]] = {c: [] for c in order}
+    # Backtracking factors: full step, then up to 8 halvings; eta=0 (keep old delta) is the implicit fallback.
+    backtrack_etas = [1.0] + [1.0 / (2**k) for k in range(1, 9)]
+    for sweep in range(1, int(config.backfit_max_iters) + 1):
+        n_sweeps = sweep
+        for c in order:
+            reset_all()
+            for c2 in order:
+                if c2 == c:
+                    continue
+                w2, b2 = deltas[c2]
+                _mount_component(
+                    shim, local_block, c2, base[c2][0] + w2, None if base[c2][1] is None else base[c2][1] + b2
+                )
+            component_h, out_batches = _replay_block_components(shim, local_block, x_batches, [c], device)
+            h_batches = component_h[c]
+            e_batches = [d - (t - t0) for d, t, t0 in zip(d_batches, out_batches, t0_batches, strict=True)]
+            width = int(base[c][0].shape[0])
+            identity_out = torch.eye(width, dtype=torch.float32)
+            scale_module = scale_modules[c]
+            effective_out = identity_out
+            if not isinstance(scale_module, nn.Identity):
+                scale = getattr(scale_module, "gamma", None)
+                if scale is None or scale.ndim != 1 or scale.shape[0] != width:
+                    raise ValueError("Unsupported non-diagonal target LayerScale")
+                effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
+            stats = ResidualSufficientStatistics(device=device)
+            for h, e in zip(h_batches, e_batches, strict=True):
+                stats.update(h.reshape(-1, h.shape[-1]), e.reshape(-1, e.shape[-1]), None, effective_out)
+            correction, diag = stats.solve(
+                ridge_relative=config.ridge_relative,
+                ridge_estimator=config.ridge_estimator,
+                exact_form=config.exact_form,
+            )
+            correction = correction.cpu()
+            diag["bias_correction"] = diag["bias_correction"].cpu()
+            if correction.shape != base[c][0].shape or not torch.isfinite(correction).all():
+                raise RuntimeError("block_split='backfit' produced an invalid projection")
+            per_component_diag[c] = diag
+            per_component_h[c] = h_batches
+            per_component_effective_out[c] = effective_out
+
+            # Freeze lambda_c at its first-sweep value so J stays a FIXED function of Delta;
+            # solve()'s per-sweep ridge only shapes the candidate, not the accept test.
+            if sweep == 1:
+                lambdas[c] = float(diag["ridge"])
+
+            old_w, old_b = deltas[c]
+            candidate_w, candidate_b = correction, diag["bias_correction"]
+            trial_deltas = dict(deltas)
+            j_old, _ = _backfit_objective(
+                shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, trial_deltas, lambdas
+            )
+            accepted_eta = 0.0
+            accepted_delta = (old_w, old_b)
+            for eta in backtrack_etas:
+                trial_w = old_w + eta * (candidate_w - old_w)
+                trial_b = None if old_b is None else old_b + eta * (candidate_b - old_b)
+                trial_deltas[c] = (trial_w, trial_b)
+                j_trial, _ = _backfit_objective(
+                    shim,
+                    local_block64,
+                    device,
+                    x_batches,
+                    d_batches,
+                    t0_batches,
+                    order,
+                    base,
+                    trial_deltas,
+                    lambdas,
+                )
+                if j_trial < j_old:
+                    accepted_eta = eta
+                    accepted_delta = (trial_w, trial_b)
+                    break
+            deltas[c] = accepted_delta
+            per_component_eta_history[c].append(accepted_eta)
+        # Full-sweep J and ridge-free data-fit norm r (diagnostic) with every current delta mounted.
+        j_now, data_fit_sq = _backfit_objective(
+            shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas, lambdas
+        )
+        r = (data_fit_sq**0.5) / (desired_norm + 1e-12)
+        residual_trace.append(r)
+        j_trace.append(j_now)
+        if sweep == 1:
+            round1_j, round1_r = j_now, r
+        if j_prev is not None:
+            rel_decrease = (j_prev - j_now) / j_prev if j_prev > 0 else 0.0
+            if rel_decrease < float(config.backfit_tol):
+                converged = True
+                break
+        j_prev = j_now
+
+    position_corrections: dict[str, torch.Tensor] = {}
+    block_rows: list[dict[str, Any]] = []
+    for c in order:
+        key = shim.component_key(pos, c, prefixed=True)
+        correction, bias_correction = deltas[c]
+        position_corrections[key] = correction
+        bias_key = f"{key[: -len('.weight')]}.bias"
+        skip_bias = False
+        if bias_key not in current_state:
+            if config.missing_bias == "materialize":
+                raise RuntimeError(
+                    f"missing_bias='materialize' requires {bias_key} to exist on the target "
+                    "before residual completion runs; call "
+                    "materialize_missing_projection_biases() on the target model and its "
+                    "base state dict first"
+                )
+            elif config.missing_bias == "skip":
+                if torch.count_nonzero(bias_correction):
+                    raise RuntimeError(
+                        "missing_bias='skip' would discard a nonzero intercept at "
+                        f"{bias_key}; the weight was fitted on centered banks and is "
+                        "not valid without it"
+                    )
+                skip_bias = True
+            else:
+                raise RuntimeError(
+                    f"Target model is missing the expected bias parameter {bias_key}. "
+                    "Set target_residual_completion.missing_bias to 'materialize' (exact, "
+                    "adds the parameter) or 'skip' with exact_form=false."
+                )
+        if not skip_bias:
+            bias_delta = bias_correction.to(current_state[bias_key])
+            if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
+                raise RuntimeError("block_split='backfit' produced an invalid bias")
+            position_corrections[bias_key] = bias_delta
+        diag = per_component_diag[c]
+        block_row = {
+            "mode": "direct_target",
+            "component": c,
+            "component_target": "block_boundary",
+            "block_split": "backfit",
+            "position": pos,
+            "source_coordinate": float(source_coordinate),
+            "desired_norm": desired_norm,
+            "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
+            "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
+            "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+            "backfit_n_sweeps": n_sweeps,
+            "backfit_converged": converged,
+            "backfit_residual_trace": list(residual_trace),
+            "backfit_j_trace": list(j_trace),
+            "backfit_round1_j": round1_j,
+            "backfit_round1_r": round1_r,
+            "backfit_ridge_lambda": lambdas.get(c),
+            "backfit_eta_history": list(per_component_eta_history[c]),
+            "block_replay_bitwise": block_replay_bitwise,
+            **diag,
+        }
+        if bool(getattr(config, "realization_diagnostics", False)):
+            bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
+            block_row.update(
+                _realization_diagnostic_fields(
+                    per_component_h[c],
+                    correction,
+                    bias_for_pred,
+                    per_component_effective_out[c],
+                    base[c][0],
+                    desired_norm,
+                    diag["residual_norm_after"],
+                )
+            )
+        block_rows.append(block_row)
+    return position_corrections, block_rows
+
+
+@torch.no_grad()
 def _fit_block_boundary_backfit(
     target_model,
     current_state: dict[str, torch.Tensor],
@@ -194,227 +437,19 @@ def _fit_block_boundary_backfit(
         d_batches = desired_batches[pos]
         block = shim.blocks(target_model)[pos]
         local_block = copy.deepcopy(shim.block_module(block)).to(device).eval()
-
-        # Device convention: base/deltas (and everything derived) live on CPU float32, like
-        # ResidualSufficientStatistics.solve() output and _fit_all_positions_independent's current_state.
-        # base[c] needs the explicit .cpu(): otherwise it inherits local_block's device and
-        # `base[c2][0] + w2` (CPU delta) would raise on CUDA, which a CPU-only run never surfaces.
-        # _mount_component is the only place tensors move back onto `device`.
-        base: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {}
-        for c in order:
-            w, b, row_slice = _component_weight_bias(shim, local_block, c)
-            if row_slice is not None:
-                raise RuntimeError("block_split='backfit' components must not be packed (row_slice must be None)")
-            base[c] = (w.detach().cpu().clone(), None if b is None else b.detach().cpu().clone())
-        scale_modules = {c: shim.component_scale_module(local_block, c) for c in order}
-        # Float64 replica for the J(Delta) measurement only (see _backfit_data_fit_sq); copied
-        # while local_block is still pristine.
-        local_block64 = copy.deepcopy(local_block).double().eval()
-
-        def reset_all(local_block=local_block, order=order, base=base):
-            for c in order:
-                w, b = base[c]
-                _mount_component(shim, local_block, c, w, b)
-
-        # Pristine-replay check: X_j^0 through the untouched local copy must
-        # reproduce the captured boundary output T_j^0.
-        reset_all()
-        t_replayed = []
-        for x in x_batches:
-            t_replayed.append(local_block(x.to(device)).detach().float().cpu().clone())
-        block_replay_bitwise = all(torch.equal(rep, ref) for rep, ref in zip(t_replayed, t0_batches, strict=True))
-        for rep, ref in zip(t_replayed, t0_batches, strict=True):
-            if not torch.allclose(rep, ref, atol=1e-4, rtol=1e-4):
-                raise RuntimeError(
-                    f"Block replay at position {pos} does not reproduce the pristine boundary "
-                    "output within tolerance; X_j^0/local-block-copy mismatch"
-                )
-
-        deltas: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {
-            c: (torch.zeros_like(base[c][0]), None if base[c][1] is None else torch.zeros_like(base[c][1]))
-            for c in order
-        }
-        d_sq_total = sum(float((d.double() ** 2).sum().item()) for d in d_batches)
-        desired_norm = d_sq_total**0.5
-        residual_trace: list[float] = []
-        j_trace: list[float] = []
-        converged = False
-        n_sweeps = 0
-        j_prev = None
-        round1_j: float | None = None
-        round1_r: float | None = None
-        # J(Delta=0) = ||D_j - (T_j^0 - T_j^0)||^2 + 0 = ||D_j||^2 (no ridge penalty
-        # at the all-zero start).
-        lambdas: dict[str, float] = {}
-        per_component_diag: dict[str, dict] = {}
-        per_component_h: dict[str, list] = {}
-        per_component_effective_out: dict[str, torch.Tensor] = {}
-        per_component_eta_history: dict[str, list[float]] = {c: [] for c in order}
-        # Backtracking factors: full step, then up to 8 halvings; eta=0 (keep old delta) is the implicit fallback.
-        backtrack_etas = [1.0] + [1.0 / (2**k) for k in range(1, 9)]
-        for sweep in range(1, int(config.backfit_max_iters) + 1):
-            n_sweeps = sweep
-            for c in order:
-                reset_all()
-                for c2 in order:
-                    if c2 == c:
-                        continue
-                    w2, b2 = deltas[c2]
-                    _mount_component(
-                        shim, local_block, c2, base[c2][0] + w2, None if base[c2][1] is None else base[c2][1] + b2
-                    )
-                component_h, out_batches = _replay_block_components(shim, local_block, x_batches, [c], device)
-                h_batches = component_h[c]
-                e_batches = [d - (t - t0) for d, t, t0 in zip(d_batches, out_batches, t0_batches, strict=True)]
-                width = int(base[c][0].shape[0])
-                identity_out = torch.eye(width, dtype=torch.float32)
-                scale_module = scale_modules[c]
-                effective_out = identity_out
-                if not isinstance(scale_module, nn.Identity):
-                    scale = getattr(scale_module, "gamma", None)
-                    if scale is None or scale.ndim != 1 or scale.shape[0] != width:
-                        raise ValueError("Unsupported non-diagonal target LayerScale")
-                    effective_out = identity_out * scale.detach().cpu().float().unsqueeze(0)
-                stats = ResidualSufficientStatistics(device=device)
-                for h, e in zip(h_batches, e_batches, strict=True):
-                    stats.update(h.reshape(-1, h.shape[-1]), e.reshape(-1, e.shape[-1]), None, effective_out)
-                correction, diag = stats.solve(
-                    ridge_relative=config.ridge_relative,
-                    ridge_estimator=config.ridge_estimator,
-                    exact_form=config.exact_form,
-                )
-                correction = correction.cpu()
-                diag["bias_correction"] = diag["bias_correction"].cpu()
-                if correction.shape != base[c][0].shape or not torch.isfinite(correction).all():
-                    raise RuntimeError("block_split='backfit' produced an invalid projection")
-                per_component_diag[c] = diag
-                per_component_h[c] = h_batches
-                per_component_effective_out[c] = effective_out
-
-                # Freeze lambda_c at its first-sweep value so J stays a FIXED function of Delta;
-                # solve()'s per-sweep ridge only shapes the candidate, not the accept test.
-                if sweep == 1:
-                    lambdas[c] = float(diag["ridge"])
-
-                old_w, old_b = deltas[c]
-                candidate_w, candidate_b = correction, diag["bias_correction"]
-                trial_deltas = dict(deltas)
-                j_old, _ = _backfit_objective(
-                    shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, trial_deltas, lambdas
-                )
-                accepted_eta = 0.0
-                accepted_delta = (old_w, old_b)
-                for eta in backtrack_etas:
-                    trial_w = old_w + eta * (candidate_w - old_w)
-                    trial_b = None if old_b is None else old_b + eta * (candidate_b - old_b)
-                    trial_deltas[c] = (trial_w, trial_b)
-                    j_trial, _ = _backfit_objective(
-                        shim,
-                        local_block64,
-                        device,
-                        x_batches,
-                        d_batches,
-                        t0_batches,
-                        order,
-                        base,
-                        trial_deltas,
-                        lambdas,
-                    )
-                    if j_trial < j_old:
-                        accepted_eta = eta
-                        accepted_delta = (trial_w, trial_b)
-                        break
-                deltas[c] = accepted_delta
-                per_component_eta_history[c].append(accepted_eta)
-            # Full-sweep J and ridge-free data-fit norm r (diagnostic) with every current delta mounted.
-            j_now, data_fit_sq = _backfit_objective(
-                shim, local_block64, device, x_batches, d_batches, t0_batches, order, base, deltas, lambdas
-            )
-            r = (data_fit_sq**0.5) / (desired_norm + 1e-12)
-            residual_trace.append(r)
-            j_trace.append(j_now)
-            if sweep == 1:
-                round1_j, round1_r = j_now, r
-            if j_prev is not None:
-                rel_decrease = (j_prev - j_now) / j_prev if j_prev > 0 else 0.0
-                if rel_decrease < float(config.backfit_tol):
-                    converged = True
-                    break
-            j_prev = j_now
-
-        position_corrections: dict[str, torch.Tensor] = {}
-        block_rows: list[dict[str, Any]] = []
-        for c in order:
-            key = shim.component_key(pos, c, prefixed=True)
-            correction, bias_correction = deltas[c]
-            position_corrections[key] = correction
-            bias_key = f"{key[: -len('.weight')]}.bias"
-            skip_bias = False
-            if bias_key not in current_state:
-                if config.missing_bias == "materialize":
-                    raise RuntimeError(
-                        f"missing_bias='materialize' requires {bias_key} to exist on the target "
-                        "before residual completion runs; call "
-                        "materialize_missing_projection_biases() on the target model and its "
-                        "base state dict first"
-                    )
-                elif config.missing_bias == "skip":
-                    if torch.count_nonzero(bias_correction):
-                        raise RuntimeError(
-                            "missing_bias='skip' would discard a nonzero intercept at "
-                            f"{bias_key}; the weight was fitted on centered banks and is "
-                            "not valid without it"
-                        )
-                    skip_bias = True
-                else:
-                    raise RuntimeError(
-                        f"Target model is missing the expected bias parameter {bias_key}. "
-                        "Set target_residual_completion.missing_bias to 'materialize' (exact, "
-                        "adds the parameter) or 'skip' with exact_form=false."
-                    )
-            if not skip_bias:
-                bias_delta = bias_correction.to(current_state[bias_key])
-                if bias_delta.shape != current_state[bias_key].shape or not torch.isfinite(bias_delta).all():
-                    raise RuntimeError("block_split='backfit' produced an invalid bias")
-                position_corrections[bias_key] = bias_delta
-            diag = per_component_diag[c]
-            block_row = {
-                "mode": "direct_target",
-                "component": c,
-                "component_target": "block_boundary",
-                "block_split": "backfit",
-                "position": pos,
-                "source_coordinate": float(source_coordinates[pos]),
-                "desired_norm": desired_norm,
-                "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
-                "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-                "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
-                "backfit_n_sweeps": n_sweeps,
-                "backfit_converged": converged,
-                "backfit_residual_trace": list(residual_trace),
-                "backfit_j_trace": list(j_trace),
-                "backfit_round1_j": round1_j,
-                "backfit_round1_r": round1_r,
-                "backfit_ridge_lambda": lambdas.get(c),
-                "backfit_eta_history": list(per_component_eta_history[c]),
-                "block_replay_bitwise": block_replay_bitwise,
-                **diag,
-            }
-            if bool(getattr(config, "realization_diagnostics", False)):
-                bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
-                block_row.update(
-                    _realization_diagnostic_fields(
-                        per_component_h[c],
-                        correction,
-                        bias_for_pred,
-                        per_component_effective_out[c],
-                        base[c][0],
-                        desired_norm,
-                        diag["residual_norm_after"],
-                    )
-                )
-            block_rows.append(block_row)
-        results[pos] = (position_corrections, block_rows)
+        results[pos] = _backfit_one_block(
+            shim,
+            local_block,
+            x_batches,
+            d_batches,
+            t0_batches,
+            pos,
+            source_coordinates[pos],
+            order,
+            current_state,
+            config,
+            device,
+        )
     return results
 
 

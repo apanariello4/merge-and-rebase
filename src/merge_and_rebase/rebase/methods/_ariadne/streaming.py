@@ -745,6 +745,18 @@ def fit_direct_residual_sequential_streaming(
             device=device,
             family_adapter=family_adapter,
         )
+    if config.block_split == "backfit":
+        return _fit_sequential_backfit_streaming(
+            target_model,
+            target_base_state,
+            source_base_model,
+            source_ft_model,
+            prepared,
+            pairing,
+            config=config,
+            device=device,
+            family_adapter=family_adapter,
+        )
     components = order_components(config.components)
     groups = target_groups(pairing.pairing)
     if len(components) != 1:
@@ -873,6 +885,141 @@ def fit_direct_residual_sequential_streaming(
                 row["upstream_effect_norm"] = upstream_sq**0.5
                 diagnostics.append(row)
             # Mount this block's update (weight and bias, as updated in current_state) before the next block.
+            target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)
+    finally:
+        target_model.load_state_dict(original_state, strict=True)
+        for mid, m in unique_models.items():
+            orig_device, orig_training = originals[mid]
+            m.to(orig_device).train(orig_training)
+        del pristine_model
+    annotate_target_split(diagnostics, config, pairing)
+    return target_corrections, diagnostics
+
+
+@torch.no_grad()
+def _fit_sequential_backfit_streaming(
+    target_model,
+    target_base_state: Mapping[str, Tensor],
+    source_base_model,
+    source_ft_model,
+    prepared: Mapping[str, Any],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: DirectResidualConfig,
+    device,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
+    """``depth_fit="sequential"`` with ``block_split="backfit"`` (vision only; attn.out_proj + mlp.c_proj).
+
+    Same depth loop as `fit_direct_residual_sequential_streaming` (current target holding the fitted blocks < j, a
+    pristine copy for ``U_j``), but per block ``j`` the batches ``X_j`` (block input on the CURRENT target),
+    ``E_j = D_j - U_j`` and ``T_j = out_current_j`` are collected (CPU float32) and the block is fitted by the
+    intra-block Gauss-Seidel backfit (`ablations._backfit_one_block`) with ``E_j`` as the shared block target. Block 0
+    (``U_0 = 0``) equals the resident independent backfit of position 0. Both components' updates (weights and
+    biases) are mounted before block ``j + 1``. Rows: backfit diagnostics plus ``depth_fit`` / ``upstream_effect_norm``.
+    """
+    if family_adapter is not None:
+        raise NotImplementedError("depth_fit='sequential' with block_split='backfit' is vision-only")
+    from .ablations import _backfit_one_block  # local import: ablations imports the fit modules
+
+    components = order_components(config.components)
+    batches = prepared["target_batches"]
+    source_batches = prepared["source_batches"]
+    q_by_position = prepared["q_by_position"]
+    fingerprints = prepared["fingerprints"]
+    positions = list(range(pairing.target_depth))
+    for j in positions:
+        if j not in q_by_position:
+            raise ValueError(f"Missing prepared Procrustes map for position {j}")
+    source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
+    shim = _layout_for(family_adapter)
+
+    unique_models: dict[int, Any] = {}
+    for m in (target_model, source_base_model, source_ft_model):
+        unique_models.setdefault(id(m), m)
+    originals = {mid: (next(m.parameters()).device, m.training) for mid, m in unique_models.items()}
+
+    original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    target_corrections: dict[str, Tensor] = {}
+    diagnostics: list[dict[str, Any]] = []
+    pristine_model = None
+    try:
+        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        target_model.load_state_dict(current_state, strict=True)
+        pristine_model = deepcopy(target_model)
+        pristine_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
+        sb_model = pristine_model if source_base_model is target_model else source_base_model
+        sf_model = pristine_model if source_ft_model is target_model else source_ft_model
+        for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
+            m.to(device).eval()
+
+        fit_set = set(resolve_fit_blocks(config, pairing.target_depth))
+        for pos in positions:
+            if pos not in fit_set:
+                continue
+            i = pairing.pairing[pos]
+            q = q_by_position[pos]
+            upstream_sq = 0.0
+            src_requests = {str(i): (i, "boundary")}
+            out_key, in_key = f"{pos}.out", f"{pos}.block_input"
+            tgt_requests = {out_key: (pos, "boundary"), in_key: (pos, "block_input")}
+            ref_requests = {out_key: (pos, "boundary")}
+            gens = (
+                iter_capture_tokens(
+                    sb_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    sf_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+                iter_capture_tokens(
+                    pristine_model, batches, ref_requests, device, family_adapter=family_adapter, store_device=device
+                ),
+            )
+            x_batches: list[Tensor] = []
+            e_batches: list[Tensor] = []
+            t0_batches: list[Tensor] = []
+            with contextlib.ExitStack() as stack:
+                for gen in gens:
+                    stack.enter_context(contextlib.closing(gen))
+                for k, (sb, sf, tgt, ref) in enumerate(zip(*gens, strict=True)):
+                    _check_boundary_fingerprint(ref[out_key], fingerprints[(k, pos)], config, pos, k)
+                    out_cpu = tgt[out_key].cpu()
+                    b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
+                    f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
+                    desired = (f - b) @ q
+                    upstream = out_cpu - ref[out_key].cpu()
+                    upstream_sq += float((upstream.double() ** 2).sum().item())
+                    x_batches.append(tgt[in_key].cpu())
+                    e_batches.append(desired - upstream)
+                    t0_batches.append(out_cpu)
+
+            local_block = deepcopy(shim.block_module(shim.blocks(target_model)[pos])).to(device).eval()
+            position_corrections, block_rows = _backfit_one_block(
+                shim,
+                local_block,
+                x_batches,
+                e_batches,
+                t0_batches,
+                pos,
+                source_coordinates[pos],
+                components,
+                current_state,
+                config,
+                device,
+            )
+            del local_block, x_batches, e_batches, t0_batches
+            target_corrections.update(position_corrections)
+            for name, delta in position_corrections.items():
+                current_state[name] = current_state[name] + delta.to(current_state[name])
+            for row in block_rows:
+                row["source_position"] = row.pop("source_coordinate")
+                row["procrustes_source"] = prepared.get("procrustes_source", "activation")
+                row["depth_fit"] = "sequential"
+                row["upstream_effect_norm"] = upstream_sq**0.5
+                diagnostics.append(row)
             target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)
     finally:
         target_model.load_state_dict(original_state, strict=True)

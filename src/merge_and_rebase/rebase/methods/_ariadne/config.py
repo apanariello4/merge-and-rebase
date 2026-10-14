@@ -480,7 +480,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     if cfg.activation_storage == "streaming":
         if cfg.component_target != "block_boundary":
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
-        if cfg.block_split != "none":
+        if cfg.block_split != "none" and not (cfg.block_split == "backfit" and cfg.depth_fit == "sequential"):
             raise ValueError("activation_storage='streaming' requires block_split='none'")
     if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix"}:
         raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet' or 'vision8_mix'")
@@ -548,15 +548,33 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "fidelity_holdout": False,
             "realization_diagnostics": False,
         }
+        # Opt-in: intra-block Gauss-Seidel backfit of attn.out_proj + mlp.c_proj inside the sequential depth loop
+        # (vision only; the shared full E_j target rules out any pair/two-point target split).
+        seq_backfit = cfg.block_split == "backfit"
+        if seq_backfit:
+            required = {
+                **required,
+                "block_split": "backfit",
+                "sequential_points": "single",
+                "pair_target_split": "none",
+                "component_fit": "closed_form",
+            }
         bad = {name: getattr(cfg, name) for name, want in required.items() if getattr(cfg, name) != want}
         two_points = cfg.sequential_points != "single"
-        if two_points:
+        if seq_backfit:
+            if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
+                bad["components"] = components
+        elif two_points:
             if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
                 bad["components"] = components
         elif len(components) != 1:
             bad["components"] = components
         if bad:
-            what = "exactly the components attn.out_proj and mlp.c_proj" if two_points else "exactly one component"
+            what = (
+                "exactly the components attn.out_proj and mlp.c_proj"
+                if two_points or seq_backfit
+                else "exactly one component"
+            )
             raise ValueError(f"depth_fit='sequential' requires {required} and {what}; got incompatible {bad}")
         if two_points:
             if cfg.sequential_impl != "reference":
