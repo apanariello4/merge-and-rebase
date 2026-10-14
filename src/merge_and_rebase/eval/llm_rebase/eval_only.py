@@ -124,6 +124,7 @@ def main() -> None:
             model_kind=str(cfg.get("model_kind", "causal_lm")),
             trust_remote_code=bool(cfg.get("trust_remote_code", False)),
             use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+            chat_template_from=cfg.get("chat_template_from", None),
         )
         print(f"Model: {model_name}")
         llm = TextLM.build(build_cfg)

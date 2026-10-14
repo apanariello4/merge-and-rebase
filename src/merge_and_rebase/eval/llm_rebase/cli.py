@@ -227,6 +227,7 @@ def main() -> None:
             num_labels=num_labels,
             trust_remote_code=bool(cfg.get("trust_remote_code", False)),
             use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+            chat_template_from=cfg.get("chat_template_from", None),
         )
         target_build_cfg = TextBuildConfig(
             model_name_or_path=str(target_model_name),
@@ -237,6 +238,7 @@ def main() -> None:
             num_labels=num_labels,
             trust_remote_code=bool(cfg.get("trust_remote_code", False)),
             use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+            chat_template_from=cfg.get("chat_template_from", None),
         )
 
         run_logger = start_run(
