@@ -338,13 +338,13 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise TypeError("exact_form must be bool")
     if not isinstance(cfg.copy_shape_matching_source_deltas, bool):
         raise TypeError("copy_shape_matching_source_deltas must be bool")
-    if cfg.component_target in {"output_local", "output_total"}:
+    if cfg.component_target == "output_local":
         raise ValueError(
-            f"component_target={cfg.component_target!r} was retired (closed dead end) in the release "
-            "cleanup; only 'block_boundary' is supported"
+            "component_target='output_local' was retired (closed dead end) in the release "
+            "cleanup; only 'block_boundary' and the opt-in 'output_total' are supported"
         )
-    if cfg.component_target != "block_boundary":
-        raise ValueError("component_target must be 'block_boundary'")
+    if cfg.component_target not in {"block_boundary", "output_total"}:
+        raise ValueError("component_target must be 'block_boundary' or 'output_total'")
     if not isinstance(cfg.realization_diagnostics, bool):
         raise TypeError("realization_diagnostics must be bool")
     components = cfg.components
@@ -478,7 +478,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         if cfg.streaming_position_chunk <= 0:
             raise ValueError("streaming_position_chunk must be None or a positive integer")
     if cfg.activation_storage == "streaming":
-        if cfg.component_target != "block_boundary":
+        if cfg.component_target not in {"block_boundary", "output_total"}:
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
         if cfg.block_split != "none" and not (cfg.block_split == "backfit" and cfg.depth_fit == "sequential"):
             raise ValueError("activation_storage='streaming' requires block_split='none'")
@@ -567,7 +567,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         elif two_points:
             if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
                 bad["components"] = components
-        elif len(components) != 1:
+        elif len(components) != 1 and cfg.component_target != "output_total":
             bad["components"] = components
         if bad:
             what = (
@@ -591,6 +591,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
                 if bad:
                     raise ValueError(f"sequential_points='mid_end' requires {need}; got incompatible {bad}")
     _validate_component_ablations(cfg, components)
+    _validate_output_total(cfg, components)
     return cfg
 
 
@@ -722,6 +723,44 @@ def _validate_component_ablations(cfg: DirectResidualConfig, components: tuple[s
             raise ValueError(f"fit_blocks requires {need}; got incompatible {bad}")
 
 
+def _validate_output_total(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of the opt-in ``component_target='output_total'`` (vision only, streaming; see ``output_total.py``)."""
+    if cfg.component_target != "output_total":
+        return
+    need = {
+        "activation_storage": "streaming",
+        "block_split": "none",
+        "component_fit": "closed_form",
+        "procrustes_source": "activation",
+        "alignment_map": "polar",
+        "alignment_row_weighting": "uniform",
+        "tv_scaling": "none",
+        "residual_target": "transported_delta",
+        "endpoint_construction": "native_delta",
+        "merge_mode": "per_task_then_merge",
+        "depth_pairing": "relative",
+        "sequential_impl": "reference",
+        "sequential_points": "single",
+        "pair_target_split": "none",
+        "fit_blocks": None,
+        "v_fit": None,
+        "procrustes_rank": None,
+        "procrustes_energy": None,
+        "exclude_first_token": False,
+        "realization_diagnostics": False,
+        "fidelity_holdout": False,
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if not set(components) <= set(COMPONENT_FORWARD_ORDER):
+        bad["components"] = components
+    if bad:
+        raise ValueError(
+            "component_target='output_total' (restored as an opt-in ablation after being retired; per-layer target in "
+            f"the projection-output space, components within {list(COMPONENT_FORWARD_ORDER)}, "
+            f"depth_fit independent or sequential) requires {need}; got incompatible {bad}"
+        )
+
+
 def resolve_fit_blocks(config: DirectResidualConfig, depth: int) -> list[int]:
     """Target blocks a fit covers: ``config.fit_blocks`` (range-checked against ``depth``) or every block."""
     if config.fit_blocks is None:
@@ -786,6 +825,9 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
         raise NotImplementedError("residual_target=native_oracle is vision-only")
     if cfg.component_fit != "closed_form":
         raise NotImplementedError("component_fit=gradient is vision-only")
+    if cfg.component_target == "output_total":
+        # A decoder port is a layout entry (layouts.COMPONENT_OUTPUT_KIND) plus the decoder projections.
+        raise NotImplementedError("component_target='output_total' is vision-only")
     if cfg.v_fit is not None:
         # GQA later: stack the Z_h rows of the query heads that share a key/value head.
         raise NotImplementedError("v_fit='preimage' is vision-only")

@@ -62,6 +62,11 @@ from ._ariadne.fit import (
     fit_sequential_source_endpoints,
 )
 from ._ariadne.gradient_fit import fit_direct_residual_gradient_streaming
+from ._ariadne.output_total import (
+    fit_output_total_independent_streaming,
+    fit_output_total_sequential_streaming,
+    prepare_output_total_streaming,
+)
 from ._ariadne.sequential_carry import fit_direct_residual_sequential_block_carry
 from ._ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
@@ -144,6 +149,12 @@ def _fit_body(
     ``config.activation_storage`` selects the resident path (full per-batch banks) or the streaming path
     (O(1)-in-``num_batches`` host RAM); ``realization_diagnostics`` is supported under both.
     """
+    output_total = config.component_target == "output_total"
+    if output_total:
+        if family_adapter is not None:
+            raise NotImplementedError("component_target='output_total' is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("component_target='output_total' needs activation_storage='streaming'")
     if config.v_fit is not None:
         if family_adapter is not None:
             # GQA later: stack the Z_h rows of the query heads that share a key/value head.
@@ -216,7 +227,21 @@ def _fit_body(
             device=device,
             text_features=target_text_features,
         )
-    if streaming:
+    if streaming and output_total:
+        # Per-layer target in the projection-output space: Q_j^c from component outputs (no block-boundary Q).
+        prepared = prepare_output_total_streaming(
+            source_base_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+            components=config.components,
+            family_adapter=family_adapter,
+        )
+    elif streaming:
         prepared = prepare_direct_residual_streaming(
             source_base_model,
             target_model,
@@ -307,7 +332,7 @@ def _fit_body(
                 family_adapter=family_adapter,
             ).items():
                 procrustes_diagnostics[j]["activation_gradient_delta_disagreement"] = value
-        if config.procrustes_source == "activation":
+        if config.procrustes_source == "activation" and not output_total:
             if streaming:
                 alignment_diagnostics = compute_alignment_diagnostics_streaming(
                     source_base_model,
@@ -342,7 +367,13 @@ def _fit_body(
             family_adapter=family_adapter,
         )
     elif streaming:
-        if config.component_fit != "closed_form":
+        if output_total:
+            fit_streaming = (
+                fit_output_total_sequential_streaming
+                if config.depth_fit == "sequential"
+                else fit_output_total_independent_streaming
+            )
+        elif config.component_fit != "closed_form":
             fit_streaming = fit_direct_residual_gradient_streaming
         elif config.v_fit is not None:
             fit_streaming = fit_direct_residual_vfit_streaming

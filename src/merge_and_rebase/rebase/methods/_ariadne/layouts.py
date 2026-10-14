@@ -197,6 +197,16 @@ COMPONENT_INPUT_KIND = {
 }
 
 
+#: Which capture kind supplies each residual-writing projection's own OUTPUT (before LayerScale and the residual add):
+#: the output of ``mlp.c_proj``, and of ``attn.out_proj`` (read from the attention module's output for a stock
+#: nn.MultiheadAttention, which applies out_proj functionally). Used by ``component_target='output_total'``; a decoder
+#: port is an entry in this table plus its layout.
+COMPONENT_OUTPUT_KIND = {
+    "attn.out_proj": "attn_proj",
+    "mlp.c_proj": "c_proj",
+}
+
+
 #: Row index of each packed-QKV component within nn.MultiheadAttention's
 #: in_proj_weight [3d,d] / in_proj_bias [3d] (F._in_projection_packed's
 #: convention: w_q, w_k, w_v stacked along dim 0).
