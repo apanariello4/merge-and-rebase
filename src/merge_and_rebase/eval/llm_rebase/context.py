@@ -434,6 +434,7 @@ def build_runtime(
             ("system_instruction", cfg.get("harness_system_instruction", None)),
             ("dump_generations_dir", cfg.get("harness_dump_generations_dir", None)),
             ("decoding", cfg.get("harness_decoding", None)),
+            ("confirm_run_unsafe_code", bool(cfg.get("harness_confirm_run_unsafe_code", False))),
         )
         if v
     }

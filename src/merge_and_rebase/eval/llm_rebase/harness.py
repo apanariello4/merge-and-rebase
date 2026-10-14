@@ -226,6 +226,7 @@ def run(
     system_instruction: str | None = None,
     dump_generations_dir: str | None = None,
     decoding: str = "model",
+    confirm_run_unsafe_code: bool = False,
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -254,6 +255,9 @@ def run(
     decoding : "model" (default, historical): the checkpoint's generation_config is merged into lm-eval's
         generate calls. "task": a neutral config (see ``task_decoding_config``) replaces it for the duration of
         the evaluation, so the same weights decode identically whatever model object carries them.
+    confirm_run_unsafe_code : Opt-in. Lets lm-eval execute model-generated code, which tasks marked ``unsafe_code``
+        (humaneval, mbpp) require to score; they raise without it. Their metric also needs ``HF_ALLOW_CODE_EVAL=1``
+        in the environment.
 
     Returns
     -------
@@ -313,6 +317,8 @@ def run(
                 )
             if dump_generations_dir:
                 extra["log_samples"] = True
+            if confirm_run_unsafe_code:
+                extra["confirm_run_unsafe_code"] = True
             try:
                 results = simple_evaluate(
                     model="hf",
