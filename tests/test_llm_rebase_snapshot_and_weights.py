@@ -29,7 +29,7 @@ def test_runtime_snapshots_survive_model_updates(tmp_path, monkeypatch, base_che
     def check_build(*args, **kwargs):
         rt = build(*args, **kwargs)
         for model, snapshot in (
-            (rt.source_llm.model, rt.source_base_sd), (rt.target_llm.model, rt.target_base_sd)
+            (rt.models.source_llm.model, rt.models.source_base_sd), (rt.models.target_llm.model, rt.models.target_base_sd)
         ):
             before = hash_tensor_dict(snapshot)
             original = {k: v.clone() for k, v in model.state_dict().items()}

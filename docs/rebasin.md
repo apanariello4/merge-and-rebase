@@ -76,3 +76,26 @@ not set any BRACE key. Configs from before the release that relied on the old de
 
 Example configs: `configs/examples/`. Every accepted key, annotated with its role, default and status (main /
 ablation / diagnostic / legacy), per method and modality: `configs/examples/reference/` (see its `README.md`).
+
+## LLM search and held-out evaluation
+
+LLM rebase supports sequential and Sobol searches over alpha. Run each set of transport method parameters as a
+separate experiment; `hyperparam_search.method_params` is rejected before loading models.
+
+To score an independent test slice after choosing alpha, configure both `harness_samples` (the search documents)
+and `harness_test_samples`, with a non-empty list of unique document indices for every harness task. The lists must
+be disjoint. An omitted search slice means unrestricted evaluation, so it cannot establish a held-out test set.
+When calibration comes from those harness tasks, both selections must be subsets of the remaining calibration
+holdout. You can partition that holdout explicitly; documents used for calibration are refused in either selection.
+
+```json
+{
+  "harness_tasks": ["ifeval"],
+  "calibration_prompts": ["An independent calibration prompt."],
+  "harness_samples": {"ifeval": [0, 1, 2]},
+  "harness_test_samples": {"ifeval": [3, 4]}
+}
+```
+
+Task-vector labels must also be unique; repeated labels are rejected before model loading rather than overwriting
+an earlier checkpoint.

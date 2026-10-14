@@ -12,6 +12,9 @@ uv pip install -e ".[data,dev]"
 
 Install only the package with `uv pip install -e .`. The `data` extra adds Hugging Face dataset and Hub support; `dev` adds test and lint tooling.
 
+`lm-eval` is included in the base installation for LLM evaluation. Add the `harness` extra for the additional
+IFEval and mathematical-task graders: `uv pip install -e ".[data,dev,harness]"`.
+
 ## Repository Layout
 
 - `configs/`: runnable evaluation and rebasin configurations.

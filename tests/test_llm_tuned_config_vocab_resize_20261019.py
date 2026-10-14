@@ -29,11 +29,13 @@ def _resized_tuned(tmp_path, base, extra=8):
 def _env(base, ctx):
     runtime = SimpleNamespace(
         task_contexts={"a": ctx},
-        source_llm=SimpleNamespace(model=base),
-        target_llm=SimpleNamespace(model=base),
-        source_base_sd={k: v.detach().clone() for k, v in base.state_dict().items()},
-        source_build_cfg=TextBuildConfig(model_name_or_path="unused", device="cpu", dtype="fp32"),
-        load_tuned=load_aligned_tuned_from_ref,
+        models=SimpleNamespace(
+            source_llm=SimpleNamespace(model=base),
+            target_llm=SimpleNamespace(model=base),
+            source_base_sd={k: v.detach().clone() for k, v in base.state_dict().items()},
+            source_build_cfg=TextBuildConfig(model_name_or_path="unused", device="cpu", dtype="fp32"),
+            load_tuned=load_aligned_tuned_from_ref,
+        ),
     )
     return SimpleNamespace(
         plan=SimpleNamespace(task_block_extension_prestep=False, task_discrete_layer_match_prestep=False),
@@ -90,7 +92,7 @@ def test_offload_source_original_gives_identical_copies(tmp_path):
     for flag in (False, True):
         env = _env(base, LlmTaskContext(ckpt_ref=ref, index=0, config_overrides=overrides))
         env.runtime.cfg = {"offload_source_original": flag}
-        env.runtime.device = "cpu"
+        env.runtime.models.device = "cpu"
         models = build_task_models(env, "a")
         out[flag] = (models.source_base.state_dict(), models.source_ft.state_dict())
     for i in (0, 1):

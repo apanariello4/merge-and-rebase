@@ -175,22 +175,22 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     # the target do not fit (gemma-2-9b -> 2b, job 61488501).
     offload = bool((getattr(rt, "cfg", None) or {}).get("offload_source_original", False))
     if offload:
-        rt.source_llm.model.to("cpu")
+        rt.models.source_llm.model.to("cpu")
     # Each task starts from an immutable source template, then its
     # own copy is resized to the target depth before transport.
     # Keep that depth-matched source model alive below.
-    source_base_model_task = deepcopy(rt.source_llm.model)
+    source_base_model_task = deepcopy(rt.models.source_llm.model)
     overrides = rt.task_contexts[task].config_overrides
     # Equal configs: the source deepcopy carrying the tuned weights is exactly the fine-tuned model. Otherwise the
     # tuned weights would run under the source's RoPE / window geometry, so build it from the tuned ref's own config.
-    source_ft_model_task = None if overrides else deepcopy(rt.source_llm.model)
+    source_ft_model_task = None if overrides else deepcopy(rt.models.source_llm.model)
 
     # Load tuned checkpoint into ft model
-    aligned = rt.load_tuned(
+    aligned = rt.models.load_tuned(
         ckpt_ref=ckpt_ref,
-        base_sd=rt.source_base_sd,
-        build_cfg=rt.source_build_cfg,
-        model=source_ft_model_task if source_ft_model_task is not None else rt.source_llm.model,
+        base_sd=rt.models.source_base_sd,
+        build_cfg=rt.models.source_build_cfg,
+        model=source_ft_model_task if source_ft_model_task is not None else rt.models.source_llm.model,
         prefer_lora_view=False,
     )
     tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
@@ -198,17 +198,17 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
         print(f"  '{task}': fine-tuned forward model built from the tuned ref's own config ({changed})")
         source_ft_model_task = build_model_with_tuned_config(
-            str(ckpt_ref), rt.source_build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in rt.source_base_sd.items()}
+            str(ckpt_ref), rt.models.source_build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in rt.models.source_base_sd.items()}
         )
     else:
         load_into_model(source_ft_model_task, tuned_sd, strict=False)
     if offload:
-        source_base_model_task.to(rt.device)
-        source_ft_model_task.to(rt.device)
+        source_base_model_task.to(rt.models.device)
+        source_ft_model_task.to(rt.models.device)
     rt.task_contexts[task].forward_geometry = {
         "source_base": model_geometry(source_base_model_task),
         "source_ft": model_geometry(source_ft_model_task),
-        "target": model_geometry(rt.target_llm.model),
+        "target": model_geometry(rt.models.target_llm.model),
     }
     return TaskModels(source_base=source_base_model_task, source_ft=source_ft_model_task)
 
@@ -220,20 +220,20 @@ class BracePrestep:
 
     def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
         rt = env.runtime
-        family_adapter_for_ext = rt.target_family or rt.source_family
+        family_adapter_for_ext = rt.models.target_family or rt.models.source_family
         if family_adapter_for_ext is None:
             raise ValueError("Block extension requires a family adapter but none was inferred.")
 
         prepared_task = _prepare_resized_task_delta(
             source_base_model=models.source_base,
             source_ft_model=models.source_ft,
-            calibration_loader=rt.blockext_calib_loader,
-            target_layers_total=int(rt.target_depth),
-            config=rt.block_extension_cfg,
+            calibration_loader=rt.calibration.blockext_loader,
+            target_layers_total=int(rt.plan.target_depth),
+            config=rt.resolved.block_extension_cfg,
             family_adapter=family_adapter_for_ext,
-            device=rt.device,
+            device=rt.models.device,
         )
-        print(f"  block extension completed (source_depth={rt.source_depth} -> {rt.target_depth})")
+        print(f"  block extension completed (source_depth={rt.plan.source_depth} -> {rt.plan.target_depth})")
         # The resized ft model has already been absorbed into the delta; drop it before the observers run so it is
         # not holding device memory while lm-harness runs.
         models.source_ft = None
@@ -243,7 +243,7 @@ class BracePrestep:
             task_delta=prepared_task.delta,
             source_base_model=prepared_task.source_model,
             layout=prepared_task.extension_layout or {},
-            final_depth=int(rt.target_depth),
+            final_depth=int(rt.plan.target_depth),
             transport_keys=prepared_task.transport_keys,
             uncorrected_delta=prepared_task.uncorrected_delta,
         )
@@ -259,13 +259,13 @@ class NoPrestep:
 
     def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
         rt = env.runtime
-        source_llm = rt.source_llm
-        source_base_sd = rt.source_base_sd
-        full_fp_keys = rt.full_fp_keys
-        aligned = rt.load_tuned(
+        source_llm = rt.models.source_llm
+        source_base_sd = rt.models.source_base_sd
+        full_fp_keys = rt.models.full_fp_keys
+        aligned = rt.models.load_tuned(
             ckpt_ref=task.ctx.ckpt_ref,
             base_sd=source_base_sd,
-            build_cfg=rt.source_build_cfg,
+            build_cfg=rt.models.source_build_cfg,
             model=source_llm.model,
             prefer_lora_view=False,
         )
@@ -291,7 +291,7 @@ class NoPrestep:
             # Ariadne gets the native per-task pair from build_task_models; transport uses the shared source model.
             source_base_model=models.source_base if models is not None else source_llm.model,
             source_ft_model=models.source_ft if models is not None else None,
-            transport_keys=set(rt.tp_keys or ()),
+            transport_keys=set(rt.models.tp_keys or ()),
         )
 
     def load_delta(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> PrestepResult:
@@ -309,8 +309,8 @@ class ExtendedSourceBaseObserver:
 
     def after(self, env: StageEnv, task: TaskInputs, models: TaskModels | None, result: PrestepResult) -> None:
         rt = env.runtime
-        if rt.run_before_rebase_eval:
-            rt._eval_before_rebase(models.source_base, f"extended_source_base:{task.task}")
+        if rt.evaluation.run_before_rebase_eval:
+            rt.evaluation.evaluate_before_rebase(rt.models, models.source_base, f"extended_source_base:{task.task}")
         models.source_base.to("cpu")
 
 
@@ -325,10 +325,10 @@ class DiscreteIndexPrestep:
 
     def run(self, env: StageEnv, task: TaskInputs, models: TaskModels | None) -> PrestepResult:
         rt = env.runtime
-        family_adapter = rt.target_family or rt.source_family
+        family_adapter = rt.models.target_family or rt.models.source_family
         if family_adapter is None:
             raise ValueError("Discrete index match requires a family adapter but none was inferred.")
-        pairing = DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth))
+        pairing = DiscreteLayerPairing.compute(int(rt.plan.source_depth), int(rt.plan.target_depth))
         base = build_discrete_indexed_decoder(models.source_base, pairing, family_adapter)
         ft = build_discrete_indexed_decoder(models.source_ft, pairing, family_adapter)
         models.source_ft = None
@@ -336,14 +336,14 @@ class DiscreteIndexPrestep:
         ft_sd = to_cpu_fp32(ft.state_dict())
         del ft
         delta = TaskVector.from_checkpoints(base_sd, ft_sd, strict=False).delta
-        print(f"  discrete index match (source_depth={rt.source_depth} -> {rt.target_depth}): {list(pairing.pairing)}")
+        print(f"  discrete index match (source_depth={rt.plan.source_depth} -> {rt.plan.target_depth}): {list(pairing.pairing)}")
         return PrestepResult(
             kind=self.kind,
             source_base_sd=base_sd,
             task_delta=delta,
             source_base_model=base,
             layout={"pairing": list(pairing.pairing)},
-            final_depth=int(rt.target_depth),
+            final_depth=int(rt.plan.target_depth),
             transport_keys=set(family_adapter.transportable_keys(base_sd)),
         )
 

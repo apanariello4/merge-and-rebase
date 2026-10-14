@@ -943,11 +943,11 @@ def stage_generate(cfg: dict[str, Any], device: str, config_bytes: bytes, config
     native_name = str(cfg.get("native_model_name_or_path", "Qwen/Qwen2.5-1.5B-Instruct"))
     native = TextLM.build(sink["build_cfg"](native_name))
     toks = check_tokenizers(
-        {"source": rt.source_llm.tokenizer, "target": rt.target_llm.tokenizer, "native": native.tokenizer}, texts
+        {"source": rt.models.source_llm.tokenizer, "target": rt.models.target_llm.tokenizer, "native": native.tokenizer}, texts
     )
-    tok = rt.target_llm.tokenizer
+    tok = rt.models.target_llm.tokenizer
     prompt_ids = [tok.encode(t, add_special_tokens=False) for t in texts]
-    hashes_before = {"native": _state_sha(native.model), "target": _state_sha(rt.target_llm.model)}
+    hashes_before = {"native": _state_sha(native.model), "target": _state_sha(rt.models.target_llm.model)}
     eos = native.model.generation_config.eos_token_id
     eos_ids = [int(eos)] if isinstance(eos, int) else [int(e) for e in eos]
     pad_id = int(tok.pad_token_id if tok.pad_token_id is not None else eos_ids[0])
@@ -960,7 +960,7 @@ def stage_generate(cfg: dict[str, Any], device: str, config_bytes: bytes, config
         batch_size=int(cfg.get("batch_size", 4)),
         device=device,
     )
-    hashes_after = {"native": _state_sha(native.model), "target": _state_sha(rt.target_llm.model)}
+    hashes_after = {"native": _state_sha(native.model), "target": _state_sha(rt.models.target_llm.model)}
     lines = []
     for d, p, r in zip(docs, prompt_ids, responses, strict=True):
         lines.append(
@@ -1054,10 +1054,10 @@ def stage_measure(cfg: dict[str, Any], device: str, config_bytes: bytes, config_
     native_name = str(cfg.get("native_model_name_or_path", "Qwen/Qwen2.5-1.5B-Instruct"))
     native = TextLM.build(sink["build_cfg"](native_name))
     toks = check_tokenizers(
-        {"source": rt.source_llm.tokenizer, "target": rt.target_llm.tokenizer, "native": native.tokenizer},
+        {"source": rt.models.source_llm.tokenizer, "target": rt.models.target_llm.tokenizer, "native": native.tokenizer},
         [r["prompt_text"] for r in responses],
     )
-    if [rt.target_llm.tokenizer.encode(r["prompt_text"], add_special_tokens=False) for r in responses] != [
+    if [rt.models.target_llm.tokenizer.encode(r["prompt_text"], add_special_tokens=False) for r in responses] != [
         r["prompt_ids"] for r in responses
     ]:
         raise ValueError("stored prompt ids differ from the target tokenizer's")
@@ -1119,7 +1119,7 @@ def stage_measure(cfg: dict[str, Any], device: str, config_bytes: bytes, config_
         q=q,
         target_base_state=inp.target_base_state,
         updates=updates,
-        pad_id=int(rt.target_llm.tokenizer.pad_token_id or 0),
+        pad_id=int(rt.models.target_llm.tokenizer.pad_token_id or 0),
     )
     hashes_before = model_hashes(setup)
     if torch.cuda.is_available():

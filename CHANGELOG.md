@@ -36,6 +36,12 @@ unless a change below says otherwise.
   `materialized_bias_keys` (LLM Ariadne).
 
 ### Behaviour changes (declared)
+- LLM rebase rejects method-parameter search dimensions instead of silently reusing one transported model. Alpha
+  search remains supported. Duplicate task labels and configuration-only errors fail before model loading.
+- LLM held-out test evaluation requires explicit, disjoint search/test indices for every requested task. Both slices
+  must lie outside harness-derived calibration data; explicit subsets of the calibration holdout are accepted.
+- Per-task prepared transport maps are released before the next task builds its model pair. The LLM runtime now
+  groups typed model, calibration and evaluation state, with separate validation/loading/calibration stages.
 - LLM source/target base snapshots now own their CPU fp32 storage: alpha-search candidates and saved checkpoints
   are computed from the original base instead of accumulating earlier candidates. LLM weight lists must match
   the number of tuned checkpoints; scalar weights still broadcast. Local experiment: `artifacts/llm_rebase_fix_comparison/`.

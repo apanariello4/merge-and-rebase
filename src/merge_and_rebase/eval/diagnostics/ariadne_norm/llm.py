@@ -139,7 +139,7 @@ def _heldout_docs(rt: Any) -> list[dict[str, Any]]:
 
     from merge_and_rebase.data.llm_calibration import _task_docs
 
-    eval_samples = rt._calibration().eval_samples
+    eval_samples = rt.calibration.cache.get().eval_samples
     if len(eval_samples) != 1:
         raise ValueError(f"expected exactly one held-out harness task, got {sorted(eval_samples)}")
     ((task_name, indices),) = eval_samples.items()
@@ -234,7 +234,7 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
         raise ValueError(f"expected ridge_estimator='empirical_bayes', got {config.ridge_estimator!r}")
     if _ariadne_params(run_cfg).get("seed", config.seed) != config.seed:
         raise ValueError("resolved Ariadne seed differs from ariadne_params.seed")
-    family_adapter = rt.family_adapter
+    family_adapter = rt.models.family_adapter
     layout = _layout_for(family_adapter)
 
     env = StageEnv(
@@ -242,8 +242,8 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
         plan=rt.plan,
         cfg=run_cfg,
         device=device,
-        source_base_sd=rt.source_base_sd,
-        target_base_sd=rt.target_base_sd,
+        source_base_sd=rt.models.source_base_sd,
+        target_base_sd=rt.models.target_base_sd,
         run_logger=None,
         runtime=rt,
     )
@@ -265,7 +265,7 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
             run_cfg=run_cfg,
             ref_summary=ref_summary,
             build_cfg=_build_cfg,
-            eval_samples=rt._calibration().eval_samples,
+            eval_samples=rt.calibration.cache.get().eval_samples,
             heldout_docs=_heldout_docs(rt),
         )
         if context_only:
@@ -276,18 +276,18 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
     if config.missing_bias == "materialize":
         materialized = list(
             materialize_missing_projection_biases(
-                rt.target_llm.model, rt.target_base_sd, family_adapter=family_adapter, components=config.components
+                rt.models.target_llm.model, rt.models.target_base_sd, family_adapter=family_adapter, components=config.components
             )
         )
-    texts = rt._calibration().texts
+    texts = rt.calibration.cache.get().texts
     source_loader = build_text_calibration_loader(
-        tokenizer=rt.source_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size, max_length=rt.calib_max_length
+        tokenizer=rt.models.source_llm.tokenizer, texts=texts, batch_size=rt.calibration.batch_size, max_length=rt.calibration.max_length
     )
     target_loader = build_text_calibration_loader(
-        tokenizer=rt.target_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size, max_length=rt.calib_max_length
+        tokenizer=rt.models.target_llm.tokenizer, texts=texts, batch_size=rt.calibration.batch_size, max_length=rt.calibration.max_length
     )
     pairing = apply_depth_pairing_override(
-        DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth)), config.depth_pairing
+        DiscreteLayerPairing.compute(int(rt.plan.source_depth), int(rt.plan.target_depth)), config.depth_pairing
     )
 
     def component_key(j: int) -> str:
@@ -296,7 +296,7 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
     source_component_key = component_key  # the same decoder layout/adapter names both models' blocks
 
     # -- calibration provenance: recomputed corpus against the reference summary's ---------------------------------
-    ours = rt._calibration().provenance()
+    ours = rt.calibration.cache.get().provenance()
     ref_cal = ref_summary.get("calibration_provenance") or {}
     cal_compare = {
         k: {"reference": ref_cal.get(k), "recomputed": ours.get(k), "match": ref_cal.get(k) == ours.get(k)}
@@ -307,14 +307,14 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
     n_generic = int(cfg.get("generic_num_batches", 25))
     generic_texts, generic_prov = _generic_texts(
         str(cfg.get("generic_dataset", "hellaswag")),
-        n_generic * int(rt.calib_batch_size),
+        n_generic * int(rt.calibration.batch_size),
         int(cfg.get("generic_seed", 0)),
     )
     generic_loader = build_text_calibration_loader(
-        tokenizer=rt.target_llm.tokenizer,
+        tokenizer=rt.models.target_llm.tokenizer,
         texts=generic_texts,
-        batch_size=rt.calib_batch_size,
-        max_length=rt.calib_max_length,
+        batch_size=rt.calibration.batch_size,
+        max_length=rt.calibration.max_length,
     )
     generic_batches = []
     for batch in generic_loader:
@@ -322,16 +322,16 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
         generic_batches.append(tgt)
     if len(generic_batches) != n_generic:
         raise ValueError(f"built {len(generic_batches)} generic batches, expected {n_generic}")
-    tok = rt.target_llm.tokenizer
+    tok = rt.models.target_llm.tokenizer
     generic_prov["tokenizer"] = {
         "padding_side": tok.padding_side,
         "bos_token": tok.bos_token,
         "pad_token": tok.pad_token,
-        "max_length": int(rt.calib_max_length),
-        "batch_size": int(rt.calib_batch_size),
+        "max_length": int(rt.calibration.max_length),
+        "batch_size": int(rt.calibration.batch_size),
     }
 
-    target_depth = int(rt.target_depth)
+    target_depth = int(rt.plan.target_depth)
     ref_keys = [k for j in range(target_depth) for k in (component_key(j), _bias_key(component_key(j)))]
 
     for task in task_names:
@@ -340,10 +340,10 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
             raise RuntimeError("build_task_models returned None for an Ariadne run")
         source_base_model = models.source_base.to(device)
         source_ft_model = models.source_ft.to(device)
-        rt.target_llm.model.to(device)
+        rt.models.target_llm.model.to(device)
 
         # Lazily, once: the 7.1 GB fp32 merged state is dropped as soon as the 56 tensors are copied out.
-        reference_tv = _load_reference_task_vector(str(cfg["reference_merged_state"]), rt.target_base_sd, ref_keys)
+        reference_tv = _load_reference_task_vector(str(cfg["reference_merged_state"]), rt.models.target_base_sd, ref_keys)
 
         provenance = {
             "reference_summary": ref_summary_path,
@@ -371,8 +371,8 @@ def build_llm_inputs(cfg: dict, device: str, context_sink: dict[str, Any] | None
             pairing=pairing,
             source_base_model=source_base_model,
             source_ft_model=source_ft_model,
-            target_model=rt.target_llm.model,
-            target_base_state=rt.target_base_sd,
+            target_model=rt.models.target_llm.model,
+            target_base_state=rt.models.target_base_sd,
             source_loader=source_loader,
             target_loader=target_loader,
             generic_target_batches=generic_batches,

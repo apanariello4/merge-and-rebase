@@ -75,6 +75,9 @@ Use `hyperparam_search` instead of a fixed alpha for multi-parameter search:
 
 `strategy` is either `sequential` or `sobol`. Sequential search enumerates supplied candidates; Sobol search accepts bounded numeric method parameters plus `num_samples`, `refinement_steps`, and `refine_factor`.
 
+LLM rebase supports alpha search only. It rejects `hyperparam_search.method_params`: changing transport parameters
+requires a separate run, because each parameter configuration needs its own fitted task vector.
+
 ## Post-Merge Block
 
 Add `postmerge` to a vision merge configuration to run adaptation after initial merging.

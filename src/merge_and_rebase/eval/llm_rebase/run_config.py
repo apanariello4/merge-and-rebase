@@ -9,6 +9,7 @@ task list and harness settings stay on ``LlmRuntime``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -29,8 +30,14 @@ from ...rebase.run_config import (
 
 
 def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
-    """Pre-model validation: method lookup, the Ariadne stop and the ``method_params.n_batches`` rename."""
+    """Validate method lookup and supported search settings before model construction."""
     cfg = canonicalize(cfg)
+    search = cfg.get("hyperparam_search")
+    if isinstance(search, Mapping) and search.get("method_params"):
+        raise ValueError(
+            "LLM rebase supports alpha search only; hyperparam_search.method_params is not supported. "
+            "Run a separate transport for each method-parameter configuration."
+        )
     method_name = str(cfg.get("method", "theseus"))
     method = get_method(method_name)
     method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
