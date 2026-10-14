@@ -543,3 +543,16 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   Python 3.14 / PyTorch 2.11 environment. The regression tests independently pin candidate equality, immutable
   snapshots, saved-winner equality and weight validation; reference-environment hash regeneration remains necessary.
 
+### Declared changes — 2026-10-14, LLM validation and typed runtime
+
+- Method-parameter search dimensions and duplicate task labels are refused early. Configuration-only errors now
+  precede model loading: the error-table build counts change from two to zero for the affected cases.
+- Held-out test scoring requires explicit search indices and a disjoint test selection, both outside calibration.
+  The `theseus_holdout_samples_and_test_slice` fixture now partitions its actual calibration holdout; its search
+  samples are `arc_easy=[0], piqa=[3]` and test samples are `arc_easy=[1,2], piqa=[4]`.
+- Same-environment differential captures cover 260 vision/LLM pins. Only that fixture's `resolved_config` and
+  `harness_calls` change, reflecting the corrected selections. All 258 other pins, including numerical summaries
+  and saved checkpoints, are identical. Existing reference-environment numerical pins are not regenerated here.
+- Runtime state is grouped into typed model/calibration/evaluation records. Prepared task maps are released at the
+  end of each task, before constructing the next model pair.
+

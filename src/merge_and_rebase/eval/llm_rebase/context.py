@@ -14,29 +14,30 @@ from ...data.llm_calibration import (
     build_text_calibration_loader as _build_text_calibration_loader,
 )
 from ...data.llm_calibration import resolve_calibration_texts, tokenization_stats
+from ...hyperparam_search import build_search_planner
 from ...io.ckpt import load_ckpt, load_into_model
 from ...io.text_checkpoints import load_aligned_tuned_from_ref
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
+from ...rebase.base import FitMethod, TransportMethod
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
 from ...rebase.capabilities import check_pair, depth_prestep_methods, uses_calibration
 from ...rebase.depth_report import describe_depth_handling
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
+from ...rebase.run_config import ResolvedRunConfig, RunPlan
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
-from .pipeline import LlmRuntime
 from .run_config import bind_llm_plan, resolve_llm_run_config
+from .runtime import CalibrationSettings, LlmCalibration, LlmEvaluation, LlmModels, LlmRuntime
+from .splits import resolve_harness_slices
 from .stages import LlmTaskContext
 
 
 def _owned_cpu_fp32(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Keep base snapshots independent of later loads into a CPU fp32 model."""
     out = to_cpu_fp32(sd)
-    return {
-        key: value.clone() if value.data_ptr() == sd[key].data_ptr() else value
-        for key, value in out.items()
-    }
+    return {key: value.clone() if value.data_ptr() == sd[key].data_ptr() else value for key, value in out.items()}
 
 
 class TextCalibrationCache:
@@ -111,18 +112,124 @@ class TextCalibrationCache:
         return record
 
 
-def build_runtime(
+def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> LlmEvaluation:
+    """Validate task/checkpoint and evaluation settings without loading either model."""
+    eval_before_rebase_only = bool(cfg.get("eval_before_rebase_only", False))
+    harness_tasks_raw = cfg.get("harness_tasks", None)
+    is_harness_only = harness_tasks_raw is not None and cfg.get("tasks") is None and cfg.get("suite") is None
+    harness_tasks_resolved = (
+        parse_csv(harness_tasks_raw) if isinstance(harness_tasks_raw, str) else (harness_tasks_raw or [])
+    )
+    harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
+    harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
+    harness_limit = cfg.get("harness_limit", None)
+
+    # The "before rebase" reference is the SOURCE model exactly as transport
+    # sees it: resized (and LMC-corrected) to the target depth by block
+    # extension, before any task vector is transported. The target base is
+    # not a useful reference here -- block extension never touches it, so
+    # its score says nothing about how much the extension cost us.
+    eval_before_rebase = bool(cfg.get("eval_before_rebase", False)) or eval_before_rebase_only
+    if eval_before_rebase_only and not harness_tasks_resolved:
+        raise ValueError("eval_before_rebase_only needs harness_tasks: there is nothing else to run.")
+    run_before_rebase_eval = eval_before_rebase and bool(harness_tasks_resolved)
+    if eval_before_rebase and not harness_tasks_resolved:
+        print("eval_before_rebase requested but no harness_tasks configured; skipping.")
+    if is_harness_only:
+        tasks = []
+        suite_name = None
+    else:
+        suite_name = resolve_suite_name(cfg.get("suite", None))
+        tasks = resolve_tasks(cfg.get("tasks", None), suite_name=suite_name)
+
+    tuned_bodies_raw = cfg.get("tuned_bodies", None)
+    if not tuned_bodies_raw:
+        raise ValueError("tuned_bodies config is required (dict task->path or list).")
+
+    if isinstance(tuned_bodies_raw, dict):
+        tuned_ref_dict = {str(k).strip().lower(): str(v) for k, v in tuned_bodies_raw.items()}
+        if not is_harness_only:
+            missing = [t for t in tasks if t not in tuned_ref_dict]
+            if missing:
+                raise ValueError(f"tuned_bodies missing task keys: {missing}. Provided: {sorted(tuned_ref_dict)}")
+            tuned_ref_list = [tuned_ref_dict[t] for t in tasks]
+        else:
+            # Harness-only: use first tuned body
+            tuned_ref_list = [next(iter(tuned_ref_dict.values()))]
+    elif isinstance(tuned_bodies_raw, (list, tuple)):
+        tuned_ref_list = [str(x) for x in tuned_bodies_raw]
+    else:
+        raise ValueError("tuned_bodies must be a dict or list.")
+
+    task_heads_path = cfg.get("task_heads", None)
+    eval_mode = resolve_eval_mode(str(cfg.get("eval_mode", "auto")), task_heads_path)
+    head_key_pattern = str(cfg.get("head_key_pattern", "modules_to_save"))
+
+    allow_prompt_eval = bool(cfg.get("allow_prompt_eval", False))
+    if eval_mode == "prompt" and not allow_prompt_eval and not is_harness_only:
+        raise ValueError(
+            "Prompt evaluation is disabled unless explicitly enabled. "
+            "Set --allow-prompt-eval (or config['allow_prompt_eval']=true)."
+        )
+
+    _task_contexts(tasks, tuned_ref_list)
+    return LlmEvaluation(
+        tasks=tasks,
+        tuned_ref_list=tuned_ref_list,
+        suite_name=suite_name,
+        is_harness_only=is_harness_only,
+        harness_tasks=list(harness_tasks_resolved),
+        harness_num_fewshot=harness_num_fewshot,
+        harness_batch_size=harness_batch_size,
+        harness_limit=harness_limit,
+        slices=resolve_harness_slices(cfg, harness_tasks_resolved),
+        run_before_rebase_eval=run_before_rebase_eval,
+        eval_before_rebase_only=eval_before_rebase_only,
+        eval_mode=eval_mode,
+        head_key_pattern=head_key_pattern,
+        task_heads_path=task_heads_path,
+        search_planner=build_search_planner(cfg=cfg, base_method_params=method_params),
+    )
+
+
+def _resolve_calibration_settings(cfg: dict[str, Any]) -> CalibrationSettings:
+    """Validate the calibration inputs independently of model construction."""
+    calibration_prompts_cfg = cfg.get("calibration_prompts", None)
+    if isinstance(calibration_prompts_cfg, str):
+        # Allow pointing at a JSON file shaped {"prompts": [...]}, so a large
+        # domain-specific calibration bank doesn't have to be inlined into
+        # (and duplicated across) every config.
+        calibration_prompts_cfg = load_json(calibration_prompts_cfg).get("prompts", None)
+    if calibration_prompts_cfg is not None and not isinstance(calibration_prompts_cfg, list):
+        raise ValueError(
+            "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one."
+        )
+
+    batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
+    max_length = int(cfg.get("calibration_max_length", 128))
+    if batch_size <= 0 or max_length <= 0:
+        raise ValueError("calibration_batch_size and calibration_max_length must be > 0.")
+    n_sequences = cfg.get("calibration_n_sequences")
+    if n_sequences is not None and int(n_sequences) <= 0:
+        raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
+    return CalibrationSettings(
+        prompts=calibration_prompts_cfg,
+        dataset=cfg.get("calibration_dataset"),
+        n_sequences=int(n_sequences) if n_sequences is not None else None,
+        include_target=bool(cfg.get("calibration_include_target", False)),
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+
+
+def _load_models(
     cfg: dict[str, Any],
-    *,
-    method_name: str,
-    method: Any,
-    method_params: dict[str, Any],
     source_build_cfg: TextBuildConfig,
     target_build_cfg: TextBuildConfig,
     device: str,
     num_labels: int,
-) -> LlmRuntime:
-    """Build both models, resolve block extension / harness / tuned-body / calibration settings (former main body)."""
+    method_name: str,
+) -> LlmModels:
     source_model_name = cfg.get("source_model_name_or_path")
     target_model_name = cfg.get("target_model_name_or_path")
     print(f"Source model: {source_model_name}")
@@ -154,9 +261,36 @@ def build_runtime(
 
     source_family = infer_family(source_llm.model)
     target_family = infer_family(target_llm.model)
-    source_meta = source_family.metadata(source_llm.model) if source_family else None
-    target_meta = target_family.metadata(target_llm.model) if target_family else None
 
+    tp_keys = source_family.transportable_keys(source_base_sd) if source_family else None
+    full_fp_keys = {k for k, v in source_base_sd.items() if default_key_filter(k, v)} if source_family else None
+    return LlmModels(
+        source_llm=source_llm,
+        target_llm=target_llm,
+        source_build_cfg=source_build_cfg,
+        source_base_sd=source_base_sd,
+        target_base_sd=target_base_sd,
+        source_family=source_family,
+        target_family=target_family,
+        device=device,
+        num_labels=num_labels,
+        tp_keys=tp_keys,
+        full_fp_keys=full_fp_keys,
+        load_tuned=load_aligned_tuned_from_ref,
+    )
+
+
+def _resolve_plan(
+    cfg: dict[str, Any],
+    models: LlmModels,
+    method_name: str,
+    method: TransportMethod | FitMethod,
+    method_params: dict[str, Any],
+) -> tuple[ResolvedRunConfig, RunPlan, list[str]]:
+    source_family, target_family = models.source_family, models.target_family
+    source_meta = source_family.metadata(models.source_llm.model) if source_family else None
+    target_meta = target_family.metadata(models.target_llm.model) if target_family else None
+    device = models.device
     # Block extension config
     depth_prestep_method = method_name in depth_prestep_methods("llm")
     if "block_extension_enabled" not in cfg:
@@ -237,279 +371,86 @@ def build_runtime(
                 f"({reason}, source_depth={source_depth}, target_depth={target_depth})."
             )
 
-    harness_tasks_raw = cfg.get("harness_tasks", None)
-    is_harness_only = harness_tasks_raw is not None and cfg.get("tasks") is None and cfg.get("suite") is None
-    harness_tasks_resolved = (
-        parse_csv(harness_tasks_raw)
-        if isinstance(harness_tasks_raw, str)
-        else (harness_tasks_raw or [])
-    )
-    harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
-    harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
-    harness_limit = cfg.get("harness_limit", None)
+    return resolved, plan, ignored_block_extension_fields
 
-    # The "before rebase" reference is the SOURCE model exactly as transport
-    # sees it: resized (and LMC-corrected) to the target depth by block
-    # extension, before any task vector is transported. The target base is
-    # not a useful reference here -- block extension never touches it, so
-    # its score says nothing about how much the extension cost us.
-    eval_before_rebase = bool(cfg.get("eval_before_rebase", False)) or eval_before_rebase_only
-    if eval_before_rebase_only and not harness_tasks_resolved:
-        raise ValueError(
-            "eval_before_rebase_only needs harness_tasks: there is nothing else to run."
-        )
-    run_before_rebase_eval = eval_before_rebase and bool(harness_tasks_resolved)
-    if eval_before_rebase and not harness_tasks_resolved:
-        print("eval_before_rebase requested but no harness_tasks configured; skipping.")
-    baseline_harness_results_by_task: dict[str, dict[str, float]] = {}
 
-    def _baseline_summary() -> dict[str, Any] | None:
-        """Flat for a single task vector, label -> results for several."""
-        if not baseline_harness_results_by_task:
-            return None
-        if len(baseline_harness_results_by_task) == 1:
-            return next(iter(baseline_harness_results_by_task.values()))
-        return dict(baseline_harness_results_by_task)
-
-    def _eval_before_rebase(model: torch.nn.Module, label: str) -> None:
-        from .harness import run as run_harness
-
-        print(f"\nEvaluating source model ({label}) with lm-harness (before rebase)...")
-        results = run_harness(
-            tasks=list(harness_tasks_resolved),
-            model=model,
-            tokenizer=source_llm.tokenizer,
-            device=device,
-            num_fewshot=harness_num_fewshot,
-            batch_size=harness_batch_size,
-            limit=harness_limit,
-            samples=harness_samples,
-        )
-        for task_name, acc in results.items():
-            print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")
-        baseline_harness_results_by_task[label] = results
-
-    if is_harness_only:
-        tasks = []
-        suite_name = None
-    else:
-        suite_name = resolve_suite_name(cfg.get("suite", None))
-        tasks = resolve_tasks(cfg.get("tasks", None), suite_name=suite_name)
-
-    tuned_bodies_raw = cfg.get("tuned_bodies", None)
-    if not tuned_bodies_raw:
-        raise ValueError("tuned_bodies config is required (dict task->path or list).")
-
-    if isinstance(tuned_bodies_raw, dict):
-        tuned_ref_dict = {
-            str(k).strip().lower(): str(v)
-            for k, v in tuned_bodies_raw.items()
-        }
-        if not is_harness_only:
-            missing = [t for t in tasks if t not in tuned_ref_dict]
-            if missing:
-                raise ValueError(
-                    f"tuned_bodies missing task keys: {missing}. "
-                    f"Provided: {sorted(tuned_ref_dict)}"
-                )
-            tuned_ref_list = [tuned_ref_dict[t] for t in tasks]
-        else:
-            # Harness-only: use first tuned body
-            tuned_ref_list = [next(iter(tuned_ref_dict.values()))]
-    elif isinstance(tuned_bodies_raw, (list, tuple)):
-        tuned_ref_list = [str(x) for x in tuned_bodies_raw]
-    else:
-        raise ValueError("tuned_bodies must be a dict or list.")
-
-    task_heads_path = cfg.get("task_heads", None)
-    eval_mode = resolve_eval_mode(
-        str(cfg.get("eval_mode", "auto")), task_heads_path
-    )
-    print(f"Using eval_mode={eval_mode}")
-    head_key_pattern = str(cfg.get("head_key_pattern", "modules_to_save"))
-
-    allow_prompt_eval = bool(cfg.get("allow_prompt_eval", False))
-    if eval_mode == "prompt" and not allow_prompt_eval and not is_harness_only:
-        raise ValueError(
-            "Prompt evaluation is disabled unless explicitly enabled. "
-            "Set --allow-prompt-eval (or config['allow_prompt_eval']=true)."
-        )
-
-    # Compute per-task source deltas
-    print("\nComputing task deltas...")
-
-    tp_keys = None
-    full_fp_keys = None
-    if source_family is not None:
-        tp_keys = source_family.transportable_keys(source_base_sd)
-        full_fp_keys = {
-            k for k, v in source_base_sd.items()
-            if isinstance(v, torch.Tensor) and default_key_filter(k, v)
-        }
-        if tp_keys:
-            print(f"Transportable body keys: {len(tp_keys)} / {len(full_fp_keys)} total FP keys")
-
-    calibration_prompts_cfg = cfg.get("calibration_prompts", None)
-    if isinstance(calibration_prompts_cfg, str):
-        # Allow pointing at a JSON file shaped {"prompts": [...]}, so a large
-        # domain-specific calibration bank doesn't have to be inlined into
-        # (and duplicated across) every config.
-        calibration_prompts_cfg = load_json(calibration_prompts_cfg).get("prompts", None)
-    if calibration_prompts_cfg is not None and not isinstance(calibration_prompts_cfg, list):
-        raise ValueError(
-            "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one."
-        )
-
-    # Calibration text comes from the dataset the run is actually scored
-    # on (or an explicitly configured one), not from a fixed prompt bank:
-    # size the slice to what the run will consume so num_batches is real.
-    calib_batch_size = int(cfg.get("calibration_batch_size", cfg.get("batch_size", 2) or 2))
-    calib_max_length = int(cfg.get("calibration_max_length", 128))
-    # method_params.num_batches is the one calibration-budget knob theseus/bico
-    # read from config (method_params.n_batches is rejected above). Resolve it
-    # once here so it's counted when sizing the corpus and can beat the
-    # _DEFAULT_CALIB_BATCHES default injected at the transport call below.
-    # Vision configs express the calibration budget as
-    # method_params.num_batches, and theseus/bico accept either name
-    # (preferring n_batches). Resolve it once here so a vision-style config
-    # means the same thing on this path: without this, num_batches was
-    # neither counted when sizing the corpus nor able to beat the n_batches
-    # default injected at the transport call, so it silently did nothing.
-    calib_n_batches_cfg = method_params.get("n_batches", method_params.get("num_batches"))
-    calib_n_batches = int(calib_n_batches_cfg) if calib_n_batches_cfg is not None else None
-    # These are two separate budgets over one shared text pool, not one
-    # knob: block extension consumes n_batches_act batches for its
-    # activation capture, theseus/bico consume num_batches for theirs, and
-    # neither is derived from the other. The max only sizes the pool, so
-    # whichever consumer asks for more still finds enough text. Ariadne's
-    # budget is ariadne_params.num_batches: without it here, the pool held
-    # only n_batches_act batches and the fit silently ran on fewer batches
-    # than configured.
-    ariadne_n_batches = int(resolved.ariadne_cfg.num_batches) if resolved.ariadne_cfg is not None else 0
-    n_calib_batches = max(
-        int(block_extension_cfg.n_batches_act),
-        int(calib_n_batches or 0),
-        ariadne_n_batches,
-    )
-    # Opt-in calibration knobs (all default to the historical behaviour):
-    #   calibration_n_sequences      explicit pool size instead of max(batches) * batch_size
-    #   calibration_dataset          explicit HF corpus, decoupled from the evaluated task (no eval hold-out);
-    #                                beats block_extension_params.calibration_dataset
-    #   calibration_include_target   harness source: append the gold target to each rendered prompt
-    calibration_n_sequences_cfg = cfg.get("calibration_n_sequences", None)
-    if calibration_n_sequences_cfg is not None and int(calibration_n_sequences_cfg) <= 0:
-        raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
-    calibration_dataset_cfg = cfg.get("calibration_dataset", None)
-    calibration_include_target = bool(cfg.get("calibration_include_target", False))
-    _calibration_cache = TextCalibrationCache(
-        prompts=calibration_prompts_cfg,
-        calibration_dataset_cfg=calibration_dataset_cfg,
-        block_extension_cfg=block_extension_cfg,
-        harness_tasks=harness_tasks_resolved,
-        n_sequences_cfg=calibration_n_sequences_cfg,
-        n_calib_batches=n_calib_batches,
-        calib_batch_size=calib_batch_size,
-        calib_max_length=calib_max_length,
+def _build_calibration(
+    cfg: dict[str, Any],
+    settings: CalibrationSettings,
+    models: LlmModels,
+    evaluation: LlmEvaluation,
+    resolved: ResolvedRunConfig,
+    plan: RunPlan,
+) -> LlmCalibration:
+    """Bind the calibration budgets and document selections to the loaded model pair."""
+    batch_budget = resolved.method_params.get("num_batches")
+    num_batches = int(batch_budget) if batch_budget is not None else None
+    ariadne_batches = int(resolved.ariadne_cfg.num_batches) if resolved.ariadne_cfg is not None else 0
+    cache = TextCalibrationCache(
+        prompts=settings.prompts,
+        calibration_dataset_cfg=settings.dataset,
+        block_extension_cfg=resolved.block_extension_cfg,
+        harness_tasks=evaluation.harness_tasks,
+        n_sequences_cfg=settings.n_sequences,
+        n_calib_batches=max(int(resolved.block_extension_cfg.n_batches_act), int(num_batches or 0), ariadne_batches),
+        calib_batch_size=settings.batch_size,
+        calib_max_length=settings.max_length,
         seed=int(cfg.get("seed", 0)),
-        include_target=calibration_include_target,
-        tokenizer=source_llm.tokenizer,
+        include_target=settings.include_target,
+        tokenizer=models.source_llm.tokenizer,
     )
-    _calibration = _calibration_cache.get
-    _calibration_provenance = _calibration_cache.provenance
-
-    configured_harness_samples_raw = cfg.get("harness_samples", None)
-    configured_harness_samples: dict[str, list[int]] | None = None
-    if configured_harness_samples_raw is not None:
-        if not isinstance(configured_harness_samples_raw, dict):
-            raise ValueError("config['harness_samples'] must map task names to document-index lists.")
-        configured_harness_samples = {}
-        for task_name, indices in configured_harness_samples_raw.items():
-            if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
-                raise ValueError(
-                    "config['harness_samples'] values must be lists of non-negative document indices."
-                )
-            configured_harness_samples[str(task_name)] = list(indices)
-
-    # Every calibrating method (THESEUS, theseus_gqa, BiCo, Ariadne) must evaluate on the hold-out only;
-    # without it the harness scores the very documents the calibration text came from.
-    needs_calibration = run_block_extension_prestep or uses_calibration(method_name)
-    # The eval slice must be known before the first before-rebase eval, so
-    # resolve up front whenever this run will calibrate at all.
-    calibration_eval_samples = _calibration().eval_samples or None if needs_calibration else None
-    if (
-        configured_harness_samples is not None
-        and calibration_eval_samples is not None
-        and configured_harness_samples != calibration_eval_samples
-    ):
-        raise ValueError(
-            "config['harness_samples'] disagrees with the IFEval hold-out derived from calibration; "
-            "use the derived samples or an independent calibration corpus."
+    needs_calibration = plan.run_block_extension_prestep or uses_calibration(resolved.method_name)
+    holdout = cache.get().eval_samples or None if needs_calibration else None
+    evaluation.slices = resolve_harness_slices(cfg, evaluation.harness_tasks, calibration_holdout=holdout)
+    loader = None
+    if plan.run_block_extension_prestep:
+        loader = _build_text_calibration_loader(
+            tokenizer=models.source_llm.tokenizer,
+            texts=cache.get().texts,
+            batch_size=settings.batch_size,
+            max_length=settings.max_length,
         )
-    harness_samples = configured_harness_samples or calibration_eval_samples
+    return LlmCalibration(cache, settings.batch_size, settings.max_length, num_batches, loader)
 
-    # Block extension: build calibration loader once if needed
-    blockext_calib_loader = None
-    if run_block_extension_prestep:
-        blockext_calib_loader = _build_text_calibration_loader(
-            tokenizer=source_llm.tokenizer,
-            texts=_calibration().texts,
-            batch_size=calib_batch_size,
-            max_length=calib_max_length,
-        )
-    family_adapter = target_family or source_family
+
+def build_runtime(
+    cfg: dict[str, Any],
+    *,
+    method_name: str,
+    method: TransportMethod | FitMethod,
+    method_params: dict[str, Any],
+    source_build_cfg: TextBuildConfig,
+    target_build_cfg: TextBuildConfig,
+    device: str,
+    num_labels: int,
+) -> LlmRuntime:
+    """Validate inputs, load models, resolve geometry, then bind calibration and evaluation."""
+    evaluation = _resolve_evaluation(cfg, method_params)
+    settings = _resolve_calibration_settings(cfg)
+    models = _load_models(cfg, source_build_cfg, target_build_cfg, device, num_labels, method_name)
+    resolved, plan, ignored = _resolve_plan(cfg, models, method_name, method, method_params)
+    print(f"Using eval_mode={evaluation.eval_mode}")
+    print("\nComputing task deltas...")
+    if models.tp_keys:
+        print(f"Transportable body keys: {len(models.tp_keys)} / {len(models.full_fp_keys)} total FP keys")
+    calibration = _build_calibration(cfg, settings, models, evaluation, resolved, plan)
     return LlmRuntime(
         cfg=cfg,
-        method_name=method_name,
-        method=method,
-        method_params=method_params,
-        source_llm=source_llm,
-        target_llm=target_llm,
-        source_build_cfg=source_build_cfg,
-        source_base_sd=source_base_sd,
-        target_base_sd=target_base_sd,
-        source_family=source_family,
-        target_family=target_family,
-        family_adapter=family_adapter,
-        device=device,
-        num_labels=num_labels,
-        block_extension_cfg=block_extension_cfg,
-        run_block_extension_prestep=run_block_extension_prestep,
-        source_depth=source_depth,
-        target_depth=target_depth,
-        tuned_ref_list=tuned_ref_list,
-        tasks=tasks,
-        suite_name=suite_name,
-        is_harness_only=is_harness_only,
-        harness_tasks_resolved=harness_tasks_resolved,
-        harness_num_fewshot=harness_num_fewshot,
-        harness_batch_size=harness_batch_size,
-        harness_limit=harness_limit,
-        harness_samples=harness_samples,
-        run_before_rebase_eval=run_before_rebase_eval,
-        eval_before_rebase_only=eval_before_rebase_only,
-        ignored_block_extension_fields=ignored_block_extension_fields,
-        _calibration=_calibration,
-        _calibration_provenance=_calibration_provenance,
-        calib_batch_size=calib_batch_size,
-        calib_max_length=calib_max_length,
-        calib_n_batches=calib_n_batches,
-        blockext_calib_loader=blockext_calib_loader,
-        tp_keys=tp_keys,
-        full_fp_keys=full_fp_keys,
-        eval_mode=eval_mode,
-        head_key_pattern=head_key_pattern,
-        task_heads_path=task_heads_path,
-        _eval_before_rebase=_eval_before_rebase,
-        _baseline_summary=_baseline_summary,
-        load_tuned=load_aligned_tuned_from_ref,
+        models=models,
+        calibration=calibration,
+        evaluation=evaluation,
         resolved=resolved,
         plan=plan,
-        task_contexts=_task_contexts(tasks, tuned_ref_list),
+        ignored_block_extension_fields=ignored,
+        task_contexts=_task_contexts(evaluation.tasks, evaluation.tuned_ref_list),
     )
 
 
 def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
     """One context per tuned body; with named tasks the two lists must have equal length."""
+    if len(tasks) != len(set(tasks)):
+        duplicates = sorted({task for task in tasks if tasks.count(task) > 1})
+        raise ValueError(f"Task names must be unique; duplicate labels: {duplicates}.")
     if tasks and len(tasks) != len(tuned_ref_list):
         raise ValueError(
             f"{len(tuned_ref_list)} tuned bodies for {len(tasks)} tasks: every tuned body needs exactly one task name"

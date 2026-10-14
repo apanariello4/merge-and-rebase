@@ -6,7 +6,7 @@ dictionary from it (key order is part of the output contract).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ...rebase.block_extension.config import block_extension_protocol
@@ -50,13 +50,6 @@ class RunRecord:
     best_alpha: Any
     best_baseline_alpha: Any
     direct_fit: Any
-    # The independent-endpoint diagnostics are never populated (dead since the endpoint-average baseline moved
-    # into the BRACE stage); the summary keeps the keys.
-    independent_base_dispersion: Any = None
-    independent_base_distance_by_task: Any = field(default_factory=dict)
-    independent_source_merge_param_count: Any = None
-    independent_base_diagnostics_path: Any = None
-    independent_direct_delta_key_count: Any = field(default_factory=dict)
     single_tv_test_accs: Any
     single_tv_alpha_protocol: Any
     direct_residual_calibration_meta: Any
@@ -76,7 +69,6 @@ class RunRecord:
     selected_baseline_alpha_by_task: Any
     direct_residual_cfg: Any
     method_name: Any
-    independent_base_average: Any = None
     baseline_test_accs: Any
     rebase_test_accs: Any
     norm_accs: Any
@@ -200,14 +192,13 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
                 "task_vector_definition": "tau_ind_t = ft_ind_t - base_ind_t",
                 "base_average_definition": "base_ind_avg = mean_t(base_ind_t)",
                 "base_average_key_scope": "common floating-point visual tensors",
-                "n_common_visual_keys": len(record.independent_base_average)
-                if record.independent_base_average is not None
-                else None,
-                "base_dispersion_ind": record.independent_base_dispersion,
-                "per_task_distance_to_mean_base": record.independent_base_distance_by_task,
-                "source_merge_direction_param_count": record.independent_source_merge_param_count,
-                "diagnostics_path": record.independent_base_diagnostics_path,
-                "direct_delta_key_count": record.independent_direct_delta_key_count,
+                # Historical output keys; these diagnostics are no longer produced.
+                "n_common_visual_keys": None,
+                "base_dispersion_ind": None,
+                "per_task_distance_to_mean_base": {},
+                "source_merge_direction_param_count": None,
+                "diagnostics_path": None,
+                "direct_delta_key_count": {},
                 "direct_endpoint_difference_used": record.base_construction == "independent_endpoint_average",
             }
             if record.base_construction == "independent_endpoint_average"

@@ -418,7 +418,10 @@ CASES: dict[str, tuple[dict[str, Any], Callable[[Path], dict[str, Any]]]] = {
 # lm-harness hold-out plumbing (resolver faked: returns eval_samples), harness_test_samples re-scoring
 CASES["theseus_holdout_samples_and_test_slice"] = (
     _SAME,
-    lambda r: {"harness_test_samples": {"arc_easy": [10, 11], "piqa": [12]}, **_SEARCH},
+    lambda r: {
+        "harness_samples": {"arc_easy": [0], "piqa": [3]},
+        "harness_test_samples": {"arc_easy": [1, 2], "piqa": [4]}, **_SEARCH,
+    },
 )
 FAKE_CALIBRATION = {"theseus_holdout_samples_and_test_slice"}
 
@@ -576,7 +579,7 @@ EXPECTED: dict[str, str] = {
     "theseus_gqa_same_depth:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_holdout_samples_and_test_slice:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
     "theseus_holdout_samples_and_test_slice:harness_calls": "e202a4d8e7daade92d194e555600f2971287a8447bcf5ee4f6c7087b828a3bcb",
-    "theseus_holdout_samples_and_test_slice:resolved_config": "25a5c8779c7620667e0261f331ee9346d696524f976d5aee910bb2309b0a7c32",
+    "theseus_holdout_samples_and_test_slice:resolved_config": "d90427c66a974d2dd183835b05619f5677fbb879f5dd2c96969c023458a126fc",
     "theseus_holdout_samples_and_test_slice:summary": "f96e033e339ef9bb1a2cf6ec9238dbcca4b6cf485e98dc7b418e308db20bdc43",
     "theseus_holdout_samples_and_test_slice:tuned_loads": "a1ee106db8d03412d6b1bebfdc71b2419905a4ce536a6254ebe11f7d44d20319",
     "theseus_same_depth_alpha_search_save_merged_base_ckpts:builds": "40b826545ffac45f8c89117af922984a7e5ae7b5943c5e9d0e833b5e1027bd56",
@@ -614,7 +617,7 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
         1,
         ["failed"],
     ],
-    "alpha_step_nonpositive": ["ValueError", "alpha_step must be > 0.", 2, 1, ["failed"]],
+    "alpha_step_nonpositive": ["ValueError", "alpha_step must be > 0.", 0, 1, ["failed"]],
     "block_extension_bad_strategy": [
         "ValueError",
         "Unsupported extension_strategy 'bogus'. Expected: interpolate, per_weight, shrink, interpolate_per_weight, duplicate_per_weight.",
@@ -625,14 +628,14 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "calibration_n_sequences_zero": [
         "ValueError",
         "config['calibration_n_sequences'] must be > 0 when given.",
-        2,
+        0,
         1,
         ["failed"],
     ],
     "calibration_prompts_not_list": [
         "ValueError",
         "config['calibration_prompts'] must be a list of strings, or a path to a JSON file holding one.",
-        2,
+        0,
         1,
         ["failed"],
     ],
@@ -653,14 +656,14 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "eval_before_rebase_only_no_harness": [
         "ValueError",
         "eval_before_rebase_only needs harness_tasks: there is nothing else to run.",
-        2,
+        0,
         1,
         ["failed"],
     ],
     "harness_samples_bad_indices": [
         "ValueError",
         "config['harness_samples'] values must be lists of non-negative document indices.",
-        2,
+        0,
         1,
         ["failed"],
     ],
@@ -674,21 +677,21 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "harness_samples_not_dict": [
         "ValueError",
         "config['harness_samples'] must map task names to document-index lists.",
-        2,
+        0,
         1,
         ["failed"],
     ],
     "harness_test_samples_not_dict": [
         "ValueError",
-        "config['harness_test_samples'] must map task names to index lists.",
-        2,
+        "config['harness_test_samples'] must map task names to document-index lists.",
+        0,
         1,
         ["failed"],
     ],
     "harness_test_samples_overlap": [
         "ValueError",
         "harness_test_samples overlaps the alpha-search slice for {'arc_easy': 1}; the reported number would be selected on documents it is scored on.",
-        2,
+        0,
         1,
         ["failed"],
     ],
@@ -709,7 +712,7 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "prompt_eval_not_allowed": [
         "ValueError",
         "Prompt evaluation is disabled unless explicitly enabled. Set --allow-prompt-eval (or config['allow_prompt_eval']=true).",
-        2,
+        0,
         1,
         ["failed"],
     ],
@@ -730,18 +733,18 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
     "tuned_bodies_missing": [
         "ValueError",
         "tuned_bodies config is required (dict task->path or list).",
-        2,
+        0,
         1,
         ["failed"],
     ],
     "tuned_bodies_missing_task_key": [
         "ValueError",
         "tuned_bodies missing task keys: ['rte']. Provided: ['snli']",
-        2,
+        0,
         1,
         ["failed"],
     ],
-    "tuned_bodies_wrong_type": ["ValueError", "tuned_bodies must be a dict or list.", 2, 1, ["failed"]],
+    "tuned_bodies_wrong_type": ["ValueError", "tuned_bodies must be a dict or list.", 0, 1, ["failed"]],
     "unknown_method": [
         "KeyError",
         "\"Unknown rebase method 'nope'. Available: ['ariadne', 'bico', 'direct_residual', 'gradfix', 'identity', 'orthogonal_shift', 'theseus', 'theseus_gqa', 'transfusion']\"",
@@ -749,7 +752,7 @@ EXPECTED_ERRORS: dict[str, list[Any]] = {
         0,
         [],
     ],
-    "unknown_suite": ["ValueError", "Unknown suite 'foo'. Available: ['nli6']", 2, 1, ["failed"]],
+    "unknown_suite": ["ValueError", "Unknown suite 'foo'. Available: ['nli6']", 0, 1, ["failed"]],
 }
 
 
@@ -822,8 +825,8 @@ def test_holdout_samples_flow_to_harness(tmp_path, monkeypatch):
     r = tmp_path / "h"
     calls = _launch(_base_cfg(r, **make_cfg(r)), r, monkeypatch, World(**world_kw), fake_calibration=True)
     samples = [c["samples"] for c in calls.harness]
-    assert samples[:-1] == [{"arc_easy": [0, 1, 2], "piqa": [3, 4]}] * (len(samples) - 1)
-    assert samples[-1] == {"arc_easy": [10, 11], "piqa": [12]}  # test slice rescored once, at the best alpha
+    assert samples[:-1] == [{"arc_easy": [0], "piqa": [3]}] * (len(samples) - 1)
+    assert samples[-1] == {"arc_easy": [1, 2], "piqa": [4]}  # held out from calibration and alpha search
 
 
 def test_alpha_search_visits_every_grid_point(tmp_path, monkeypatch):
@@ -873,7 +876,12 @@ ERROR_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], bool]] = {
     "harness_samples_bad_indices": (_SAME, {"harness_samples": {"arc_easy": [-1]}}, False),
     "harness_samples_disagree_with_holdout": (_SAME, {"harness_samples": {"arc_easy": [9]}}, True),
     "harness_test_samples_not_dict": (_SAME, {"harness_test_samples": [1]}, False),
-    "harness_test_samples_overlap": (_SAME, {"harness_test_samples": {"arc_easy": [1, 20]}}, True),
+    "harness_test_samples_overlap": (
+        _SAME,
+        {"harness_samples": {"arc_easy": [0, 1, 2], "piqa": [3, 4]},
+         "harness_test_samples": {"arc_easy": [1, 20], "piqa": [6]}},
+        True,
+    ),
     "delta_norm_match_bad": (_SAME, {"delta_norm_match": "foo"}, False),
     "transport_delta_source_bad": (_SAME, {"transport_delta_source": "foo"}, False),
     "shrink_non_per_weight": (_SHR, {"block_extension_params": {**_BE, "extension_strategy": "duplicate"}}, False),

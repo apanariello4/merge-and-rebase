@@ -187,6 +187,8 @@ class TaskPipeline:
                     )
 
                 self.saver(task, transported_delta)
+                # Prepared maps can retain large tensors. Release them before the next task builds models.
+                del method_result
             else:
                 out.original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")

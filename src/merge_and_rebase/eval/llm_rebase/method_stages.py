@@ -63,7 +63,7 @@ class TransportStage:
         t0 = time.time()
         resized = pre.kind in (PrestepKind.BRACE, PrestepKind.DISCRETE_INDEX)
         if resized:
-            pre.source_base_model.to(rt.device)
+            pre.source_base_model.to(rt.models.device)
 
         transported = self._transport(rt, pre, delta, transport_keys)
         print(f"  transported {len(transported)} keys in {time.time() - t0:.1f}s")
@@ -88,18 +88,18 @@ class TransportStage:
         delta: dict[str, torch.Tensor],
         transport_keys: set[str],
     ) -> dict[str, torch.Tensor]:
-        method = rt.method
-        method_name = rt.method_name
-        method_params = rt.method_params
-        source_llm = rt.source_llm
-        target_llm = rt.target_llm
-        _calibration = rt._calibration
-        calib_batch_size = rt.calib_batch_size
-        calib_max_length = rt.calib_max_length
-        calib_n_batches = rt.calib_n_batches
-        family_adapter = rt.family_adapter
-        device = rt.device
-        target_base_sd = rt.target_base_sd
+        method = rt.resolved.method
+        method_name = rt.resolved.method_name
+        method_params = rt.resolved.method_params
+        source_llm = rt.models.source_llm
+        target_llm = rt.models.target_llm
+        _calibration = rt.calibration.cache.get
+        calib_batch_size = rt.calibration.batch_size
+        calib_max_length = rt.calibration.max_length
+        calib_n_batches = rt.calibration.num_batches
+        family_adapter = rt.models.family_adapter
+        device = rt.models.device
+        target_base_sd = rt.models.target_base_sd
         if method_family(method_name) is MethodFamily.ACTIVATION_ALIGNED and transport_keys:
             # Hybrid: transport body keys, identity-pass the rest
             body_delta = {k: v for k, v in delta.items() if k in transport_keys}
@@ -210,37 +210,37 @@ class DirectFitStage:
     def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult:
         rt = env.runtime
         config = env.resolved.ariadne_cfg
-        family_adapter = rt.family_adapter
+        family_adapter = rt.models.family_adapter
         print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) [ariadne] ---")
         if config.missing_bias == "materialize" and self.materialized_bias_keys is None:
             self.materialized_bias_keys = list(
                 materialize_missing_projection_biases(
-                    rt.target_llm.model, rt.target_base_sd, family_adapter=family_adapter, components=config.components
+                    rt.models.target_llm.model, rt.models.target_base_sd, family_adapter=family_adapter, components=config.components
                 )
             )
-        texts = rt._calibration().texts
+        texts = rt.calibration.cache.get().texts
         source_loader = _build_text_calibration_loader(
-            tokenizer=rt.source_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
-            max_length=rt.calib_max_length,
+            tokenizer=rt.models.source_llm.tokenizer, texts=texts, batch_size=rt.calibration.batch_size,
+            max_length=rt.calibration.max_length,
         )
         target_loader = _build_text_calibration_loader(
-            tokenizer=rt.target_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
-            max_length=rt.calib_max_length,
+            tokenizer=rt.models.target_llm.tokenizer, texts=texts, batch_size=rt.calibration.batch_size,
+            max_length=rt.calibration.max_length,
         )
         pairing = apply_depth_pairing_override(
-            DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth)), config.depth_pairing
+            DiscreteLayerPairing.compute(int(rt.plan.source_depth), int(rt.plan.target_depth)), config.depth_pairing
         )
         t0 = time.time()
         prepared = AriadneRebase().prepare(
             source_base_model=pre.source_base_model,
             source_ft_model=pre.source_ft_model,
-            target_model=rt.target_llm.model,
-            target_base_sd=rt.target_base_sd,
+            target_model=rt.models.target_llm.model,
+            target_base_sd=rt.models.target_base_sd,
             source_loader=source_loader,
             target_loader=target_loader,
             pairing=pairing,
             config=config,
-            device=rt.device,
+            device=rt.models.device,
             family_adapter=family_adapter,
         )
         calibration = prepared.extra.get("calibration", {})
@@ -255,7 +255,7 @@ class DirectFitStage:
         fitted = dict(prepared.task_vector)
         if config.copy_shape_matching_source_deltas and pre.task_delta:
             for key, value in pre.task_delta.items():
-                target = rt.target_base_sd.get(key)
+                target = rt.models.target_base_sd.get(key)
                 if key not in fitted and target is not None and tuple(target.shape) == tuple(value.shape):
                     fitted[key] = value
         print(f"  ariadne fitted {len(fitted)} keys in {time.time() - t0:.1f}s (pairing {list(pairing.pairing)})")

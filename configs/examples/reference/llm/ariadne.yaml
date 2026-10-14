@@ -127,7 +127,7 @@ calibration_max_length: 192                 # calibration token length (default 
 #                                           #   {path, name|config, split, text_column | text_columns + text_template}
 #                                           #   (text_columns + text_template build question/answer texts).
 # calibration_include_target: false         # [ablation] append the gold target to harness calibration prompts.
-# hyperparam_search: null                   # alpha and method_params sweep: {strategy: sequential | sobol,
+# hyperparam_search: null                   # alpha-only search: {strategy: sequential | sobol,
 #                                           #   num_samples: 16, refine_factor: 0.5, refinement_steps, refinement_samples,
 #                                           #   alpha: <dim>}; <dim> = list | {values: [...]} |
 #                                           #   {min, max, type: float | int, step}.
@@ -136,8 +136,8 @@ harness_tasks:                              # lm-eval tasks (list or CSV). Witho
 harness_num_fewshot: 0                      # few-shot count.
 harness_batch_size: 4                       # int or "auto".
 # harness_limit: null                       # doc limit; exclusive with a held-out calibration slice.
-# harness_samples: null                     # {task: [doc indices]} evaluated (must agree with the derived hold-out).
-# harness_test_samples: null                # {task: [doc indices]} disjoint docs that re-score the best alpha.
+# harness_samples: null                     # {task: [doc indices]} search documents; must be outside calibration.
+# harness_test_samples: null                # {task: [doc indices]} test documents; requires explicit harness_samples.
 # eval_mode: "auto"                         # auto (head_logits if task_heads else prompt) | prompt | head_logits.
 # allow_prompt_eval: false                  # required for prompt evaluation on NLI.
 # split: "validation"                       # train | validation | test.

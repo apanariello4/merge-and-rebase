@@ -9,6 +9,7 @@ transported deltas. The LLM stages (``stages``, ``method_stages``) implement the
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -19,62 +20,8 @@ from ...rebase.orchestration import TaskPipeline
 from ...rebase.prestep import StageEnv
 from .merge import _summarize_merged_delta, report_merged_delta
 from .method_stages import build_method_stage
+from .runtime import LlmRuntime
 from .stages import build_prestep, build_prestep_observers, build_task_models
-
-
-@dataclass
-class LlmRuntime:
-    """Everything ``cli.main`` resolved before the first task: config, models, state dicts, calibration, flags."""
-
-    cfg: Any
-    method_name: Any
-    method: Any
-    method_params: Any
-    source_llm: Any
-    target_llm: Any
-    source_build_cfg: Any
-    source_base_sd: Any
-    target_base_sd: Any
-    source_family: Any
-    target_family: Any
-    family_adapter: Any
-    device: Any
-    num_labels: Any
-    block_extension_cfg: Any
-    run_block_extension_prestep: Any
-    source_depth: Any
-    target_depth: Any
-    tuned_ref_list: Any
-    tasks: Any
-    suite_name: Any
-    is_harness_only: Any
-    harness_tasks_resolved: Any
-    harness_num_fewshot: Any
-    harness_batch_size: Any
-    harness_limit: Any
-    harness_samples: Any
-    run_before_rebase_eval: Any
-    eval_before_rebase_only: Any
-    ignored_block_extension_fields: Any
-    _calibration: Any
-    _calibration_provenance: Any
-    calib_batch_size: Any
-    calib_max_length: Any
-    calib_n_batches: Any
-    blockext_calib_loader: Any
-    tp_keys: Any
-    full_fp_keys: Any
-    eval_mode: Any
-    head_key_pattern: Any
-    task_heads_path: Any
-    _eval_before_rebase: Any
-    _baseline_summary: Any
-    load_tuned: Any
-    #: Shared run contract (``rebase.run_config``): resolved LLM config and its post-model plan.
-    resolved: Any
-    plan: Any
-    #: Task label -> ``LlmTaskContext`` (tuned checkpoint ref + position), in task order.
-    task_contexts: Any
 
 
 @dataclass
@@ -101,22 +48,22 @@ def _resolve_task_weights(raw: Any, count: int) -> list[float]:
 def run_rebase(rt: LlmRuntime, run_logger: Any) -> RebaseOutputs | None:
     """Returns None when the run stops after the before-rebase eval (eval_before_rebase_only)."""
     cfg = rt.cfg
-    method_name = rt.method_name
-    source_llm = rt.source_llm
-    source_base_sd = rt.source_base_sd
-    target_base_sd = rt.target_base_sd
-    device = rt.device
-    run_block_extension_prestep = rt.run_block_extension_prestep
-    source_depth = rt.source_depth
-    target_depth = rt.target_depth
-    tuned_ref_list = rt.tuned_ref_list
-    tasks = rt.tasks
-    run_before_rebase_eval = rt.run_before_rebase_eval
-    eval_before_rebase_only = rt.eval_before_rebase_only
+    method_name = rt.resolved.method_name
+    source_llm = rt.models.source_llm
+    source_base_sd = rt.models.source_base_sd
+    target_base_sd = rt.models.target_base_sd
+    device = rt.models.device
+    run_block_extension_prestep = rt.plan.run_block_extension_prestep
+    source_depth = rt.plan.source_depth
+    target_depth = rt.plan.target_depth
+    tuned_ref_list = rt.evaluation.tuned_ref_list
+    tasks = rt.evaluation.tasks
+    run_before_rebase_eval = rt.evaluation.run_before_rebase_eval
+    eval_before_rebase_only = rt.evaluation.eval_before_rebase_only
     ignored_block_extension_fields = rt.ignored_block_extension_fields
-    _calibration_provenance = rt._calibration_provenance
-    _eval_before_rebase = rt._eval_before_rebase
-    _baseline_summary = rt._baseline_summary
+    _calibration_provenance = rt.calibration.cache.provenance
+    _eval_before_rebase = partial(rt.evaluation.evaluate_before_rebase, rt.models)
+    _baseline_summary = rt.evaluation.baseline_summary
     weights = _resolve_task_weights(cfg.get("weights"), len(tuned_ref_list))
 
     if run_before_rebase_eval and not run_block_extension_prestep:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...data.text_loaders import NLITaskData, NLITokenizedData, build_nli_task_data, build_nli_tokenized_loader
-from ...hyperparam_search import SearchEvaluation, build_search_planner, describe_candidate
+from ...hyperparam_search import SearchEvaluation, describe_candidate
 from ...io.ckpt import load_into_model
 from ...merge.runtime import apply_delta
 from ..print_utils import pretty_print_task_accuracies
@@ -20,6 +20,7 @@ from .common import (
     resolve_task_mask_class,
     to_unit_acc,
 )
+from .splits import HarnessSlices, resolve_harness_slices
 from .summary import RunRecord
 
 
@@ -113,6 +114,7 @@ def score_harness_test_slice(
     harness_batch_size: Any,
     harness_samples: Any,
     best_alpha: float,
+    slices: HarnessSlices | None = None,
 ) -> tuple[dict[str, float] | None, dict[str, list[int]] | None]:
     from .harness import run as run_harness
 
@@ -125,28 +127,12 @@ def score_harness_test_slice(
     # documents and that is the number to quote. Costs one extra pass,
     # not one per alpha.
     harness_test_results: dict[str, float] | None = None
-    test_samples_cfg = cfg.get("harness_test_samples", None)
-    if test_samples_cfg is not None:
-        if not isinstance(test_samples_cfg, dict):
-            raise ValueError("config['harness_test_samples'] must map task names to index lists.")
-        test_samples = {}
-        for task_name, indices in test_samples_cfg.items():
-            if not isinstance(indices, list) or not all(isinstance(i, int) and i >= 0 for i in indices):
-                raise ValueError(
-                    "config['harness_test_samples'] values must be lists of non-negative indices."
-                )
-            test_samples[str(task_name)] = list(indices)
-        overlap = {
-            t: sorted(set(test_samples.get(t, ())) & set((harness_samples or {}).get(t, ())))
-            for t in test_samples
-        }
-        leaking = {t: v for t, v in overlap.items() if v}
-        if leaking:
-            raise ValueError(
-                "harness_test_samples overlaps the alpha-search slice for "
-                f"{ {t: len(v) for t, v in leaking.items()} }; the reported number would be "
-                "selected on documents it is scored on."
-            )
+    if slices is None:
+        slices = resolve_harness_slices(
+            {**cfg, "harness_samples": harness_samples}, harness_tasks_resolved,
+        )
+    test_samples = slices.test
+    if test_samples is not None:
         scaled = {k: v * best_alpha for k, v in merged_delta.items()}
         load_into_model(target_llm.model, apply_delta(target_base_sd, scaled), strict=False)
         print(f"\nScoring held-out test slice at alpha={best_alpha:.3f}...")
@@ -164,7 +150,7 @@ def score_harness_test_slice(
         for task_name, acc in harness_test_results.items():
             print(f"  {task_name}: {acc:.4f}")
 
-    return harness_test_results, (test_samples if test_samples_cfg is not None else None)
+    return harness_test_results, test_samples
 
 
 def nli_alpha_search(
@@ -186,8 +172,6 @@ def nli_alpha_search(
 ) -> tuple[SearchEvaluation, list[SearchEvaluation]]:
     best_result: SearchEvaluation | None = None
     search_results: list[SearchEvaluation] = []
-    alpha_to_task_accs: dict[float, list[float]] = {}
-    alpha_to_task_norm_accs: dict[float, list[float]] = {}
 
     while True:
         batch = search_planner.next_batch()
@@ -251,8 +235,6 @@ def nli_alpha_search(
             )
             batch_results.append(result)
             search_results.append(result)
-            alpha_to_task_accs[alpha] = [float(v) for v in accs]
-            alpha_to_task_norm_accs[alpha] = [float(v) for v in norm_accs]
 
             if best_result is None or result.score > best_result.score:
                 best_result = result
@@ -282,34 +264,31 @@ def nli_alpha_search(
 def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
     """Dispatch the evaluation backend (lm-harness or NLI), search alpha, score, save; return the summary record."""
     cfg = rt.cfg
-    method_name = rt.method_name
-    method_params = rt.method_params
-    target_llm = rt.target_llm
-    target_base_sd = rt.target_base_sd
-    device = rt.device
-    harness_tasks_resolved = rt.harness_tasks_resolved
-    harness_num_fewshot = rt.harness_num_fewshot
-    harness_batch_size = rt.harness_batch_size
-    harness_limit = rt.harness_limit
-    harness_samples = rt.harness_samples
-    is_harness_only = rt.is_harness_only
+    method_name = rt.resolved.method_name
+    target_llm = rt.models.target_llm
+    target_base_sd = rt.models.target_base_sd
+    device = rt.models.device
+    harness_tasks_resolved = rt.evaluation.harness_tasks
+    harness_num_fewshot = rt.evaluation.harness_num_fewshot
+    harness_batch_size = rt.evaluation.harness_batch_size
+    harness_limit = rt.evaluation.harness_limit
+    harness_samples = rt.evaluation.slices.search
+    is_harness_only = rt.evaluation.is_harness_only
     ignored_block_extension_fields = rt.ignored_block_extension_fields
-    _calibration_provenance = rt._calibration_provenance
-    run_block_extension_prestep = rt.run_block_extension_prestep
-    tasks = rt.tasks
-    suite_name = rt.suite_name
-    eval_mode = rt.eval_mode
-    head_key_pattern = rt.head_key_pattern
-    task_heads_path = rt.task_heads_path
-    num_labels = rt.num_labels
-    _baseline_summary = rt._baseline_summary
+    _calibration_provenance = rt.calibration.cache.provenance
+    run_block_extension_prestep = rt.plan.run_block_extension_prestep
+    tasks = rt.evaluation.tasks
+    suite_name = rt.evaluation.suite_name
+    eval_mode = rt.evaluation.eval_mode
+    head_key_pattern = rt.evaluation.head_key_pattern
+    task_heads_path = rt.evaluation.task_heads_path
+    num_labels = rt.models.num_labels
+    _baseline_summary = rt.evaluation.baseline_summary
     merged_delta = outputs.merged_delta
     delta_stats = outputs.delta_stats
     task_vector_report = outputs.task_vector_report
 
-    search_planner = build_search_planner(
-        cfg=cfg, base_method_params=method_params
-    )
+    search_planner = rt.evaluation.search_planner
 
     # ---- Dispatch evaluation backend ----
     if is_harness_only or harness_tasks_resolved:
@@ -347,6 +326,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             harness_batch_size=harness_batch_size,
             harness_samples=harness_samples,
             best_alpha=best_alpha,
+            slices=rt.evaluation.slices,
         )
 
         if cfg.get("save_merged", None) is not None:
