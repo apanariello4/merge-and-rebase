@@ -263,10 +263,18 @@ class ResidualSufficientStatistics:
 
     ``device``, when given, moves each batch onto it before the float64 Gram accumulation in ``update()``, so the
     statistics (and ``solve()``) live there; ``None`` (default) moves nothing (historical CPU behaviour).
+
+    ``store_device`` (opt-in, default ``None`` = same as ``device``) holds the accumulated statistics between batches:
+    each batch's float64 products are still computed on ``device`` and then added into accumulators on
+    ``store_device`` (float64 addition is exact-rounded on CPU and GPU alike, so the sums are bitwise those of the
+    default). ``solve()`` first moves them back to ``device``, so only the position being solved occupies it.
     """
 
-    def __init__(self, device: torch.device | str | None = None) -> None:
+    def __init__(
+        self, device: torch.device | str | None = None, store_device: torch.device | str | None = None
+    ) -> None:
         self.device = device
+        self.store_device = store_device
         self.s: Tensor | None = None
         self.g: Tensor | None = None
         self.b: Tensor | None = None
@@ -319,6 +327,9 @@ class ResidualSufficientStatistics:
         b = a.T @ er @ lmat
         sum_a = a.sum(dim=0)
         sum_e = er.sum(dim=0)
+        if self.store_device is not None:
+            s, g, b = s.to(self.store_device), g.to(self.store_device), b.to(self.store_device)
+            sum_a, sum_e = sum_a.to(self.store_device), sum_e.to(self.store_device)
         if self.s is None:
             self.s, self.g, self.b = s, g, b
             self.sum_a, self.sum_e = sum_a, sum_e
@@ -383,6 +394,10 @@ class ResidualSufficientStatistics:
                 raise ValueError("ridge_absolute must be finite and > 0 for absolute ridge")
             if ridge_estimator != "fixed_relative":
                 raise ValueError("ridge_mode='absolute' is only valid with ridge_estimator='fixed_relative'")
+        if self.store_device is not None and self.device is not None:
+            # Bring the accumulated statistics back to the compute device; the solve below is then unchanged.
+            self.s, self.g, self.b = self.s.to(self.device), self.g.to(self.device), self.b.to(self.device)
+            self.sum_a, self.sum_e = self.sum_a.to(self.device), self.sum_e.to(self.device)
         s = (self.s + self.s.T) * 0.5
         g = (self.g + self.g.T) * 0.5
         n = float(self.n_rows)

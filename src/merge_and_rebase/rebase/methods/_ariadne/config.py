@@ -90,6 +90,11 @@ class DirectResidualConfig:
     activation_storage: str = "resident"
     # Streaming only: fit target positions in chunks of this size (one capture sweep each) to bound host RAM; None = one chunk.
     streaming_position_chunk: int | None = None
+    # Streaming only: device holding the accumulated float64 statistics (S, B, G, sums) between batches. None (default):
+    # the compute device, as before. 'cpu': per-batch products are still computed on the compute device and added into
+    # host-RAM accumulators (float64 addition is exact-rounded on both, so sums are bitwise those of the default); each
+    # position's statistics return to the compute device only for its solve. Bounds GPU memory for wide MLPs.
+    stats_device: str | None = None
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
@@ -204,6 +209,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "gradient_fit_tol": 1e-9,
     "gradient_ridge": "eb_input",
     "v_fit": None,
+    "stats_device": None,
 }
 
 
@@ -287,6 +293,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "tv_scaling_iters",
         "activation_storage",
         "streaming_position_chunk",
+        "stats_device",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -477,6 +484,15 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("streaming_position_chunk must be None or a positive integer")
         if cfg.streaming_position_chunk <= 0:
             raise ValueError("streaming_position_chunk must be None or a positive integer")
+    if cfg.stats_device not in {None, "cpu"}:
+        raise ValueError("stats_device must be None (the compute device) or 'cpu'")
+    if cfg.stats_device is not None and cfg.activation_storage != "streaming":
+        raise ValueError("stats_device requires activation_storage='streaming'")
+    if cfg.stats_device is not None and (
+        cfg.depth_fit != "independent" or cfg.component_target != "block_boundary" or cfg.v_fit is not None
+    ):
+        # Only fit_direct_residual_streaming honours it; refuse rather than silently keep GPU statistics elsewhere.
+        raise ValueError("stats_device is implemented for the independent block-boundary streaming fit only")
     if cfg.activation_storage == "streaming":
         if cfg.component_target not in {"block_boundary", "output_total"}:
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")

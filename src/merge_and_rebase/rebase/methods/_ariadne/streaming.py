@@ -578,7 +578,7 @@ def fit_direct_residual_streaming(
                     pair = (pos, component)
                     effective_out[pair] = _component_effective_out(shim, target_model, pos, component, width)
                     stats_by[pair] = (
-                        ResidualSufficientStatistics(device=device)
+                        ResidualSufficientStatistics(device=device, store_device=config.stats_device)
                         if stats_factory is None
                         else stats_factory(pos, component, device)
                     )
@@ -681,6 +681,9 @@ def fit_direct_residual_streaming(
                         block_rows,
                         h_batches=None,
                     )
+                    # Release this position's statistics now (not at the next chunk): with stats_device the solve
+                    # moved them to the compute device, and only one position should be resident there at a time.
+                    del stats_by[pair]
                 target_corrections.update(position_corrections)
                 for row in block_rows:
                     row["source_position"] = row.pop("source_coordinate")
