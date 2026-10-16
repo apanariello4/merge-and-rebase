@@ -586,7 +586,8 @@ def build_runtime(
     # Opt-in calibration knobs (all default to the historical behaviour):
     #   calibration_n_sequences      explicit pool size instead of max(batches) * batch_size
     #   calibration_dataset          explicit HF corpus, decoupled from the evaluated task (no eval hold-out);
-    #                                beats block_extension_params.calibration_dataset
+    #                                beats block_extension_params.calibration_dataset; a list of specs mixes
+    #                                several corpora round-robin with equal quotas (data/llm_calibration)
     #   calibration_include_target   harness source: append the gold target to each rendered prompt
     calibration_n_sequences_cfg = cfg.get("calibration_n_sequences", None)
     if calibration_n_sequences_cfg is not None and int(calibration_n_sequences_cfg) <= 0:

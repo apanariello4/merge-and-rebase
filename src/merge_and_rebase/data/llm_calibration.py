@@ -515,6 +515,35 @@ def _finalize_rendered(
 
 
 def _from_hf_dataset(
+    spec: str | Mapping[str, Any] | Sequence[str | Mapping[str, Any]],
+    *,
+    calibration_split: str,
+    n_sequences: int,
+) -> CalibrationTexts:
+    """One HF corpus (``str`` / mapping spec, unchanged), or opt-in a list of specs (e.g. one per language).
+
+    With a list, source ``k`` of ``K`` contributes ``n_sequences // K`` texts (the first ``n_sequences % K`` sources one
+    more), each read exactly as a single spec would be, and the texts are interleaved round-robin in list order so
+    every calibration batch mixes the sources. Fewer rows than requested in a source raise (no silent imbalance).
+    """
+    if isinstance(spec, (list, tuple)):
+        if not spec:
+            raise ValueError("calibration_dataset list must not be empty.")
+        k = len(spec)
+        quotas = [n_sequences // k + (1 if i < n_sequences % k else 0) for i in range(k)]
+        parts = [
+            _from_hf_dataset_one(sub, calibration_split=calibration_split, n_sequences=q)
+            for sub, q in zip(spec, quotas, strict=True)
+        ]
+        for part, q in zip(parts, quotas, strict=True):
+            if len(part.texts) < q:
+                raise ValueError(f"calibration_dataset source {part.source} has {len(part.texts)} texts, needs {q}.")
+        texts = [part.texts[i] for i in range(max(quotas)) for part in parts if i < len(part.texts)]
+        return CalibrationTexts(texts, source=" + ".join(part.source for part in parts), decoupled=True)
+    return _from_hf_dataset_one(spec, calibration_split=calibration_split, n_sequences=n_sequences)
+
+
+def _from_hf_dataset_one(
     spec: str | Mapping[str, Any],
     *,
     calibration_split: str,
