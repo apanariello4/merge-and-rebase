@@ -146,6 +146,40 @@ def tiny_qwen3(
     return _init_seeded(Qwen3ForCausalLM, config, seed)
 
 
+def tiny_gemma2(
+    *,
+    layers: int = 2,
+    hidden: int = 32,
+    heads: int = 4,
+    kv_heads: int = 2,
+    inter: int = 64,
+    head_dim: int = 8,
+    vocab: int = 64,
+    seed: int = 0,
+) -> torch.nn.Module:
+    """Tiny Gemma-2 (post-attention and post-MLP RMSNorms, (1 + w) gains, logit soft-capping, sliding window)."""
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    config = Gemma2Config(
+        hidden_size=hidden,
+        num_hidden_layers=layers,
+        num_attention_heads=heads,
+        num_key_value_heads=kv_heads,
+        intermediate_size=inter,
+        head_dim=head_dim,
+        vocab_size=vocab,
+        max_position_embeddings=64,
+        sliding_window=8,
+        attn_implementation="eager",
+    )
+    model = _init_seeded(Gemma2ForCausalLM, config, seed)
+    with torch.no_grad():  # HF initialises the (1 + w) norm weights at 0; give them a non-trivial gain
+        for name, param in model.named_parameters():
+            if "layernorm" in name or name.endswith("norm.weight"):
+                param.normal_(0.0, 0.2)
+    return model
+
+
 def perturbed_copy(model: torch.nn.Module, *, scale: float = 0.05, seed: int = 1) -> torch.nn.Module:
     """Deterministic 'fine-tuned' copy: base + scale * N(0, 1) on every parameter."""
     ft = deepcopy(model)

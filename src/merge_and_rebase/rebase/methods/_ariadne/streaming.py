@@ -543,6 +543,9 @@ def fit_direct_residual_streaming(
 
     chunk_size = config.streaming_position_chunk or len(positions)
     chunks = [positions[start : start + chunk_size] for start in range(0, len(positions), chunk_size)]
+    post_mlp_norm = config.post_mlp_norm
+    if post_mlp_norm is not None and not callable(getattr(family_adapter, "post_mlp_norm", None)):
+        raise ValueError("post_mlp_norm needs a family adapter exposing post_mlp_norm(block) (e.g. gemma2)")
 
     unique_models: dict[int, Any] = {}
     for m in (target_model, source_base_model, source_ft_model):
@@ -566,17 +569,26 @@ def fit_direct_residual_streaming(
                 tgt_requests[f"{pos}.out"] = (pos, "boundary")
                 for component in components:
                     tgt_requests[f"{pos}.{component}.h"] = (pos, COMPONENT_INPUT_KIND[component])
+                if post_mlp_norm is not None:
+                    # y = W h of the target base's down_proj (pre-norm), for the per-row RMS r of its post-MLP norm.
+                    tgt_requests[f"{pos}.mlp.c_proj.y"] = (pos, "c_proj")
 
             stats_by: dict[tuple[int, str], ResidualSufficientStatistics] = {}
             desired_sq: dict[tuple[int, str], float] = {}
             effect_sq: dict[tuple[int, str], float] = {}
             effective_out: dict[tuple[int, str], Tensor] = {}
+            norm_gain: dict[int, tuple[Tensor, float]] = {}
             for pos in chunk:
+                if post_mlp_norm is not None:
+                    norm_gain[pos] = family_adapter.post_mlp_norm(shim.blocks(target_model)[pos])
                 for component in components:
                     key = shim.component_key(pos, component, prefixed=True)
                     width = int(current_state[key].shape[0])
                     pair = (pos, component)
                     effective_out[pair] = _component_effective_out(shim, target_model, pos, component, width)
+                    if post_mlp_norm == "linearized":
+                        # The norm is part of the output map: d(residual) = (1/r) diag(g) dW h (rank-one term dropped).
+                        effective_out[pair] = effective_out[pair] @ torch.diag(norm_gain[pos][0])
                     stats_by[pair] = (
                         ResidualSufficientStatistics(device=device, store_device=config.stats_device)
                         if stats_factory is None
@@ -653,12 +665,17 @@ def fit_direct_residual_streaming(
                             h = tgt[f"{pos}.{component}.h"].cpu()
                             desired_sq[pair] += desired_sq_val
                             effect_sq[pair] += effect_sq_val
-                            stats_by[pair].update(
-                                h.reshape(-1, h.shape[-1]),
-                                error.reshape(-1, error.shape[-1]),
-                                None,
-                                effective_out[pair],
-                            )
+                            h_rows = h.reshape(-1, h.shape[-1])
+                            e_rows = error.reshape(-1, error.shape[-1])
+                            if post_mlp_norm is not None:
+                                gain, eps = norm_gain[pos]
+                                y = tgt[f"{pos}.mlp.c_proj.y"].cpu().reshape(-1, e_rows.shape[-1]).float()
+                                rms = torch.sqrt(y.pow(2).mean(dim=-1, keepdim=True) + eps)
+                                if post_mlp_norm == "pre_norm":
+                                    e_rows = e_rows * rms / gain
+                                else:
+                                    h_rows = h_rows / rms
+                            stats_by[pair].update(h_rows, e_rows, None, effective_out[pair])
 
             for pos in chunk:
                 position_corrections: dict[str, Tensor] = {}

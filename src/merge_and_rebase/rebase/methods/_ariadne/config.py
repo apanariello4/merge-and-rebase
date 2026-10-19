@@ -95,6 +95,14 @@ class DirectResidualConfig:
     # host-RAM accumulators (float64 addition is exact-rounded on both, so sums are bitwise those of the default); each
     # position's statistics return to the compute device only for its solve. Bounds GPU memory for wide MLPs.
     stats_device: str | None = None
+    # Decoder families whose block writes post_mlp_norm(down_proj(h)) into the residual (Gemma-2): how the block-
+    # boundary target E_j reaches down_proj. y = W h (target base down_proj output), r = sqrt(mean(y^2) + eps),
+    # g = norm gain; the norm's linearization is (1/r) diag(g) (I - y y^T / (d r^2)), whose rank-one term (the
+    # direction that only rescales y, which the norm cancels) both modes drop.
+    # 'pre_norm': fit before the norm, min ||H dW^T - E * r / g|| (target pulled back per row; solver unchanged).
+    # 'linearized': the norm is part of the output map, min ||(H / r) dW^T diag(g) - E|| (rows of H scaled by 1/r,
+    # effective_out = diag(g)). None (default): the down_proj output enters the residual directly (Llama/Qwen).
+    post_mlp_norm: str | None = None
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
@@ -210,6 +218,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "gradient_ridge": "eb_input",
     "v_fit": None,
     "stats_device": None,
+    "post_mlp_norm": None,
 }
 
 
@@ -294,6 +303,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "activation_storage",
         "streaming_position_chunk",
         "stats_device",
+        "post_mlp_norm",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -484,6 +494,18 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("streaming_position_chunk must be None or a positive integer")
         if cfg.streaming_position_chunk <= 0:
             raise ValueError("streaming_position_chunk must be None or a positive integer")
+    if cfg.post_mlp_norm not in {None, "pre_norm", "linearized"}:
+        raise ValueError("post_mlp_norm must be None, 'pre_norm' or 'linearized'")
+    if cfg.post_mlp_norm is not None and (
+        cfg.activation_storage != "streaming"
+        or cfg.depth_fit != "independent"
+        or cfg.component_target != "block_boundary"
+        or cfg.v_fit is not None
+        or tuple(cfg.components) != ("mlp.c_proj",)
+    ):
+        raise ValueError(
+            "post_mlp_norm is implemented for the independent block-boundary streaming fit of mlp.c_proj only"
+        )
     if cfg.stats_device not in {None, "cpu"}:
         raise ValueError("stats_device must be None (the compute device) or 'cpu'")
     if cfg.stats_device is not None and cfg.activation_storage != "streaming":
@@ -810,6 +832,8 @@ _DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
 
 def reject_decoder_only_options(cfg: DirectResidualConfig) -> None:
     """Vision path guard: refuse options that are only defined on decoder (text) calibration."""
+    if cfg.post_mlp_norm is not None:
+        raise ValueError("Ariadne option post_mlp_norm is decoder-only (Gemma-2 post-MLP RMSNorm)")
     if cfg.exclude_first_token:
         raise ValueError(
             "Ariadne option exclude_first_token=true is decoder-only (it needs the attention mask of text "
@@ -837,6 +861,14 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
                 f"Ariadne on decoder models does not support {name}={got!r} (must be {required!r}): "
                 "this option is vision-only"
             )
+    has_post_mlp_norm = bool(getattr(family_adapter, "HAS_POST_MLP_NORM", False))
+    if has_post_mlp_norm and cfg.post_mlp_norm is None:
+        raise ValueError(
+            f"{getattr(family_adapter, 'name', 'this family')} normalises the MLP output before the residual add "
+            "(post_feedforward_layernorm): set ariadne post_mlp_norm to 'pre_norm' or 'linearized'"
+        )
+    if not has_post_mlp_norm and cfg.post_mlp_norm is not None:
+        raise ValueError(f"post_mlp_norm={cfg.post_mlp_norm!r} needs a family with a post-MLP norm (e.g. gemma2)")
     if cfg.residual_target == "native_oracle":
         raise NotImplementedError("residual_target=native_oracle is vision-only")
     if cfg.component_fit != "closed_form":
