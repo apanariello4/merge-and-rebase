@@ -30,7 +30,7 @@ from ...rebase.orchestration import AriadneRunRecord, MethodResult
 from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
 from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from ..utils import to_cpu_fp32
-from .artifacts import _load_saved_sequential_tv
+from .artifacts import _load_precomputed_tv, _load_saved_sequential_tv, _state_dict_sha256, truncate_tv_rank
 from .context import _TaskContext
 from .merge import _merge_direction
 from .stages import _visual_only_filter
@@ -514,7 +514,40 @@ class DirectFitStage:
         # Ariadne never resizes: capture runs on freshly built native (un-resized) source models. The
         # block-extension prestep never runs for Ariadne (it is not a depth_prestep_method).
         pairing = self.pairing(env)
-        if cfg.get("load_direct_residual_tvs_dir"):
+        if cfg.get("precomputed_tv_dir"):
+            # Eval-only: no fit, no calibration, no transport; the saved delta is the transported delta.
+            transported_delta, file_meta = _load_precomputed_tv(cfg["precomputed_tv_dir"], t, env.target_base_sd)
+            pre_rec = self.record.precomputed
+            if pre_rec is None:
+                pre_rec = self.record.precomputed = {
+                    "provenance": {
+                        "dir": str(cfg["precomputed_tv_dir"]),
+                        "source_summary": cfg.get("precomputed_tv_source_summary"),
+                        "files_by_task": {},
+                    },
+                    "truncation": None,
+                }
+            pre_rec["provenance"]["files_by_task"][t] = file_meta
+            trunc = cfg.get("tv_rank_truncation")
+            if trunc:
+                transported_delta, trunc_rec = truncate_tv_rank(
+                    transported_delta,
+                    energy=float(trunc["energy"]),
+                    blocks=str(trunc.get("blocks", "all")),
+                    depth=env.target_depth,
+                )
+                if pre_rec["truncation"] is None:
+                    pre_rec["truncation"] = {
+                        "energy": trunc_rec["energy"],
+                        "blocks": trunc_rec["blocks"],
+                        "by_task": {},
+                    }
+                pre_rec["truncation"]["by_task"][t] = trunc_rec["keys"]
+            pre_rec["provenance"].setdefault("transported_delta_sha256_by_task", {})[t] = _state_dict_sha256(
+                transported_delta
+            )
+            result.transported_delta = transported_delta
+        elif cfg.get("load_direct_residual_tvs_dir"):
             transported_delta, loaded_meta = _load_saved_sequential_tv(
                 cfg["load_direct_residual_tvs_dir"], t, env.target_base_sd, direct_residual_cfg
             )

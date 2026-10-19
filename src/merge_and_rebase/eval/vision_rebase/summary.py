@@ -69,6 +69,7 @@ class RunRecord:
     direct_residual_pairing_record: Any
     direct_residual_fidelity_holdout: Any
     direct_residual_sequential_endpoints: Any
+    precomputed_tvs: Any = None
     loaded_direct_residual_tvs: Any
     per_task_premerge_alphas: Any
     selected_alpha_by_task: Any
@@ -154,6 +155,7 @@ class RunRecord:
             direct_residual_fidelity_holdout=ariadne.fidelity_holdout,
             direct_residual_sequential_endpoints=ariadne.sequential_endpoints,
             loaded_direct_residual_tvs=ariadne.loaded_vectors,
+            precomputed_tvs=ariadne.precomputed,
             per_task_premerge_alphas=alpha.per_task_premerge_alphas,
             selected_alpha_by_task=alpha.selected_alpha_by_task,
             per_task=per_task,
@@ -362,4 +364,8 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
     }
     if record.save_policy is not None:
         summary["save_policy"] = record.save_policy
+    if record.precomputed_tvs is not None:
+        # Opt-in eval-only path (precomputed_tv_dir): provenance + per-task rank truncation; absent otherwise.
+        summary["precomputed_tvs"] = record.precomputed_tvs["provenance"]
+        summary["tv_rank_truncation"] = record.precomputed_tvs["truncation"]
     return summary
