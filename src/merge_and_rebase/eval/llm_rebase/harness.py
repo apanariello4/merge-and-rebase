@@ -198,6 +198,31 @@ def task_decoding_config(tokenizer: Any, *, apply_chat_template: bool) -> Any:
     )
 
 
+def _preload_numpy_for_code_execution() -> None:
+    """Make numpy importable inside code_eval's test processes.
+
+    code_eval runs each generated program in a process (forkserver start method, the Linux default on Python >= 3.14)
+    after ``reliability_guard`` has disabled many ``os``/builtin functions. A test that imports numpy there (all of
+    HumanEval+, via its ``is_floats`` helper) fails with "'NoneType' object is not callable" unless numpy is already
+    loaded, i.e. preloaded by the forkserver. Our launches (``-c`` / ``-m package``) give the forkserver no
+    ``__main__`` to preload, so every HumanEval+ test failed (pass@1 = 0 for every model, jobs 60731099/60731100).
+    Must run before the forkserver starts; raises if it is already running without numpy preloaded.
+    """
+    import multiprocessing
+    import multiprocessing.forkserver as forkserver
+
+    server = getattr(forkserver, "_forkserver", None)
+    running = getattr(server, "_forkserver_pid", None) is not None
+    preloaded = list(getattr(server, "_preload_modules", []) or [])
+    if running and "numpy" not in preloaded:
+        raise RuntimeError(
+            "harness_confirm_run_unsafe_code: the multiprocessing forkserver is already running without numpy "
+            "preloaded, so code tests that import numpy would fail; it must not be started before the harness."
+        )
+    if "numpy" not in preloaded:
+        multiprocessing.set_forkserver_preload([*preloaded, "numpy"])
+
+
 def _seed_langdetect() -> None:
     """Make lm-eval's IFEval language checks deterministic.
 
@@ -278,6 +303,8 @@ def run(
 
     _check_samples_conflict(limit, samples)
     _seed_langdetect()
+    if confirm_run_unsafe_code:
+        _preload_numpy_for_code_execution()
     if apply_chat_template and getattr(tokenizer, "chat_template", None) is None:
         raise ValueError(
             "harness_apply_chat_template=true but the tokenizer has no chat_template; "
