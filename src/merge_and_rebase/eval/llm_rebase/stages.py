@@ -191,7 +191,9 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     if overrides:
         changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
         print(f"  '{task}': fine-tuned forward model built from the tuned ref's own config ({changed})")
-        source_ft_model_task = build_model_with_tuned_config(str(ckpt_ref), rt.source_build_cfg, tuned_sd)
+        source_ft_model_task = build_model_with_tuned_config(
+            str(ckpt_ref), rt.source_build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in rt.source_base_sd.items()}
+        )
     else:
         load_into_model(source_ft_model_task, tuned_sd, strict=False)
     rt.task_contexts[task].forward_geometry = {

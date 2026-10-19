@@ -275,7 +275,9 @@ def tuned_generator_factory(
             changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
             print(f"  calibration generator built from the tuned ref's own config ({changed})")
             del template
-            return build_model_with_tuned_config(ref, build_cfg, tuned_sd)
+            return build_model_with_tuned_config(
+                ref, build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in source_base_sd.items()}
+            )
         load_into_model(template, tuned_sd, strict=False)
         return template
 

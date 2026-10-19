@@ -650,12 +650,20 @@ def tuned_config_mismatch(ckpt_ref: str, source_config: Any, *, trust_remote_cod
 
 
 def build_model_with_tuned_config(
-    ckpt_ref: str, build_cfg: TextBuildConfig, tuned_sd: Mapping[str, torch.Tensor]
+    ckpt_ref: str,
+    build_cfg: TextBuildConfig,
+    tuned_sd: Mapping[str, torch.Tensor],
+    base_shapes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> torch.nn.Module:
     """A model built from the tuned ref's own config (RoPE, window, ...) carrying exactly the aligned tuned weights.
 
     Device/dtype follow ``build_cfg``; the weights are then overwritten with ``tuned_sd`` so they are identical to the
     ones the parameter delta is defined by.
+
+    ``base_shapes`` (source-base key -> shape, optional): a key absent from ``tuned_sd`` is accepted when the model's
+    tensor has a different shape from the source base's (e.g. ``embed_tokens`` of a fine-tune with a larger vocabulary):
+    alignment drops exactly those, they carry no parameter delta, and the value kept is the tuned ref's own (loaded by
+    ``from_pretrained`` above). Any other gap still raises; ``None`` keeps the strict historical check.
     """
     from transformers import AutoModelForCausalLM
 
@@ -669,6 +677,12 @@ def build_model_with_tuned_config(
     # A tied lm_head may be absent from either side; any other gap would leave from_pretrained weights in place.
     tied = {"lm_head.weight"} if getattr(model.config, "tie_word_embeddings", False) else set()
     missing, unexpected = sorted(set(missing) - tied), sorted(set(unexpected) - tied)
+    if base_shapes is not None:
+        own = dict(model.state_dict())
+        reshaped = [k for k in missing if k in base_shapes and tuple(own[k].shape) != tuple(base_shapes[k])]
+        if reshaped:
+            print(f"  tuned-config model {ckpt_ref!r}: keeping the ref's own {reshaped} (shape differs from the source base)")
+        missing = [k for k in missing if k not in reshaped]
     if missing or unexpected:
         raise RuntimeError(
             f"Tuned-config model for {ckpt_ref!r}: aligned tuned weights do not cover the model "
