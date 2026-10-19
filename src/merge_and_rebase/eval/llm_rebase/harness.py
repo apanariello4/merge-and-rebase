@@ -198,6 +198,22 @@ def task_decoding_config(tokenizer: Any, *, apply_chat_template: bool) -> Any:
     )
 
 
+BUNDLED_TASKS_DIR = Path(__file__).resolve().parent / "lm_eval_tasks"
+_TASK_MANAGERS: dict[str, Any] = {}
+
+
+def _task_manager(include_path: str) -> Any:
+    """lm-eval TaskManager with an extra task directory (``"bundled"`` -> ``BUNDLED_TASKS_DIR``), built once per path."""
+    path = str(BUNDLED_TASKS_DIR if include_path == "bundled" else Path(include_path).resolve())
+    if not Path(path).is_dir():
+        raise ValueError(f"harness_include_path {include_path!r} is not a directory ({path})")
+    if path not in _TASK_MANAGERS:
+        from lm_eval.tasks import TaskManager
+
+        _TASK_MANAGERS[path] = TaskManager(include_path=path)
+    return _TASK_MANAGERS[path]
+
+
 def _preload_numpy_for_code_execution() -> None:
     """Make numpy importable inside code_eval's test processes.
 
@@ -252,6 +268,7 @@ def run(
     dump_generations_dir: str | None = None,
     decoding: str = "model",
     confirm_run_unsafe_code: bool = False,
+    include_path: str | None = None,
 ) -> dict[str, float]:
     """
     Evaluate a causal-LM model on lm-eval harness tasks.
@@ -283,6 +300,8 @@ def run(
     confirm_run_unsafe_code : Opt-in. Lets lm-eval execute model-generated code, which tasks marked ``unsafe_code``
         (humaneval, mbpp) require to score; they raise without it. Their metric also needs ``HF_ALLOW_CODE_EVAL=1``
         in the environment.
+    include_path : Opt-in. Extra lm-eval task directory (a ``TaskManager(include_path=...)``); ``"bundled"`` is this
+        package's ``lm_eval_tasks/`` (e.g. ``gsm8k_cot_tolerant``). ``None`` keeps lm-eval's default task registry.
 
     Returns
     -------
@@ -346,6 +365,8 @@ def run(
                 extra["log_samples"] = True
             if confirm_run_unsafe_code:
                 extra["confirm_run_unsafe_code"] = True
+            if include_path:
+                extra["task_manager"] = _task_manager(include_path)
             try:
                 results = simple_evaluate(
                     model="hf",

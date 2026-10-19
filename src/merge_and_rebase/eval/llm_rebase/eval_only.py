@@ -144,6 +144,7 @@ def main() -> None:
             dump_generations_dir=cfg.get("harness_dump_generations_dir", None),
             decoding=str(cfg.get("harness_decoding", "model")),
             confirm_run_unsafe_code=bool(cfg.get("harness_confirm_run_unsafe_code", False)),
+            include_path=cfg.get("harness_include_path", None),
         )
         print("\n=== Harness results ===")
         for name, value in harness_results.items():
