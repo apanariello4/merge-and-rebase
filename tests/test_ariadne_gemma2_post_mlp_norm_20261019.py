@@ -132,10 +132,13 @@ def test_config_guards():
 # ---- end-to-end fit -------------------------------------------------------------------------------------------
 
 
-def _fit(mode, stats_device=None):
+def _fit(mode, stats_device=None, zero_gain=None):
     src = tiny_gemma2(layers=2, seed=0)
     ft = perturbed_copy(src, scale=0.05, seed=1)
     tgt = tiny_gemma2(layers=3, seed=2)
+    if zero_gain is not None:  # (layer, coordinate) whose post-MLP gain 1 + w is exactly 0
+        with torch.no_grad():
+            tgt.model.layers[zero_gain[0]].post_feedforward_layernorm.weight[zero_gain[1]] = -1.0
     fam = infer_family(src)
     cfg = DirectResidualConfig(
         num_batches=len(TEXTS) // 2,
@@ -179,3 +182,12 @@ def test_modes_give_different_fits():
 def test_gemma2_without_mode_is_refused_at_the_fit():
     with pytest.raises(ValueError, match="post_mlp_norm"):
         resolve_ariadne_decoder_config({"preset": "ariadne"}, infer_family(tiny_gemma2()))
+
+
+@pytest.mark.parametrize("mode", ["pre_norm", "linearized"])
+def test_zero_gain_coordinate_gets_no_correction(mode):
+    # gemma-2-9b has one post-MLP gain exactly 0 (layer 11): that residual coordinate is unreachable by down_proj.
+    tv = _fit(mode, zero_gain=(1, 5)).task_vector
+    assert all(torch.isfinite(v).all() for v in tv.values())
+    assert torch.count_nonzero(tv["model.layers.1.mlp.down_proj.weight"][5]) == 0
+    assert torch.count_nonzero(tv["model.layers.1.mlp.down_proj.weight"][4]) > 0

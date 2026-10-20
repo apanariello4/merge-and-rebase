@@ -170,6 +170,12 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         return None
     rt = env.runtime
     ckpt_ref = rt.task_contexts[task].ckpt_ref
+    # Opt-in (default off): park the source template on CPU while the task copies are made, then move only the copies
+    # to the device. Copies are bitwise either way; on a 64 GB GPU three 9B sources (template + base copy + ft) plus
+    # the target do not fit (gemma-2-9b -> 2b, job 61488501).
+    offload = bool((getattr(rt, "cfg", None) or {}).get("offload_source_original", False))
+    if offload:
+        rt.source_llm.model.to("cpu")
     # Each task starts from an immutable source template, then its
     # own copy is resized to the target depth before transport.
     # Keep that depth-matched source model alive below.
@@ -196,6 +202,9 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         )
     else:
         load_into_model(source_ft_model_task, tuned_sd, strict=False)
+    if offload:
+        source_base_model_task.to(rt.device)
+        source_ft_model_task.to(rt.device)
     rt.task_contexts[task].forward_geometry = {
         "source_base": model_geometry(source_base_model_task),
         "source_ft": model_geometry(source_ft_model_task),

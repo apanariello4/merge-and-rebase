@@ -672,7 +672,10 @@ def fit_direct_residual_streaming(
                                 y = tgt[f"{pos}.mlp.c_proj.y"].cpu().reshape(-1, e_rows.shape[-1]).float()
                                 rms = torch.sqrt(y.pow(2).mean(dim=-1, keepdim=True) + eps)
                                 if post_mlp_norm == "pre_norm":
-                                    e_rows = e_rows * rms / gain
+                                    # Pseudo-inverse of the gain: a coordinate with g = 0 (gemma-2-9b layer 11 has one)
+                                    # is zeroed by the norm, so down_proj cannot reach it; ask nothing of it.
+                                    inv_gain = torch.where(gain != 0, 1.0 / gain, torch.zeros_like(gain))
+                                    e_rows = e_rows * rms * inv_gain
                                 else:
                                     h_rows = h_rows / rms
                             stats_by[pair].update(h_rows, e_rows, None, effective_out[pair])

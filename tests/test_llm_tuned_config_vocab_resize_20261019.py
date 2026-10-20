@@ -80,3 +80,20 @@ def test_same_shape_gap_still_raises(tmp_path):
         build_model_with_tuned_config(
             ref, build_cfg, aligned, base_shapes={k: tuple(v.shape) for k, v in base_sd.items()}
         )
+
+
+def test_offload_source_original_gives_identical_copies(tmp_path):
+    base = tiny_qwen2()
+    ref, _ = _resized_tuned(tmp_path, base)
+    overrides = tuned_config_mismatch(ref, base.config)
+    out = {}
+    for flag in (False, True):
+        env = _env(base, LlmTaskContext(ckpt_ref=ref, index=0, config_overrides=overrides))
+        env.runtime.cfg = {"offload_source_original": flag}
+        env.runtime.device = "cpu"
+        models = build_task_models(env, "a")
+        out[flag] = (models.source_base.state_dict(), models.source_ft.state_dict())
+    for i in (0, 1):
+        assert out[False][i].keys() == out[True][i].keys()
+        for k in out[False][i]:
+            assert torch.equal(out[False][i][k], out[True][i][k]), k
