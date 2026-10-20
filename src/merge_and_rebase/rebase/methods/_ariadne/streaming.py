@@ -28,7 +28,14 @@ from .capture import (
     iter_capture_tokens,
     paired_calibration,
 )
-from .config import DirectResidualConfig, annotate_target_split, order_components, resolve_fit_blocks, target_groups
+from .config import (
+    DirectResidualConfig,
+    annotate_target_split,
+    increment_references,
+    order_components,
+    resolve_fit_blocks,
+    target_groups,
+)
 from .diagnostics import measure_direct_residual_realization_streaming
 from .fit import ResidualSufficientStatistics, _finalize_independent_component
 from .layouts import COMPONENT_INPUT_KIND, _aligned, _component_effective_out, _layout_for
@@ -537,6 +544,9 @@ def fit_direct_residual_streaming(
     positions = resolve_fit_blocks(config, pairing.target_depth)
     groups = target_groups(pairing.pairing)
     share = config.pair_target_split == "per_block_share"
+    increment = config.block_target == "increment"
+    # block_target='increment': previous target position p(j) of each block's run (None for the first run).
+    prev_position = increment_references(pairing.pairing) if increment else {}
     source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
     solver_config = replace(config, cascade_order="independent") if config.cascade_order != "independent" else config
     shim = _layout_for(family_adapter)
@@ -562,8 +572,12 @@ def fit_direct_residual_streaming(
             m.to(device).eval()
 
         for chunk in chunks:
-            distinct_i_needed = sorted({pairing.pairing[pos] for pos in chunk})
-            src_requests = {str(i): (i, "boundary") for i in distinct_i_needed}
+            distinct_i_needed = {pairing.pairing[pos] for pos in chunk}
+            if increment:
+                distinct_i_needed |= {
+                    pairing.pairing[prev_position[pos]] for pos in chunk if prev_position[pos] is not None
+                }
+            src_requests = {str(i): (i, "boundary") for i in sorted(distinct_i_needed)}
             tgt_requests: dict[str, tuple[int, str]] = {}
             for pos in chunk:
                 tgt_requests[f"{pos}.out"] = (pos, "boundary")
@@ -576,6 +590,7 @@ def fit_direct_residual_streaming(
             stats_by: dict[tuple[int, str], ResidualSufficientStatistics] = {}
             desired_sq: dict[tuple[int, str], float] = {}
             effect_sq: dict[tuple[int, str], float] = {}
+            total_sq: dict[int, float] = dict.fromkeys(chunk, 0.0)  # ||D_j||^2, block_target='increment' rows only
             effective_out: dict[tuple[int, str], Tensor] = {}
             norm_gain: dict[int, tuple[Tensor, float]] = {}
             for pos in chunk:
@@ -652,6 +667,15 @@ def fit_direct_residual_streaming(
                             q = q_by_position[pos]
                             if residual_target == "transported_delta":
                                 desired = (f - b) @ q
+                                if increment:
+                                    total_sq[pos] += float((desired.double() ** 2).sum().item())
+                                    p = prev_position[pos]
+                                    if p is not None:
+                                        # Same alignment and the same Q_j for the previous reference's difference.
+                                        b_p = _aligned([sb[str(pairing.pairing[p])].cpu()], [out_cpu])[0]
+                                        f_p = _aligned([sf[str(pairing.pairing[p])].cpu()], [out_cpu])[0]
+                                        desired = ((f - b) - (f_p - b_p)) @ q
+                                    desired = desired / groups[pos][0]
                                 if share and groups[pos][0] > 1:
                                     desired = desired / groups[pos][0]
                             else:
@@ -709,6 +733,9 @@ def fit_direct_residual_streaming(
                     row["source_position"] = row.pop("source_coordinate")
                     # Same analysis-only tag the resident path sets in fit_direct_residual.
                     row["procrustes_source"] = prepared.get("procrustes_source", "activation")
+                    if increment:
+                        row["block_target"] = "increment"
+                        row["total_target_norm"] = total_sq[pos] ** 0.5
                     if oracle:
                         row["residual_target"] = "native_oracle"
                         row["procrustes_used"] = False

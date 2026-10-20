@@ -103,6 +103,14 @@ class DirectResidualConfig:
     # 'linearized': the norm is part of the output map, min ||(H / r) dW^T diag(g) - E|| (rows of H scaled by 1/r,
     # effective_out = diag(g)). None (default): the down_proj output enters the residual directly (Llama/Qwen).
     post_mlp_norm: str | None = None
+    # Target each block of the independent block-boundary streaming fit is regressed on.
+    # 'total' (default): D_j = (f_i - b_i) Q_j, the whole accumulated source difference at block i = pairing[j]
+    #     (bit-identical to pre-field code; with every block mounted the upstream difference is counted again at each).
+    # 'increment': the part added since the previous target position's source reference, split equally over the run
+    #     of target blocks sharing one source block: ((f_i - b_i) - (f_p - b_p)) Q_j / g(j), p = source block paired
+    #     with the last target position before j's run (none for the first run), g(j) = size of j's run; needs a
+    #     non-decreasing pairing (see `increment_references`).
+    block_target: str = "total"
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
@@ -219,6 +227,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "v_fit": None,
     "stats_device": None,
     "post_mlp_norm": None,
+    "block_target": "total",
 }
 
 
@@ -304,6 +313,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "streaming_position_chunk",
         "stats_device",
         "post_mlp_norm",
+        "block_target",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -505,6 +515,25 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     ):
         raise ValueError(
             "post_mlp_norm is implemented for the independent block-boundary streaming fit of mlp.c_proj only"
+        )
+    if cfg.block_target not in {"total", "increment"}:
+        raise ValueError("block_target must be 'total' or 'increment'")
+    if cfg.block_target == "increment" and (
+        cfg.activation_storage != "streaming"
+        or cfg.depth_fit != "independent"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.residual_target != "transported_delta"
+        or cfg.pair_target_split != "none"
+        or cfg.fit_blocks is not None
+        or cfg.component_fit != "closed_form"
+        or cfg.v_fit is not None
+    ):
+        raise ValueError(
+            "block_target='increment' is implemented for the independent block-boundary streaming fit only "
+            "(activation_storage='streaming', depth_fit='independent', block_split='none', "
+            "component_target='block_boundary', residual_target='transported_delta', pair_target_split='none', "
+            "fit_blocks unset, component_fit='closed_form', no v_fit)"
         )
     if cfg.stats_device not in {None, "cpu"}:
         raise ValueError("stats_device must be None (the compute device) or 'cpu'")
@@ -900,6 +929,15 @@ def target_groups(pairing) -> dict[int, tuple[int, int, int]]:
             out[t] = (k - j + 1, t - j, j)
         j = k + 1
     return out
+
+
+def increment_references(pairing) -> dict[int, int | None]:
+    """``{j: p(j)}`` for ``block_target='increment'``: p(j) is the last target position before j's run of consecutive
+    target blocks sharing one source block (``None`` for the first run). Raises if the pairing is not non-decreasing."""
+    if any(b < a for a, b in zip(pairing, pairing[1:], strict=False)):
+        raise ValueError("block_target='increment' needs a non-decreasing pairing (increment undefined)")
+    groups = target_groups(pairing)
+    return {j: (groups[j][2] - 1 if groups[j][2] > 0 else None) for j in groups}
 
 
 def annotate_target_split(rows, config: DirectResidualConfig, pairing) -> None:
