@@ -749,6 +749,56 @@ def fit_direct_residual_streaming(
     return target_corrections, diagnostics
 
 
+class _OffTargetUpstream:
+    """Single-pass statistics for ``sequential_subtract='off_target'``.
+
+    The target of block j is ``E_j = D_j - (U_j - c_j D_j)`` with the global scalar ``c_j = <U_j, D_j> / ||D_j||^2``
+    (``0`` if ``D_j = 0``), known only after the last batch. ``E_j`` is linear in ``c_j``, so the ``D``-statistics go
+    into the ordinary ``ResidualSufficientStatistics(h, D)`` and this object accumulates the ``U``-statistics
+    (``A^T U L``, ``sum U``) and the scalars ``<U, D>``, ``||D||^2``, ``||U||^2``; `merge_into` then rewrites the
+    ``b``, ``sum_e`` and ``sum_e2`` of that object to those of ``E_j`` (``s``, ``g``, ``sum_a``, ``n_rows`` are
+    target-independent). No per-batch rows are stored.
+    """
+
+    def __init__(self) -> None:
+        self.b_u: Tensor | None = None
+        self.sum_u: Tensor | None = None
+        self.dd = 0.0
+        self.uu = 0.0
+        self.ud = 0.0
+
+    def update(self, h: Tensor, desired: Tensor, upstream: Tensor, t_out: Tensor, device) -> None:
+        h2 = h.reshape(-1, h.shape[-1])
+        d = desired.reshape(-1, desired.shape[-1]).to(torch.float64)
+        u = upstream.reshape(-1, upstream.shape[-1]).to(torch.float64)
+        a, lmat, ur = h2.to(device).to(torch.float64), t_out.to(device).to(torch.float64).T, u.to(device)
+        b_u, sum_u = a.T @ ur @ lmat, ur.sum(dim=0)
+        if self.b_u is None:
+            self.b_u, self.sum_u = b_u, sum_u
+        else:
+            self.b_u += b_u
+            self.sum_u += sum_u
+        self.dd += float((d * d).sum().item())
+        self.uu += float((u * u).sum().item())
+        self.ud += float((u * d).sum().item())
+
+    @property
+    def along_target(self) -> float:
+        return self.ud / self.dd if self.dd > 0.0 else 0.0
+
+    @property
+    def off_target_norm(self) -> float:
+        c = self.along_target
+        return max(0.0, self.uu - 2.0 * c * self.ud + c * c * self.dd) ** 0.5
+
+    def merge_into(self, stats: ResidualSufficientStatistics) -> None:
+        c = self.along_target
+        k = 1.0 + c
+        stats.b = k * stats.b - self.b_u.to(stats.b.device)
+        stats.sum_e = k * stats.sum_e - self.sum_u.to(stats.sum_e.device)
+        stats.sum_e2 = max(0.0, k * k * self.dd - 2.0 * k * self.ud + self.uu)
+
+
 @torch.no_grad()
 def fit_direct_residual_sequential_streaming(
     target_model,
@@ -854,6 +904,7 @@ def fit_direct_residual_sequential_streaming(
             width = int(current_state[key].shape[0])
             effective_out = _component_effective_out(shim, target_model, pos, component, width)
             stats = ResidualSufficientStatistics(device=device)
+            off_target = _OffTargetUpstream() if config.sequential_subtract == "off_target" else None
             desired_sq = 0.0
             upstream_sq = 0.0
             src_requests = {str(i): (i, "boundary")}
@@ -902,11 +953,17 @@ def fit_direct_residual_sequential_streaming(
                             d_prev = torch.zeros_like(desired)
                         desired = d_prev + interp_weight * (desired - d_prev)
                     upstream = out_cpu - ref[out_key].cpu()
-                    error = desired - upstream
+                    # 'off_target': the D-statistics are accumulated here, the U-statistics beside them; E_j is formed
+                    # after the pass (see _OffTargetUpstream).
+                    error = desired if off_target is not None else desired - upstream
                     desired_sq += float((desired.double() ** 2).sum().item())
                     upstream_sq += float((upstream.double() ** 2).sum().item())
                     h = tgt[h_key].cpu()
                     stats.update(h.reshape(-1, h.shape[-1]), error.reshape(-1, error.shape[-1]), None, effective_out)
+                    if off_target is not None:
+                        off_target.update(h, desired, upstream, effective_out, stats.device)
+            if off_target is not None:
+                off_target.merge_into(stats)
 
             position_corrections: dict[str, Tensor] = {}
             block_rows: list[dict[str, Any]] = []
@@ -933,6 +990,11 @@ def fit_direct_residual_sequential_streaming(
                 row["procrustes_source"] = prepared.get("procrustes_source", "activation")
                 row["depth_fit"] = "sequential"
                 row["upstream_effect_norm"] = upstream_sq**0.5
+                if off_target is not None:
+                    row["sequential_subtract"] = "off_target"
+                    row["upstream_along_target"] = off_target.along_target
+                    row["upstream_norm"] = upstream_sq**0.5
+                    row["upstream_off_target_norm"] = off_target.off_target_norm
                 diagnostics.append(row)
             # Mount this block's update (weight and bias, as updated in current_state) before the next block.
             target_model.load_state_dict({name: current_state[name] for name in position_corrections}, strict=False)

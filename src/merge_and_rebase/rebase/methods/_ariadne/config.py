@@ -111,6 +111,11 @@ class DirectResidualConfig:
     #     with the last target position before j's run (none for the first run), g(j) = size of j's run; needs a
     #     non-decreasing pairing (see `increment_references`).
     block_target: str = "total"
+    # What the sequential block-boundary streaming fit subtracts from D_j (depth_fit='sequential' only).
+    # 'all' (default): the whole upstream change, E_j = D_j - U_j (bit-identical to pre-field code).
+    # 'off_target': only the part of U_j orthogonal to D_j, E_j = D_j - (U_j - c_j D_j), c_j = <U_j, D_j> / ||D_j||^2
+    #     (global over all calibration rows; 0 if D_j = 0): the component of the upstream change along D_j is kept.
+    sequential_subtract: str = "all"
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
@@ -228,6 +233,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "stats_device": None,
     "post_mlp_norm": None,
     "block_target": "total",
+    "sequential_subtract": "all",
 }
 
 
@@ -314,6 +320,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "stats_device",
         "post_mlp_norm",
         "block_target",
+        "sequential_subtract",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -534,6 +541,29 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "(activation_storage='streaming', depth_fit='independent', block_split='none', "
             "component_target='block_boundary', residual_target='transported_delta', pair_target_split='none', "
             "fit_blocks unset, component_fit='closed_form', no v_fit)"
+        )
+    if cfg.sequential_subtract not in {"all", "off_target"}:
+        raise ValueError("sequential_subtract must be 'all' or 'off_target'")
+    if cfg.sequential_subtract == "off_target" and (
+        cfg.depth_fit != "sequential"
+        or cfg.sequential_impl != "reference"
+        or cfg.sequential_points != "single"
+        or cfg.activation_storage != "streaming"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.residual_target != "transported_delta"
+        or cfg.block_target != "total"
+        or cfg.pair_target_split != "none"
+        or cfg.component_fit != "closed_form"
+        or cfg.v_fit is not None
+        or cfg.post_mlp_norm is not None
+    ):
+        raise ValueError(
+            "sequential_subtract='off_target' is implemented for the plain sequential block-boundary streaming fit "
+            "only (depth_fit='sequential', sequential_impl='reference', sequential_points='single', "
+            "activation_storage='streaming', block_split='none', component_target='block_boundary', "
+            "residual_target='transported_delta', block_target='total', pair_target_split='none', "
+            "component_fit='closed_form', no v_fit, no post_mlp_norm)"
         )
     if cfg.stats_device not in {None, "cpu"}:
         raise ValueError("stats_device must be None (the compute device) or 'cpu'")
