@@ -62,6 +62,7 @@ from ._ariadne.fit import (
     fit_sequential_source_endpoints,
 )
 from ._ariadne.gradient_fit import fit_direct_residual_gradient_streaming
+from ._ariadne.joint import fit_direct_residual_joint_streaming
 from ._ariadne.output_total import (
     fit_output_total_independent_streaming,
     fit_output_total_sequential_streaming,
@@ -377,6 +378,8 @@ def _fit_body(
             fit_streaming = fit_direct_residual_gradient_streaming
         elif config.v_fit is not None:
             fit_streaming = fit_direct_residual_vfit_streaming
+        elif config.depth_fit == "joint":
+            fit_streaming = fit_direct_residual_joint_streaming
         elif config.depth_fit != "sequential":
             fit_streaming = fit_direct_residual_streaming
         elif config.sequential_impl == "block_carry":

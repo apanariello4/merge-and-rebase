@@ -116,6 +116,13 @@ class DirectResidualConfig:
     # 'off_target': only the part of U_j orthogonal to D_j, E_j = D_j - (U_j - c_j D_j), c_j = <U_j, D_j> / ||D_j||^2
     #     (global over all calibration rows; 0 if D_j = 0): the component of the upstream change along D_j is kept.
     sequential_subtract: str = "all"
+    # depth_fit='joint' (J ~ I): all blocks solved together for the cumulative objective
+    # sum_j w_j ||S_j - D_j||^2 + sum_k lambda_k ||dW_k||^2, S_j = sum_{k<=j} (H_k dW_k + 1 b_k^T) L_k, by preconditioned
+    # conjugate gradients started from the independent solution (see joint.py). 'uniform': w_j = 1.
+    joint_weights: str = "uniform"
+    # Stop when ||r|| / ||b|| <= joint_tol (normal-equation residual) or after joint_max_iters iterations.
+    joint_tol: float = 1e-6
+    joint_max_iters: int = 50
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
@@ -234,6 +241,9 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "post_mlp_norm": None,
     "block_target": "total",
     "sequential_subtract": "all",
+    "joint_weights": "uniform",
+    "joint_tol": 1e-6,
+    "joint_max_iters": 50,
 }
 
 
@@ -321,6 +331,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "post_mlp_norm",
         "block_target",
         "sequential_subtract",
+        "joint_weights",
+        "joint_tol",
+        "joint_max_iters",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -623,8 +636,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError(f"procrustes_rank/procrustes_energy require {need}; got incompatible {bad}")
     if not isinstance(cfg.exclude_first_token, bool):
         raise TypeError("exclude_first_token must be bool")
-    if cfg.depth_fit not in {"independent", "sequential"}:
-        raise ValueError("depth_fit must be 'independent' or 'sequential'")
+    if cfg.depth_fit not in {"independent", "sequential", "joint"}:
+        raise ValueError("depth_fit must be 'independent', 'sequential' or 'joint'")
+    _validate_joint(cfg, components)
     if cfg.sequential_impl not in {"reference", "block_carry"}:
         raise ValueError("sequential_impl must be 'reference' or 'block_carry'")
     if cfg.sequential_impl != "reference" and cfg.depth_fit != "sequential":
@@ -704,6 +718,50 @@ _GRADIENT_FIT_GROUPS: frozenset[frozenset[str]] = frozenset(
         ("mlp.c_proj",),
     )
 )
+
+
+def _validate_joint(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of ``depth_fit='joint'`` and its solver fields (joint_tol / joint_max_iters stay default otherwise)."""
+    if cfg.joint_weights != "uniform":
+        raise ValueError("joint_weights must be 'uniform'")
+    tol, iters = cfg.joint_tol, cfg.joint_max_iters
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
+        raise ValueError("joint_tol must be a positive finite number")
+    if isinstance(iters, bool) or not isinstance(iters, int) or iters < 1:
+        raise ValueError("joint_max_iters must be an integer >= 1")
+    if cfg.depth_fit != "joint":
+        if (cfg.joint_tol, cfg.joint_max_iters) != (1e-6, 50):
+            raise ValueError("joint_tol / joint_max_iters require depth_fit='joint'")
+        return
+    need = {
+        "activation_storage": "streaming",
+        "component_target": "block_boundary",
+        "block_split": "none",
+        "block_target": "total",
+        "residual_target": "transported_delta",
+        "component_fit": "closed_form",
+        "pair_target_split": "none",
+        "tv_scaling": "none",
+        "endpoint_construction": "native_delta",
+        "merge_mode": "per_task_then_merge",
+        "fidelity_holdout": False,
+        "realization_diagnostics": False,
+        "fit_blocks": None,
+        "v_fit": None,
+        "post_mlp_norm": None,
+        "stats_device": None,
+        "sequential_subtract": "all",
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if tuple(components) != ("mlp.c_proj",):
+        bad["components"] = tuple(components)
+    if cfg.ridge_estimator == "none":
+        bad["ridge_estimator"] = "none"
+    if bad:
+        raise ValueError(
+            f"depth_fit='joint' requires {need}, components=('mlp.c_proj',) and a ridge_estimator other than 'none' "
+            f"(the normal operator needs lambda_k > 0); got incompatible {bad}"
+        )
 
 
 def _validate_component_ablations(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
