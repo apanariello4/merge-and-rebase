@@ -872,6 +872,7 @@ def fit_direct_residual_sequential_streaming(
             raise ValueError(f"Missing prepared Procrustes map for position {j}")
     source_coordinates = {j: float(pairing.pairing[j]) for j in positions}
     shim = _layout_for(family_adapter)
+    strength = float(config.sequential_strength)
 
     unique_models: dict[int, Any] = {}
     for m in (target_model, source_base_model, source_ft_model):
@@ -952,6 +953,9 @@ def fit_direct_residual_sequential_streaming(
                         else:
                             d_prev = torch.zeros_like(desired)
                         desired = d_prev + interp_weight * (desired - d_prev)
+                    if strength != 1.0:
+                        # Upstream blocks are mounted at strength s, so block j targets s D_j (see sequential_strength).
+                        desired = desired * strength
                     upstream = out_cpu - ref[out_key].cpu()
                     # 'off_target': the D-statistics are accumulated here, the U-statistics beside them; E_j is formed
                     # after the pass (see _OffTargetUpstream).
@@ -984,11 +988,16 @@ def fit_direct_residual_sequential_streaming(
                 block_rows,
                 h_batches=None,
             )
-            target_corrections.update(position_corrections)
+            # current_state keeps the strength-s update mounted for the next block; the returned task vector is unit-scale.
+            target_corrections.update(
+                position_corrections if strength == 1.0 else {k: v / strength for k, v in position_corrections.items()}
+            )
             for row in block_rows:
                 row["source_position"] = row.pop("source_coordinate")
                 row["procrustes_source"] = prepared.get("procrustes_source", "activation")
                 row["depth_fit"] = "sequential"
+                if strength != 1.0:
+                    row["sequential_strength"] = strength
                 row["upstream_effect_norm"] = upstream_sq**0.5
                 if off_target is not None:
                     row["sequential_subtract"] = "off_target"

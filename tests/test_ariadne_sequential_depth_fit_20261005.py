@@ -406,3 +406,123 @@ def test_decoder_bias_free_materialize_exactness(source_layers, target_layers):
     for row in rows:
         assert row["relative_residual_after"] > 1e-3
         assert realized[row["position"]] == pytest.approx(row["relative_residual_after"], rel=1e-4), row["position"]
+
+
+# ---- sequential_strength (2026-10-23): upstream blocks mounted at s times their unit update ---------------------------
+
+
+def _mounted_relative_errors_at(target_model, base_sd, tau, prepared, pairing, source_base, source_ft, s, family_adapter=None):
+    """||T_j(base + s tau) - T_j(base) - s D_j|| / ||s D_j|| per boundary (s = 1 is _mounted_relative_errors)."""
+    positions = list(range(pairing.target_depth))
+    mounted = deepcopy(target_model)
+    mounted.load_state_dict({k: v + s * tau[k].to(v) if k in tau else v for k, v in base_sd.items()}, strict=True)
+    base = deepcopy(target_model)
+    base.load_state_dict(base_sd, strict=True)
+    req = {str(j): (j, "boundary") for j in positions}
+    gens = _streaming_source_iters(source_base, source_ft, prepared, pairing, "cpu", family_adapter)
+    gens["m"] = iter_capture_tokens(mounted, prepared["target_batches"], req, "cpu", family_adapter=family_adapter)
+    gens["b"] = iter_capture_tokens(base, prepared["target_batches"], req, "cpu", family_adapter=family_adapter)
+    num = dict.fromkeys(positions, 0.0)
+    den = dict.fromkeys(positions, 0.0)
+    for sb, sf, m, b in zip(*(gens[n] for n in ("sb", "sf", "m", "b")), strict=True):
+        desired = _streaming_desired(prepared, pairing, "transported_delta", {"sb": sb, "sf": sf}, b, positions)
+        for j in positions:
+            num[j] += float(((m[str(j)] - b[str(j)] - s * desired[j]).double() ** 2).sum())
+            den[j] += float(((s * desired[j]).double() ** 2).sum())
+    return {j: num[j] ** 0.5 / den[j] ** 0.5 for j in positions}
+
+
+def _fit_both_strength(source_base, source_ft, target_base, data, pairing, target_base_sd, s):
+    """As _fit_both, with sequential_strength=s on the sequential config only."""
+    cfg_i = parse_direct_residual_config(IND)
+    cfg_s = parse_direct_residual_config({**SEQ, "sequential_strength": s})
+    prepared = prepare_direct_residual_streaming(
+        source_base, target_base, data, data, pairing, num_batches=cfg_i.num_batches, seed=cfg_i.seed, device="cpu"
+    )
+    args = (target_base, target_base_sd, source_base, source_ft, prepared, pairing)
+    ind = fit_direct_residual_streaming(*args, config=cfg_i, device="cpu")
+    seq = fit_direct_residual_sequential_streaming(*args, config=cfg_s, device="cpu")
+    return ind, seq, prepared
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_sequential_strength_one_is_bitwise_default(source_depth, target_depth):
+    source_base, source_ft, target_base, data, pairing, sd = _setup(source_depth, target_depth)
+    _, (seq, _), _ = _fit_both(source_base, source_ft, target_base, data, pairing, sd)
+    _, (seq1, rows1), _ = _fit_both_strength(source_base, source_ft, target_base, data, pairing, sd, 1.0)
+    assert _sha(seq) == _sha(seq1)
+    assert "sequential_strength" not in rows1[0]
+
+
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_sequential_strength_block0_is_independent_and_later_blocks_change(source_depth, target_depth):
+    source_base, source_ft, target_base, data, pairing, sd = _setup(source_depth, target_depth)
+    (ind, _), (seq1, _), _ = _fit_both(source_base, source_ft, target_base, data, pairing, sd)
+    _, (seqh, rows), _ = _fit_both_strength(source_base, source_ft, target_base, data, pairing, sd, 0.5)
+    for key in [k for k in ind if ".0." in k]:  # the solve is linear in the target: (0.5 D_0) / 0.5 = D_0 up to rounding
+        torch.testing.assert_close(seqh[key], ind[key], rtol=1e-5, atol=1e-7)
+    later = [k for k in ind if ".0." not in k]
+    assert any(not torch.allclose(seqh[k], seq1[k], rtol=1e-4, atol=1e-6) for k in later)
+    assert all(r["sequential_strength"] == 0.5 for r in rows)
+
+
+@pytest.mark.parametrize("s", [0.25, 0.5, 2.0])
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_sequential_strength_mounted_error_equals_fit_residual(source_depth, target_depth, s):
+    """Exactness at the fitted strength: mounting s * tau leaves, at boundary j, exactly block j's fit residual vs s D_j."""
+    source_base, source_ft, target_base, data, pairing, sd = _setup(source_depth, target_depth)
+    _, (seq, rows), prepared = _fit_both_strength(source_base, source_ft, target_base, data, pairing, sd, s)
+    realized = _mounted_relative_errors_at(target_base, sd, seq, prepared, pairing, source_base, source_ft, s)
+    for row in rows:
+        j = row["position"]
+        assert realized[j] == pytest.approx(row["relative_residual_after"], rel=1e-5), j
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequential_strength": 0.0},
+        {"sequential_strength": -0.5},
+        {"sequential_strength": float("nan")},
+        {"sequential_strength": True},
+        {"sequential_strength": 0.5, "depth_fit": "independent"},
+        {"sequential_strength": 0.5, "sequential_impl": "block_carry"},
+        {"sequential_strength": 0.5, "sequential_points": "end_end", "components": ("attn.out_proj", "mlp.c_proj")},
+    ],
+)
+def test_sequential_strength_rejects(overrides):
+    with pytest.raises(ValueError):
+        parse_direct_residual_config({**SEQ, **overrides})
+
+
+def test_sequential_strength_serialized_only_when_non_default():
+    assert "sequential_strength" not in direct_residual_config_dict(DirectResidualConfig())
+    assert direct_residual_config_dict(parse_direct_residual_config({**SEQ, "sequential_strength": 0.4}))["sequential_strength"] == 0.4
+
+
+@pytest.mark.parametrize("source_layers, target_layers", [(2, 3), (3, 2)])
+def test_decoder_sequential_strength_exactness(source_layers, target_layers):
+    """Decoder (tiny Qwen2, fitted bias): at s = 0.5 the mounted s * tau leaves each block's fit residual vs s D_j."""
+    texts = CALIB_TEXTS * 4
+    src = tiny_qwen2(layers=source_layers, seed=0)
+    ft = perturbed_copy(src, scale=0.05, seed=1)
+    tgt = tiny_qwen2(layers=target_layers, seed=2)
+    fam = infer_family(src)
+    base_sd = {k: v.clone() for k, v in tgt.state_dict().items()}
+    materialize_missing_projection_biases(tgt, base_sd, family_adapter=fam, components=("mlp.c_proj",))
+    cfg = resolve_ariadne_decoder_config(
+        {"depth_fit": "sequential", "num_batches": len(texts) // 2, "alignment_map": "ridge", "sequential_strength": 0.5}, fam
+    )
+    pairing = DiscreteLayerPairing.compute(source_layers, target_layers)
+    prepared = prepare_direct_residual_streaming(
+        src, tgt, _text_loader(texts), _text_loader(texts), pairing, num_batches=cfg.num_batches, seed=cfg.seed,
+        device="cpu", family_adapter=fam, alignment_map="ridge",
+    )
+    tau, rows = fit_direct_residual_sequential_streaming(
+        tgt, base_sd, src, ft, prepared, pairing, config=cfg, device="cpu", family_adapter=fam
+    )
+    assert any(k.endswith("down_proj.bias") for k in tau)
+    realized = _mounted_relative_errors_at(tgt, base_sd, tau, prepared, pairing, src, ft, 0.5, family_adapter=fam)
+    for row in rows:
+        assert row["sequential_strength"] == 0.5
+        assert realized[row["position"]] == pytest.approx(row["relative_residual_after"], rel=1e-4), row["position"]

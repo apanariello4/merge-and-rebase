@@ -116,6 +116,12 @@ class DirectResidualConfig:
     # 'off_target': only the part of U_j orthogonal to D_j, E_j = D_j - (U_j - c_j D_j), c_j = <U_j, D_j> / ||D_j||^2
     #     (global over all calibration rows; 0 if D_j = 0): the component of the upstream change along D_j is kept.
     sequential_subtract: str = "all"
+    # Strength s at which the already-fitted upstream blocks are mounted during the sequential block-boundary fit
+    # (depth_fit='sequential' only). 1.0 (default): unit-strength updates, E_j = D_j - U_j (bit-identical to pre-field
+    # code). s != 1: blocks 0..j-1 are mounted at s times their unit update and block j is fitted to E_j = s D_j - U_j(s)
+    # (the network operating point of a final scaling alpha ~ s); the solved update is returned divided by s, so the
+    # task vector stays at unit scale for the alpha search. Linear in the limit: s -> 0 is the linearised sequential fit.
+    sequential_strength: float = 1.0
     # depth_fit='joint' (J ~ I): all blocks solved together for the cumulative objective
     # sum_j w_j ||S_j - D_j||^2 + sum_k lambda_k ||dW_k||^2, S_j = sum_{k<=j} (H_k dW_k + 1 b_k^T) L_k, by preconditioned
     # conjugate gradients started from the independent solution (see joint.py). 'uniform': w_j = 1.
@@ -241,6 +247,7 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "post_mlp_norm": None,
     "block_target": "total",
     "sequential_subtract": "all",
+    "sequential_strength": 1.0,
     "joint_weights": "uniform",
     "joint_tol": 1e-6,
     "joint_max_iters": 50,
@@ -331,6 +338,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "post_mlp_norm",
         "block_target",
         "sequential_subtract",
+        "sequential_strength",
         "joint_weights",
         "joint_tol",
         "joint_max_iters",
@@ -554,6 +562,24 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "(activation_storage='streaming', depth_fit='independent', block_split='none', "
             "component_target='block_boundary', residual_target='transported_delta', pair_target_split='none', "
             "fit_blocks unset, component_fit='closed_form', no v_fit)"
+        )
+    if isinstance(cfg.sequential_strength, bool) or not isinstance(cfg.sequential_strength, (int, float)):
+        raise ValueError("sequential_strength must be a positive finite number")
+    if not math.isfinite(float(cfg.sequential_strength)) or float(cfg.sequential_strength) <= 0:
+        raise ValueError("sequential_strength must be a positive finite number")
+    if float(cfg.sequential_strength) != 1.0 and (
+        cfg.depth_fit != "sequential"
+        or cfg.sequential_impl != "reference"
+        or cfg.sequential_points != "single"
+        or cfg.activation_storage != "streaming"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.endpoint_construction != "native_delta"
+    ):
+        raise ValueError(
+            "sequential_strength != 1 is implemented for the plain sequential block-boundary streaming fit only "
+            "(depth_fit='sequential', sequential_impl='reference', sequential_points='single', "
+            "activation_storage='streaming', block_split='none', component_target='block_boundary')"
         )
     if cfg.sequential_subtract not in {"all", "off_target"}:
         raise ValueError("sequential_subtract must be 'all' or 'off_target'")
