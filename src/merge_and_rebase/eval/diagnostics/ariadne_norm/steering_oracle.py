@@ -19,6 +19,15 @@ fine-tuned / base block-``i`` outputs on ``x`` (``_aligned`` to the target token
 One alpha per task (shared by all blocks), chosen on the reference's ``alpha_search_split`` with ``select_alpha`` over
 the same grid logic as the readout (first maximum). Test accuracy is read at that alpha; alpha = 0 is the untouched
 target (gate: the hooked alpha = 0 forward equals the hook-free forward).
+
+Mean steering (``mean_block_total`` / ``mean_block_increment``): the same ``v_j`` averaged over the fit's calibration
+images (the identical ``paired_calibration`` draw that gives ``Q_j``: ``num_batches`` x ``batch_size`` train images,
+``config.seed``), then ONE fixed vector per block is added to every evaluated image -- no source model at evaluation
+time. ``steer_mean_pools`` (default all three) sets how the mean is pooled over the token grid, each scored with its own
+alpha: ``tokens`` (one ``[D]`` vector, mean over images and all tokens: with ``mean_block_total`` this is the
+calibration mean of the Ariadne c_proj update, i.e. Ariadne with dW = 0), ``cls_patch`` (CLS mean, patch mean),
+``position`` (``[T, D]``, mean over images per token position). Per block, ``energy_fraction`` =
+``n ||m_j||_F^2 / sum_x ||v_j(x)||_F^2`` on the calibration images (share of the second moment the pooled mean carries).
 """
 
 from __future__ import annotations
@@ -38,7 +47,8 @@ from . import readout as R
 
 Tensor = torch.Tensor
 
-STEER_MODES = ("last_block", "block_increment", "block_total")
+STEER_MODES = ("last_block", "block_increment", "block_total", "mean_block_increment", "mean_block_total")
+MEAN_POOLS = ("tokens", "cls_patch", "position")
 
 
 def validate_steer_mode(mode: Any) -> str:
@@ -47,10 +57,43 @@ def validate_steer_mode(mode: Any) -> str:
     return str(mode)
 
 
+def validate_mean_pools(pools: Any) -> tuple[str, ...]:
+    """``None`` -> all of `MEAN_POOLS`; otherwise a non-empty list of distinct known pools (order kept)."""
+    if pools is None:
+        return MEAN_POOLS
+    if isinstance(pools, str) or not pools or len(set(pools)) != len(pools) or any(p not in MEAN_POOLS for p in pools):
+        raise ValueError(
+            f"steer_mean_pools must be a non-empty list of distinct values from {MEAN_POOLS}, got {pools!r}"
+        )
+    return tuple(str(p) for p in pools)
+
+
+def pooled_mean(sums: Tensor, n_images: int, pool: str) -> Tensor:
+    """``[T, D]`` mean steering vector of one block from its per-position sums ``[T, D]`` over ``n_images`` images:
+    ``position`` = per-position mean; ``tokens`` = one mean over images and all T tokens, repeated on every token;
+    ``cls_patch`` = token 0 (CLS) mean, and one mean over images and tokens 1..T-1 repeated on the patch tokens."""
+    if n_images <= 0:
+        raise ValueError("no calibration images")
+    n_tok = sums.shape[0]
+    if pool == "position":
+        return sums / n_images
+    if pool == "tokens":
+        return (sums.sum(0) / (n_images * n_tok)).expand(n_tok, -1).clone()
+    if pool == "cls_patch":
+        if n_tok < 2:
+            raise ValueError("cls_patch needs a CLS token and at least one patch token")
+        out = torch.empty_like(sums)
+        out[0] = sums[0] / n_images
+        out[1:] = sums[1:].sum(0) / (n_images * (n_tok - 1))
+        return out
+    raise ValueError(f"unknown pool {pool!r}")
+
+
 def steering_references(pairing: Sequence[int], mode: str) -> dict[int, tuple[int | None, int]]:
     """``{j: (previous source block or None, g(j))}``: ``block_total`` -> ``(None, 1)``; ``block_increment`` follows
-    ``increment_references`` / ``target_groups`` (same pairing validation: non-decreasing)."""
+    ``increment_references`` / ``target_groups`` (same pairing validation: non-decreasing). ``mean_*`` = same vectors."""
     pairing = [int(i) for i in pairing]
+    mode = mode.removeprefix("mean_")  # mean steering averages the same per-image vectors
     if mode == "block_total":
         return {j: (None, 1) for j in range(len(pairing))}
     if mode != "block_increment":
@@ -146,9 +189,14 @@ def steering_oracle_task(
     eval_subset_seed: int = 0,
     micro_batch: int = 32,
     alpha_tol: float = 1e-5,
+    mean_pools: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Steering oracle for one task: ``(record, arrays)`` shaped like ``readout_task``'s so ``readout.main`` writes them."""
+    """Steering oracle for one task: ``(record, arrays)`` shaped like ``readout_task``'s so ``readout.main`` writes them.
+    ``mean_*`` modes hand over to `_mean_steering` after the shared setup (loaders, head, Q_j)."""
     mode = validate_steer_mode(steer_mode)
+    pools = validate_mean_pools(mean_pools) if mode.startswith("mean_") else None
+    if mean_pools is not None and pools is None:
+        raise ValueError(f"steer_mean_pools is only read by the mean_* modes, not steer_mode={mode!r}")
     if mode == "last_block":
         raise ValueError("steering_oracle_task is for the per-block modes; last_block is readout_task")
     if eval_subset_size is not None and max_batches:
@@ -215,10 +263,25 @@ def steering_oracle_task(
     )
     q_all = {int(j): v.float().cpu() for j, v in prepared["q_by_position"].items()}
     calibration = {k: v for k, v in prepared["calibration"].items() if k != "indices"}
+    calibration_indices = prepared["calibration"].get("indices")
     del prepared
     if any(j not in q_all for j in range(depth)):
         raise ValueError(f"no Q_j for target blocks {[j for j in range(depth) if j not in q_all]}")
     lap("fit_pass_a_q")
+    if pools is not None:
+        record, arrays = _mean_steering(
+            inp, head, q_all, pairing, refs, src_blocks, loaders, alphas, pools,
+            calibration_indices=calibration_indices, max_batches=max_batches, micro_batch=micro_batch,
+            alpha_tol=alpha_tol, selection_split=resolved.alpha.search_split, lap=lap,
+        )  # fmt: skip
+        record.update(
+            task=inp.task, steer_mode=mode, alpha_grid=grid_info, subset=subset_info, pairing_checks=pairing_checks,
+            q={"calibration": calibration}, provenance=inp.provenance, timings_seconds=timings,
+            references={
+                str(j): {"source_block": pairing[j], "previous_source_block": p, "g": g} for j, (p, g) in refs.items()
+            },
+        )  # fmt: skip
+        return record, arrays
 
     sb_model, sf_model, tgt_model = inp.source_base_model, inp.source_ft_model, inp.target_model
     src_req = {i: (i, "boundary") for i in src_blocks}
@@ -335,5 +398,169 @@ def steering_oracle_task(
         "labels": {s: torch.cat(labels_all[s]) for s in loaders},
         "preds": {s: torch.cat(preds[s], dim=1) for s in loaders},  # [A, n]
         "untouched_preds": {s: torch.cat(base_preds[s]) for s in loaders},
+    }
+    return record, arrays
+
+
+@torch.no_grad()
+def _mean_steering(
+    inp: Any,
+    head: Any,
+    q_all: Mapping[int, Tensor],
+    pairing: Sequence[int],
+    refs: Mapping[int, tuple[int | None, int]],
+    src_blocks: Sequence[int],
+    loaders: Mapping[str, tuple[Any, Any]],
+    alphas: Sequence[float],
+    pools: Sequence[str],
+    *,
+    calibration_indices: Sequence[int] | None,
+    max_batches: int | None,
+    micro_batch: int,
+    alpha_tol: float,
+    selection_split: str,
+    lap: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Mean steering: ``v_j`` averaged over the calibration draw (source models run there only), one fixed vector per
+    block added to every evaluated image (target view only). One alpha per pool, chosen on ``selection_split``."""
+    from merge_and_rebase.rebase.methods._ariadne.capture import paired_calibration
+
+    device = inp.device
+    cfg = inp.config
+    depth = len(pairing)
+    sb_model, sf_model, tgt_model = inp.source_base_model, inp.source_ft_model, inp.target_model
+    src_batches, tgt_batches, cal_meta = paired_calibration(
+        inp.source_loader,
+        inp.target_loader,
+        num_batches=cfg.num_batches,
+        seed=cfg.seed,
+        family_adapter=inp.family_adapter,
+    )
+    if calibration_indices is not None and list(cal_meta["indices"]) != list(calibration_indices):
+        raise ValueError("mean-steering calibration draw differs from the draw that gave Q_j")
+    src_req = {i: (i, "boundary") for i in src_blocks}
+    sums: dict[int, Tensor] = {}
+    sq = torch.zeros(depth, dtype=torch.float64)
+    v_norm = torch.zeros(depth, dtype=torch.float64)
+    d_norm = torch.zeros(depth, dtype=torch.float64)
+    n_img = 0
+    n_tok: int | None = None
+    for a, b in zip(src_batches, tgt_batches, strict=True):
+        xs_all, xt_all = a[0].to(device), b[0].to(device)
+        for lo in range(0, len(xt_all), int(micro_batch)):
+            xs, xt = xs_all[lo : lo + micro_batch], xt_all[lo : lo + micro_batch]
+            if n_tok is None:
+                n_tok = int(R.capture_batch(tgt_model, xt[:1], {0: (0, "boundary")}, device)[0].shape[1])
+            sbc = R.capture_batch(sb_model, xs, src_req, device)
+            sfc = R.capture_batch(sf_model, xs, src_req, device)
+            dummy = torch.empty(len(xt), n_tok, 1, device=device)
+            v, total = steering_vectors(sfc, sbc, dummy, q_all, pairing, refs)
+            for j in range(depth):
+                vj = v[j].double()
+                sums[j] = vj.sum(0) if j not in sums else sums[j] + vj.sum(0)
+                sq[j] += float(vj.pow(2).sum())
+                v_norm[j] += float(vj.norm(dim=-1).sum())
+                d_norm[j] += float(total[j].double().norm(dim=-1).sum())
+            n_img += len(xt)
+    lap("calibration_means")
+    assert n_tok is not None
+    means = {p: {j: pooled_mean(sums[j], n_img, p).float() for j in range(depth)} for p in pools}
+    pool_stats = {
+        p: {
+            "mean_vector_norm": [float(means[p][j].double().norm(dim=-1).mean()) for j in range(depth)],
+            "energy_fraction": [
+                float(n_img * means[p][j].double().pow(2).sum() / sq[j].clamp_min(1e-300)) for j in range(depth)
+            ],
+        }
+        for p in pools
+    }
+
+    a_n = len(alphas)
+    zero_i = list(alphas).index(0.0)
+    correct = {p: {s: torch.zeros(a_n, dtype=torch.long) for s in loaders} for p in pools}
+    preds = {p: {s: [] for s in loaders} for p in pools}
+    base_correct = dict.fromkeys(loaders, 0)
+    base_preds: dict[str, list[Tensor]] = {s: [] for s in loaders}
+    labels_all: dict[str, list[Tensor]] = {s: [] for s in loaders}
+    count = dict.fromkeys(loaders, 0)
+    alpha0_diff = dict.fromkeys(pools, 0.0)
+    t0_scale = 0.0
+    for split, (_src_loader, tgt_loader) in loaders.items():
+        tgt_labels: list[Tensor] = []
+        for k, t_in in enumerate(R._tap(R._take(tgt_loader, max_batches), tgt_labels)):
+            xt_all, lab = t_in[0].to(device), tgt_labels[k].to(device)
+            for lo in range(0, len(xt_all), int(micro_batch)):
+                xt, y = xt_all[lo : lo + micro_batch], lab[lo : lo + micro_batch]
+                plain = forward_with_block_patches(tgt_model, xt, {}, device)
+                t0_scale = max(t0_scale, float(plain.abs().max()))
+                bp = head.logits(plain).argmax(-1)
+                base_correct[split] += int((bp == y).sum())
+                base_preds[split].append(bp.cpu().to(torch.int32))
+                for p in pools:
+                    batch_preds = []
+                    for ai, alpha in enumerate(alphas):
+                        patches = {
+                            j: (float(alpha) * means[p][j]).to(device).expand(len(xt), -1, -1) for j in range(depth)
+                        }
+                        cls = forward_with_block_patches(tgt_model, xt, patches, device)
+                        if ai == zero_i:
+                            alpha0_diff[p] = max(alpha0_diff[p], float((cls - plain).abs().max()))
+                        pr = head.logits(cls).argmax(-1)
+                        correct[p][split][ai] += int((pr == y).sum())
+                        batch_preds.append(pr.cpu().to(torch.int32))
+                    preds[p][split].append(torch.stack(batch_preds))
+                labels_all[split].append(y.cpu())
+                count[split] += len(y)
+        lap(f"sweep_{split}")
+
+    base_acc = {s: base_correct[s] / count[s] for s in loaders}
+    curves = {p: {s: [int(c) / count[s] for c in correct[p][s]] for s in loaders} for p in pools}
+    selection = {}
+    for p in pools:
+        i = R.select_alpha(alphas, curves[p][selection_split])
+        selection[p] = {
+            "selected_alpha": alphas[i],
+            "selected_index": i,
+            "selection_split": selection_split,
+            "val_acc": curves[p]["val"][i],
+            "test_acc": curves[p]["test"][i],
+            "untouched_target_val_acc": base_acc["val"],
+            "untouched_target_test_acc": base_acc["test"],
+        }
+    tol = max(alpha_tol * max(t0_scale, 1.0), 1e-6)
+    gates = {
+        f"g_alpha0_equals_untouched_target_{p}": {
+            "max_abs_cls_diff": alpha0_diff[p],
+            "tolerance": tol,
+            "passed": bool(alpha0_diff[p] <= tol),
+        }
+        for p in pools
+    }
+    toks = n_img * n_tok
+    record = {
+        "family": "vision",
+        "pools": list(pools),
+        "alphas": list(alphas),
+        "n": dict(count),
+        "curves": curves,
+        "selection": selection,
+        "calibration_means": {
+            "n_images": n_img,
+            "n_tokens": n_tok,
+            "mean_v_norm": (v_norm / toks).tolist(),
+            "mean_D_norm": (d_norm / toks).tolist(),
+            "v_over_D": (v_norm / d_norm.clamp_min(1e-300)).tolist(),
+            "pools": pool_stats,
+        },
+        "gates": gates,
+        "failed_gates": [name for name, g in gates.items() if g.get("passed") is False],
+    }
+    arrays = {
+        "alphas": torch.tensor(list(alphas), dtype=torch.float64),
+        "labels": {s: torch.cat(labels_all[s]) for s in loaders},
+        "preds": {p: {s: torch.cat(preds[p][s], dim=1) for s in loaders} for p in pools},  # [A, n]
+        "untouched_preds": {s: torch.cat(base_preds[s]) for s in loaders},
+        "position_sums": {j: sums[j].cpu() for j in range(depth)},  # [T, D] float64; every pool derives from these
+        "n_calibration_images": n_img,
     }
     return record, arrays

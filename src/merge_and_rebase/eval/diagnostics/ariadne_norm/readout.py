@@ -1741,9 +1741,13 @@ def main(argv: list[str] | None = None) -> None:
     cfg = json.loads(config_bytes)
     if cfg.get("family", "vision") != "vision":
         raise NotImplementedError("readout is vision-only")
-    from .steering_oracle import steering_oracle_task, validate_steer_mode
+    from .steering_oracle import steering_oracle_task, validate_mean_pools, validate_steer_mode
 
     steer_mode = validate_steer_mode(cfg.get("steer_mode", "last_block"))  # before anything is created
+    if steer_mode.startswith("mean_"):
+        validate_mean_pools(cfg.get("steer_mean_pools"))
+    elif cfg.get("steer_mean_pools") is not None:
+        raise ValueError(f"steer_mean_pools is only read by the mean_* steer modes, not {steer_mode!r}")
     out_dir = Path(cfg["out_dir"])
     if out_dir.exists():
         raise FileExistsError(f"{out_dir} exists; readout results are write-once")
@@ -1780,6 +1784,7 @@ def main(argv: list[str] | None = None) -> None:
                 eval_subset_size=cfg.get("eval_subset_size"),
                 eval_subset_seed=int(cfg.get("eval_subset_seed", 0)),
                 micro_batch=int(cfg.get("steer_micro_batch", 32)),
+                mean_pools=cfg.get("steer_mean_pools"),
             )
             if steer_mode != "last_block"
             else readout_task(

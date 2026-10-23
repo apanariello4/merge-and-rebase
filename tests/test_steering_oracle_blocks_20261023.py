@@ -323,3 +323,101 @@ def test_main_default_calls_readout_task_only_and_writes_the_same_files(tmp_path
     R.main(["--config", str(cfg), "--device", "cpu"])
     assert len(calls) == 1 and calls[0]["score_target"] is True and "steer_mode" not in calls[0]
     assert sorted(p.name for p in (tmp_path / "o" / "Toy").iterdir()) == ["arrays.pt", "readout.json"]
+
+
+# ---- mean steering (mean_block_total / mean_block_increment) ------------------------------------------------------
+
+
+def test_pooled_mean_definitions():
+    g = torch.Generator().manual_seed(1)
+    sums = torch.randn(5, 3, generator=g, dtype=torch.float64)
+    assert torch.allclose(S.pooled_mean(sums, 4, "position"), sums / 4)
+    tok = S.pooled_mean(sums, 4, "tokens")
+    assert torch.allclose(tok, (sums.sum(0) / 20).expand(5, -1))
+    cp = S.pooled_mean(sums, 4, "cls_patch")
+    assert torch.allclose(cp[0], sums[0] / 4) and torch.allclose(cp[1:], (sums[1:].sum(0) / 16).expand(4, -1))
+    assert S.validate_mean_pools(None) == S.MEAN_POOLS
+    for bad in ([], ["tokens", "tokens"], ["mean"], "tokens"):
+        with pytest.raises(ValueError, match="steer_mean_pools"):
+            S.validate_mean_pools(bad)
+
+
+def _q_like_the_task(inp):
+    from merge_and_rebase.rebase.methods._ariadne.streaming import prepare_direct_residual_streaming
+
+    cfg = inp.config
+    prepared = prepare_direct_residual_streaming(
+        inp.source_base_model, inp.target_model, inp.source_loader, inp.target_loader, inp.pairing,
+        num_batches=cfg.num_batches, seed=cfg.seed, device="cpu", family_adapter=None,
+        source_ft_model=inp.source_ft_model, procrustes_source=cfg.procrustes_source, alignment_map=cfg.alignment_map,
+        alignment_row_weighting=cfg.alignment_row_weighting, alignment_seed=cfg.alignment_seed,
+    )  # fmt: skip
+    return {int(j): v.float() for j, v in prepared["q_by_position"].items()}, prepared["calibration"]["indices"]
+
+
+@pytest.mark.parametrize("mode", ["mean_block_total", "mean_block_increment"])
+def test_mean_is_the_calibration_average_of_the_per_image_vectors(mode):
+    inp, sink = _fake(2, 3)
+    rec, arrays = _steer(inp, sink, mode, micro_batch=5)
+    inp2, _ = _fake(2, 3)
+    q_all, idx = _q_like_the_task(inp2)
+    pairing = [int(i) for i in inp2.pairing.pairing]
+    refs = S.steering_references(pairing, mode.removeprefix("mean_"))
+    # explicit: the calibration rows (same seeded draw), one image at a time, own hooks / own interpolation
+    xs_all = torch.stack([inp2.source_loader.dataset[i][0] for i in idx])
+    xt_all = torch.stack([inp2.target_loader.dataset[i][0] for i in idx])
+    want = {j: 0.0 for j in range(3)}
+    for k in range(len(idx)):
+        v = _explicit(inp2, xs_all[k : k + 1], xt_all[k : k + 1], q_all, mode.removeprefix("mean_"))
+        for j in range(3):
+            want[j] = want[j] + v[j][0].double()
+    assert arrays["n_calibration_images"] == len(idx) == 12
+    for j in range(3):
+        assert torch.allclose(arrays["position_sums"][j], want[j], atol=1e-4, rtol=1e-4)
+    assert rec["references"] == {
+        str(j): {"source_block": pairing[j], "previous_source_block": p, "g": g} for j, (p, g) in refs.items()
+    }
+    # energy fractions are nested: tokens <= cls_patch <= position <= 1
+    ef = rec["calibration_means"]["pools"]
+    for j in range(3):
+        t, c, p = (ef[x]["energy_fraction"][j] for x in ("tokens", "cls_patch", "position"))
+        assert 0.0 <= t <= c + 1e-12 and c <= p + 1e-12 and p <= 1.0 + 1e-9
+
+
+def test_mean_steering_record_gates_and_patched_forward():
+    inp, sink = _fake(2, 3)
+    rec, arrays = _steer(inp, sink, "mean_block_total", micro_batch=3, mean_pools=["tokens", "position"])
+    assert rec["pools"] == ["tokens", "position"] and rec["failed_gates"] == []
+    for p in ("tokens", "position"):
+        assert rec["gates"][f"g_alpha0_equals_untouched_target_{p}"]["max_abs_cls_diff"] == 0.0
+        sel = rec["selection"][p]
+        assert sel["val_acc"] == max(rec["curves"][p]["val"])
+        assert sel["test_acc"] == rec["curves"][p]["test"][sel["selected_index"]]
+        for s in ("val", "test"):
+            assert rec["curves"][p][s][0] == sel[f"untouched_target_{s}_acc"]
+            assert arrays["preds"][p][s].shape == (len(GRID), 10)
+            assert torch.equal(arrays["preds"][p][s][0], arrays["untouched_preds"][s])
+    # the fixed patch is the same for every image: steered predictions at alpha=1 equal an explicit hooked forward
+    n = arrays["n_calibration_images"]
+    m = {j: S.pooled_mean(arrays["position_sums"][j], n, "position").float() for j in range(3)}
+    xt = torch.stack([sink["eval_context"].loaders.test.dataset[i][0] for i in range(10)])
+    cls = S.forward_with_block_patches(inp.target_model, xt, {j: m[j].expand(10, -1, -1) for j in m}, "cpu")
+    head = R.VisionHead.from_classifier(sink["target_clf"], "cpu")
+    assert torch.equal(
+        head.logits(cls).argmax(-1).to(torch.int32), arrays["preds"]["position"]["test"][GRID.index(1.0)]
+    )
+
+
+def test_mean_pools_config_validated_before_anything_is_created(tmp_path):
+    for extra in (
+        {"steer_mode": "block_total", "steer_mean_pools": ["tokens"]},
+        {"steer_mode": "mean_block_total", "steer_mean_pools": ["x"]},
+    ):
+        out = tmp_path / "out"
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text(json.dumps({"family": "vision", "reference_summary": "x", "out_dir": str(out), **extra}))
+        with pytest.raises(ValueError, match="steer_mean_pools"):
+            R.main(["--config", str(cfg), "--device", "cpu"])
+        assert not out.exists()
+    with pytest.raises(ValueError, match="steer_mean_pools"):
+        _steer(*_fake(2, 3), "block_total", mean_pools=["tokens"])
