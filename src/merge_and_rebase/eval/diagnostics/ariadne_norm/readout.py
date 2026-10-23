@@ -1741,6 +1741,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg = json.loads(config_bytes)
     if cfg.get("family", "vision") != "vision":
         raise NotImplementedError("readout is vision-only")
+    from .steering_oracle import steering_oracle_task, validate_steer_mode
+
+    steer_mode = validate_steer_mode(cfg.get("steer_mode", "last_block"))  # before anything is created
     out_dir = Path(cfg["out_dir"])
     if out_dir.exists():
         raise FileExistsError(f"{out_dir} exists; readout results are write-once")
@@ -1766,29 +1769,43 @@ def main(argv: list[str] | None = None) -> None:
         t0 = time.perf_counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        record, arrays = readout_task(
-            inp,
-            sink,
-            alpha_grid=cfg.get("alpha_grid"),
-            gate_batches=int(cfg.get("gate_batches", 2)),
-            gate_logit_tol=float(cfg.get("gate_logit_tol", 1e-4)),
-            gate_acc_tol=float(cfg.get("gate_acc_tol", 1e-3)),
-            gate_cls_tol=float(cfg.get("gate_cls_tol", 1e-5)),
-            zs_cache_dir=cfg.get("zs_cache_dir", ZERO_SHOT_CACHE_DIR),
-            max_batches=cfg.get("max_batches_per_split"),
-            native_ckpt_path=(
-                cfg["native_target_ckpt_template"].format(task=inp.task)
-                if cfg.get("native_target_ckpt_template")
-                else None
-            ),
-            boundary_max_batches=cfg.get("boundary_max_batches", 10),
-            boundary_block_group=int(cfg.get("boundary_block_group", 4)),
-            oracle_patch_blocks=cfg.get("oracle_patch_blocks"),
-            oracle_beta_grid=cfg.get("oracle_beta_grid", [0.25, 0.5, 1.0, 1.5]),
-            eval_subset_size=cfg.get("eval_subset_size"),
-            eval_subset_applies_to_all=bool(cfg.get("eval_subset_applies_to_all", False)),
-            eval_subset_seed=int(cfg.get("eval_subset_seed", 0)),
-            score_target=bool(cfg.get("score_target", False)),
+        record, arrays = (
+            steering_oracle_task(
+                inp,
+                sink,
+                steer_mode=steer_mode,
+                alpha_grid=cfg.get("alpha_grid"),
+                zs_cache_dir=cfg.get("zs_cache_dir", ZERO_SHOT_CACHE_DIR),
+                max_batches=cfg.get("max_batches_per_split"),
+                eval_subset_size=cfg.get("eval_subset_size"),
+                eval_subset_seed=int(cfg.get("eval_subset_seed", 0)),
+                micro_batch=int(cfg.get("steer_micro_batch", 32)),
+            )
+            if steer_mode != "last_block"
+            else readout_task(
+                inp,
+                sink,
+                alpha_grid=cfg.get("alpha_grid"),
+                gate_batches=int(cfg.get("gate_batches", 2)),
+                gate_logit_tol=float(cfg.get("gate_logit_tol", 1e-4)),
+                gate_acc_tol=float(cfg.get("gate_acc_tol", 1e-3)),
+                gate_cls_tol=float(cfg.get("gate_cls_tol", 1e-5)),
+                zs_cache_dir=cfg.get("zs_cache_dir", ZERO_SHOT_CACHE_DIR),
+                max_batches=cfg.get("max_batches_per_split"),
+                native_ckpt_path=(
+                    cfg["native_target_ckpt_template"].format(task=inp.task)
+                    if cfg.get("native_target_ckpt_template")
+                    else None
+                ),
+                boundary_max_batches=cfg.get("boundary_max_batches", 10),
+                boundary_block_group=int(cfg.get("boundary_block_group", 4)),
+                oracle_patch_blocks=cfg.get("oracle_patch_blocks"),
+                oracle_beta_grid=cfg.get("oracle_beta_grid", [0.25, 0.5, 1.0, 1.5]),
+                eval_subset_size=cfg.get("eval_subset_size"),
+                eval_subset_applies_to_all=bool(cfg.get("eval_subset_applies_to_all", False)),
+                eval_subset_seed=int(cfg.get("eval_subset_seed", 0)),
+                score_target=bool(cfg.get("score_target", False)),
+            )
         )
         task_dir = out_dir / inp.task
         task_dir.mkdir()
