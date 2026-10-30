@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -311,6 +311,8 @@ def _build_task_context(
         pin_memory=True,
         val_fraction=float(cfg.get("val_fraction", DEFAULT_VAL_FRACTION)),
         seed=int(cfg.get("seed", DEFAULT_SEED)),
+        # opt-in: validation drawn from train (AGENT_NEXT step 5); absent = the default carve of the test split
+        **({} if cfg.get("val_size") is None else {"val_size": int(cfg["val_size"])}),
     )
     loaders = build_vision_loaders(preprocess=clf_target.preprocess, **loader_kwargs)
 
@@ -356,6 +358,9 @@ class RunCalibration:
     #: The dedicated BRACE loader (replaced by the balanced vision8 mix loader under that protocol).
     block_extension_calibration_loader: Any
     brace_calibration_metadata: dict[str, Any] | None
+    #: ``anchors`` only: the generic pool (tiny_imagenet / vision8_mix) its anchors and (mu, c) are drawn from.
+    anchors_pool_ctx: _TaskContext | None = None
+    anchors_pool_meta: dict[str, Any] = field(default_factory=dict)
 
 
 def build_run_calibration(
@@ -439,6 +444,54 @@ def build_run_calibration(
         )
         print(f"Direct Residual calibration: {direct_residual_calibration_meta}")
 
+    # anchors: the frame's generic image pool (never the task data). Built only for that method, so no other
+    # method's context order (and global RNG state) changes.
+    anchors_cfg = getattr(resolved, "anchors_cfg", None)
+    anchors_pool_ctx: _TaskContext | None = None
+    anchors_pool_meta: dict[str, Any] = {}
+    if anchors_cfg is not None:
+        # The frame must not depend on the run's task list: 'vision8_mix' always mixes every task of the suite
+        # (as the M2 driver does), building loaders for the tasks this run does not evaluate.
+        pool_per_task: list[dict[str, Any]] = []
+        if anchors_cfg.anchor_pool == "vision8_mix":
+            by_name = {item["task"]: item for item in per_task}
+            for task in suite.tasks:
+                item = by_name.get(task)
+                if item is None or item["source_loaders"] is None:
+                    extra_ctx = _build_task_context(
+                        task,
+                        suite=suite,
+                        cfg=cfg,
+                        clf_target=clf_target,
+                        clf_source=clf_source,
+                        source_cfg=source_cfg,
+                        target_cfg=target_cfg,
+                        use_humanized_classnames=False,
+                        need_source_loaders=True,
+                    )
+                    item = {
+                        "task": task,
+                        "loaders": extra_ctx.loaders,
+                        "classnames": extra_ctx.classnames,
+                        "build_cfg_task": extra_ctx.build_cfg_task,
+                        "source_loaders": extra_ctx.source_loaders,
+                        "source_build_cfg_task": extra_ctx.source_build_cfg_task,
+                    }
+                pool_per_task.append(item)
+        anchors_pool_ctx, anchors_pool_meta = _build_direct_residual_calibration(
+            anchors_cfg.anchor_pool,
+            per_task=pool_per_task,
+            suite=suite,
+            cfg=cfg,
+            clf_source=clf_source,
+            clf_target=clf_target,
+            source_cfg=source_cfg,
+            target_cfg=target_cfg,
+            num_batches=int(anchors_cfg.anchor_batches + anchors_cfg.registration_batches),
+            calibration_seed=int(anchors_cfg.pool_seed),
+        )
+        print(f"anchors pool: {anchors_pool_meta}")
+
     # Task-independent THESEUS/BiCo calibration (transport_calibration_data):
     # one paired context for every task's prepare; alpha search and
     # evaluation keep each task's own splits.
@@ -493,4 +546,6 @@ def build_run_calibration(
         transport_calibration_meta=transport_calibration_meta,
         block_extension_calibration_loader=block_extension_calibration_loader,
         brace_calibration_metadata=brace_calibration_metadata,
+        anchors_pool_ctx=anchors_pool_ctx,
+        anchors_pool_meta=anchors_pool_meta,
     )

@@ -44,7 +44,9 @@ from .capabilities import MethodFamily, default_depth_prestep, depth_prestep_met
 from .config_schema import canonicalize
 from .merge_modes import _SINGLE_TRANSPORT_MODES, _TRANSPORT_THEN_MERGE_MODES, _resolve_merge_mode_config
 from .methods._ariadne.config import reject_decoder_only_options
+from .methods.anchors import parse_anchors_config
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
+from .registry import canonical_method_name
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
 
 _BASE_CONSTRUCTION_MODES = ("per_task", "independent_endpoint_average")
@@ -154,6 +156,8 @@ class ResolvedRunConfig:
     depth_guard: str | None = None
     #: Entrypoint that resolved this config; selects the methods that run the depth prestep there.
     entrypoint: Literal["vision", "llm"] = "vision"
+    #: ``AnchorsConfig`` when the method is ``anchors`` (then ``ariadne_cfg`` is its ridge config), else None.
+    anchors_cfg: Any = None
 
     # -- method dispatch predicates (from ``rebase.capabilities.METHOD_TRAITS``) ------------------
     @property
@@ -479,6 +483,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     # summary); only the dispatch decision goes through the canonical name.
     family = method_family(method_name)
     direct_fit = family is MethodFamily.DIRECT_FIT
+    anchors_cfg = None
     if direct_fit:
         method = SimpleNamespace(name=method_name)
         block_extension_enabled = False
@@ -492,7 +497,14 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         direct_residual_raw_params = (
             cfg["ariadne_params"] if cfg.get("ariadne_params") is not None else cfg.get("direct_residual_params")
         )
-        direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
+        if canonical_method_name(method_name) == "anchors":
+            # anchors reads ``method.params`` (method_params); its ridge runs on the Ariadne config it derives.
+            if direct_residual_raw_params is not None:
+                raise ValueError("method 'anchors' takes method.params / method_params, not ariadne_params")
+            anchors_cfg = parse_anchors_config(method_params)
+            direct_residual_cfg = anchors_cfg.ridge_config()
+        else:
+            direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
         reject_decoder_only_options(direct_residual_cfg)
         direct_residual_preset = resolve_direct_residual_preset(direct_residual_raw_params)
         _validate_precomputed_tv_options(cfg, direct_residual_cfg)
@@ -640,6 +652,7 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         depth_rule=depth_rule,
         ariadne_cfg=direct_residual_cfg,
         ariadne_preset=direct_residual_preset,
+        anchors_cfg=anchors_cfg,
         merge=MergeSpec(
             mode=merge_mode,
             method_name=merge_method_name,

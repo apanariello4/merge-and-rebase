@@ -1,0 +1,230 @@
+"""Configuration of the shared-anchor method (Step 0 of the reference document).
+
+Two groups of fields:
+
+- **frame fields** (``FRAME_FIELDS``) define the common coordinate system: which pool the anchor and
+  registration images come from, how many anchors, the canonical token grid, the anchor draw. They are stored
+  with the method state and must be identical for every model ever registered in it (a later model C reuses
+  them verbatim);
+- **per-run fields** (decode and ridge options, task calibration budget) may change between runs on the same
+  state.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, fields
+from typing import Any
+
+from .._ariadne.config import DirectResidualConfig
+
+ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix")
+
+FRAME_FIELDS = (
+    "anchor_pool",
+    "num_anchors",
+    "anchor_batches",
+    "registration_batches",
+    "pool_seed",
+    "anchor_seed",
+    "canonical_tokens",
+    "anchor_positions",
+    "anchor_sampling",
+)
+
+
+@dataclass(frozen=True)
+class AnchorsConfig:
+    # ---- frame (stored with the state, identical for every registered model)
+    # Generic image pool for anchors and registration statistics (mu, c); the task data never enters the frame.
+    anchor_pool: str = "tiny_imagenet"
+    # T: dimension of the common space. T <= d of every model gives exact round trips and cycle consistency.
+    num_anchors: int = 512
+    # The pool draw is anchor_batches + registration_batches batches from paired_calibration(seed=pool_seed):
+    # the first anchor_batches hold the anchor images, the rest the registration images (disjoint by construction).
+    anchor_batches: int = 4
+    registration_batches: int = 10
+    pool_seed: int = 0
+    # Seeded choice of the T (image, token position) anchor rows among the anchor images' canonical tokens.
+    anchor_seed: int = 0
+    # Token rows live on one fixed grid (CLS + square patch grid): 197 = CLS + 14x14 (ViT-B/16 at 224px).
+    canonical_tokens: int = 197
+    # 'all' (CLS and patch positions) or 'patch' (anchor rows drawn from patch positions only).
+    anchor_positions: str = "all"
+    # How the T anchor rows are drawn from the anchor images x positions. 'random': T rows uniformly at random
+    # (a few tokens from each of many images). 'whole_images': every position of T / n_positions images (seeded
+    # image choice; T must be a multiple of n_positions). 'one_per_image': one random position from each of T images.
+    anchor_sampling: str = "random"
+    # ---- per run
+    # eps = eps_rel * tr(K) / T in the decode solve.
+    eps_rel: float = 1e-3
+    # True: D carries the target scale c_k; False: the source scale c_m (Ariadne leaves scale to alpha).
+    rescale_target: bool = True
+    # Map between the source and target anchor frames. 'pairwise': the encode/decode of the kernel (with
+    # spectral_filter). 'gpa': generalized Procrustes (AGENT_NEXT.md section 4, universe.py): one map A_m (d_U x d_m,
+    # orthonormal columns) per model into a common centre G(s) estimated on the stored anchors;
+    # D = (scale / c_m) E A_m[:r]^T A_k[:r]. gpa_dim: d_U (None = widest model). gpa_rank: r, the nested truncation
+    # to the top-r axes of G (None = d_U). gpa_models: further registered models fitted into G with source and target
+    # (G3). gpa_add_models: registered models added afterwards by a Procrustes towards the fixed G (G4/G5).
+    frame_map: str = "pairwise"
+    # High-norm anchor filter (AGENT_NEXT step 2, variant F1). None: off. 'norm': drop the anchors whose centred norm
+    # exceeds anchor_filter_k x the block median in the source OR the target block (any fitted model for GPA), and
+    # use mu, c recomputed without such registration rows (AnchorState.norm_filter, stored once per model).
+    anchor_filter: str | None = None
+    anchor_filter_k: float = 3.0
+    gpa_dim: int | None = None
+    gpa_rank: int | None = None
+    gpa_models: tuple[str, ...] = ()
+    gpa_add_models: tuple[str, ...] = ()
+    # Spectral filter of the decode: 'tikhonov' (eps above) or a hard cut at spectral_rank directions,
+    # 'truncate_target' | 'truncate_cross' | 'procrustes_cross' (core.spectral_transport_map). None = full rank.
+    spectral_filter: str = "tikhonov"
+    spectral_rank: int | None = None
+    # Rows the transport map is estimated from. 'frame': the registered anchors of the shared frame (the method).
+    # 'task': the task's own paired-calibration rows (base-model boundaries, same seeded draw as E), the bridge to
+    # Ariadne: with procrustes_cross at full rank, rescale_target=False and the target's token grid as canonical
+    # grid it is Ariadne's Procrustes. map_num_batches: batches of that draw (None = num_batches; the draw is
+    # prefix-consistent, so the first num_batches are E's images); map_rows_per_image: token rows kept per image
+    # (None = all); map_num_rows: rows kept in total after that (None = all); map_seed: seed of both subsamples.
+    map_rows: str = "frame"
+    map_num_batches: int | None = None
+    map_rows_per_image: int | None = None
+    map_num_rows: int | None = None
+    map_seed: int = 0
+    # Task calibration (E and ridge rows), same budget and draw as Ariadne's paired_calibration.
+    num_batches: int = 10
+    seed: int = 89
+    components: tuple[str, ...] = ("mlp.c_proj",)
+    ridge_estimator: str = "empirical_bayes"
+    ridge_relative: float = 0.01
+    exact_form: bool = True
+    missing_bias: str = "error"
+    strength: float = 1.0
+    depth_pairing: str = "relative"
+    # How the per-block D_j are compiled across depth. 'independent': every block j regressed on the cumulative D_j
+    # (Ariadne's resident fit; upstream contributions add up, the realized change overshoots D_j). 'sequential':
+    # blocks fitted in order on D_j - U_j, U_j = the change the already-fitted upstream blocks produce at j
+    # (Ariadne's sequential streaming fit with the anchor decode as desired_fn; host memory O(1) in depth).
+    depth_fit: str = "independent"
+    # None: every target block is compiled. A float s_max in (0, 1]: only target blocks j with relative depth
+    # j / (L_k - 1) < s_max keep their update, the others are zero (exact: the ridge fits blocks independently).
+    compile_max_depth: float | None = None
+    # Optional on-disk state directory (frame + registered models); None keeps the state in memory.
+    state_dir: str | None = None
+    # Analysis-only: per-position coverage of E by the source anchors (one d x d scatter per position).
+    coverage_diagnostics: bool = True
+
+    def frame(self) -> dict[str, Any]:
+        out = {name: getattr(self, name) for name in FRAME_FIELDS}
+        if out["anchor_sampling"] == "random":
+            del out["anchor_sampling"]  # the default leaves the frame of existing states unchanged
+        return out
+
+    def ridge_config(self) -> DirectResidualConfig:
+        """The Ariadne config of the shared ridge: resident independent fit, or the sequential streaming fit."""
+        return DirectResidualConfig(
+            ridge_relative=self.ridge_relative,
+            ridge_estimator=self.ridge_estimator,
+            num_batches=self.num_batches,
+            seed=self.seed,
+            components=self.components,
+            exact_form=self.exact_form,
+            missing_bias=self.missing_bias,
+            activation_storage="resident" if self.depth_fit == "independent" else "streaming",
+            depth_fit=self.depth_fit,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = asdict(self)
+        out["components"] = list(self.components)
+        out["gpa_models"] = list(self.gpa_models)
+        out["gpa_add_models"] = list(self.gpa_add_models)
+        return out
+
+
+_ALLOWED = {f.name for f in fields(AnchorsConfig)}
+
+
+def parse_anchors_config(value: Mapping[str, Any] | None) -> AnchorsConfig:
+    """Parse ``method.params`` for ``anchors``; unknown keys are rejected."""
+    payload = dict(value or {})
+    unknown = sorted(set(payload) - _ALLOWED)
+    if unknown:
+        raise ValueError(f"unknown anchors config keys: {unknown}; allowed: {sorted(_ALLOWED)}")
+    for key in ("gpa_models", "gpa_add_models"):
+        if isinstance(payload.get(key), (list, str)):
+            value = payload[key]
+            payload[key] = (value,) if isinstance(value, str) else tuple(value)
+    if isinstance(payload.get("components"), (list, str)):
+        comps = payload["components"]
+        payload["components"] = (comps,) if isinstance(comps, str) else tuple(comps)
+    cfg = AnchorsConfig(**payload)
+    validate_anchors_config(cfg)
+    return cfg
+
+
+def validate_anchors_config(cfg: AnchorsConfig) -> None:
+    if cfg.anchor_pool not in ANCHOR_POOLS:
+        raise ValueError(f"anchor_pool must be one of {ANCHOR_POOLS}, got {cfg.anchor_pool!r}")
+    for name in ("num_anchors", "anchor_batches", "registration_batches", "num_batches", "canonical_tokens"):
+        if int(getattr(cfg, name)) < 1:
+            raise ValueError(f"{name} must be >= 1")
+    if cfg.anchor_positions not in {"all", "patch"}:
+        raise ValueError("anchor_positions must be 'all' or 'patch'")
+    if cfg.anchor_sampling not in {"random", "whole_images", "one_per_image"}:
+        raise ValueError("anchor_sampling must be 'random', 'whole_images' or 'one_per_image'")
+    if not cfg.eps_rel >= 0.0:
+        raise ValueError("eps_rel must be >= 0")
+    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
+        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
+    if not set(cfg.components) <= {"mlp.c_proj", "attn.out_proj"} or not cfg.components:
+        raise ValueError("components must be a non-empty subset of {'mlp.c_proj', 'attn.out_proj'}")
+    if cfg.compile_max_depth is not None and not 0.0 < float(cfg.compile_max_depth) <= 1.0:
+        raise ValueError("compile_max_depth must be None or in (0, 1]")
+    if cfg.spectral_filter not in {"tikhonov", "truncate_target", "truncate_cross", "procrustes_cross"}:
+        raise ValueError(
+            "spectral_filter must be 'tikhonov', 'truncate_target', 'truncate_cross' or 'procrustes_cross'"
+        )
+    if cfg.spectral_rank is not None:
+        if cfg.spectral_filter == "tikhonov":
+            raise ValueError("spectral_rank applies to the truncating spectral filters only")
+        if isinstance(cfg.spectral_rank, bool) or not isinstance(cfg.spectral_rank, int) or cfg.spectral_rank < 1:
+            raise ValueError("spectral_rank must be None or a positive integer")
+    if cfg.anchor_filter not in {None, "norm"}:
+        raise ValueError("anchor_filter must be None or 'norm'")
+    if not float(cfg.anchor_filter_k) > 0.0:
+        raise ValueError("anchor_filter_k must be > 0")
+    if cfg.anchor_filter is not None and cfg.map_rows != "frame":
+        raise ValueError("anchor_filter applies to the registered frame (map_rows='frame')")
+    if cfg.frame_map not in {"pairwise", "gpa"}:
+        raise ValueError("frame_map must be 'pairwise' or 'gpa'")
+    for name in ("gpa_dim", "gpa_rank"):
+        value = getattr(cfg, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"{name} must be None or a positive integer")
+    if cfg.frame_map != "gpa" and (
+        cfg.gpa_dim is not None or cfg.gpa_rank is not None or cfg.gpa_models or cfg.gpa_add_models
+    ):
+        raise ValueError("gpa_dim / gpa_rank / gpa_models / gpa_add_models apply to frame_map='gpa' only")
+    if cfg.frame_map == "gpa" and cfg.map_rows != "frame":
+        raise ValueError("frame_map='gpa' needs the registered frame (map_rows='frame')")
+    if cfg.frame_map == "gpa" and cfg.spectral_filter != "tikhonov":
+        raise ValueError("frame_map='gpa' replaces the decode; leave spectral_filter='tikhonov'")
+    if cfg.map_rows not in {"frame", "task"}:
+        raise ValueError("map_rows must be 'frame' or 'task'")
+    for name in ("map_num_batches", "map_rows_per_image", "map_num_rows"):
+        value = getattr(cfg, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"{name} must be None or a positive integer")
+    if cfg.map_rows == "frame" and any(
+        getattr(cfg, n) is not None for n in ("map_num_batches", "map_rows_per_image", "map_num_rows")
+    ):
+        raise ValueError("map_num_batches / map_rows_per_image / map_num_rows apply to map_rows='task' only")
+    if cfg.map_rows == "task" and cfg.depth_fit != "independent":
+        raise ValueError("map_rows='task' is implemented for depth_fit='independent' only")
+    if cfg.depth_fit not in {"independent", "sequential"}:
+        raise ValueError("depth_fit must be 'independent' or 'sequential'")
+    if cfg.depth_fit == "sequential" and len(cfg.components) != 1:
+        raise ValueError("depth_fit='sequential' requires exactly one component")
+    if cfg.depth_pairing != "relative":
+        raise ValueError("anchors supports depth_pairing='relative' only (pi_m(s) = round(s (L_m - 1)))")

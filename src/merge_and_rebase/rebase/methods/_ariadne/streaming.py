@@ -811,6 +811,7 @@ def fit_direct_residual_sequential_streaming(
     config: DirectResidualConfig,
     device,
     family_adapter=None,
+    desired_fn=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Sequential-across-depth variant of `fit_direct_residual_streaming` (``depth_fit="sequential"``).
 
@@ -828,11 +829,27 @@ def fit_direct_residual_sequential_streaming(
     (``sqrt(sum ||U_j||^2)``; ``effect_before_norm`` stays 0 because the solver is called with a zero pre-fit
     effect). Returns ``(corrections, rows)``. The target model's entry state and placement are restored in a
     ``finally``. A pristine deep copy of the target model is held for the duration (extra model memory).
+    ``desired_fn`` (optional, default None = the transported delta ``(f - b) Q_j`` above): a callable
+    ``desired_fn(pos, i, b, f, out) -> D_j`` returning the desired block-end change of target block ``pos`` for one
+    calibration batch, from the source base/FT boundary activations ``b``/``f`` of source block ``i`` on the
+    SOURCE token grid and the current target boundary ``out`` (its shape fixes the target grid). It replaces only
+    the ``D_j`` line, so another transport (e.g. the shared-anchor decode) can reuse the sequential fit; the
+    upstream effect ``U_j`` and the ridge are unchanged. Not combined with ``pair_target_split='interpolate'``,
+    two-point or backfit fits.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
     if config.depth_fit != "sequential":
         raise ValueError("fit_direct_residual_sequential_streaming requires depth_fit='sequential'")
+    if desired_fn is not None and (
+        config.sequential_points != "single"
+        or config.block_split == "backfit"
+        or config.pair_target_split == "interpolate"
+    ):
+        raise ValueError(
+            "desired_fn supports the single-point sequential fit without block_split='backfit' or "
+            "pair_target_split='interpolate'"
+        )
     if config.sequential_points != "single":
         return _fit_sequential_two_points_streaming(
             target_model,
@@ -942,9 +959,12 @@ def fit_direct_residual_sequential_streaming(
                     # The pristine copy's boundary must match Pass A's fingerprint (detects a mutated base).
                     _check_boundary_fingerprint(ref[out_key], fingerprints[(k, pos)], config, pos, k)
                     out_cpu = tgt[out_key].cpu()
-                    b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
-                    f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
-                    desired = (f - b) @ q
+                    if desired_fn is not None:
+                        desired = desired_fn(pos, i, sb[str(i)].cpu(), sf[str(i)].cpu(), out_cpu)
+                    else:
+                        b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
+                        f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
+                        desired = (f - b) @ q
                     if interp:
                         if group_start > 0:
                             b_prev = _aligned([sb[str(i_prev)].cpu()], [out_cpu])[0]

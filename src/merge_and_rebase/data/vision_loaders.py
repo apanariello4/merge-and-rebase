@@ -397,6 +397,7 @@ def build_vision_loaders(
     pin_memory: bool = True,
     val_fraction: float = DEFAULT_VAL_FRACTION,
     seed: int = DEFAULT_SEED,
+    val_size: int | None = None,
     image_key: str = "image",
     label_key: str = "label",
     label_remap: LabelRemap = None,
@@ -412,6 +413,8 @@ def build_vision_loaders(
       - requires train + test (or split_map mapping those to existing keys)
       - val is a reproducible random slice of test (val_fraction)
       - no contamination: val/test are disjoint subsets of the original test split
+      - ``val_size`` (opt-in, default None = the rule above): val is instead a reproducible random slice of
+        ``val_size`` TRAIN examples (removed from train, same seed), and test is the whole original test split
     """
     # resolve split keys
     if split_map is None:
@@ -426,10 +429,19 @@ def build_vision_loaders(
 
     # Create val/test from test using HF-native split (fast, reproducible)
     test_full = hf_ds[test_key]
-    # test_size here means fraction of *kept* test, so keep 1 - val_fraction
-    split = test_full.train_test_split(test_size=(1.0 - float(val_fraction)), seed=int(seed), shuffle=True)
-    val_split = split["train"]
-    test_split = split["test"]
+    train_split = hf_ds[train_key]
+    if val_size is None:
+        # test_size here means fraction of *kept* test, so keep 1 - val_fraction
+        split = test_full.train_test_split(test_size=(1.0 - float(val_fraction)), seed=int(seed), shuffle=True)
+        val_split = split["train"]
+        test_split = split["test"]
+    else:
+        if not 0 < int(val_size) < len(train_split):
+            raise ValueError(f"val_size={val_size} must be in (0, {len(train_split)}) for split {train_key!r}")
+        split = train_split.train_test_split(test_size=int(val_size), seed=int(seed), shuffle=True)
+        train_split = split["train"]
+        val_split = split["test"]
+        test_split = test_full
 
     eval_preprocess = preprocess
     train_transform = train_preprocess if train_preprocess is not None else eval_preprocess
@@ -439,7 +451,7 @@ def build_vision_loaders(
 
     # Wrap with torch datasets
     train_ds = HFVisionDataset(
-        hf_ds[train_key],
+        train_split,
         transform=train_transform,
         image_key=image_key,
         label_key=label_key,
@@ -518,6 +530,7 @@ def build_vision_loaders(
         "split_map": {"train": train_key, "test": test_key},
         "val_fraction": float(val_fraction),
         "seed": int(seed),
+        **({} if val_size is None else {"val_size": int(val_size), "val_source": "train"}),
         "image_key": image_key,
         "label_key": label_key,
     }

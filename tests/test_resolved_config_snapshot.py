@@ -85,6 +85,8 @@ def _resolve(rel: str) -> dict:
         plans = {f"{s}->{t}": _normalize(resolved.bind(s, t)) for s, t in DEPTHS[modality]}
     view = _normalize(resolved)
     view.pop("cfg", None)  # the raw input dict: it changes with every key rename, its meaning must not
+    if view.get("anchors_cfg") is None:  # added with the anchors method: pinned only where it is set
+        view.pop("anchors_cfg", None)
     return {"modality": modality, "resolved": view, "plans": plans}
 
 

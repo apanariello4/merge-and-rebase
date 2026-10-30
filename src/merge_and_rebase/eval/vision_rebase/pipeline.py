@@ -272,6 +272,7 @@ def run_rebase(resolved: Any, runtime: VisionRuntime, run_logger: Any) -> dict[s
         merge_weights=merge_weights,
         ariadne_calibration_ctx=calibration.ariadne_calibration_ctx,
         ariadne_calibration_meta=calibration.ariadne_calibration_meta,
+        anchors_pool_ctx=calibration.anchors_pool_ctx,
     )
     ariadne_record = method_stage.record if resolved.direct_fit else AriadneRunRecord()
     # merge_then_brace_then_transport merges deltas on the native source base first and only then runs its own

@@ -33,6 +33,10 @@ def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     cfg = canonicalize(cfg)
     method_name = str(cfg.get("method", "theseus"))
     method = get_method(method_name)
+    if method.name == "anchors":
+        # The decoder stage fits with AriadneRebase directly; refusing here keeps an LLM 'anchors' config from
+        # silently running Ariadne. Text-unit rows for decoders are milestones M8-M9.
+        raise NotImplementedError("method 'anchors' is vision-only for now (LLM support: milestones M8-M9)")
     method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
     if "n_batches" in method_params:
         raise ValueError(

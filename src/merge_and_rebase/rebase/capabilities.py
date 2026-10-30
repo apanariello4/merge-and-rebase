@@ -59,6 +59,8 @@ METHOD_TRAITS: dict[str, MethodTraits] = {
     "transfusion": MethodTraits(_WEIGHT, cross_size=False, required=False),
     # "direct_residual" is a registry alias of "ariadne" and resolves to this entry.
     "ariadne": MethodTraits(MethodFamily.DIRECT_FIT, cross_size=True, any_depth=True, calibrates=True),
+    # Shared-anchor rebasin: decodes D from a common anchor frame, then compiles it with Ariadne's ridge.
+    "anchors": MethodTraits(MethodFamily.DIRECT_FIT, cross_size=True, any_depth=True, calibrates=True),
 }
 
 

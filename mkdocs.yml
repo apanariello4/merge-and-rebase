@@ -67,6 +67,7 @@ nav:
   - Reference:
       - Methods Overview: methods.md
       - Ariadne: methods/ariadne.md
+      - Anchors (experimental): methods/anchors.md
       - Merge Methods API: api/merge-methods.md
       - Rebasin Methods API: api/rebase-methods.md
       - Post-Merge Methods API: api/postmerge-methods.md

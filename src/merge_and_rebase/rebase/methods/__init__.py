@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .anchors import AnchorsRebase
 from .ariadne import AriadneRebase
 from .bico import BiCoRebase
 from .gradfix import GradFixRebase
@@ -10,6 +11,7 @@ from .theseus_gqa import TheseusGqaRebase
 from .transfusion import TransFusionRebase
 
 __all__ = [
+    "AnchorsRebase",
     "AriadneRebase",
     "GradFixRebase",
     "BiCoRebase",

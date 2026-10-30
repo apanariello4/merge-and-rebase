@@ -25,6 +25,7 @@ from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifie
 from ...rebase.block_extension.config import select_loader
 from ...rebase.depth_pairing import spread_duplicate_pairing
 from ...rebase.discrete_layer_match import DiscreteLayerPairing
+from ...rebase.methods.anchors import AnchorsRebase
 from ...rebase.methods.ariadne import AriadneRebase, apply_depth_pairing_override
 from ...rebase.orchestration import AriadneRunRecord, MethodResult
 from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
@@ -399,8 +400,15 @@ class DirectFitStage:
         merge_weights: list[float],
         calibration_ctx: _TaskContext | None,
         calibration_meta: dict[str, Any],
+        anchors_pool_ctx: _TaskContext | None = None,
     ) -> None:
         self.cfg = env.resolved.ariadne_cfg
+        # anchors: its own config, the generic pool context and ONE state shared by every task of the run.
+        self.anchors_cfg = getattr(env.resolved, "anchors_cfg", None)
+        self.anchors_pool_ctx = anchors_pool_ctx
+        self._anchors_state = None
+        if self.anchors_cfg is not None and anchors_pool_ctx is None:
+            raise ValueError("method 'anchors' needs the anchor-pool context (RunCalibration.anchors_pool_ctx)")
         self.task_contexts = task_contexts
         self.tasks = tasks
         self.merge_weights = merge_weights
@@ -586,12 +594,13 @@ class DirectFitStage:
                     test_loader=task.loaders.test,
                     val_loader=task.loaders.val,
                 )
+            fit = _run_direct_residual_fit if self.anchors_cfg is None else self._run_anchors_fit
             (
                 transported_delta,
                 direct_residual_timing,
                 task_direct_residual_diag,
                 task_direct_residual_extra,
-            ) = _run_direct_residual_fit(
+            ) = fit(
                 source_base_model=source_base_model_native,
                 source_ft_model=source_ft_model_native,
                 target_model=env.clf_target.model,
@@ -618,6 +627,32 @@ class DirectFitStage:
             self.record.record_fit(t, task_direct_residual_diag, task_direct_residual_extra)
         return result
 
+    def _run_anchors_fit(self, **kwargs: Any):
+        """``AnchorsRebase.prepare`` with the run's anchor pool and shared state; same return as the Ariadne fit."""
+        cfg = self.anchors_cfg
+        if self._anchors_state is None:
+            self._anchors_state = AnchorsRebase.open_state(cfg)
+        source_build = kwargs["source_build_cfg_task"]
+        target_build = kwargs["build_cfg_task"]
+        prepared = AnchorsRebase().prepare(
+            **{k: v for k, v in kwargs.items() if k != "config"},
+            config=cfg,
+            source_anchor_loader=self.anchors_pool_ctx.source_loaders.train,
+            target_anchor_loader=self.anchors_pool_ctx.loaders.train,
+            source_model_id=_anchors_model_id(source_build),
+            target_model_id=_anchors_model_id(target_build),
+            source_model_meta={"model_name": source_build.model_name, "pretrained": str(source_build.pretrained)},
+            target_model_meta={"model_name": target_build.model_name, "pretrained": str(target_build.pretrained)},
+            state=self._anchors_state,
+        )
+        return prepared.task_vector, prepared.timing, prepared.diagnostics, prepared.extra
+
+
+def _anchors_model_id(build: OpenClipBuildConfig) -> str:
+    """Filesystem-safe registry id of a base model: ``<model_name>__<pretrained>``."""
+    raw = f"{build.model_name}__{build.pretrained}"
+    return "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in raw)
+
 
 def build_method_stage(
     env: StageEnv,
@@ -628,6 +663,7 @@ def build_method_stage(
     merge_weights: list[float],
     ariadne_calibration_ctx: _TaskContext | None,
     ariadne_calibration_meta: dict[str, Any],
+    anchors_pool_ctx: _TaskContext | None = None,
 ) -> TransportStage | DirectFitStage:
     """Select the method stage once from the resolved config (Ariadne vs every state-dict transport)."""
     if env.resolved.direct_fit:
@@ -638,6 +674,7 @@ def build_method_stage(
             merge_weights=merge_weights,
             calibration_ctx=ariadne_calibration_ctx,
             calibration_meta=ariadne_calibration_meta,
+            anchors_pool_ctx=anchors_pool_ctx,
         )
     return TransportStage(
         bypass_ordinary_transport=False,
