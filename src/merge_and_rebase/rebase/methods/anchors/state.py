@@ -56,6 +56,39 @@ def to_canonical(tokens: Tensor, canonical_tokens: int) -> Tensor:
     return _interp_2d_tokens(tokens, int(canonical_tokens))
 
 
+_POOL_GRID = {"pool2": 2, "pool4": 4}
+
+
+def units_per_image(unit: str, canonical_tokens: int) -> int:
+    """Number of anchor units of kind ``unit`` in one image on the canonical grid (CLS + g x g patches)."""
+    if unit in ("image_mean", "cls"):
+        return 1
+    g = _patch_side(canonical_tokens)
+    return max(1, round(g / _POOL_GRID[unit])) ** 2
+
+
+def _patch_side(canonical_tokens: int) -> int:
+    g = int(round((int(canonical_tokens) - 1) ** 0.5))
+    if g * g != int(canonical_tokens) - 1:
+        raise ValueError(f"centroid anchors need a square patch grid, got {canonical_tokens} canonical tokens")
+    return g
+
+
+def unit_features(canon: Tensor, unit: str) -> Tensor:
+    """``[B, U, d]`` centroid rows of the canonical tokens ``[B, 1 + g*g, d]`` (AGENT_KERNEL.md R1a/R1b)."""
+    if unit == "cls":
+        return canon[:, :1]
+    patches = canon[:, 1:]
+    if unit == "image_mean":
+        return patches.mean(dim=1, keepdim=True)
+    b, n, d = patches.shape
+    g = _patch_side(n + 1)
+    grid = patches.reshape(b, g, g, d).permute(0, 3, 1, 2)
+    side = max(1, round(g / _POOL_GRID[unit]))
+    pooled = torch.nn.functional.adaptive_avg_pool2d(grid.float(), side).to(patches.dtype)
+    return pooled.permute(0, 2, 3, 1).reshape(b, side * side, d)
+
+
 @dataclass
 class RegisteredModel:
     model_id: str
@@ -107,7 +140,9 @@ class AnchorState:
         cfg = self.config
         n_images = sum(batch_sizes[: cfg.anchor_batches])
         positions = list(range(cfg.canonical_tokens))
-        if cfg.anchor_positions == "patch":
+        if cfg.anchor_unit != "token":  # centroid units: "positions" index the units of one image
+            positions = list(range(units_per_image(cfg.anchor_unit, cfg.canonical_tokens)))
+        elif cfg.anchor_positions == "patch":
             positions = positions[1:]
         n_candidates = n_images * len(positions)
         if cfg.num_anchors > n_candidates:
@@ -314,6 +349,8 @@ class AnchorState:
             offsets.append(offsets[-1] + size)
         anchor_rows: list[list[Tensor]] = [[] for _ in range(depth)]
         moments = [MomentAccumulator() for _ in range(depth)]
+        centroid = cfg.anchor_unit != "token"
+        unit_moments = [MomentAccumulator() for _ in range(depth)] if centroid else None
         native_tokens = None
         width = None
         for b, values in enumerate(iter_capture_tokens(model, batches, requests, device)):
@@ -329,16 +366,21 @@ class AnchorState:
                 native_tokens = int(tokens.shape[1])
                 width = int(tokens.shape[2])
                 canon = to_canonical(tokens, cfg.canonical_tokens)
+                units = unit_features(canon, cfg.anchor_unit) if centroid else canon
                 if b < cfg.anchor_batches:
-                    anchor_rows[j].append(canon[img_idx, pos_idx].to(torch.float64))
+                    anchor_rows[j].append(units[img_idx, pos_idx].to(torch.float64))
                 else:
                     moments[j].update(canon)
+                    if centroid:
+                        unit_moments[j].update(units)
         p_blocks, mu_blocks, c_blocks = [], [], []
         for j in range(depth):
             s_anc = torch.cat(anchor_rows[j], dim=0)
             if s_anc.shape[0] != cfg.num_anchors:
                 raise RuntimeError(f"collected {s_anc.shape[0]} anchor rows at block {j}, expected {cfg.num_anchors}")
             mu, c = moments[j].finalize()
+            if centroid:  # centred by the mean of the same unit, scaled by the token spread (the scale of E)
+                mu = unit_moments[j].finalize()[0]
             p_blocks.append(anchor_frame(s_anc, mu, c).float())
             mu_blocks.append(mu)
             c_blocks.append(c)
@@ -348,6 +390,7 @@ class AnchorState:
             "width": width,
             "native_tokens": native_tokens,
             "registration_rows_per_block": moments[0].n,
+            **({"anchor_unit": cfg.anchor_unit, "mu_kind": "unit_mean"} if centroid else {}),
             **(model_meta or {}),
         }
         reg = RegisteredModel(model_id, meta, p_blocks, mu_blocks, c_blocks)

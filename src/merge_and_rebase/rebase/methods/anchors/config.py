@@ -19,6 +19,7 @@ from typing import Any
 from .._ariadne.config import DirectResidualConfig
 
 ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix")
+ANCHOR_UNITS = ("token", "image_mean", "cls", "pool2", "pool4")
 
 FRAME_FIELDS = (
     "anchor_pool",
@@ -30,6 +31,7 @@ FRAME_FIELDS = (
     "canonical_tokens",
     "anchor_positions",
     "anchor_sampling",
+    "anchor_unit",
 )
 
 
@@ -55,6 +57,12 @@ class AnchorsConfig:
     # (a few tokens from each of many images). 'whole_images': every position of T / n_positions images (seeded
     # image choice; T must be a multiple of n_positions). 'one_per_image': one random position from each of T images.
     anchor_sampling: str = "random"
+    # What one anchor row is (AGENT_KERNEL.md R1). 'token': one canonical token (image, position). Centroid anchors,
+    # the same members in every model: 'image_mean' (mean of the image's patch tokens), 'cls' (the CLS token),
+    # 'pool2' (mean over 2 x 2 patch regions: a 7 x 7 grid on 14 x 14), 'pool4' (adaptive average pooling of the
+    # patch grid to 4 x 4 regions of 3-4 patches). Centroid rows are drawn at random over (image, region) and centred
+    # by the mean of the same unit over the registration images; c stays the token spread (the scale of E).
+    anchor_unit: str = "token"
     # ---- per run
     # eps = eps_rel * tr(K) / T in the decode solve.
     eps_rel: float = 1e-3
@@ -80,6 +88,21 @@ class AnchorsConfig:
     # 'truncate_target' | 'truncate_cross' | 'procrustes_cross' (core.spectral_transport_map). None = full rank.
     spectral_filter: str = "tikhonov"
     spectral_rank: int | None = None
+    # Kernel decode of the pairwise map (AGENT_KERNEL.md; V1 = spectral_filter 'truncate_target' + spectral_rank).
+    # 'tikhonov': D = scale R (K_k + eps I)^{-1} P_k (V0). 'zca' (V2): each model whitened by its own kernel,
+    # D = scale (E / c_m) Q_m^T Q_k, Q = (K + eps I)^{-1/2} P, eps = eps_rel tr(K) / T per model (pseudo-inverse
+    # root at eps_rel = 0). 'agreement' (V3): V2 restricted to the directions where the two whitened kernels agree,
+    # 1/agreement_tau <= gamma_i <= agreement_tau (core.whitened_transport_map).
+    kernel_decode: str = "tikhonov"
+    agreement_tau: float | None = None
+    # Anchor post-processing (AGENT_KERNEL.md K1b), applied to the stored frames at use time (no new registration).
+    # anchor_row_norm (R3): the centred anchor rows of every model scaled to unit norm before P, K and any rotation;
+    # E is not normalised and the decode scale stays c_k / c_m. anchor_dedup_cos (R2): keep only anchors whose pairwise
+    # cosine, measured in the run's SOURCE model at the source block (after the norm filter), is below this value
+    # (greedy, seeded by anchor_seed); anchor_dedup_max caps how many are kept (None: all that pass).
+    anchor_row_norm: bool = False
+    anchor_dedup_cos: float | None = None
+    anchor_dedup_max: int | None = None
     # Rows the transport map is estimated from. 'frame': the registered anchors of the shared frame (the method).
     # 'task': the task's own paired-calibration rows (base-model boundaries, same seeded draw as E), the bridge to
     # Ariadne: with procrustes_cross at full rank, rescale_target=False and the target's token grid as canonical
@@ -118,6 +141,8 @@ class AnchorsConfig:
         out = {name: getattr(self, name) for name in FRAME_FIELDS}
         if out["anchor_sampling"] == "random":
             del out["anchor_sampling"]  # the default leaves the frame of existing states unchanged
+        if out["anchor_unit"] == "token":
+            del out["anchor_unit"]
         return out
 
     def ridge_config(self) -> DirectResidualConfig:
@@ -171,6 +196,10 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
             raise ValueError(f"{name} must be >= 1")
     if cfg.anchor_positions not in {"all", "patch"}:
         raise ValueError("anchor_positions must be 'all' or 'patch'")
+    if cfg.anchor_unit not in ANCHOR_UNITS:
+        raise ValueError(f"anchor_unit must be one of {ANCHOR_UNITS}")
+    if cfg.anchor_unit != "token" and (cfg.anchor_sampling != "random" or cfg.anchor_filter is not None):
+        raise ValueError("centroid anchor_unit needs anchor_sampling='random' and no anchor_filter (token semantics)")
     if cfg.anchor_sampling not in {"random", "whole_images", "one_per_image"}:
         raise ValueError("anchor_sampling must be 'random', 'whole_images' or 'one_per_image'")
     if not cfg.eps_rel >= 0.0:
@@ -190,6 +219,23 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
             raise ValueError("spectral_rank applies to the truncating spectral filters only")
         if isinstance(cfg.spectral_rank, bool) or not isinstance(cfg.spectral_rank, int) or cfg.spectral_rank < 1:
             raise ValueError("spectral_rank must be None or a positive integer")
+    if cfg.kernel_decode not in {"tikhonov", "zca", "agreement"}:
+        raise ValueError("kernel_decode must be 'tikhonov', 'zca' or 'agreement'")
+    if cfg.kernel_decode != "tikhonov" and (cfg.frame_map != "pairwise" or cfg.spectral_filter != "tikhonov"):
+        raise ValueError("kernel_decode 'zca'/'agreement' needs frame_map='pairwise' and spectral_filter='tikhonov'")
+    if (cfg.kernel_decode == "agreement") != (cfg.agreement_tau is not None):
+        raise ValueError("agreement_tau is required by, and only allowed with, kernel_decode='agreement'")
+    if cfg.agreement_tau is not None and not float(cfg.agreement_tau) >= 1.0:
+        raise ValueError("agreement_tau must be >= 1")
+    if cfg.anchor_dedup_cos is not None and not -1.0 < float(cfg.anchor_dedup_cos) <= 1.0:
+        raise ValueError("anchor_dedup_cos must be None or in (-1, 1]")
+    if cfg.anchor_dedup_max is not None:
+        if cfg.anchor_dedup_cos is None:
+            raise ValueError("anchor_dedup_max applies with anchor_dedup_cos only")
+        if isinstance(cfg.anchor_dedup_max, bool) or not isinstance(cfg.anchor_dedup_max, int) or cfg.anchor_dedup_max < 1:
+            raise ValueError("anchor_dedup_max must be None or a positive integer")
+    if (cfg.anchor_row_norm or cfg.anchor_dedup_cos is not None) and cfg.map_rows != "frame":
+        raise ValueError("anchor_row_norm / anchor_dedup_cos apply to the registered frame (map_rows='frame')")
     if cfg.anchor_filter not in {None, "norm"}:
         raise ValueError("anchor_filter must be None or 'norm'")
     if not float(cfg.anchor_filter_k) > 0.0:

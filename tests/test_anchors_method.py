@@ -670,3 +670,45 @@ def test_anchor_sampling_default_keeps_the_frame_and_rejects_bad_sizes(tmp_path)
         )
     with pytest.raises(ValueError, match="anchor_sampling"):
         parse_anchors_config({"anchor_sampling": "bogus"})
+
+
+# ---------------------------------------------------------------- K1b R1: centroid anchors
+
+
+def test_unit_features_on_a_14x14_grid():
+    from merge_and_rebase.rebase.methods.anchors.state import unit_features, units_per_image
+
+    canon = torch.randn(3, 197, 6, dtype=torch.float64)
+    patches = canon[:, 1:].reshape(3, 14, 14, 6)
+    assert torch.equal(unit_features(canon, "cls")[:, 0], canon[:, 0])
+    torch.testing.assert_close(unit_features(canon, "image_mean")[:, 0], patches.reshape(3, 196, 6).mean(1))
+    pool2 = unit_features(canon, "pool2")
+    assert pool2.shape == (3, 49, 6) and units_per_image("pool2", 197) == 49
+    torch.testing.assert_close(pool2[:, 0], patches[:, :2, :2].reshape(3, 4, 6).mean(1))
+    torch.testing.assert_close(pool2[:, 8], patches[:, 2:4, 2:4].reshape(3, 4, 6).mean(1))
+    pool4 = unit_features(canon, "pool4")
+    assert pool4.shape == (3, 16, 6) and units_per_image("pool4", 197) == 16
+    # every region of the adaptive pooling is a mean of 3-4 patches; the regions cover the grid (means agree)
+    torch.testing.assert_close(pool4.mean(1), patches.reshape(3, 196, 6).mean(1), rtol=0.2, atol=0.2)
+
+
+@pytest.mark.parametrize("unit", ["image_mean", "cls", "pool2"])
+def test_centroid_anchors_register_and_rotate(unit):
+    """Same members in every model: a rotated model gets the rotated centroid frame; prepare runs end to end."""
+    cfg = _cfg(num_anchors=3, anchor_unit=unit)
+    assert cfg.frame()["anchor_unit"] == unit
+    torch.manual_seed(5)
+    model = _Model(5, 2).eval()
+    o = _orthogonal(5, 6)
+    state = AnchorState(cfg)
+    reg = state.register_model(model, "A", POOL, device="cpu")
+    rot = state.register_model(_rotated(model, o), "R", POOL, device="cpu")
+    assert reg.meta["anchor_unit"] == unit and reg.p[0].shape == (3, 5)
+    for j in range(reg.depth):
+        torch.testing.assert_close(rot.p[j].double(), reg.p[j].double() @ o.double(), rtol=1e-4, atol=1e-5)
+        assert rot.c[j] == pytest.approx(reg.c[j], rel=1e-5)
+    prepared = _prepare(cfg, _setup(), state=AnchorState(cfg))
+    assert all(torch.isfinite(v).all() for v in prepared.unit_task_vector.values())
+    with pytest.raises(ValueError):
+        parse_anchors_config({"anchor_unit": "pool2", "anchor_filter": "norm"})
+    assert "anchor_unit" not in _cfg().frame()

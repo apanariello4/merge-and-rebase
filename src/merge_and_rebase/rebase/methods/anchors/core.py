@@ -313,6 +313,129 @@ def spectral_transport_map(
     return phi, {"spectral_rank_used": float(r), "spectral_kept_fraction": kept}
 
 
+# ---------------------------------------------------------------- anchor selection / normalisation (AGENT_KERNEL.md R2, R3)
+
+
+def row_normalize(p: Tensor) -> Tensor:
+    """R3: every (centred) anchor row scaled to unit norm; zero rows stay zero. ``E`` is never normalised."""
+    p64 = p.to(torch.float64)
+    norms = torch.linalg.vector_norm(p64, dim=1, keepdim=True)
+    return torch.where(norms > 0, p64 / norms.clamp_min(torch.finfo(torch.float64).tiny), p64)
+
+
+def dedup_mask(p: Tensor, cos_max: float, *, max_count: int | None = None, seed: int = 0) -> Tensor:
+    """R2: greedy selection of anchors whose pairwise cosine (centred rows of ``p``) stays below ``cos_max``.
+
+    Anchors are visited in a seeded random order; one is kept when its cosine with every anchor kept so far is
+    ``< cos_max``. Stops after ``max_count`` kept anchors (None: visit all). Returns a bool mask over the rows.
+    """
+    x = row_normalize(p).to(torch.float32)
+    t = x.shape[0]
+    order = torch.randperm(t, generator=torch.Generator().manual_seed(int(seed)))
+    keep = torch.zeros(t, dtype=torch.bool)
+    kept = torch.empty(0, x.shape[1], dtype=x.dtype)
+    limit = t if max_count is None else int(max_count)
+    for i in order.tolist():
+        xi = x[i]
+        if kept.shape[0] and float((kept @ xi).max()) >= float(cos_max):
+            continue
+        keep[i] = True
+        kept = torch.cat([kept, xi[None]], dim=0)
+        if kept.shape[0] >= limit:
+            break
+    return keep
+
+
+# ---------------------------------------------------------------- whitened kernel decodes (AGENT_KERNEL.md V2, V3)
+
+KERNEL_DECODES = ("tikhonov", "zca", "agreement")
+PINV_RTOL = 1e-10  # relative eigenvalue threshold of the pseudo-inverses (eps = 0)
+
+
+def _whitening_factors(p: Tensor, eps: float) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Thin SVD ``P = U S V^T`` and ``f = s / sqrt(s^2 + eps)``, so that ``(K + eps I)^{-1/2} P = U diag(f) V^T``.
+
+    With ``eps = 0`` the inverse root is the pseudo-inverse one: ``f = 1`` on the eigenvalues ``s^2`` above
+    ``PINV_RTOL * s_max^2``, 0 below. Returns ``(U, s, f, V^T)``.
+    """
+    u, s, vt = torch.linalg.svd(p.to(torch.float64), full_matrices=False)
+    lam = s * s
+    if eps > 0.0:
+        f = s / torch.sqrt(lam + float(eps))
+    else:
+        f = (lam > PINV_RTOL * lam[0]).to(torch.float64)
+    return u, s, f, vt
+
+
+def whitened_transport_map(
+    p_m: Tensor,
+    c_m: float,
+    p_k: Tensor,
+    *,
+    scale: float,
+    eps_rel: float,
+    mode: str,
+    tau: float | None = None,
+) -> tuple[Tensor, dict[str, float]]:
+    """``Phi`` (``[d_m, d_k]``, ``D = E Phi``) of the whitened kernel decodes; each model whitened by its own kernel.
+
+    ``Q_m = (K_m + eps_m I)^{-1/2} P_m`` with ``eps_m = eps_rel tr(K_m) / T`` (pseudo-inverse root at ``eps_rel = 0``).
+
+    - ``zca`` (V2): ``Phi = (scale / c_m) Q_m^T Q_k``: encode ``R~ = (E / c_m) Q_m^T``, decode ``D = scale R~ Q_k``.
+      At ``eps = 0`` ``Q_m^T`` and ``Q_k`` are partial isometries, so ``||D|| / scale <= ||E|| / c_m``; with
+      ``K_m = K_k`` it equals the Tikhonov decode at the same ``eps``.
+    - ``agreement`` (V3): ``M = (K_k + eps_k I)^{-1/2} K_m (K_k + eps_k I)^{-1/2} = W Gamma W^T``; only the directions
+      with ``1/tau <= gamma_i <= tau`` (``W_S``) are kept: ``Phi = (scale / c_m) Q_m^T W_S W_S^T Q_k``. Built with
+      ``T x T`` matrices; with ``T > d`` the directions outside the range of ``M`` (``gamma = 0``) are never kept.
+    """
+    if mode not in KERNEL_DECODES[1:]:
+        raise ValueError(f"whitened decode must be one of {KERNEL_DECODES[1:]}, got {mode!r}")
+    pm = p_m.to(torch.float64)
+    pk = p_k.to(torch.float64)
+    t = pm.shape[0]
+    if pk.shape[0] != t:
+        raise ValueError(f"frames must share the anchor set, got {t} vs {pk.shape[0]} anchors")
+    eps_m = resolve_eps_from_frame(pm, eps_rel)
+    eps_k = resolve_eps_from_frame(pk, eps_rel)
+    u_m, _, f_m, vt_m = _whitening_factors(pm, eps_m)
+    u_k, s_k, f_k, vt_k = _whitening_factors(pk, eps_k)
+    factor = float(scale) / float(c_m)
+    info = {"kernel_eps_source": eps_m, "kernel_eps_target": eps_k}
+    if mode == "zca":
+        core = (u_m * f_m).T @ (u_k * f_k)  # diag(f_m) U_m^T U_k diag(f_k)
+        phi = factor * vt_m.T @ core @ vt_k
+        info["kernel_map_spectral_norm"] = float(torch.linalg.matrix_norm(core, ord=2).item())
+        return phi, info
+    if tau is None or not float(tau) >= 1.0:
+        raise ValueError("agreement decode needs tau >= 1")
+    lam_k = s_k * s_k
+    if eps_k > 0.0:
+        inv_root = 1.0 / torch.sqrt(lam_k + eps_k)
+    else:
+        keep_k = lam_k > PINV_RTOL * lam_k[0]
+        inv_root = torch.where(keep_k, 1.0 / torch.sqrt(lam_k.clamp_min(1e-300)), torch.zeros_like(lam_k))
+    w_k = (u_k * inv_root) @ u_k.T
+    if eps_k > 0.0:  # the null space of K_k is whitened by eps_k^{-1/2}
+        w_k = w_k + (torch.eye(t, dtype=torch.float64) - u_k @ u_k.T) / eps_k**0.5
+    a = w_k @ pm  # (K_k + eps_k I)^{-1/2} P_m, so M = a a^T
+    gamma, w = torch.linalg.eigh(0.5 * ((a @ a.T) + (a @ a.T).T))
+    sel = (gamma >= 1.0 / float(tau)) & (gamma <= float(tau))
+    ws = w[:, sel]
+    q_m = (u_m * f_m) @ vt_m
+    q_k = (u_k * f_k) @ vt_k
+    phi = factor * (q_m.T @ ws) @ (ws.T @ q_k)
+    pos = gamma[gamma > PINV_RTOL * gamma.abs().max()]
+    info.update(
+        {
+            "agreement_kept": float(sel.sum().item()),
+            "agreement_nonzero": float(pos.numel()),
+            "agreement_gamma_median": float(pos.median().item()) if pos.numel() else float("nan"),
+            "agreement_gamma_in_band_fraction": float(sel.sum().item()) / max(int(pos.numel()), 1),
+        }
+    )
+    return phi, info
+
+
 # ---------------------------------------------------------------- generalized Procrustes (GPA) on the anchors
 #
 # AGENT_NEXT.md section 4. Every model m gets A_m (d_U x d_m, orthonormal COLUMNS: A_m^T A_m = I_{d_m}); a row h of

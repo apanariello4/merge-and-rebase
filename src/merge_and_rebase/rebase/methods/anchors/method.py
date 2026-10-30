@@ -33,6 +33,7 @@ from .config import AnchorsConfig
 from .core import (
     CoverageAccumulator,
     decode_rows,
+    dedup_mask,
     encode_rows,
     gpa,
     gpa_transport_map,
@@ -44,8 +45,10 @@ from .core import (
     resolve_eps,
     resolve_eps_from_frame,
     round_trip_operator_primal,
+    row_normalize,
     spectral_transport_map,
     transport_map_primal,
+    whitened_transport_map,
 )
 from .state import AnchorState, RegisteredModel, to_canonical
 from .universe import fit_universe
@@ -91,18 +94,21 @@ def anchor_keep(regs_blocks: list[tuple[RegisteredModel, int]], k: float) -> Ten
 def pair_frames(
     source: RegisteredModel, source_block: int, target: RegisteredModel, target_block: int, *, config: AnchorsConfig
 ) -> tuple[Tensor, float, Tensor, float]:
-    """``(P_m, c_m, P_k, c_k)`` of one block pair, with the high-norm filter applied when configured."""
+    """``(P_m, c_m, P_k, c_k)`` of one block pair, with the high-norm filter, then the R2 dedup (measured in the
+    source) and the R3 row normalisation applied when configured."""
     if config.anchor_filter is None:
-        return (
-            source.p[source_block].to(torch.float64),
-            source.c[source_block],
-            target.p[target_block].to(torch.float64),
-            target.c[target_block],
-        )
-    k = float(config.anchor_filter_k)
-    keep = anchor_keep([(source, source_block), (target, target_block)], k)
-    p_m, c_m = filtered_frame(source, source_block, keep, k)
-    p_k, c_k = filtered_frame(target, target_block, keep, k)
+        p_m, c_m = source.p[source_block].to(torch.float64), source.c[source_block]
+        p_k, c_k = target.p[target_block].to(torch.float64), target.c[target_block]
+    else:
+        k = float(config.anchor_filter_k)
+        keep = anchor_keep([(source, source_block), (target, target_block)], k)
+        p_m, c_m = filtered_frame(source, source_block, keep, k)
+        p_k, c_k = filtered_frame(target, target_block, keep, k)
+    if config.anchor_dedup_cos is not None:
+        sel = dedup_mask(p_m, config.anchor_dedup_cos, max_count=config.anchor_dedup_max, seed=config.anchor_seed)
+        p_m, p_k = p_m[sel], p_k[sel]
+    if config.anchor_row_norm:
+        p_m, p_k = row_normalize(p_m), row_normalize(p_k)
     return p_m, c_m, p_k, c_k
 
 
@@ -120,6 +126,7 @@ def transport_map(
     ``T <= d_k``: ``R = (E / c_m) P_m^T``, ``D = scale * R (K_k + eps I)^{-1} P_k`` (kernel form).
     ``T > d_k``: the same map as one ``[d_m, d_k]`` matrix ``Phi`` (``transport_map_primal``), built once.
     ``spectral_filter != 'tikhonov'``: ``Phi`` from ``spectral_transport_map`` (``eps`` is then None).
+    ``kernel_decode`` zca / agreement: ``Phi`` from ``whitened_transport_map`` (``eps`` = the target's eps).
     """
     p_m, c_m, p_k, c_k = pair_frames(source, source_block, target, target_block, config=config)
     scale = c_k if config.rescale_target else c_m
@@ -137,6 +144,11 @@ def transport_map(
             p_m, c_m, p_k, scale=scale, mode=config.spectral_filter, rank=config.spectral_rank
         )
         return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
+    if config.kernel_decode != "tikhonov":
+        phi, info = whitened_transport_map(
+            p_m, c_m, p_k, scale=scale, eps_rel=config.eps_rel, mode=config.kernel_decode, tau=config.agreement_tau
+        )
+        return (lambda e: e.to(torch.float64) @ phi.to(e.device)), info["kernel_eps_target"], info
     if _primal(p_k):
         eps = resolve_eps_from_frame(p_k, config.eps_rel)
         phi = transport_map_primal(p_m, c_m, p_k, scale=scale, eps=eps)
@@ -581,6 +593,10 @@ def _prepare_body(
             d_u=config.gpa_dim,
             add_models=config.gpa_add_models,
             filter_k=None if config.anchor_filter is None else float(config.anchor_filter_k),
+            dedup=None
+            if config.anchor_dedup_cos is None
+            else (source_model_id, float(config.anchor_dedup_cos), config.anchor_dedup_max, int(config.anchor_seed)),
+            row_norm=bool(config.anchor_row_norm),
         )
         gpa_maps = {j: universe.block_maps(j, source_model_id, target_model_id) for j in range(target.depth)}
         universe_meta = {
