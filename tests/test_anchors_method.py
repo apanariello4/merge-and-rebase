@@ -712,3 +712,144 @@ def test_centroid_anchors_register_and_rotate(unit):
     with pytest.raises(ValueError):
         parse_anchors_config({"anchor_unit": "pool2", "anchor_filter": "norm"})
     assert "anchor_unit" not in _cfg().frame()
+
+
+# ---------------------------------------------------------------- O1: operator library end to end
+
+
+@pytest.mark.parametrize("target_calibration", ["same", "disjoint"])
+def test_operator_library_prepare_end_to_end(target_calibration):
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)  # 8 batches of 2: 3 fit + 1 held-out (+ 3 disjoint target batches)
+    cfg = _cfg(frame_map="gpa", library="operator", operator_holdout_batches=1, target_calibration=target_calibration,
+               rescale_target=False)
+    prepared = _prepare(cfg, (source_base, source_ft, target_base, data, pairing, target_sd))
+    assert prepared.unit_task_vector and all(torch.isfinite(v).all() for v in prepared.unit_task_vector.values())
+    rows = [r for r in prepared.diagnostics if "anchors_op_r2_train" in r]
+    assert len(rows) == pairing.target_depth
+    assert all(r["anchors_op_r2_train"] <= 1.0 + 1e-9 and r["anchors_op_library_bytes"] > 0 for r in rows)
+    cal = prepared.extra["calibration"]
+    assert cal["target_calibration"] == target_calibration
+    data_cfg = _cfg(frame_map="gpa", rescale_target=False)
+    ref = _prepare(data_cfg, (source_base, source_ft, target_base, data, pairing, target_sd))
+    assert set(ref.unit_task_vector) == set(prepared.unit_task_vector)
+
+
+def test_operator_library_entries_are_saved_with_the_frame_version(tmp_path):
+    from merge_and_rebase.rebase.methods.anchors.operators import load_library
+
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)
+    cfg = _cfg(frame_map="gpa", library="operator", operator_holdout_batches=1, rescale_target=False,
+               operator_library_dir=str(tmp_path / "lib"))
+    prepared = AnchorsRebase().prepare(
+        source_base_model=source_base, source_ft_model=source_ft, target_model=target_base, target_base_sd=target_sd,
+        source_loader=data, target_loader=data, pairing=pairing, config=cfg, device="cpu",
+        source_anchor_loader=POOL, target_anchor_loader=POOL, source_model_id="A", target_model_id="B",
+        task_name="T1",
+    )
+    version = prepared.extra["anchors"]["gpa_universe"]["version"]
+    ops, meta = load_library(tmp_path / "lib" / version / "A__T1.pt")
+    assert meta["universe_version"] == version and meta["task"] == "T1" and set(ops) == set(range(pairing.target_depth))
+
+
+def test_operator_norm_filter_loose_is_unfiltered_and_tight_zeroes_target_rows(tmp_path):
+    """operator_norm_filter with a k that flags nothing gives the unfiltered operator update; a small k drops target
+    rows (D = 0 there). The operator path also reports its cosine with the data library's D on the same rows."""
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)
+    setup = (source_base, source_ft, target_base, data, pairing, target_sd)
+    base = dict(frame_map="gpa", library="operator", operator_holdout_batches=1, rescale_target=False,
+                anchor_filter="norm")
+    plain = _prepare(_cfg(**base, anchor_filter_k=1e6), setup, state=AnchorState(_cfg(), tmp_path))
+    loose = _prepare(_cfg(**base, anchor_filter_k=1e6, operator_norm_filter=True), setup,
+                     state=AnchorState(_cfg(), tmp_path))
+    for key, value in plain.unit_task_vector.items():
+        torch.testing.assert_close(loose.unit_task_vector[key], value, rtol=1e-6, atol=1e-8)
+    rows = [r for r in loose.diagnostics if "anchors_op_cos_data" in r]
+    assert len(rows) == pairing.target_depth and all(-1.0 - 1e-9 <= r["anchors_op_cos_data"] <= 1.0 + 1e-9 for r in rows)
+    assert all(r["anchors_op_target_rows_dropped"] == 0.0 for r in rows)
+    tight = _prepare(_cfg(**base, anchor_filter_k=1.0, operator_norm_filter=True), setup,
+                     state=AnchorState(_cfg(), tmp_path))
+    assert any(r["anchors_op_target_rows_dropped"] > 0.0 for r in tight.diagnostics if "anchors_op_target_rows_dropped" in r)
+    assert all(torch.isfinite(v).all() for v in tight.unit_task_vector.values())
+    with pytest.raises(ValueError):
+        parse_anchors_config({"frame_map": "gpa", "library": "operator", "operator_norm_filter": True})
+
+
+@pytest.mark.parametrize("space,input_map", [("common", "gpa"), ("native", "anchor_ridge"), ("common", "paired"), ("common", "pool_ridge")])
+def test_operator_space_and_input_map_variants_run_and_report(space, input_map):
+    """O1 iterations: operator fitted in the common space and/or an input map target -> source coordinates; every
+    variant decodes finite updates and reports the input reproduction (R^2 <= 1) and the source-side fidelity."""
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)
+    cfg = _cfg(frame_map="gpa", library="operator", operator_holdout_batches=1, rescale_target=False,
+               operator_space=space, operator_input_map=input_map)
+    prepared = _prepare(cfg, (source_base, source_ft, target_base, data, pairing, target_sd))
+    assert all(torch.isfinite(v).all() for v in prepared.unit_task_vector.values())
+    rows = [r for r in prepared.diagnostics if "anchors_op_input_r2" in r]
+    assert len(rows) == pairing.target_depth
+    assert all(r["anchors_op_input_r2"] <= 1.0 + 1e-9 and r["anchors_op_common_r2_heldout"] <= 1.0 + 1e-9 for r in rows)
+    with pytest.raises(ValueError):
+        parse_anchors_config({"operator_space": "common"})
+    with pytest.raises(ValueError):
+        parse_anchors_config({"frame_map": "gpa", "library": "operator", "operator_input_map": "paired",
+                              "target_calibration": "disjoint"})
+
+
+def test_operator_identity_input_map_is_the_plain_decode():
+    from merge_and_rebase.rebase.methods.anchors.operators import decode_operator, explained
+
+    torch.manual_seed(0)
+    h, w, b = torch.randn(2, 5, 6, dtype=torch.float64), torch.randn(4, 4, dtype=torch.float64), torch.randn(4, dtype=torch.float64)
+    a = torch.linalg.qr(torch.randn(6, 4, dtype=torch.float64))[0].T
+    plain = decode_operator(h, w, b, a, None, 2.0)
+    ident = decode_operator(h, w, b, a, None, 2.0, (torch.eye(4, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)))
+    torch.testing.assert_close(plain, ident)
+    x = torch.randn(7, 3, dtype=torch.float64)
+    assert explained([x], [x]) == pytest.approx((1.0, 1.0))
+
+
+# ---------------------------------------------------------------- O2: ridge with conservation end to end
+
+
+def test_ridge_preserve_rho_zero_matches_the_ridge_and_rho_positive_runs():
+    setup = _setup()
+    ref = _prepare(_cfg(), setup)
+    zero = _prepare(_cfg(synthesis="ridge_preserve", rho_g=0.0, preserve_tokens=6), setup)
+    for k, v in ref.unit_task_vector.items():
+        torch.testing.assert_close(zero.unit_task_vector[k], v, rtol=1e-3, atol=1e-5)
+    pos = _prepare(_cfg(synthesis="ridge_preserve", rho_g=10.0, preserve_tokens=6), setup)
+    rows = [r for r in pos.diagnostics if "generic_change" in r]
+    assert rows and all(r["generic_change"] <= r["generic_change_ridge"] + 1e-9 for r in rows)
+    with pytest.raises(ValueError):
+        parse_anchors_config({"rho_g": 1.0})
+
+
+# ---------------------------------------------------------------- O3: residual spread
+
+
+def test_spread_with_every_block_a_measurement_is_the_sequential_fit():
+    setup = _setup(source_depth=2, target_depth=4)
+    seq = _prepare(_cfg(depth_fit="sequential"), setup)
+    spread = _prepare(_cfg(depth_fit="spread", measure_depths=(0.0, 1 / 3, 2 / 3, 1.0)), setup)
+    assert set(seq.unit_task_vector) == set(spread.unit_task_vector)
+    for k, v in seq.unit_task_vector.items():
+        torch.testing.assert_close(spread.unit_task_vector[k], v, rtol=1e-3, atol=1e-5)
+
+
+def test_spread_over_one_interval_fits_every_block_and_shrinks_the_residual():
+    setup = _setup(source_depth=2, target_depth=4)
+    spread = _prepare(_cfg(depth_fit="spread", measure_depths=(1.0,)), setup)
+    rows = [r for r in spread.diagnostics if r.get("mode") == "anchors_spread"]
+    assert [r["position"] for r in rows] == [0, 1, 2, 3] and [r["quota_divisor"] for r in rows] == [4, 3, 2, 1]
+    assert all(r["measure_block"] == 3 for r in rows)
+    # the measurement block itself takes the whole remaining residual, so the interval ends below its last step
+    assert rows[-1]["interval_final_residual_norm"] < rows[-1]["residual_norm_before"]
+    # a measurement before the last block leaves the later blocks untouched
+    early = _prepare(_cfg(depth_fit="spread", measure_depths=(1 / 3,)), setup)
+    later = [k for k in early.unit_task_vector if ".resblocks.2." in k or ".resblocks.3." in k]
+    assert not later
+    for bad in ({"depth_fit": "spread"}, {"measure_depths": [0.5]}, {"depth_fit": "spread", "measure_depths": [1.5]}):
+        with pytest.raises(ValueError):
+            parse_anchors_config(bad)

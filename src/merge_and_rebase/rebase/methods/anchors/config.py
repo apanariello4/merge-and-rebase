@@ -103,6 +103,42 @@ class AnchorsConfig:
     anchor_row_norm: bool = False
     anchor_dedup_cos: float | None = None
     anchor_dedup_max: int | None = None
+    # Expert library (AGENT_NEXT_PHASE.md O1). 'data': D from the source displacement rows (the method so far).
+    # 'operator': per source block a ridge operator e ~ h W_E + b_E (h, e centred/scaled by the source frame), carried
+    # into the GPA space (W_U = A_m W_E A_m^T) and applied to the TARGET's own base activations (anchors/operators.py).
+    # operator_rank: data-weighted rank of W_E (None: full). operator_holdout_batches: extra calibration batches (the
+    # tail of the same seeded draw, disjoint) for the held-out R^2. target_calibration 'disjoint': the target's H and
+    # h_k come from num_batches further batches of that draw, never seen by the source (O1.3).
+    library: str = "data"
+    operator_rank: int | None = None
+    operator_holdout_batches: int = 2
+    target_calibration: str = "same"
+    # operator_norm_filter (needs anchor_filter='norm'): the source rows whose centred norm exceeds anchor_filter_k x
+    # the block median are left out of the operator fit and its R^2, and the target rows above that bound in the
+    # target block get D = 0 (the GPA maps were fitted without such rows, so A_k^T is not defined on them).
+    operator_norm_filter: bool = False
+    # operator_space 'native': fit e ~ h in the source's own coordinates, then W_U = A_m W_E A_m^T; 'common': fit
+    # directly e A_m^T ~ h A_m^T in the GPA coordinates (the operator sees the inputs it will be applied to).
+    # operator_input_map: how the target's common coordinates u_k = h_k A_k^T are carried onto the source's before
+    # the operator: 'gpa' (identity, the shared frame alone), 'anchor_ridge' (ridge u_k -> u_m on the shared anchor
+    # frames of the block pair: still no task data from the target side), 'paired' (the same ridge on the task
+    # calibration rows of both models: a ceiling, it needs the source and target on the same task images),
+    # 'pool_ridge' (that ridge on all tokens of the frame's anchor images, both models: task-free, many rows).
+    operator_space: str = "native"
+    operator_input_map: str = "gpa"
+    # Optional: save each expert's operators {grid point j: (W_U, b_U)} as <dir>/<universe version>/<source>__<task>.pt
+    # (with the source scales), for decode-only fusion in the common space (O4 F2/F3).
+    operator_library_dir: str | None = None
+    # Update synthesis (AGENT_NEXT_PHASE.md O2). 'ridge': Ariadne's ridge (unchanged). 'ridge_preserve' (D2): weight
+    # and bias solved jointly with an extra (rho_g / m)||G dW + 1 beta^T||^2 term, G = the target base's c_proj inputs
+    # on the Tiny-ImageNet anchor images (preserve_tokens tokens per block, high-norm tokens dropped when the anchor
+    # filter is on); rho_g = 0 is Ariadne's ridge (anchors/synthesis.py).
+    synthesis: str = "ridge"
+    rho_g: float = 0.0
+    preserve_tokens: int = 32768
+    # D5 (O4): the compiled c_proj update reduced to update_rank by the data-weighted projection dW V_r V_r^T (V_r
+    # from the fitted displacement's scatter dW^T H~^T H~ dW), intercept recomputed; None: full rank.
+    update_rank: int | None = None
     # Rows the transport map is estimated from. 'frame': the registered anchors of the shared frame (the method).
     # 'task': the task's own paired-calibration rows (base-model boundaries, same seeded draw as E), the bridge to
     # Ariadne: with procrustes_cross at full rank, rescale_target=False and the target's token grid as canonical
@@ -129,6 +165,10 @@ class AnchorsConfig:
     # blocks fitted in order on D_j - U_j, U_j = the change the already-fitted upstream blocks produce at j
     # (Ariadne's sequential streaming fit with the anchor decode as desired_fn; host memory O(1) in depth).
     depth_fit: str = "independent"
+    # depth_fit 'spread' (D3, AGENT_NEXT_PHASE.md O3): D is used only at the measurement depths measure_depths
+    # (target blocks round(s (L_k - 1))); the blocks of each interval are fitted in order to equal shares of what is
+    # still missing at its measurement block (anchors/synthesis.py fit_spread); blocks after the last one: no update.
+    measure_depths: tuple[float, ...] = ()
     # None: every target block is compiled. A float s_max in (0, 1]: only target blocks j with relative depth
     # j / (L_k - 1) < s_max keep their update, the others are zero (exact: the ridge fits blocks independently).
     compile_max_depth: float | None = None
@@ -155,8 +195,9 @@ class AnchorsConfig:
             components=self.components,
             exact_form=self.exact_form,
             missing_bias=self.missing_bias,
-            activation_storage="resident" if self.depth_fit == "independent" else "streaming",
-            depth_fit=self.depth_fit,
+            activation_storage="streaming" if self.depth_fit == "sequential" else "resident",
+            # 'spread' compiles block by block in anchors itself; only the ridge parameters are read from here
+            depth_fit="independent" if self.depth_fit == "spread" else self.depth_fit,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -164,6 +205,7 @@ class AnchorsConfig:
         out["components"] = list(self.components)
         out["gpa_models"] = list(self.gpa_models)
         out["gpa_add_models"] = list(self.gpa_add_models)
+        out["measure_depths"] = [float(x) for x in self.measure_depths]
         return out
 
 
@@ -180,6 +222,8 @@ def parse_anchors_config(value: Mapping[str, Any] | None) -> AnchorsConfig:
         if isinstance(payload.get(key), (list, str)):
             value = payload[key]
             payload[key] = (value,) if isinstance(value, str) else tuple(value)
+    if isinstance(payload.get("measure_depths"), (list, tuple)):
+        payload["measure_depths"] = tuple(float(x) for x in payload["measure_depths"])
     if isinstance(payload.get("components"), (list, str)):
         comps = payload["components"]
         payload["components"] = (comps,) if isinstance(comps, str) else tuple(comps)
@@ -227,6 +271,49 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("agreement_tau is required by, and only allowed with, kernel_decode='agreement'")
     if cfg.agreement_tau is not None and not float(cfg.agreement_tau) >= 1.0:
         raise ValueError("agreement_tau must be >= 1")
+    if cfg.synthesis not in {"ridge", "ridge_preserve"}:
+        raise ValueError("synthesis must be 'ridge' or 'ridge_preserve'")
+    if cfg.synthesis == "ridge_preserve" and (
+        cfg.depth_fit == "sequential" or tuple(cfg.components) != ("mlp.c_proj",) or cfg.anchor_pool != "tiny_imagenet"
+    ):
+        raise ValueError("ridge_preserve needs depth_fit 'independent'/'spread', mlp.c_proj and the tiny pool")
+    if cfg.synthesis == "ridge" and float(cfg.rho_g) != 0.0:
+        raise ValueError("rho_g applies to synthesis='ridge_preserve' only")
+    if cfg.update_rank is not None and (
+        isinstance(cfg.update_rank, bool) or not isinstance(cfg.update_rank, int) or cfg.update_rank < 1
+        or cfg.depth_fit == "sequential" or tuple(cfg.components) != ("mlp.c_proj",)
+    ):
+        raise ValueError("update_rank must be a positive integer, with depth_fit 'independent'/'spread', mlp.c_proj")
+    if not float(cfg.rho_g) >= 0.0 or int(cfg.preserve_tokens) < 1:
+        raise ValueError("rho_g must be >= 0 and preserve_tokens >= 1")
+    if cfg.library not in {"data", "operator"}:
+        raise ValueError("library must be 'data' or 'operator'")
+    if cfg.target_calibration not in {"same", "disjoint"}:
+        raise ValueError("target_calibration must be 'same' or 'disjoint'")
+    if cfg.library == "operator" and (
+        cfg.frame_map != "gpa" or cfg.depth_fit == "sequential" or cfg.map_rows != "frame"
+    ):
+        raise ValueError("library='operator' needs frame_map='gpa', depth_fit 'independent'/'spread', map_rows='frame'")
+    if cfg.library == "data" and (
+        cfg.operator_rank is not None or cfg.target_calibration != "same" or cfg.operator_library_dir is not None
+    ):
+        raise ValueError("operator_rank / target_calibration apply to library='operator' only")
+    if cfg.operator_rank is not None and (
+        isinstance(cfg.operator_rank, bool) or not isinstance(cfg.operator_rank, int) or cfg.operator_rank < 1
+    ):
+        raise ValueError("operator_rank must be None or a positive integer")
+    if cfg.operator_space not in {"native", "common"} or cfg.operator_input_map not in {
+        "gpa", "anchor_ridge", "paired", "pool_ridge"
+    }:
+        raise ValueError("operator_space must be native|common, operator_input_map gpa|anchor_ridge|paired|pool_ridge")
+    if cfg.library != "operator" and (cfg.operator_space != "native" or cfg.operator_input_map != "gpa"):
+        raise ValueError("operator_space / operator_input_map apply to library='operator' only")
+    if cfg.operator_input_map == "paired" and cfg.target_calibration != "same":
+        raise ValueError("operator_input_map='paired' needs target_calibration='same'")
+    if cfg.operator_norm_filter and (cfg.library != "operator" or cfg.anchor_filter != "norm"):
+        raise ValueError("operator_norm_filter needs library='operator' and anchor_filter='norm'")
+    if int(cfg.operator_holdout_batches) < 1:
+        raise ValueError("operator_holdout_batches must be >= 1")
     if cfg.anchor_dedup_cos is not None and not -1.0 < float(cfg.anchor_dedup_cos) <= 1.0:
         raise ValueError("anchor_dedup_cos must be None or in (-1, 1]")
     if cfg.anchor_dedup_max is not None:
@@ -268,8 +355,15 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("map_num_batches / map_rows_per_image / map_num_rows apply to map_rows='task' only")
     if cfg.map_rows == "task" and cfg.depth_fit != "independent":
         raise ValueError("map_rows='task' is implemented for depth_fit='independent' only")
-    if cfg.depth_fit not in {"independent", "sequential"}:
-        raise ValueError("depth_fit must be 'independent' or 'sequential'")
+    if cfg.depth_fit not in {"independent", "sequential", "spread"}:
+        raise ValueError("depth_fit must be 'independent', 'sequential' or 'spread'")
+    if (cfg.depth_fit == "spread") != bool(cfg.measure_depths):
+        raise ValueError("measure_depths is required by, and only allowed with, depth_fit='spread'")
+    if cfg.depth_fit == "spread" and (
+        tuple(cfg.components) != ("mlp.c_proj",) or cfg.map_rows != "frame" or cfg.compile_max_depth is not None
+        or not all(0.0 <= float(s) <= 1.0 for s in cfg.measure_depths)
+    ):
+        raise ValueError("depth_fit='spread' needs mlp.c_proj, map_rows='frame', no compile_max_depth, depths in [0, 1]")
     if cfg.depth_fit == "sequential" and len(cfg.components) != 1:
         raise ValueError("depth_fit='sequential' requires exactly one component")
     if cfg.depth_pairing != "relative":

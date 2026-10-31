@@ -26,7 +26,12 @@ import torch
 
 from ....utils.cost_accounting import PhaseCostRecorder, recording
 from ...discrete_layer_match import DiscreteLayerPairing
-from .._ariadne.capture import capture_paired_boundary_activations, iter_capture_tokens, paired_calibration
+from .._ariadne.capture import (
+    capture_paired_boundary_activations,
+    capture_tokens,
+    iter_capture_tokens,
+    paired_calibration,
+)
 from .._ariadne.fit import fit_direct_residual
 from .._ariadne.streaming import fit_direct_residual_sequential_streaming, prepare_direct_residual_streaming
 from .config import AnchorsConfig
@@ -188,6 +193,226 @@ def _pair_diagnostics(p_m: Tensor, p_k: Tensor) -> dict[str, float]:
         **{f"anchors_kernel_{k}": v for k, v in kd.items()},
         **{f"anchors_target_kernel_{k}": v for k, v in ks.items()},
     }
+
+
+def _frame_moments(reg: RegisteredModel, block: int, config: AnchorsConfig) -> tuple[Tensor, float]:
+    """``(mu, c)`` the frame of ``block`` was centred and scaled with (the norm-filtered ones when configured)."""
+    if config.anchor_filter is None:
+        return reg.mu[block].to(torch.float64), float(reg.c[block])
+    flt = reg.extras[f"norm_k{float(config.anchor_filter_k):g}"]
+    return flt["mu"][block].to(torch.float64), float(flt["c"][block])
+
+
+def _operator_keep(config: AnchorsConfig, source: RegisteredModel, target: RegisteredModel):
+    """``keep(side, block, rows) -> bool mask`` of the anchor norm filter's rule (``||x - mu|| <= k median``), or None."""
+    if not config.operator_norm_filter:
+        return None
+    k = float(config.anchor_filter_k)
+    regs = {"source": source, "target": target}
+    meds = {side: reg.extras[f"norm_k{k:g}"]["median"] for side, reg in regs.items()}
+
+    def keep(side: str, block: int, rows: Tensor) -> Tensor:
+        mu = regs[side].mu[block].to(device=rows.device, dtype=torch.float64)
+        return (rows.to(torch.float64) - mu).norm(dim=-1) <= k * float(meds[side][block])
+
+    return keep
+
+
+def _pool_input_maps(source_model, target_model, pool_batches, pairing, source, target, *, config, gpa_maps, keep,
+                     device) -> dict[int, tuple[Tensor, Tensor]]:
+    """``operator_input_map='pool_ridge'``: per target position j, the ridge ``u_k -> u_m`` (GPA coordinates, both
+    frames' moments) on every canonical token of the anchor images kept by the norm filter in both models, moments
+    streamed batch by batch."""
+    from .operators import _Moments, common_rows, fit_from_moments
+
+    if pool_batches is None:
+        raise ValueError("operator_input_map='pool_ridge' needs the anchor pool batches")
+    canon, rank = int(config.canonical_tokens), config.gpa_rank
+    distinct = sorted({int(i) for i in pairing.pairing})
+    moms = {j: _Moments() for j in range(pairing.target_depth)}
+    frames = {("s", i): _frame_moments(source, i, config) for i in distinct}
+    frames.update({("t", j): _frame_moments(target, j, config) for j in range(pairing.target_depth)})
+    for sb, tb in zip(*pool_batches, strict=True):
+        s_out = capture_tokens(source_model, [sb], {str(i): (i, "boundary") for i in distinct}, device)
+        t_out = capture_tokens(target_model, [tb], {str(j): (j, "boundary") for j in range(pairing.target_depth)}, device)
+        for j in range(pairing.target_depth):
+            i = int(pairing.pairing[j])
+            sc = to_canonical(s_out[str(i)][0].double(), canon)
+            tc = to_canonical(t_out[str(j)][0].double(), canon)
+            m = torch.ones(sc.shape[0] * sc.shape[1], dtype=torch.bool, device=sc.device)
+            if keep is not None:
+                m = keep("source", i, sc).reshape(-1) & keep("target", j, tc).reshape(-1)
+            (mu_m, c_m), (mu_k, c_k) = frames[("s", i)], frames[("t", j)]
+            a_m, a_k = gpa_maps[j]
+            moms[j].update(common_rows((tc - mu_k) / c_k, a_k, rank)[m], common_rows((sc - mu_m) / c_m, a_m, rank)[m])
+    out = {}
+    for j, mom in moms.items():
+        fitted = fit_from_moments(mom)
+        out[j] = (fitted.w, fitted.b)
+    return out
+
+
+def operator_desired_effects(
+    source_base_model,
+    source_ft_model,
+    target_model,
+    source_loader,
+    target_loader,
+    pairing: DiscreteLayerPairing,
+    source: RegisteredModel,
+    target: RegisteredModel,
+    *,
+    config: AnchorsConfig,
+    gpa_maps: Mapping[int, tuple[Tensor, Tensor]],
+    device,
+    library_entry: Mapping[str, Any] | None = None,
+    pool_batches: tuple[list[Any], list[Any]] | None = None,
+) -> tuple[dict[str, Any], dict[int, list[Tensor]], dict[int, dict[str, Any]]]:
+    """O1 (``library='operator'``): ``(captured for the ridge, {j: [D per batch]}, per-position diagnostics)``.
+
+    One seeded draw of ``num_batches + operator_holdout_batches (+ num_batches if disjoint)`` batches (prefix
+    consistent with the data library's draw): the first ``num_batches`` fit the source operators, the next
+    ``operator_holdout_batches`` give their held-out R^2, and the target rows are the first ``num_batches`` ('same',
+    exactly the data library's) or the last ``num_batches`` ('disjoint', never seen by the source).
+    """
+    from .operators import (
+        common_rows, decode_operator, explained, fit_effect_operator, operator_nbytes, r_squared, save_library,
+        to_common_space,
+    )
+
+    nb, ho = int(config.num_batches), int(config.operator_holdout_batches)
+    extra = nb if config.target_calibration == "disjoint" else 0
+    source_batches, target_batches, metadata = paired_calibration(
+        source_loader, target_loader, num_batches=nb + ho + extra, seed=config.seed
+    )
+    if len(source_batches) != nb + ho + extra:
+        raise ValueError(f"task calibration too small for library='operator': {len(source_batches)} batches")
+    tgt = target_batches[:nb] if extra == 0 else target_batches[nb + ho :]
+    distinct = sorted({int(i) for i in pairing.pairing})
+    src_req = {str(i): (i, "boundary") for i in distinct}
+    base_out = capture_tokens(source_base_model, source_batches[: nb + ho], src_req, device)
+    ft_out = capture_tokens(source_ft_model, source_batches[: nb + ho], src_req, device)
+    tgt_out = capture_tokens(target_model, tgt, {str(j): (j, "boundary") for j in range(pairing.target_depth)}, device)
+    rank = config.gpa_rank
+    keep = _operator_keep(config, source, target)
+    canon = int(config.canonical_tokens)
+    src: dict[int, tuple[list[Tensor], list[Tensor], list[Tensor], float]] = {}
+    ops: dict[int, Any] = {}
+    for i in distinct:
+        mu, c = _frame_moments(source, i, config)
+        b, f = base_out[str(i)], ft_out[str(i)]
+        hb = [(x.to(torch.float64) - mu) / c for x in b]
+        eb = [(y.to(torch.float64) - x.to(torch.float64)) / c for x, y in zip(b, f, strict=True)]
+        if keep is not None:
+            masks = [keep("source", i, x).reshape(-1) for x in b]
+        else:
+            masks = [torch.ones(x.shape[0] * x.shape[1], dtype=torch.bool, device=x.device) for x in b]
+        h = [x.reshape(-1, x.shape[-1])[m] for x, m in zip(hb, masks, strict=True)]
+        e = [y.reshape(-1, y.shape[-1])[m] for y, m in zip(eb, masks, strict=True)]
+        src[i] = (hb, h, e, c)
+        if config.operator_space == "native":
+            op = fit_effect_operator(h[:nb], e[:nb], rank=config.operator_rank)
+            op.info["r2_train"] = r_squared(op, h[:nb], e[:nb])
+            op.info["r2_heldout"] = r_squared(op, h[nb:], e[nb:])
+            ops[i] = op
+    pool_maps: dict[int, tuple[Tensor, Tensor]] = {}
+    if config.operator_input_map == "pool_ridge":
+        pool_maps = _pool_input_maps(source_base_model, target_model, pool_batches, pairing, source, target,
+                                     config=config, gpa_maps=gpa_maps, keep=keep, device=device)
+    desired: dict[int, list[Tensor]] = {}
+    diag: dict[int, dict[str, Any]] = {}
+    library: dict[int, tuple[Tensor, Tensor]] = {}
+    for j in range(pairing.target_depth):
+        i = int(pairing.pairing[j])
+        hb, h, e, c_m = src[i]
+        a_m, a_k = gpa_maps[j]
+        uh = [common_rows(x, a_m, rank) for x in h]
+        ue = [common_rows(y, a_m, rank) for y in e]
+        if config.operator_space == "native":
+            op = ops[i]
+            w_u, b_u = to_common_space(op, a_m, rank)
+        else:
+            op = fit_effect_operator(uh[:nb], ue[:nb], rank=config.operator_rank)
+            op.info["r2_train"] = r_squared(op, uh[:nb], ue[:nb])
+            op.info["r2_heldout"] = r_squared(op, uh[nb:], ue[nb:])
+            w_u, b_u = op.w, op.b
+        library[j] = (w_u, b_u)
+        # the operator in the common space, on the source's own held-out rows (no transfer of the inputs)
+        r2_src, cos_src = explained([x @ w_u + b_u for x in uh[nb:]], ue[nb:])
+        mu_k, c_k = _frame_moments(target, j, config)
+        hk = [(t.to(torch.float64) - mu_k) / c_k for t in tgt_out[str(j)]]
+        input_map = pool_maps.get(j)
+        if config.operator_input_map == "anchor_ridge":
+            p_m, _, p_k, _ = pair_frames(source, i, target, j, config=config)
+            fitted = fit_effect_operator([common_rows(p_k, a_k, rank)], [common_rows(p_m, a_m, rank)])
+            input_map = (fitted.w, fitted.b)
+        input_diag: dict[str, Any] = {}
+        if extra == 0:
+            # the same task images through both models, on the canonical grid: how well the target's common
+            # coordinates (after the input map) reproduce the source's (rows kept by the norm filter in both)
+            uk_c, um_c = [], []
+            for t, x, sb in zip(tgt_out[str(j)], hb[:nb], base_out[str(i)][:nb], strict=True):
+                tc, sc = to_canonical(t.double(), canon), to_canonical(sb.double(), canon)
+                m = torch.ones(tc.shape[0] * tc.shape[1], dtype=torch.bool, device=tc.device)
+                if keep is not None:
+                    m = keep("target", j, tc).reshape(-1) & keep("source", i, sc).reshape(-1)
+                uk_c.append(common_rows((tc - mu_k) / c_k, a_k, rank)[m])
+                um_c.append(common_rows(to_canonical(x, canon), a_m, rank)[m])
+            if config.operator_input_map == "paired":
+                fitted = fit_effect_operator(uk_c, um_c)
+                input_map = (fitted.w, fitted.b)
+            pred = uk_c if input_map is None else [u @ input_map[0] + input_map[1] for u in uk_c]
+            r2_in, cos_in = explained(pred, um_c)
+            input_diag = {"anchors_op_input_r2": r2_in, "anchors_op_input_cos": cos_in}
+        scale = c_k if config.rescale_target else c_m
+        out = [decode_operator(x, w_u, b_u, a_k, rank, scale, input_map).float() for x in hk]
+        dropped = 0.0
+        if keep is not None:
+            masks = [keep("target", j, t) for t in tgt_out[str(j)]]
+            out = [d * m.unsqueeze(-1).to(d.dtype) for d, m in zip(out, masks, strict=True)]
+            dropped = 1.0 - sum(float(m.sum()) for m in masks) / sum(m.numel() for m in masks)
+        desired[j] = out
+        diag[j] = {
+            "anchors_source_block": i,
+            "anchors_d_norm": float(sum(float((d.double() ** 2).sum()) for d in out) ** 0.5),
+            "anchors_op_target_rows_dropped": dropped,
+            "anchors_op_common_r2_heldout": r2_src,
+            "anchors_op_common_cos_heldout": cos_src,
+            **input_diag,
+            **{f"anchors_op_{k}": v for k, v in op.info.items()},
+            "anchors_op_library_bytes": operator_nbytes(w_u, config.operator_rank),
+        }
+    if library_entry is not None:
+        # One entry per (source, task), in the coordinates of the GPA frame it was encoded in; keyed by the target
+        # grid point j (the map A_m of grid point j); c_m per entry so a decode can restore the source scale.
+        from pathlib import Path
+
+        path = Path(library_entry["dir"]) / str(library_entry["universe_version"])
+        path = path / f"{library_entry['source_model_id']}__{library_entry['task']}.pt"
+        save_library(path, library, {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank,
+                                     "c_source": {j: float(src[int(pairing.pairing[j])][3]) for j in library}})
+    if extra == 0:
+        # Diagnostic only: the data library's D on the very same target rows (same calibration draw), and its cosine
+        # with the operator's D per position (all rows, and the rows the norm filter keeps).
+        data_d, _ = decode_desired_effects(
+            {"source_base_outputs": {i: base_out[str(i)][:nb] for i in distinct},
+             "source_ft_outputs": {i: ft_out[str(i)][:nb] for i in distinct},
+             "target_base_outputs_by_position": {j: tgt_out[str(j)] for j in desired}},
+            pairing, source, target, config=config, gpa_maps=gpa_maps,
+        )
+        for j in desired:
+            dot = nd = no = 0.0
+            for d_op, d_dat in zip(desired[j], data_d[j], strict=True):
+                d_op, d_dat = d_op.double(), d_dat.double()
+                dot += float((d_op * d_dat).sum())
+                no += float((d_op**2).sum())
+                nd += float((d_dat**2).sum())
+            diag[j]["anchors_op_cos_data"] = dot / max((no * nd) ** 0.5, 1e-300)
+            diag[j]["anchors_op_norm_over_data"] = (no / max(nd, 1e-300)) ** 0.5
+    captured = {"target_batches": tgt, "target_base_outputs_by_position": {j: tgt_out[str(j)] for j in desired},
+                "calibration": {**metadata, "target_calibration": config.target_calibration,
+                                "operator_holdout_batches": ho}}
+    return captured, desired, diag
 
 
 def decode_desired_effects(
@@ -375,6 +600,7 @@ class AnchorsRebase:
             state=state,
             source_model_meta=source_model_meta,
             target_model_meta=target_model_meta,
+            task_name=_unused.get("task_name"),
         )
         if recorder is not None:
             return _prepare_body(recorder, **kwargs)
@@ -530,6 +756,7 @@ def _prepare_body(
     state: AnchorState,
     source_model_meta=None,
     target_model_meta=None,
+    task_name: str | None = None,
 ) -> AnchorsPrepared:
     """Registration + task capture + encode/decode (``alignment_calibration`` bracket), then the ridge
     (``correction_fit`` bracket); timing keys mirror Ariadne's so the run summary reads both alike."""
@@ -620,6 +847,27 @@ def _prepare_body(
             source_ft_model=source_ft_model,
         )
         calibration = prepared_stream["calibration"]
+    elif config.library == "operator":
+        captured, desired, position_diag = operator_desired_effects(
+            source_base_model,
+            source_ft_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            source,
+            target,
+            config=config,
+            gpa_maps=gpa_maps,
+            device=device,
+            library_entry=None
+            if config.operator_library_dir is None
+            else {"dir": config.operator_library_dir, "universe_version": universe_meta["version"],
+                  "source_model_id": source_model_id, "task": task_name or "unnamed"},
+            pool_batches=_pool_draw(state, source_anchor_loader, target_anchor_loader)
+            if config.operator_input_map == "pool_ridge" else None,
+        )
+        calibration = captured["calibration"]
     else:
         captured = capture_paired_boundary_activations(
             source_base_model,
@@ -660,9 +908,24 @@ def _prepare_body(
         )
         position_diag = decoder.diagnostics()
     else:
-        corrections, rows = compile_desired_effects(
-            target_model, target_base_sd, captured, desired, pairing, config=config, device=device
-        )
+        solve_hook = None
+        if config.synthesis == "ridge_preserve" or config.update_rank is not None:
+            solve_hook = _synthesis_hook(
+                state, target, target_model, target_base_sd, target_anchor_loader, config=config, device=device
+            )
+        if config.depth_fit == "spread":
+            from .synthesis import fit_spread, measure_blocks
+
+            corrections, rows = fit_spread(
+                target_model, target_base_sd, captured, desired,
+                measure_blocks(config.measure_depths, pairing.target_depth),
+                config=config.ridge_config(), device=device, solve_hook=solve_hook,
+            )
+        else:
+            corrections, rows = compile_desired_effects(
+                target_model, target_base_sd, captured, desired, pairing, config=config, device=device,
+                solve_hook=solve_hook,
+            )
     fit_peak, fit_host_peak = recorder.peaks_since(fit_mark)
     fit_timing = {
         "correction_fit_seconds": time.perf_counter() - started,
@@ -728,8 +991,50 @@ def compile_desired_effects(
     *,
     config: AnchorsConfig,
     device,
+    solve_hook=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
-    """Step 4b: Ariadne's ridge on the target base inputs, called unchanged with the decoded ``D``."""
+    """Step 4b: Ariadne's ridge on the target base inputs, called unchanged with the decoded ``D`` (``solve_hook``:
+    a synthesis variant, ``anchors/synthesis.py``)."""
     return fit_direct_residual(
-        target_model, target_base_sd, captured, desired, pairing, config=config.ridge_config(), device=device
+        target_model, target_base_sd, captured, desired, pairing, config=config.ridge_config(), device=device,
+        solve_hook=solve_hook,
     )
+
+
+def _pool_draw(state, source_anchor_loader, target_anchor_loader) -> tuple[list[Any], list[Any]]:
+    """The frame's anchor images (first anchor_batches of the pool draw), as paired source / target batches."""
+    frame = state.config
+    s_b, t_b, _ = paired_calibration(
+        source_anchor_loader, target_anchor_loader,
+        num_batches=frame.anchor_batches + frame.registration_batches, seed=frame.pool_seed,
+    )
+    return s_b[: frame.anchor_batches], t_b[: frame.anchor_batches]
+
+
+def _synthesis_hook(state, target, target_model, target_base_sd, target_anchor_loader, *, config, device):
+    """D2 / D5 solve hook. For D2, the G statistics of the target base on the frame's anchor images (the first
+    anchor_batches of the pool draw); the target is loaded at its base weights for the capture and restored."""
+    from .synthesis import capture_generic_inputs, make_synthesis_hook
+
+    if config.synthesis != "ridge_preserve":
+        return make_synthesis_hook(rank=config.update_rank)
+    frame = state.config
+    batches, _, _ = paired_calibration(
+        target_anchor_loader, target_anchor_loader,
+        num_batches=frame.anchor_batches + frame.registration_batches, seed=frame.pool_seed,
+    )
+    norm = None
+    if config.anchor_filter is not None:
+        flt = target.extras[f"norm_k{float(config.anchor_filter_k):g}"]
+        norm = {"mu": target.mu, "k": float(flt["k"]), "median": flt["median"]}
+    current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+    try:
+        target_model.load_state_dict(dict(target_base_sd), strict=True)
+        generic = capture_generic_inputs(
+            target_model, batches[: frame.anchor_batches], target.depth, component="mlp.c_proj",
+            tokens_per_block=config.preserve_tokens, seed=config.seed, device=device, norm_filter=norm,
+        )
+    finally:
+        target_model.load_state_dict(current, strict=True)
+    weights = {j: target_base_sd[f"visual.transformer.resblocks.{j}.mlp.c_proj.weight"] for j in range(target.depth)}
+    return make_synthesis_hook(generic=generic, rho_g=float(config.rho_g), base_weights=weights, rank=config.update_rank)

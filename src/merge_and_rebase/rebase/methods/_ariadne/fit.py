@@ -31,8 +31,13 @@ def fit_direct_residual(
     config: DirectResidualConfig,
     device,
     family_adapter=None,
+    solve_hook=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Fit every target position's residual-writing components independently.
+
+    ``solve_hook`` (opt-in, default ``None`` = the ridge below, unchanged): ``solve_hook(pos, component, stats,
+    config) -> (correction, diag)`` replaces ``stats.solve(...)`` for every (position, component) of the shared-sweep
+    path (``block_split='none'``), with the same return contract; used by ``anchors`` for its synthesis variants.
 
     Wraps `_fit_all_positions_independent` for all ``j in range(pairing.target_depth)`` at once
     (``source_coordinate = pairing.pairing[j]``) from one shared target forward sweep. Always runs with independent
@@ -47,6 +52,8 @@ def fit_direct_residual(
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
+    if solve_hook is not None and config.block_split != "none":
+        raise ValueError("solve_hook is supported with block_split='none' only")
     components = order_components(config.components)
     batches = captured["target_batches"]
     target_outputs_by_position = captured["target_base_outputs_by_position"]
@@ -113,6 +120,7 @@ def fit_direct_residual(
                 solver_config,
                 device,
                 family_adapter=family_adapter,
+                solve_hook=solve_hook,
             )
         for j in positions:
             position_corrections, block_rows = fitted[j]
@@ -552,6 +560,7 @@ def _fit_all_positions_independent(
     config,
     device,
     family_adapter=None,
+    solve_hook=None,
 ) -> dict[int, tuple[dict, list]]:
     """Fit every ``(position, component)`` pair for ``cascade_order='independent'`` from ONE shared target sweep.
 
@@ -615,6 +624,7 @@ def _fit_all_positions_independent(
                 position_corrections,
                 block_rows,
                 h_batches=h_batches,
+                solve_hook=solve_hook,
             )
         results[pos] = (position_corrections, block_rows)
     return results
@@ -634,6 +644,7 @@ def _finalize_independent_component(
     position_corrections,
     block_rows,
     h_batches=None,
+    solve_hook=None,
 ):
     """Everything after one component's accumulation loop in ``_fit_all_positions_independent``: pristine-effect
     check, ridge solve, state/bookkeeping updates, missing-bias handling and the block_row diagnostic (plus optional
@@ -645,11 +656,14 @@ def _finalize_independent_component(
             "Direct completion started from a target model that is not the native "
             f"base: nonzero pre-fit effect at position {pos} (||T-T0||^2={effect_sq:.3e})"
         )
-    correction, diag = stats.solve(
-        ridge_relative=config.ridge_relative,
-        ridge_estimator=config.ridge_estimator,
-        exact_form=config.exact_form,
-    )
+    if solve_hook is None:
+        correction, diag = stats.solve(
+            ridge_relative=config.ridge_relative,
+            ridge_estimator=config.ridge_estimator,
+            exact_form=config.exact_form,
+        )
+    else:
+        correction, diag = solve_hook(pos, component, stats, config)
     correction = correction.cpu()
     diag["bias_correction"] = diag["bias_correction"].cpu()
     weight_before = current_state[key].detach().clone()

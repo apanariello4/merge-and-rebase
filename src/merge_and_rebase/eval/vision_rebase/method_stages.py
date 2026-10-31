@@ -617,8 +617,13 @@ class DirectFitStage:
                 build_cfg_task=task.build_cfg_task,
                 source_text_features=task.ctx.source_text_features,
                 target_text_features=task.ctx.target_text_features,
-                # Only the native_oracle diagnostic needs the task (fills {task} of native_target_ckpt_template).
-                **({"task_name": t} if direct_residual_cfg.residual_target == "native_oracle" else {}),
+                # Only the native_oracle diagnostic needs the task (fills {task} of native_target_ckpt_template);
+                # anchors also gets it (names the entries of its optional operator library).
+                **(
+                    {"task_name": t}
+                    if direct_residual_cfg.residual_target == "native_oracle" or self.anchors_cfg is not None
+                    else {}
+                ),
             )
             result.transported_delta = transported_delta
             result.alignment_calibration = direct_residual_timing["alignment_calibration"]
