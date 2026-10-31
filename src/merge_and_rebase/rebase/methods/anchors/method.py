@@ -342,6 +342,7 @@ def operator_desired_effects(
     diag: dict[int, dict[str, Any]] = {}
     library: dict[int, tuple[Tensor, Tensor]] = {}
     library_cls: dict[int, tuple[Tensor, Tensor]] = {}
+    composed: dict[int, tuple[Tensor, Tensor]] = {}
     for j in range(pairing.target_depth):
         i = int(pairing.pairing[j])
         hb, h, e, c_m, cls = src[i]
@@ -417,6 +418,13 @@ def operator_desired_effects(
             input_diag = {"anchors_op_input_r2": r2_in, "anchors_op_input_cos": cos_in,
                           "anchors_op_input_r2_cls": r2_in_cls}
         scale = c_k if config.rescale_target else c_m
+        if library_entry is not None and not split:
+            # the operator on the TARGET's common coordinates: input map and decode scale folded in
+            # (D = (u W~ + b~) A_k), so operators of different sources towards this target can be fused (O4 F2 / F3)
+            m_w, m_b = (None, None) if input_map is None else input_map
+            w_t = w_u if m_w is None else m_w @ w_u
+            b_t = b_u if m_b is None else m_b @ w_u + b_u
+            composed[j] = (float(scale) * w_t, float(scale) * b_t)
         out = [decode_operator(x, w_u, b_u, a_k, rank, scale, input_map) for x in hk]
         if split:
             for d, x in zip(out, hk, strict=True):
@@ -452,6 +460,11 @@ def operator_desired_effects(
         save_library(path, library, {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank,
                                      "c_source": {j: float(src[int(pairing.pairing[j])][3]) for j in library},
                                      "cls_split": split})
+        if composed:
+            save_library(path.with_name(path.stem + "__composed.pt"), composed,
+                         {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank,
+                          "acts_on": "target common coordinates u_k = h_k A_k^T, input map and scale folded in",
+                          "input_map": config.operator_input_map})
         if split:
             save_library(path.with_name(path.stem + "__cls.pt"), library_cls,
                          {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank, "rows": "cls"})
@@ -927,7 +940,8 @@ def _prepare_body(
             library_entry=None
             if config.operator_library_dir is None
             else {"dir": config.operator_library_dir, "universe_version": universe_meta["version"],
-                  "source_model_id": source_model_id, "task": task_name or "unnamed"},
+                  "source_model_id": source_model_id, "target_model_id": target_model_id,
+                  "task": task_name or "unnamed"},
             pool_batches=_pool_draw(state, source_anchor_loader, target_anchor_loader)
             if config.operator_input_map == "pool_ridge" else None,
         )

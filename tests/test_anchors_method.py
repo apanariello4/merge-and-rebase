@@ -751,6 +751,25 @@ def test_operator_library_entries_are_saved_with_the_frame_version(tmp_path):
     version = prepared.extra["anchors"]["gpa_universe"]["version"]
     ops, meta = load_library(tmp_path / "lib" / version / "A__T1.pt")
     assert meta["universe_version"] == version and meta["task"] == "T1" and set(ops) == set(range(pairing.target_depth))
+    # the target-side entry (O4 F2/F3): with the 'gpa' input map (identity) it is the source scale times W_U
+    comp, comp_meta = load_library(tmp_path / "lib" / version / "A__T1__composed.pt")
+    assert comp_meta["target_model_id"] == "B" and set(comp) == set(ops)
+    for j, (w, b) in comp.items():
+        torch.testing.assert_close(w, meta["c_source"][j] * ops[j][0], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(b, meta["c_source"][j] * ops[j][1], rtol=1e-5, atol=1e-6)
+
+
+def test_operator_folded_input_map_reproduces_the_decode():
+    """D = c ((u M + m) W + b) A  ==  (u (c M W) + c (m W + b)) A: the composed library entry decodes like the run."""
+    from merge_and_rebase.rebase.methods.anchors.operators import decode_operator
+
+    torch.manual_seed(1)
+    h, a = torch.randn(3, 5, 8, dtype=torch.float64), torch.linalg.qr(torch.randn(8, 4, dtype=torch.float64))[0].T
+    w, b = torch.randn(4, 4, dtype=torch.float64), torch.randn(4, dtype=torch.float64)
+    mw, mb, c = torch.randn(4, 4, dtype=torch.float64), torch.randn(4, dtype=torch.float64), 1.7
+    ref = decode_operator(h, w, b, a, None, c, (mw, mb))
+    folded = decode_operator(h, c * (mw @ w), c * (mb @ w + b), a, None, 1.0)
+    torch.testing.assert_close(ref, folded)
 
 
 def test_operator_norm_filter_loose_is_unfiltered_and_tight_zeroes_target_rows(tmp_path):
