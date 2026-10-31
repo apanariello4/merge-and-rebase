@@ -219,17 +219,20 @@ def _operator_keep(config: AnchorsConfig, source: RegisteredModel, target: Regis
 
 
 def _pool_input_maps(source_model, target_model, pool_batches, pairing, source, target, *, config, gpa_maps, keep,
-                     device) -> dict[int, tuple[Tensor, Tensor]]:
+                     device) -> tuple[dict[int, tuple[Tensor, Tensor]], dict[int, tuple[Tensor, Tensor]]]:
     """``operator_input_map='pool_ridge'``: per target position j, the ridge ``u_k -> u_m`` (GPA coordinates, both
     frames' moments) on every canonical token of the anchor images kept by the norm filter in both models, moments
-    streamed batch by batch."""
+    streamed batch by batch. ``(maps, CLS maps)``: with ``operator_cls_split`` the first map is fitted on the patch
+    rows and the second on the CLS rows; otherwise one map on all rows and no CLS maps."""
     from .operators import _Moments, common_rows, fit_from_moments
 
     if pool_batches is None:
         raise ValueError("operator_input_map='pool_ridge' needs the anchor pool batches")
     canon, rank = int(config.canonical_tokens), config.gpa_rank
     distinct = sorted({int(i) for i in pairing.pairing})
+    split = bool(config.operator_cls_split)
     moms = {j: _Moments() for j in range(pairing.target_depth)}
+    moms_cls = {j: _Moments() for j in range(pairing.target_depth)} if split else {}
     frames = {("s", i): _frame_moments(source, i, config) for i in distinct}
     frames.update({("t", j): _frame_moments(target, j, config) for j in range(pairing.target_depth)})
     for sb, tb in zip(*pool_batches, strict=True):
@@ -244,12 +247,23 @@ def _pool_input_maps(source_model, target_model, pool_batches, pairing, source, 
                 m = keep("source", i, sc).reshape(-1) & keep("target", j, tc).reshape(-1)
             (mu_m, c_m), (mu_k, c_k) = frames[("s", i)], frames[("t", j)]
             a_m, a_k = gpa_maps[j]
-            moms[j].update(common_rows((tc - mu_k) / c_k, a_k, rank)[m], common_rows((sc - mu_m) / c_m, a_m, rank)[m])
-    out = {}
-    for j, mom in moms.items():
-        fitted = fit_from_moments(mom)
-        out[j] = (fitted.w, fitted.b)
-    return out
+            uk, um = common_rows((tc - mu_k) / c_k, a_k, rank), common_rows((sc - mu_m) / c_m, a_m, rank)
+            if split:
+                cls = _cls_rows(sc)
+                m = m | cls  # CLS rows never filtered under the split (the readout row)
+                moms[j].update(uk[m & ~cls], um[m & ~cls])
+                moms_cls[j].update(uk[m & cls], um[m & cls])
+            else:
+                moms[j].update(uk[m], um[m])
+    fit = lambda mm: {j: (f.w, f.b) for j, f in ((j, fit_from_moments(mom)) for j, mom in mm.items())}
+    return fit(moms), fit(moms_cls)
+
+
+def _cls_rows(x: Tensor) -> Tensor:
+    """``[B*T]`` bool, True on the CLS row (token 0) of every image of ``x [B, T, d]`` (rows flattened in order)."""
+    flags = torch.zeros(x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)
+    flags[:, 0] = True
+    return flags.reshape(-1)
 
 
 def operator_desired_effects(
@@ -296,7 +310,8 @@ def operator_desired_effects(
     rank = config.gpa_rank
     keep = _operator_keep(config, source, target)
     canon = int(config.canonical_tokens)
-    src: dict[int, tuple[list[Tensor], list[Tensor], list[Tensor], float]] = {}
+    split = bool(config.operator_cls_split)
+    src: dict[int, tuple[list[Tensor], list[Tensor], list[Tensor], float, list[Tensor]]] = {}
     ops: dict[int, Any] = {}
     for i in distinct:
         mu, c = _frame_moments(source, i, config)
@@ -307,68 +322,112 @@ def operator_desired_effects(
             masks = [keep("source", i, x).reshape(-1) for x in b]
         else:
             masks = [torch.ones(x.shape[0] * x.shape[1], dtype=torch.bool, device=x.device) for x in b]
+        if split:
+            masks = [m | _cls_rows(x) for x, m in zip(hb, masks, strict=True)]  # CLS rows never filtered
         h = [x.reshape(-1, x.shape[-1])[m] for x, m in zip(hb, masks, strict=True)]
         e = [y.reshape(-1, y.shape[-1])[m] for y, m in zip(eb, masks, strict=True)]
-        src[i] = (hb, h, e, c)
+        cls = [_cls_rows(x)[m] for x, m in zip(hb, masks, strict=True)]
+        src[i] = (hb, h, e, c, cls)
         if config.operator_space == "native":
             op = fit_effect_operator(h[:nb], e[:nb], rank=config.operator_rank)
             op.info["r2_train"] = r_squared(op, h[:nb], e[:nb])
             op.info["r2_heldout"] = r_squared(op, h[nb:], e[nb:])
             ops[i] = op
     pool_maps: dict[int, tuple[Tensor, Tensor]] = {}
+    pool_maps_cls: dict[int, tuple[Tensor, Tensor]] = {}
     if config.operator_input_map == "pool_ridge":
-        pool_maps = _pool_input_maps(source_base_model, target_model, pool_batches, pairing, source, target,
+        pool_maps, pool_maps_cls = _pool_input_maps(source_base_model, target_model, pool_batches, pairing, source, target,
                                      config=config, gpa_maps=gpa_maps, keep=keep, device=device)
     desired: dict[int, list[Tensor]] = {}
     diag: dict[int, dict[str, Any]] = {}
     library: dict[int, tuple[Tensor, Tensor]] = {}
+    library_cls: dict[int, tuple[Tensor, Tensor]] = {}
     for j in range(pairing.target_depth):
         i = int(pairing.pairing[j])
-        hb, h, e, c_m = src[i]
+        hb, h, e, c_m, cls = src[i]
         a_m, a_k = gpa_maps[j]
         uh = [common_rows(x, a_m, rank) for x in h]
         ue = [common_rows(y, a_m, rank) for y in e]
         if config.operator_space == "native":
             op = ops[i]
             w_u, b_u = to_common_space(op, a_m, rank)
-        else:
+        elif not split:
             op = fit_effect_operator(uh[:nb], ue[:nb], rank=config.operator_rank)
             op.info["r2_train"] = r_squared(op, uh[:nb], ue[:nb])
             op.info["r2_heldout"] = r_squared(op, uh[nb:], ue[nb:])
             w_u, b_u = op.w, op.b
+        else:
+            # patch operator (op, W_U) and CLS operator (op_c, W_c); the R^2 entries are those of the patch one
+            pick = lambda rows, flags, want: [x[f == want] for x, f in zip(rows, flags, strict=True)]
+            op = fit_effect_operator(pick(uh[:nb], cls[:nb], False), pick(ue[:nb], cls[:nb], False),
+                                     rank=config.operator_rank)
+            op_c = fit_effect_operator(pick(uh[:nb], cls[:nb], True), pick(ue[:nb], cls[:nb], True),
+                                       rank=config.operator_rank)
+            op.info["r2_train"] = r_squared(op, pick(uh[:nb], cls[:nb], False), pick(ue[:nb], cls[:nb], False))
+            op.info["r2_heldout"] = r_squared(op, pick(uh[nb:], cls[nb:], False), pick(ue[nb:], cls[nb:], False))
+            w_u, b_u = op.w, op.b
+            library_cls[j] = (op_c.w, op_c.b)
         library[j] = (w_u, b_u)
-        # the operator in the common space, on the source's own held-out rows (no transfer of the inputs)
-        r2_src, cos_src = explained([x @ w_u + b_u for x in uh[nb:]], ue[nb:])
+
+        def source_pred(x: Tensor, flags: Tensor) -> Tensor:
+            p = x @ w_u + b_u
+            if split:
+                p[flags] = x[flags] @ library_cls[j][0] + library_cls[j][1]
+            return p
+
+        # the operator in the common space, on the source's own held-out rows (no transfer of the inputs); the CLS
+        # rows alone as well (the readout row)
+        r2_src, cos_src = explained([source_pred(x, f) for x, f in zip(uh[nb:], cls[nb:], strict=True)], ue[nb:])
+        r2_cls, _ = explained([source_pred(x, f)[f] for x, f in zip(uh[nb:], cls[nb:], strict=True)],
+                              [y[f] for y, f in zip(ue[nb:], cls[nb:], strict=True)])
         mu_k, c_k = _frame_moments(target, j, config)
         hk = [(t.to(torch.float64) - mu_k) / c_k for t in tgt_out[str(j)]]
         input_map = pool_maps.get(j)
+        input_map_cls = pool_maps_cls.get(j, input_map)
         if config.operator_input_map == "anchor_ridge":
             p_m, _, p_k, _ = pair_frames(source, i, target, j, config=config)
             fitted = fit_effect_operator([common_rows(p_k, a_k, rank)], [common_rows(p_m, a_m, rank)])
-            input_map = (fitted.w, fitted.b)
+            input_map = input_map_cls = (fitted.w, fitted.b)
         input_diag: dict[str, Any] = {}
         if extra == 0:
             # the same task images through both models, on the canonical grid: how well the target's common
             # coordinates (after the input map) reproduce the source's (rows kept by the norm filter in both)
-            uk_c, um_c = [], []
+            uk_c, um_c, cls_c = [], [], []
             for t, x, sb in zip(tgt_out[str(j)], hb[:nb], base_out[str(i)][:nb], strict=True):
                 tc, sc = to_canonical(t.double(), canon), to_canonical(sb.double(), canon)
                 m = torch.ones(tc.shape[0] * tc.shape[1], dtype=torch.bool, device=tc.device)
                 if keep is not None:
                     m = keep("target", j, tc).reshape(-1) & keep("source", i, sc).reshape(-1)
+                    m = m | _cls_rows(tc) if split else m
                 uk_c.append(common_rows((tc - mu_k) / c_k, a_k, rank)[m])
                 um_c.append(common_rows(to_canonical(x, canon), a_m, rank)[m])
-            if config.operator_input_map == "paired":
+                cls_c.append(_cls_rows(tc)[m])
+            if config.operator_input_map == "paired" and not split:
                 fitted = fit_effect_operator(uk_c, um_c)
-                input_map = (fitted.w, fitted.b)
-            pred = uk_c if input_map is None else [u @ input_map[0] + input_map[1] for u in uk_c]
+                input_map = input_map_cls = (fitted.w, fitted.b)
+            elif config.operator_input_map == "paired":
+                fitted = fit_effect_operator([u[~f] for u, f in zip(uk_c, cls_c)], [u[~f] for u, f in zip(um_c, cls_c)])
+                fitted_c = fit_effect_operator([u[f] for u, f in zip(uk_c, cls_c)], [u[f] for u, f in zip(um_c, cls_c)])
+                input_map, input_map_cls = (fitted.w, fitted.b), (fitted_c.w, fitted_c.b)
+            carry = lambda u, mp: u if mp is None else u @ mp[0] + mp[1]
+            pred = [torch.where(f.unsqueeze(-1), carry(u, input_map_cls), carry(u, input_map))
+                    for u, f in zip(uk_c, cls_c, strict=True)]
             r2_in, cos_in = explained(pred, um_c)
-            input_diag = {"anchors_op_input_r2": r2_in, "anchors_op_input_cos": cos_in}
+            r2_in_cls, _ = explained([p[f] for p, f in zip(pred, cls_c)], [u[f] for u, f in zip(um_c, cls_c)])
+            input_diag = {"anchors_op_input_r2": r2_in, "anchors_op_input_cos": cos_in,
+                          "anchors_op_input_r2_cls": r2_in_cls}
         scale = c_k if config.rescale_target else c_m
-        out = [decode_operator(x, w_u, b_u, a_k, rank, scale, input_map).float() for x in hk]
+        out = [decode_operator(x, w_u, b_u, a_k, rank, scale, input_map) for x in hk]
+        if split:
+            for d, x in zip(out, hk, strict=True):
+                d[:, :1] = decode_operator(x[:, :1], *library_cls[j], a_k, rank, scale, input_map_cls)
+        out = [d.float() for d in out]
         dropped = 0.0
         if keep is not None:
             masks = [keep("target", j, t) for t in tgt_out[str(j)]]
+            if split:
+                for m in masks:
+                    m[:, 0] = True
             out = [d * m.unsqueeze(-1).to(d.dtype) for d, m in zip(out, masks, strict=True)]
             dropped = 1.0 - sum(float(m.sum()) for m in masks) / sum(m.numel() for m in masks)
         desired[j] = out
@@ -378,9 +437,10 @@ def operator_desired_effects(
             "anchors_op_target_rows_dropped": dropped,
             "anchors_op_common_r2_heldout": r2_src,
             "anchors_op_common_cos_heldout": cos_src,
+            "anchors_op_common_r2_heldout_cls": r2_cls,
             **input_diag,
             **{f"anchors_op_{k}": v for k, v in op.info.items()},
-            "anchors_op_library_bytes": operator_nbytes(w_u, config.operator_rank),
+            "anchors_op_library_bytes": operator_nbytes(w_u, config.operator_rank) * (2 if split else 1),
         }
     if library_entry is not None:
         # One entry per (source, task), in the coordinates of the GPA frame it was encoded in; keyed by the target
@@ -390,7 +450,11 @@ def operator_desired_effects(
         path = Path(library_entry["dir"]) / str(library_entry["universe_version"])
         path = path / f"{library_entry['source_model_id']}__{library_entry['task']}.pt"
         save_library(path, library, {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank,
-                                     "c_source": {j: float(src[int(pairing.pairing[j])][3]) for j in library}})
+                                     "c_source": {j: float(src[int(pairing.pairing[j])][3]) for j in library},
+                                     "cls_split": split})
+        if split:
+            save_library(path.with_name(path.stem + "__cls.pt"), library_cls,
+                         {**dict(library_entry), "gpa_rank": rank, "operator_rank": config.operator_rank, "rows": "cls"})
     if extra == 0:
         # Diagnostic only: the data library's D on the very same target rows (same calibration draw), and its cosine
         # with the operator's D per position (all rows, and the rows the norm filter keeps).

@@ -126,6 +126,10 @@ class AnchorsConfig:
     # 'pool_ridge' (that ridge on all tokens of the frame's anchor images, both models: task-free, many rows).
     operator_space: str = "native"
     operator_input_map: str = "gpa"
+    # operator_cls_split (needs operator_space='common'): one operator for the CLS row and one for the patch rows
+    # (the readout's CLS row is poorly predicted by an operator shared with ~200 patch rows per image), and, for the
+    # 'pool_ridge' / 'paired' input maps, one input map each as well; decode: target CLS row by the CLS pair.
+    operator_cls_split: bool = False
     # Optional: save each expert's operators {grid point j: (W_U, b_U)} as <dir>/<universe version>/<source>__<task>.pt
     # (with the source scales), for decode-only fusion in the common space (O4 F2/F3).
     operator_library_dir: str | None = None
@@ -312,6 +316,8 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("operator_input_map='paired' needs target_calibration='same'")
     if cfg.operator_norm_filter and (cfg.library != "operator" or cfg.anchor_filter != "norm"):
         raise ValueError("operator_norm_filter needs library='operator' and anchor_filter='norm'")
+    if cfg.operator_cls_split and (cfg.library != "operator" or cfg.operator_space != "common"):
+        raise ValueError("operator_cls_split needs library='operator' and operator_space='common'")
     if int(cfg.operator_holdout_batches) < 1:
         raise ValueError("operator_holdout_batches must be >= 1")
     if cfg.anchor_dedup_cos is not None and not -1.0 < float(cfg.anchor_dedup_cos) <= 1.0:

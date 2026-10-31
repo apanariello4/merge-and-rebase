@@ -1445,6 +1445,7 @@
     "missing_bias": "error",
     "num_anchors": 512,
     "num_batches": 10,
+    "operator_cls_split": false,
     "operator_holdout_batches": 2,
     "operator_input_map": "gpa",
     "operator_library_dir": null,

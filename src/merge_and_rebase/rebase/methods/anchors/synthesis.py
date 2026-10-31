@@ -124,9 +124,10 @@ def solve_preserve(
 def generic_change(dw: Tensor, beta: Tensor, weight: Tensor, generic: GenericInputStats) -> float:
     """``||G dW + 1 beta^T||_F / ||G W||_F``: relative change of the component's output on the generic inputs
     (``weight`` the base ``[d_out, d_in]`` matrix; its bias is left out of the denominator)."""
-    gg, sg, m = generic.gg, generic.sg, float(generic.m)
+    gg, sg, m = generic.gg.to("cpu", torch.float64), generic.sg.to("cpu", torch.float64), float(generic.m)
+    dw, beta = dw.to("cpu", torch.float64), beta.to("cpu", torch.float64)
     change = float((dw * (gg @ dw)).sum()) + 2 * float(beta @ (dw.T @ sg)) + m * float(beta @ beta)
-    w = weight.to(torch.float64).T
+    w = weight.to("cpu", torch.float64).T
     base = float((w * (gg @ w)).sum())
     return (max(change, 0.0) / base) ** 0.5 if base > 0 else float("nan")
 
@@ -166,7 +167,8 @@ def make_synthesis_hook(
         )
         if component != "mlp.c_proj":
             raise ValueError("anchors synthesis variants are implemented for mlp.c_proj only")
-        dw, beta = correction.T.double(), diag["bias_correction"].double()
+        # Ariadne solves on the fit device; D2 / D5 and the diagnostics run on the host (float64 statistics there)
+        dw, beta = correction.T.detach().to("cpu", torch.float64), diag["bias_correction"].detach().to("cpu", torch.float64)
         if generic is not None:
             diag["generic_change_ridge"] = generic_change(dw, beta, base_weights[pos], generic[pos])
             dw, beta, info = solve_preserve(stats, generic[pos], rho_g, float(diag["ridge"]))

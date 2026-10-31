@@ -162,6 +162,8 @@ def explained(pred_batches, true_batches) -> tuple[float, float]:
         tt += float((t**2).sum())
         s = t.sum(0) if s is None else s + t.sum(0)
         n += t.shape[0]
+    if n == 0:
+        return float("nan"), float("nan")
     sst = tt - float((s**2).sum()) / n
     return (1.0 - sse / sst if sst > 0 else float("nan")), dot / max((pp * tt) ** 0.5, 1e-300)
 

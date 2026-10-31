@@ -797,6 +797,25 @@ def test_operator_space_and_input_map_variants_run_and_report(space, input_map):
                               "target_calibration": "disjoint"})
 
 
+@pytest.mark.parametrize("input_map,norm_filter", [("gpa", False), ("paired", False), ("pool_ridge", True)])
+def test_operator_cls_split_runs_reports_and_never_filters_the_cls_row(tmp_path, input_map, norm_filter):
+    """O1.5: separate CLS / patch operators (and input maps); the CLS rows are kept even by a tight norm filter."""
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)
+    extra = dict(anchor_filter="norm", anchor_filter_k=1.0, operator_norm_filter=True) if norm_filter else {}
+    cfg = _cfg(frame_map="gpa", library="operator", operator_holdout_batches=1, rescale_target=False,
+               operator_space="common", operator_input_map=input_map, operator_cls_split=True, **extra)
+    prepared = _prepare(cfg, (source_base, source_ft, target_base, data, pairing, target_sd),
+                        **({"state": AnchorState(_cfg(), tmp_path)} if norm_filter else {}))
+    assert all(torch.isfinite(v).all() for v in prepared.unit_task_vector.values())
+    rows = [r for r in prepared.diagnostics if "anchors_op_common_r2_heldout_cls" in r]
+    assert len(rows) == pairing.target_depth
+    assert all(r["anchors_op_input_r2_cls"] <= 1.0 + 1e-9 and r["anchors_op_common_r2_heldout_cls"] <= 1.0 + 1e-9
+               for r in rows)
+    with pytest.raises(ValueError):
+        parse_anchors_config({"frame_map": "gpa", "library": "operator", "operator_cls_split": True})
+
+
 def test_operator_identity_input_map_is_the_plain_decode():
     from merge_and_rebase.rebase.methods.anchors.operators import decode_operator, explained
 
