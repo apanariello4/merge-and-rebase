@@ -82,11 +82,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("--lam-grid", default="0.2:2.0:0.1")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--config-from", default=None,
+                    help="run summary JSON whose resolved config (suite, target, splits) is used when every member is a bare vector")
     args = ap.parse_args(argv)
 
     members = [parse_member(s) for s in args.member]
     loaded = [load_member(m) for m in members]
-    cfg = next(c for _, _, c in loaded if c)
+    configs = [c for _, _, c in loaded if c]
+    if args.config_from is not None:
+        configs.insert(0, dict(json.loads(Path(args.config_from).read_text())["run_logging"]["metadata"]["resolved_config"]))
+    if not configs:
+        raise ValueError("every member is a bare vector: pass --config-from RUN.json for the suite, target and splits")
+    cfg = configs[0]
     suite = SUITES[str(cfg.get("suite", "vision8"))]
     build = OpenClipBuildConfig(model_name=cfg["target_clip_model"], pretrained=cfg["target_clip_pretrained"],
                                 device=args.device, dtype=cfg.get("dtype"))
