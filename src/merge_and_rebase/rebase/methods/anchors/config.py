@@ -18,7 +18,9 @@ from typing import Any
 
 from .._ariadne.config import DirectResidualConfig
 
-ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix")
+ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix", "wikitext103")
+#: Generic text pools of a decoder (LLM) frame, whose anchor rows are tokens (AGENT_NEXT_PHASE.md L1).
+TEXT_ANCHOR_POOLS = ("wikitext103",)
 ANCHOR_UNITS = ("token", "image_mean", "cls", "pool2", "pool4")
 
 FRAME_FIELDS = (
@@ -399,3 +401,49 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("depth_fit='sequential' requires exactly one component")
     if cfg.depth_pairing != "relative":
         raise ValueError("anchors supports depth_pairing='relative' only (pi_m(s) = round(s (L_m - 1)))")
+
+
+#: Defaults of a decoder (LLM) run for absent keys; the dataclass defaults (the vision ones) are unchanged.
+DECODER_DEFAULTS: dict[str, Any] = {"anchor_pool": "wikitext103", "missing_bias": "materialize"}
+
+#: (field, required value) of the options defined on image token grids only, or not ported to decoders yet.
+_TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
+    ("anchor_unit", "token"),
+    ("anchor_positions", "all"),
+    ("anchor_sampling", "random"),
+    ("library", "data"),
+    ("synthesis", "ridge"),
+    ("update_rank", None),
+    ("depth_fit", "independent"),
+    ("map_rows_per_image", None),
+    ("components", ("mlp.c_proj",)),
+)
+
+
+def validate_text_config(cfg: AnchorsConfig) -> None:
+    """Decoder (text) guard. Rows are the content tokens of the pool sequences (BOS and padding excluded), so the
+    grid / CLS / centroid options do not apply; the operator library, the synthesis variants and the sequential /
+    spread compiles are vision-only for now (L1: data library, independent shared ridge on mlp.down_proj)."""
+    for name, required in _TEXT_REQUIRED:
+        got = getattr(cfg, name)
+        if got != required:
+            raise ValueError(f"anchors on decoder models does not support {name}={got!r} (must be {required!r})")
+    if cfg.anchor_pool not in TEXT_ANCHOR_POOLS:
+        raise ValueError(f"anchors on decoder models needs a text anchor_pool {TEXT_ANCHOR_POOLS}: {cfg.anchor_pool!r}")
+
+
+def resolve_anchors_decoder_config(value: Mapping[str, Any] | None, family_adapter: Any) -> AnchorsConfig:
+    """Parse ``method.params`` of an LLM ``anchors`` run: decoder defaults for absent keys, vision-only options refused.
+
+    ``family_adapter`` must be given. Families that normalise the MLP output before the residual add (Gemma-2) need
+    Ariadne's ``post_mlp_norm`` in the shared ridge, not wired for anchors yet.
+    """
+    if family_adapter is None:
+        raise ValueError("resolve_anchors_decoder_config requires the model family adapter")
+    if bool(getattr(family_adapter, "HAS_POST_MLP_NORM", False)):
+        raise NotImplementedError(
+            f"anchors on {getattr(family_adapter, 'name', 'this family')} (post-MLP norm) is not supported yet"
+        )
+    cfg = parse_anchors_config({**DECODER_DEFAULTS, **dict(value or {})})
+    validate_text_config(cfg)
+    return cfg

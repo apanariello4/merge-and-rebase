@@ -26,7 +26,7 @@ DEPTHS = {"vision": (12, 24), "llm": (24, 28)}
 # fmt: off
 EXPECTED = {
     "anchors/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "anchors", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
-    "anchors/llm": "error:NotImplementedError",
+    "anchors/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "anchors", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
     "ariadne/vision": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "brace", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
     "ariadne/llm": {"bico_mode": False, "depth_prestep_method": False, "depth_rule": "none", "direct_fit": True, "method_name": "ariadne", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": False, "theseus_mode": False, "transfusion_mode": False},
     "bico/vision": {"bico_mode": True, "depth_prestep_method": True, "depth_rule": "discrete_index_match", "direct_fit": False, "method_name": "bico", "run_block_extension_prestep": False, "run_discrete_layer_match_prestep": True, "theseus_mode": False, "transfusion_mode": False},

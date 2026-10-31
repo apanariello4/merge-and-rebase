@@ -6,7 +6,7 @@ See ``method.py`` for the pipeline, ``core.py`` for the algebra and ``state.py``
 from __future__ import annotations
 
 from ...registry import register
-from .config import AnchorsConfig, parse_anchors_config
+from .config import AnchorsConfig, parse_anchors_config, resolve_anchors_decoder_config
 from .method import AnchorsPrepared, AnchorsRebase, compile_desired_effects, decode_desired_effects, transport_rows
 from .state import AnchorState, RegisteredModel
 
@@ -19,6 +19,7 @@ __all__ = [
     "compile_desired_effects",
     "decode_desired_effects",
     "parse_anchors_config",
+    "resolve_anchors_decoder_config",
     "transport_rows",
 ]
 

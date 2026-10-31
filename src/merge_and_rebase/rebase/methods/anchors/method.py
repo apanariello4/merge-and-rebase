@@ -34,7 +34,7 @@ from .._ariadne.capture import (
 )
 from .._ariadne.fit import fit_direct_residual
 from .._ariadne.streaming import fit_direct_residual_sequential_streaming, prepare_direct_residual_streaming
-from .config import AnchorsConfig
+from .config import TEXT_ANCHOR_POOLS, AnchorsConfig, validate_text_config
 from .core import (
     CoverageAccumulator,
     decode_rows,
@@ -55,7 +55,7 @@ from .core import (
     transport_map_primal,
     whitened_transport_map,
 )
-from .state import AnchorState, RegisteredModel, to_canonical
+from .state import AnchorState, RegisteredModel, to_canonical, to_rows
 from .universe import fit_universe
 
 Tensor = torch.Tensor
@@ -566,12 +566,18 @@ def decode_desired_effects(
     *,
     config: AnchorsConfig,
     gpa_maps: Mapping[int, tuple[Tensor, Tensor]] | None = None,
+    family_adapter=None,
 ) -> tuple[dict[int, list[Tensor]], dict[int, dict[str, Any]]]:
-    """``{j: [D per batch]}`` on the target's native token grid, plus per-position diagnostics."""
+    """``{j: [D per batch]}`` on the target's native token grid, plus per-position diagnostics.
+
+    Decoders (``family_adapter`` given): the captures are ``[1, N, d]`` banks of the same content rows in the three
+    models (one combined row mask), so ``D`` is decoded row by row with no grid resampling.
+    """
     base = captured["source_base_outputs"]
     ft = captured["source_ft_outputs"]
     target_ref = captured["target_base_outputs_by_position"]
     canonical = config.canonical_tokens
+    text = family_adapter is not None
     desired: dict[int, list[Tensor]] = {}
     diag: dict[int, dict[str, Any]] = {}
     coverage: dict[int, dict[str, float]] = {}
@@ -582,13 +588,18 @@ def decode_desired_effects(
         out: list[Tensor] = []
         e_sq = d_sq = 0.0
         for b0, b1, t0 in zip(base[i], ft[i], target_ref[j], strict=True):
-            e = to_canonical(b1 - b0, canonical)
-            batch, _, d_m = e.shape
+            e = to_rows(b1 - b0, canonical, text)
+            batch, n_rows, d_m = e.shape
             rows = e.reshape(-1, d_m)
             if acc is not None:
                 acc.update(rows)
             d = fn(rows)
-            d = to_canonical(d.reshape(batch, canonical, -1).float(), int(t0.shape[1]))
+            if text:
+                if tuple(t0.shape[:2]) != (batch, n_rows):
+                    raise ValueError(f"source rows {(batch, n_rows)} and target rows {tuple(t0.shape[:2])} differ")
+                d = d.reshape(batch, n_rows, -1).float()
+            else:
+                d = to_canonical(d.reshape(batch, canonical, -1).float(), int(t0.shape[1]))
             e_sq += float((rows.double() ** 2).sum().item())
             d_sq += float((d.double() ** 2).sum().item())
             out.append(d)
@@ -721,9 +732,15 @@ class AnchorsRebase:
         Extra keyword arguments of ``AriadneRebase.prepare`` (classifier, text features, ...) are accepted and
         ignored so both methods share a call site. With ``recorder=None`` the fit runs under its own
         ``PhaseCostRecorder`` and ``timing["cost_phases"]`` carries its summary.
+
+        ``family_adapter`` (HF decoders sharing one tokenizer, AGENT_NEXT_PHASE.md L1): the anchor rows are tokens
+        of a generic text pool, identical token ids in every model (checked by hash), the first token of every
+        sequence (BOS / attention sink) and the padding excluded; the shared ridge fits ``mlp.down_proj``.
         """
         if family_adapter is not None:
-            raise NotImplementedError("anchors is vision-only for now (text units: milestone M8-M9)")
+            validate_text_config(config)
+        elif config.anchor_pool in TEXT_ANCHOR_POOLS:
+            raise ValueError(f"anchor_pool={config.anchor_pool!r} is a text pool: it needs a decoder family adapter")
         if state is None:
             state = self.open_state(config)
         kwargs = dict(
@@ -744,6 +761,7 @@ class AnchorsRebase:
             source_model_meta=source_model_meta,
             target_model_meta=target_model_meta,
             task_name=_unused.get("task_name"),
+            family_adapter=family_adapter,
         )
         if recorder is not None:
             return _prepare_body(recorder, **kwargs)
@@ -788,17 +806,28 @@ def _register_pair(
     device,
     source_model_meta=None,
     target_model_meta=None,
+    family_adapter=None,
 ) -> tuple[RegisteredModel, RegisteredModel]:
     """Register source and target in the shared frame (idempotent; the target at its base weights)."""
     source = state.register_model(
-        source_base_model, source_model_id, source_anchor_loader, device=device, model_meta=source_model_meta
+        source_base_model,
+        source_model_id,
+        source_anchor_loader,
+        device=device,
+        model_meta=source_model_meta,
+        family_adapter=family_adapter,
     )
     # The target must be at its base weights when registered (the frame describes the base model).
     current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     try:
         target_model.load_state_dict(dict(target_base_sd), strict=True)
         target = state.register_model(
-            target_model, target_model_id, target_anchor_loader, device=device, model_meta=target_model_meta
+            target_model,
+            target_model_id,
+            target_anchor_loader,
+            device=device,
+            model_meta=target_model_meta,
+            family_adapter=family_adapter,
         )
     finally:
         target_model.load_state_dict(current, strict=True)
@@ -829,16 +858,20 @@ def task_map_frames(
     *,
     config: AnchorsConfig,
     device,
+    family_adapter=None,
 ) -> tuple[RegisteredModel, RegisteredModel]:
     """``map_rows='task'``: in-memory frames whose rows are the task's paired-calibration rows.
 
     Base-model boundaries of every block on ``paired_calibration(num_batches=map_num_batches or num_batches,
     seed=seed)`` (E's draw; the draw is prefix-consistent), on the canonical grid. The same (image, token) rows are
     kept in both models: ``map_rows_per_image`` random tokens per image, then ``map_num_rows`` random rows overall.
+    Decoders: every content row of the draw (padding and first token dropped, as for E), then ``map_num_rows``.
     """
     n_batches = config.map_num_batches or config.num_batches
+    text = family_adapter is not None
+    text_kwargs = {"family_adapter": family_adapter, "exclude_first_token": True} if text else {}
     source_batches, target_batches, _ = paired_calibration(
-        source_loader, target_loader, num_batches=n_batches, seed=config.seed
+        source_loader, target_loader, num_batches=n_batches, seed=config.seed, **text_kwargs
     )
     canonical = config.canonical_tokens
     src_requests = {str(i): (i, "boundary") for i in range(pairing.source_depth)}
@@ -850,22 +883,24 @@ def task_map_frames(
     try:
         target_model.load_state_dict(dict(target_base_sd), strict=True)
         gens = (
-            iter_capture_tokens(source_base_model, source_batches, src_requests, device),
-            iter_capture_tokens(target_model, target_batches, tgt_requests, device),
+            iter_capture_tokens(source_base_model, source_batches, src_requests, device, family_adapter=family_adapter),
+            iter_capture_tokens(target_model, target_batches, tgt_requests, device, family_adapter=family_adapter),
         )
         for src, tgt in zip(*gens, strict=True):
             n_img = int(src["0"].shape[0])
-            if config.map_rows_per_image is None:
+            if text:  # [1, N, d] content-row bank, the same rows in both models (one combined row mask)
+                select = torch.arange(int(src["0"].shape[1]))
+            elif config.map_rows_per_image is None:
                 select = torch.arange(n_img * canonical)
             else:
                 k = min(int(config.map_rows_per_image), canonical)
                 pos = torch.stack([torch.randperm(canonical, generator=generator)[:k] for _ in range(n_img)])
                 select = (torch.arange(n_img)[:, None] * canonical + pos).reshape(-1)
             for i in range(pairing.source_depth):
-                x = to_canonical(src[str(i)], canonical)
+                x = to_rows(src[str(i)], canonical, text)
                 src_rows[i].append(x.reshape(-1, x.shape[-1])[select])
             for j in range(pairing.target_depth):
-                x = to_canonical(tgt[str(j)], canonical)
+                x = to_rows(tgt[str(j)], canonical, text)
                 tgt_rows[j].append(x.reshape(-1, x.shape[-1])[select])
     finally:
         target_model.load_state_dict(current, strict=True)
@@ -900,6 +935,7 @@ def _prepare_body(
     source_model_meta=None,
     target_model_meta=None,
     task_name: str | None = None,
+    family_adapter=None,
 ) -> AnchorsPrepared:
     """Registration + task capture + encode/decode (``alignment_calibration`` bracket), then the ridge
     (``correction_fit`` bracket); timing keys mirror Ariadne's so the run summary reads both alike."""
@@ -915,6 +951,7 @@ def _prepare_body(
             pairing,
             config=config,
             device=device,
+            family_adapter=family_adapter,
         )
     else:
         source, target = _register_pair(
@@ -929,6 +966,7 @@ def _prepare_body(
             device=device,
             source_model_meta=source_model_meta,
             target_model_meta=target_model_meta,
+            family_adapter=family_adapter,
         )
     if source.depth != pairing.source_depth or target.depth != pairing.target_depth:
         raise ValueError(
@@ -937,11 +975,15 @@ def _prepare_body(
         )
     if config.anchor_filter is not None:
         k = float(config.anchor_filter_k)
-        state.norm_filter(source_base_model, source_model_id, source_anchor_loader, k=k, device=device)
+        state.norm_filter(
+            source_base_model, source_model_id, source_anchor_loader, k=k, device=device, family_adapter=family_adapter
+        )
         current = {k_: v.detach().cpu().clone() for k_, v in target_model.state_dict().items()}
         try:
             target_model.load_state_dict(dict(target_base_sd), strict=True)
-            state.norm_filter(target_model, target_model_id, target_anchor_loader, k=k, device=device)
+            state.norm_filter(
+                target_model, target_model_id, target_anchor_loader, k=k, device=device, family_adapter=family_adapter
+            )
         finally:
             target_model.load_state_dict(current, strict=True)
         if config.frame_map == "gpa":  # models in the universe that are not live in this run: stored filters
@@ -1032,10 +1074,12 @@ def _prepare_body(
             num_batches=config.num_batches,
             seed=config.seed,
             device=device,
+            # decoders: padding and the first token of every sequence (BOS / attention sink) leave every bank
+            **({} if family_adapter is None else {"family_adapter": family_adapter, "exclude_first_token": True}),
         )
         calibration = captured["calibration"]
         desired, position_diag = decode_desired_effects(
-            captured, pairing, source, target, config=config, gpa_maps=gpa_maps
+            captured, pairing, source, target, config=config, gpa_maps=gpa_maps, family_adapter=family_adapter
         )
     alignment_peak, alignment_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
@@ -1077,7 +1121,7 @@ def _prepare_body(
         else:
             corrections, rows = compile_desired_effects(
                 target_model, target_base_sd, captured, desired, pairing, config=config, device=device,
-                solve_hook=solve_hook,
+                solve_hook=solve_hook, family_adapter=family_adapter,
             )
     fit_peak, fit_host_peak = recorder.peaks_since(fit_mark)
     fit_timing = {
@@ -1109,13 +1153,14 @@ def _prepare_body(
                 "source_model_id": source_model_id,
                 "target_model_id": target_model_id,
                 "gpa_universe": universe_meta,
+                **({} if family_adapter is None else {"rows": "tokens", "exclude_first_token": True}),
             },
         },
         config=config,
     )
 
 
-_BLOCK_KEY = re.compile(r"(?:^|\.)resblocks\.(\d+)\.")
+_BLOCK_KEY = re.compile(r"(?:^|\.)(?:resblocks|layers)\.(\d+)\.")
 
 
 def restrict_to_depth(
@@ -1145,12 +1190,13 @@ def compile_desired_effects(
     config: AnchorsConfig,
     device,
     solve_hook=None,
+    family_adapter=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Step 4b: Ariadne's ridge on the target base inputs, called unchanged with the decoded ``D`` (``solve_hook``:
-    a synthesis variant, ``anchors/synthesis.py``)."""
+    a synthesis variant, ``anchors/synthesis.py``; ``family_adapter``: decoders, ``mlp.c_proj`` = ``mlp.down_proj``)."""
     return fit_direct_residual(
         target_model, target_base_sd, captured, desired, pairing, config=config.ridge_config(), device=device,
-        solve_hook=solve_hook,
+        family_adapter=family_adapter, solve_hook=solve_hook,
     )
 
 

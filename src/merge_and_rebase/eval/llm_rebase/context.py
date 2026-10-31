@@ -43,6 +43,7 @@ from ...rebase.block_extension.config import resolve_block_extension_config, war
 from ...rebase.capabilities import MethodFamily, check_pair, depth_prestep_methods, method_family, uses_calibration
 from ...rebase.depth_report import describe_depth_handling
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
+from ...rebase.methods.anchors import resolve_anchors_decoder_config
 from ...rebase.model_families import infer_family
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
 from .pipeline import LlmRuntime
@@ -384,7 +385,18 @@ def build_runtime(
     )
     # The per-method depth defaults may have rewritten the block-extension config (THESEUS skip_correction).
     block_extension_cfg = resolved.block_extension_cfg
-    if resolved.direct_fit:
+    if resolved.direct_fit and getattr(method, "name", None) == "anchors":
+        # anchors reads method.params (method_params); its shared ridge runs on the Ariadne config it derives, with the
+        # decoder's first-token exclusion recorded (the row masks of the calibration batches carry it to the fit).
+        if _ariadne_params(cfg):
+            raise ValueError("method 'anchors' takes method.params / method_params, not ariadne_params")
+        anchors_cfg = resolve_anchors_decoder_config(method_params, target_family or source_family)
+        resolved = replace(
+            resolved,
+            anchors_cfg=anchors_cfg,
+            ariadne_cfg=replace(anchors_cfg.ridge_config(), exclude_first_token=True),
+        )
+    elif resolved.direct_fit:
         resolved = replace(
             resolved,
             ariadne_cfg=resolve_ariadne_decoder_config(_ariadne_params(cfg), target_family or source_family),

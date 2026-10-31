@@ -29,14 +29,15 @@ from ...rebase.run_config import (
 
 
 def resolve_llm_method(cfg: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
-    """Pre-model validation: method lookup, the Ariadne stop and the ``method_params.n_batches`` rename."""
+    """Pre-model validation: method lookup and the ``method_params.n_batches`` rename.
+
+    ``anchors`` runs on decoders sharing one tokenizer (rows = tokens, AGENT_NEXT_PHASE.md L1); its config is resolved
+    against the model family once the models exist (``context.build_runtime``), and the direct-fit stage dispatches on
+    ``resolved.anchors_cfg``.
+    """
     cfg = canonicalize(cfg)
     method_name = str(cfg.get("method", "theseus"))
     method = get_method(method_name)
-    if method.name == "anchors":
-        # The decoder stage fits with AriadneRebase directly; refusing here keeps an LLM 'anchors' config from
-        # silently running Ariadne. Text-unit rows for decoders are milestones M8-M9.
-        raise NotImplementedError("method 'anchors' is vision-only for now (LLM support: milestones M8-M9)")
     method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
     if "n_batches" in method_params:
         raise ValueError(

@@ -19,9 +19,11 @@ from ...rebase.discrete_layer_match import DiscreteLayerPairing
 from ...rebase.methods._ariadne.alignment import apply_depth_pairing_override
 from ...rebase.methods._ariadne.biases import materialize_missing_projection_biases
 from ...rebase.methods._ariadne.fit import _task_vector_sha256
+from ...rebase.methods.anchors import AnchorsRebase
 from ...rebase.methods.ariadne import AriadneRebase
 from ...rebase.orchestration import MethodResult
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs
+from .anchors_pool import build_anchor_pool_loaders, resolve_anchors_pool
 from .merge import norm_match_transported, resolve_delta_source, resolve_norm_match
 from .stages import _DEFAULT_CALIB_BATCHES
 
@@ -181,11 +183,15 @@ class TransportStage:
 
 
 class DirectFitStage:
-    """One task's Ariadne fit on the native source pair (no prestep, no parameter transport).
+    """One task's Ariadne (or ``anchors``) fit on the native source pair (no prestep, no parameter transport).
 
     The task vector is only the fitted corrections of the target's residual-writing projections; with
     ``copy_shape_matching_source_deltas`` (ablation, default off) shape-matching source deltas of the other keys are
     added. Missing projection biases are materialized once on the target (``missing_bias="materialize"``).
+
+    ``anchors`` (``resolved.anchors_cfg``, whose ridge config is ``resolved.ariadne_cfg``): the same task calibration
+    and the same shared ridge; the desired effects are decoded from one anchor frame on a generic text pool (run key
+    ``anchors_pool``, ``anchors_pool.py``), registered once per run and shared by every task.
     """
 
     #: Recorded in the run summary like the transport stage's; neither applies to a direct fit.
@@ -197,6 +203,9 @@ class DirectFitStage:
         #: Depth pairing used (one per run) and one record per task, reported in the summary (``report``).
         self.pairing_record: dict[str, Any] | None = None
         self.task_records: dict[str, dict[str, Any]] = {}
+        self._anchors_state = None
+        self._anchors_pool: dict[str, Any] | None = None
+        self._anchors_loaders: tuple[Any, Any] | None = None
 
     def report(self) -> dict[str, Any]:
         """Summary record: depth pairing, and per task the calibration, fit diagnostics, timings and TV hash."""
@@ -210,8 +219,10 @@ class DirectFitStage:
     def run(self, env: StageEnv, task: TaskInputs, pre: PrestepResult) -> MethodResult:
         rt = env.runtime
         config = env.resolved.ariadne_cfg
+        anchors_cfg = getattr(env.resolved, "anchors_cfg", None)
+        label = "ariadne" if anchors_cfg is None else "anchors"
         family_adapter = rt.family_adapter
-        print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) [ariadne] ---")
+        print(f"\n--- '{task.task}' ({task.ctx.index + 1}/{len(rt.task_contexts)}) [{label}] ---")
         if config.missing_bias == "materialize" and self.materialized_bias_keys is None:
             self.materialized_bias_keys = list(
                 materialize_missing_projection_biases(
@@ -234,7 +245,7 @@ class DirectFitStage:
             DiscreteLayerPairing.compute(int(rt.source_depth), int(rt.target_depth)), config.depth_pairing
         )
         t0 = time.time()
-        prepared = AriadneRebase().prepare(
+        common = dict(
             source_base_model=pre.source_base_model,
             source_ft_model=pre.source_ft_model,
             target_model=rt.target_llm.model,
@@ -242,10 +253,13 @@ class DirectFitStage:
             source_loader=source_loader,
             target_loader=target_loader,
             pairing=pairing,
-            config=config,
             device=rt.device,
             family_adapter=family_adapter,
         )
+        if anchors_cfg is None:
+            prepared = AriadneRebase().prepare(**common, config=config)
+        else:
+            prepared = self._prepare_anchors(rt, anchors_cfg, task.task, common)
         calibration = prepared.extra.get("calibration", {})
         if calibration.get("actual_batches", 0) < calibration.get("requested_batches", 0):
             warnings.warn(
@@ -263,7 +277,7 @@ class DirectFitStage:
                 target = rt.target_base_sd.get(key)
                 if key not in fitted and target is not None and tuple(target.shape) == tuple(value.shape):
                     fitted[key] = value
-        print(f"  ariadne fitted {len(fitted)} keys in {time.time() - t0:.1f}s (pairing {list(pairing.pairing)})")
+        print(f"  {label} fitted {len(fitted)} keys in {time.time() - t0:.1f}s (pairing {list(pairing.pairing)})")
         if self.pairing_record is None:
             self.pairing_record = {
                 "source_depth": pairing.source_depth,
@@ -280,6 +294,8 @@ class DirectFitStage:
             "diagnostics": prepared.diagnostics,
             "timing": {k: prepared.timing.get(k) for k in ("alignment_calibration", "correction_fit")},
         }
+        if anchors_cfg is not None:
+            self.task_records[task.task]["anchors"] = {**prepared.extra["anchors"], "pool": self._anchors_pool}
         pre.source_base_model = None
         pre.source_ft_model = None
         # "source_*" norms are the full source task vector's (Ariadne transports no source keys); "transported" is
@@ -295,6 +311,40 @@ class DirectFitStage:
             correction_fit=prepared.timing.get("correction_fit"),
             cost_phases=prepared.timing.get("cost_phases"),
         )
+
+
+    def _prepare_anchors(self, rt: Any, cfg: Any, task_name: str, common: dict[str, Any]) -> Any:
+        """``AnchorsRebase.prepare`` with the run's text pool and one state for every task (registered once)."""
+        if self._anchors_state is None:
+            self._anchors_pool = resolve_anchors_pool(
+                rt.cfg, cfg, calib_batch_size=rt.calib_batch_size, calib_max_length=rt.calib_max_length
+            )
+            self._anchors_loaders = build_anchor_pool_loaders(
+                rt.source_llm.tokenizer, rt.target_llm.tokenizer, self._anchors_pool
+            )
+            self._anchors_state = AnchorsRebase.open_state(cfg)
+        ids = {}
+        for side in ("source", "target"):
+            name, ckpt = rt.cfg.get(f"{side}_model_name_or_path"), rt.cfg.get(f"{side}_base_ckpt")
+            ids[side] = (_llm_model_id(name, ckpt), {"model_name_or_path": name, "base_ckpt": ckpt})
+        return AnchorsRebase().prepare(
+            **common,
+            config=cfg,
+            source_anchor_loader=self._anchors_loaders[0],
+            target_anchor_loader=self._anchors_loaders[1],
+            source_model_id=ids["source"][0],
+            target_model_id=ids["target"][0],
+            source_model_meta=ids["source"][1],
+            target_model_meta=ids["target"][1],
+            state=self._anchors_state,
+            task_name=task_name,
+        )
+
+
+def _llm_model_id(name: Any, base_ckpt: Any = None) -> str:
+    """Filesystem-safe registry id of a base LLM: its name, plus the base checkpoint file when one replaces it."""
+    raw = str(name) if not base_ckpt else f"{name}__{str(base_ckpt).rstrip('/').rsplit('/', 1)[-1]}"
+    return "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in raw)
 
 
 def _indices_sha256(indices: Any) -> str | None:
