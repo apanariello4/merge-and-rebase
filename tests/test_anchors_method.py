@@ -891,3 +891,50 @@ def test_spread_over_one_interval_fits_every_block_and_shrinks_the_residual():
     for bad in ({"depth_fit": "spread"}, {"measure_depths": [0.5]}, {"depth_fit": "spread", "measure_depths": [1.5]}):
         with pytest.raises(ValueError):
             parse_anchors_config(bad)
+
+
+def test_fuse_operators_sum_and_tsv():
+    from merge_and_rebase.rebase.methods.anchors.operators import fuse_operators
+
+    torch.manual_seed(2)
+    w1, w2 = torch.randn(6, 6, dtype=torch.float64), torch.randn(6, 6, dtype=torch.float64)
+    b1, b2 = torch.randn(6, dtype=torch.float64), torch.randn(6, dtype=torch.float64)
+    w, b = fuse_operators([(w1, b1), (w2, b2)], [1.0, 0.5], "sum")
+    torch.testing.assert_close(w, w1 + 0.5 * w2)
+    torch.testing.assert_close(b, b1 + 0.5 * b2)
+    one, bone = fuse_operators([(w1, b1)], [1.0], "tsv")  # one entry, all singular directions: W itself
+    torch.testing.assert_close(one, w1)
+    torch.testing.assert_close(bone, b1)
+    # two entries on orthogonal subspaces with rank r/2 each: TSV keeps both exactly (U, V already orthonormal)
+    q, _ = torch.linalg.qr(torch.randn(6, 6, dtype=torch.float64))
+    p, _ = torch.linalg.qr(torch.randn(6, 6, dtype=torch.float64))
+    e1 = q[:, :3] @ torch.diag(torch.tensor([3.0, 2.0, 1.0], dtype=torch.float64)) @ p[:, :3].T
+    e2 = q[:, 3:] @ torch.diag(torch.tensor([2.5, 1.5, 0.5], dtype=torch.float64)) @ p[:, 3:].T
+    fused, _ = fuse_operators([(e1, b1), (e2, b2)], [1.0, 1.0], "tsv")
+    torch.testing.assert_close(fused, e1 + e2)
+
+
+@pytest.mark.parametrize("rows", ["task", "pool"])
+def test_operator_fusion_of_one_entry_reproduces_the_operator_run(tmp_path, rows):
+    """F2 with a single target-side entry, weight 1, on the same task rows: the same D and the same update as the
+    run that wrote the entry; on the pool rows it runs and is finite."""
+    source_base, source_ft, target_base, _, pairing, target_sd = _setup()
+    data = _loader(16, seed=31)
+    common = dict(frame_map="gpa", library="operator", operator_holdout_batches=1, rescale_target=False,
+                  operator_space="common")
+    kw = dict(source_base_model=source_base, source_ft_model=source_ft, target_model=target_base,
+              target_base_sd=target_sd, source_loader=data, target_loader=data, pairing=pairing, device="cpu",
+              source_anchor_loader=POOL, target_anchor_loader=POOL, source_model_id="A", target_model_id="B",
+              task_name="T1")
+    ref = AnchorsRebase().prepare(config=_cfg(**common, operator_library_dir=str(tmp_path / "lib")), **kw)
+    version = ref.extra["anchors"]["gpa_universe"]["version"]
+    entry = str(tmp_path / "lib" / version / "A__T1__composed.pt")
+    fused = AnchorsRebase().prepare(
+        config=_cfg(**common, operator_fusion_entries=(entry,), operator_decode_rows=rows), **kw)
+    if rows == "task":
+        for k, v in ref.unit_task_vector.items():
+            torch.testing.assert_close(fused.unit_task_vector[k], v, rtol=1e-4, atol=1e-6)
+    else:
+        assert all(torch.isfinite(v).all() for v in fused.unit_task_vector.values())
+    with pytest.raises(ValueError):
+        parse_anchors_config({"frame_map": "gpa", "operator_fusion": "tsv"})

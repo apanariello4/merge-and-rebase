@@ -492,6 +492,72 @@ def operator_desired_effects(
     return captured, desired, diag
 
 
+def fused_operator_effects(
+    source_loader,
+    target_model,
+    target_loader,
+    pool_target_batches: list[Any] | None,
+    pairing: DiscreteLayerPairing,
+    source: RegisteredModel,
+    target: RegisteredModel,
+    *,
+    config: AnchorsConfig,
+    gpa_maps: Mapping[int, tuple[Tensor, Tensor]],
+    universe_version: str,
+    target_model_id: str,
+    device,
+) -> tuple[dict[str, Any], dict[int, list[Tensor]], dict[int, dict[str, Any]]]:
+    """O4 F2/F3 (``operator_fusion_entries``): ``(captured for the ridge, {j: [D per batch]}, diagnostics)`` of the
+    fused target-side operators, decoded once on the target rows of ``operator_decode_rows``."""
+    from pathlib import Path
+
+    from .operators import decode_operator, fuse_operators, load_library
+
+    entries = []
+    for path in config.operator_fusion_entries:
+        ops, meta = load_library(Path(path))
+        if meta.get("target_model_id") != target_model_id or str(meta.get("universe_version")) != str(universe_version):
+            raise ValueError(f"{path}: entry for target {meta.get('target_model_id')!r} in frame "
+                             f"{meta.get('universe_version')!r}, this run is {target_model_id!r} in {universe_version!r}")
+        if "acts_on" not in meta:
+            raise ValueError(f"{path}: not a target-side (__composed) library entry")
+        if set(ops) != set(range(pairing.target_depth)):
+            raise ValueError(f"{path}: grid points {sorted(ops)} != the target's {pairing.target_depth}")
+        entries.append(ops)
+    weights = list(config.operator_fusion_weights) or [1.0] * len(entries)
+    nb = int(config.num_batches)
+    if config.operator_decode_rows == "pool":
+        if pool_target_batches is None:
+            raise ValueError("operator_decode_rows='pool' needs the anchor pool batches")
+        tgt, metadata = list(pool_target_batches), {"rows": "anchor pool"}
+    else:
+        _, target_batches, metadata = paired_calibration(source_loader, target_loader, num_batches=nb, seed=config.seed)
+        tgt = target_batches[:nb]
+    tgt_out = capture_tokens(target_model, tgt, {str(j): (j, "boundary") for j in range(pairing.target_depth)}, device)
+    keep = _operator_keep(config, source, target)
+    desired: dict[int, list[Tensor]] = {}
+    diag: dict[int, dict[str, Any]] = {}
+    for j in range(pairing.target_depth):
+        w, b = fuse_operators([e[j] for e in entries], weights, config.operator_fusion)
+        mu_k, c_k = _frame_moments(target, j, config)
+        _, a_k = gpa_maps[j]
+        out = [decode_operator((t.to(torch.float64) - mu_k) / c_k, w, b, a_k, config.gpa_rank, 1.0).float()
+               for t in tgt_out[str(j)]]
+        dropped = 0.0
+        if keep is not None:
+            masks = [keep("target", j, t) for t in tgt_out[str(j)]]
+            out = [d * m.unsqueeze(-1).to(d.dtype) for d, m in zip(out, masks, strict=True)]
+            dropped = 1.0 - sum(float(m.sum()) for m in masks) / sum(m.numel() for m in masks)
+        desired[j] = out
+        diag[j] = {"anchors_d_norm": float(sum(float((d.double() ** 2).sum()) for d in out) ** 0.5),
+                   "anchors_fusion": config.operator_fusion, "anchors_fusion_entries": len(entries),
+                   "anchors_fusion_w_norm": float(torch.linalg.norm(w)), "anchors_op_target_rows_dropped": dropped}
+    captured = {"target_batches": tgt, "target_base_outputs_by_position": {j: tgt_out[str(j)] for j in desired},
+                "calibration": {**metadata, "operator_decode_rows": config.operator_decode_rows,
+                                "operator_fusion_entries": list(config.operator_fusion_entries)}}
+    return captured, desired, diag
+
+
 def decode_desired_effects(
     captured: Mapping[str, Any],
     pairing: DiscreteLayerPairing,
@@ -924,6 +990,15 @@ def _prepare_body(
             source_ft_model=source_ft_model,
         )
         calibration = prepared_stream["calibration"]
+    elif config.operator_fusion_entries:
+        captured, desired, position_diag = fused_operator_effects(
+            source_loader, target_model, target_loader,
+            _pool_draw(state, source_anchor_loader, target_anchor_loader)[1]
+            if config.operator_decode_rows == "pool" else None,
+            pairing, source, target, config=config, gpa_maps=gpa_maps, universe_version=universe_meta["version"],
+            target_model_id=target_model_id, device=device,
+        )
+        calibration = captured["calibration"]
     elif config.library == "operator":
         captured, desired, position_diag = operator_desired_effects(
             source_base_model,

@@ -187,3 +187,33 @@ def save_library(path: Path, ops: dict[int, tuple[Tensor, Tensor]], meta: dict[s
 def load_library(path: Path) -> tuple[dict[int, tuple[Tensor, Tensor]], dict[str, Any]]:
     stored = torch.load(path, map_location="cpu", weights_only=False)
     return {int(j): (w.double(), b.double()) for j, (w, b) in stored["ops"].items()}, stored["meta"]
+
+
+def fuse_operators(entries: list[tuple[Tensor, Tensor]], weights: list[float], mode: str) -> tuple[Tensor, Tensor]:
+    """One grid point's fused target-side operator (O4 F2/F3) from ``[(W_i, b_i)]`` (``W_i [r, r]``).
+
+    'sum': ``(sum_i w_i W_i, sum_i w_i b_i)``. 'tsv' (Task Singular Vectors, as ``merge/methods/tsv_merge.py``): per
+    entry the top ``floor(r / K)`` singular triplets of ``w_i W_i``, stacked; the stacked U and V each replaced by their
+    nearest orthonormal matrix (polar factor, via SVD); ``W = U diag(s) V^T``; biases averaged (``mean_i w_i b_i``,
+    the ``vector_1d_merge: average`` of F1).
+    """
+    ws = [float(w) * e[0].to(torch.float64) for w, e in zip(weights, entries, strict=True)]
+    bs = [float(w) * e[1].to(torch.float64) for w, e in zip(weights, entries, strict=True)]
+    if mode == "sum":
+        return sum(ws), sum(bs)
+    if mode != "tsv":
+        raise ValueError(f"unknown fusion {mode!r}")
+    k = max(1, ws[0].shape[0] // len(ws))
+    us, ss, vs = [], [], []
+    for w in ws:
+        u, s, vh = torch.linalg.svd(w, full_matrices=False)
+        us.append(u[:, :k])
+        ss.append(s[:k])
+        vs.append(vh[:k].T)
+
+    def polar(x: Tensor) -> Tensor:
+        p, _, qh = torch.linalg.svd(x, full_matrices=False)
+        return p @ qh
+
+    u, v = polar(torch.cat(us, 1)), polar(torch.cat(vs, 1))
+    return u @ torch.diag(torch.cat(ss)) @ v.T, sum(bs) / len(bs)

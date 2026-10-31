@@ -133,6 +133,17 @@ class AnchorsConfig:
     # Optional: save each expert's operators {grid point j: (W_U, b_U)} as <dir>/<universe version>/<source>__<task>.pt
     # (with the source scales), for decode-only fusion in the common space (O4 F2/F3).
     operator_library_dir: str | None = None
+    # O4 F2/F3, decode-only fusion: operator_fusion_entries = paths of target-side library entries
+    # (<source>__<task>__composed.pt, all towards this run's target and in this run's GPA frame); no source operator
+    # is fitted. Per grid point the entries are fused by operator_fusion 'sum' (sum_i w_i W_i, sum_i w_i b_i) or
+    # 'tsv' (per entry the top r/K singular directions of w_i W_i, stacked, U and V orthogonalised as in TSV; biases
+    # averaged), then ONE decode D = (u W + b) A_k and ONE ridge. operator_decode_rows: the target rows of that
+    # decode and ridge, 'task' (this task's calibration draw) or 'pool' (the frame's anchor images: task-free, the
+    # same update for every task of the run).
+    operator_fusion_entries: tuple[str, ...] = ()
+    operator_fusion: str = "sum"
+    operator_fusion_weights: tuple[float, ...] = ()
+    operator_decode_rows: str = "task"
     # Update synthesis (AGENT_NEXT_PHASE.md O2). 'ridge': Ariadne's ridge (unchanged). 'ridge_preserve' (D2): weight
     # and bias solved jointly with an extra (rho_g / m)||G dW + 1 beta^T||^2 term, G = the target base's c_proj inputs
     # on the Tiny-ImageNet anchor images (preserve_tokens tokens per block, high-norm tokens dropped when the anchor
@@ -210,6 +221,8 @@ class AnchorsConfig:
         out["gpa_models"] = list(self.gpa_models)
         out["gpa_add_models"] = list(self.gpa_add_models)
         out["measure_depths"] = [float(x) for x in self.measure_depths]
+        out["operator_fusion_entries"] = list(self.operator_fusion_entries)
+        out["operator_fusion_weights"] = [float(x) for x in self.operator_fusion_weights]
         return out
 
 
@@ -222,10 +235,12 @@ def parse_anchors_config(value: Mapping[str, Any] | None) -> AnchorsConfig:
     unknown = sorted(set(payload) - _ALLOWED)
     if unknown:
         raise ValueError(f"unknown anchors config keys: {unknown}; allowed: {sorted(_ALLOWED)}")
-    for key in ("gpa_models", "gpa_add_models"):
+    for key in ("gpa_models", "gpa_add_models", "operator_fusion_entries"):
         if isinstance(payload.get(key), (list, str)):
             value = payload[key]
             payload[key] = (value,) if isinstance(value, str) else tuple(value)
+    if isinstance(payload.get("operator_fusion_weights"), (list, tuple)):
+        payload["operator_fusion_weights"] = tuple(float(x) for x in payload["operator_fusion_weights"])
     if isinstance(payload.get("measure_depths"), (list, tuple)):
         payload["measure_depths"] = tuple(float(x) for x in payload["measure_depths"])
     if isinstance(payload.get("components"), (list, str)):
@@ -316,6 +331,16 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("operator_input_map='paired' needs target_calibration='same'")
     if cfg.operator_norm_filter and (cfg.library != "operator" or cfg.anchor_filter != "norm"):
         raise ValueError("operator_norm_filter needs library='operator' and anchor_filter='norm'")
+    if cfg.operator_fusion not in {"sum", "tsv"} or cfg.operator_decode_rows not in {"task", "pool"}:
+        raise ValueError("operator_fusion must be sum|tsv, operator_decode_rows task|pool")
+    if (cfg.operator_fusion_entries or cfg.operator_fusion != "sum" or cfg.operator_fusion_weights
+            or cfg.operator_decode_rows != "task") and (cfg.library != "operator" or not cfg.operator_fusion_entries):
+        raise ValueError("operator_fusion* / operator_decode_rows need library='operator' and operator_fusion_entries")
+    if cfg.operator_fusion_weights and len(cfg.operator_fusion_weights) != len(cfg.operator_fusion_entries):
+        raise ValueError("operator_fusion_weights: one weight per entry")
+    if cfg.operator_fusion_entries and (cfg.operator_cls_split or cfg.operator_library_dir is not None
+                                        or cfg.depth_fit == "sequential"):
+        raise ValueError("operator_fusion_entries: no cls split, no library_dir, no sequential fit")
     if cfg.operator_cls_split and (cfg.library != "operator" or cfg.operator_space != "common"):
         raise ValueError("operator_cls_split needs library='operator' and operator_space='common'")
     if int(cfg.operator_holdout_batches) < 1:
