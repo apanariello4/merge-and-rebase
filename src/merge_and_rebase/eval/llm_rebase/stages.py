@@ -174,7 +174,10 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
     # to the device. Copies are bitwise either way; on a 64 GB GPU three 9B sources (template + base copy + ft) plus
     # the target do not fit (gemma-2-9b -> 2b, job 61488501).
     offload = bool((getattr(rt, "cfg", None) or {}).get("offload_source_original", False))
-    if offload:
+    # Opt-in (default off): the task copies stay on CPU too; the activation captures move each model to the device for
+    # its own sweep and back, so only the target and one source sit on a 16 GB GPU (3B pair, AGENT_NEXT_PHASE L1).
+    copies_on_cpu = bool((getattr(rt, "cfg", None) or {}).get("source_task_models_on_cpu", False))
+    if offload or copies_on_cpu:
         rt.source_llm.model.to("cpu")
     # Each task starts from an immutable source template, then its
     # own copy is resized to the target depth before transport.
@@ -202,7 +205,10 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         )
     else:
         load_into_model(source_ft_model_task, tuned_sd, strict=False)
-    if offload:
+    if copies_on_cpu:
+        source_base_model_task.to("cpu")
+        source_ft_model_task.to("cpu")
+    elif offload:
         source_base_model_task.to(rt.device)
         source_ft_model_task.to(rt.device)
     rt.task_contexts[task].forward_geometry = {

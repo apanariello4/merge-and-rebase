@@ -97,3 +97,20 @@ def test_offload_source_original_gives_identical_copies(tmp_path):
         assert out[False][i].keys() == out[True][i].keys()
         for k in out[False][i]:
             assert torch.equal(out[False][i][k], out[True][i][k]), k
+
+
+def test_source_task_models_on_cpu_gives_identical_copies_on_cpu(tmp_path):
+    base = tiny_qwen2()
+    ref, _ = _resized_tuned(tmp_path, base)
+    overrides = tuned_config_mismatch(ref, base.config)
+    out = {}
+    for cfg in ({}, {"source_task_models_on_cpu": True}):
+        env = _env(base, LlmTaskContext(ckpt_ref=ref, index=0, config_overrides=overrides))
+        env.runtime.cfg = cfg
+        env.runtime.device = "cpu"
+        models = build_task_models(env, "a")
+        assert all(p.device.type == "cpu" for p in models.source_base.parameters())
+        out[bool(cfg)] = (models.source_base.state_dict(), models.source_ft.state_dict())
+    for i in (0, 1):
+        for k in out[False][i]:
+            assert torch.equal(out[False][i][k], out[True][i][k]), k
