@@ -142,6 +142,7 @@ def _cfg(**kw):
         num_batches=3,
         components=("mlp.c_proj",),
         ridge_estimator="empirical_bayes",
+        synthesis="ridge",  # pinned: these tests pin the plain ridge (the S0 default is ridge_preserve)
     )
     base.update(kw)
     return AnchorsConfig(**base)
@@ -861,7 +862,85 @@ def test_ridge_preserve_rho_zero_matches_the_ridge_and_rho_positive_runs():
     rows = [r for r in pos.diagnostics if "generic_change" in r]
     assert rows and all(r["generic_change"] <= r["generic_change_ridge"] + 1e-9 for r in rows)
     with pytest.raises(ValueError):
-        parse_anchors_config({"rho_g": 1.0})
+        parse_anchors_config({"synthesis": "ridge", "rho_g": 1.0})
+
+
+def test_s0_default_synthesis_rule():
+    """S0: ridge_preserve with rho_g = 0.1 wherever it is implemented, the plain ridge elsewhere; explicit
+    ridge_preserve on an unsupported combination (or an explicit rho_g there) is refused and names the fix."""
+    for cfg in (AnchorsConfig(), parse_anchors_config({}), parse_anchors_config({"depth_fit": "spread",
+                                                                                "measure_depths": [1.0]}),
+                parse_anchors_config({"frame_map": "gpa", "library": "operator"}),
+                parse_anchors_config({"update_rank": 4})):
+        assert (cfg.synthesis, cfg.rho_g) == ("ridge_preserve", 0.1)
+    assert parse_anchors_config({"rho_g": 0.3}).rho_g == 0.3
+    for params in ({"depth_fit": "sequential"}, {"components": ["mlp.c_proj", "attn.out_proj"]},
+                   {"map_rows": "task"}, {"anchor_pool": "vision8_mix"}, {"synthesis": "ridge"}):
+        cfg = parse_anchors_config(params)
+        assert (cfg.synthesis, cfg.rho_g) == ("ridge", 0.0), params
+        assert cfg.to_dict()["synthesis"] == "ridge" and cfg.to_dict()["rho_g"] == 0.0
+    # the bridge to Ariadne stays Ariadne by default; ridge_preserve there is explicit (Ariadne + O2)
+    bridge = parse_anchors_config({"map_rows": "task", "synthesis": "ridge_preserve"})
+    assert (bridge.synthesis, bridge.rho_g) == ("ridge_preserve", 0.1)
+    with pytest.raises(ValueError, match="synthesis: ridge"):
+        parse_anchors_config({"synthesis": "ridge_preserve", "depth_fit": "sequential"})
+    with pytest.raises(ValueError, match="synthesis: ridge"):
+        parse_anchors_config({"synthesis": "ridge_preserve", "anchor_pool": "vision8_mix"})
+    with pytest.raises(ValueError, match="rho_g"):
+        parse_anchors_config({"depth_fit": "sequential", "rho_g": 0.1})
+    # a resolved config changed with dataclasses.replace() cannot silently drop D2 on the sequential path
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="synthesis='ridge'"):
+        _prepare(replace(_cfg(synthesis=None, rho_g=None), depth_fit="sequential"), _setup())
+
+
+def test_bridge_with_explicit_ridge_preserve_is_ariadne_plus_o2():
+    """map_rows='task' + ridge_preserve: the Ariadne bridge compiled with D2 (G = the frame's anchor images);
+    rho_g = 0 is the bridge, rho_g > 0 lowers the change on G at every block."""
+    setup = _setup()
+    kw = dict(map_rows="task", spectral_filter="procrustes_cross", rescale_target=False)
+    ref = _prepare(_cfg(**kw), setup).unit_task_vector
+    zero = _prepare(_cfg(**kw, synthesis="ridge_preserve", rho_g=0.0), setup).unit_task_vector
+    for k, v in ref.items():
+        torch.testing.assert_close(zero[k], v, rtol=1e-4, atol=1e-6)
+    rows = [r for r in _prepare(_cfg(**kw, synthesis="ridge_preserve", rho_g=1.0), setup).diagnostics
+            if "generic_change" in r]
+    assert len(rows) == 4 and all(r["generic_change"] < r["generic_change_ridge"] for r in rows)
+
+
+#: sha256 of the toy unit task vectors of the vision ridge_preserve path, computed on exp/un_reb 7af4e46 (before D2
+#: was ported to decoders): the vision G (anchor images, seeded preserve_tokens rows, high-norm filter) is unchanged.
+_VISION_D2_HASHES = {
+    "rho10_m6": "639484d6230f20610be146b03cb1daebe07a9c10d0fe1699f7dec35a7421b1f7",
+    "default": "49327811c044e065fff82b0c11954dcf6c5b181cd3e9a6821d6c3c2f8cbc274b",
+    "filter": "92db0dcd140051c123d2f397240ce47415ea5c5719cea77709e084a355ff1e27",
+    "rank": "8d5da93995f033b59a1b0d5fb78a32628616d45380809e0f74637dfa1a6e70da",
+    "spread": "e0bcabd438227519fdb09ef0e628911b194e4a65f95ea38dacd00bc816e59e1d",
+}
+
+
+def _tv_hash(tv):
+    h = hashlib.sha256()
+    for k in sorted(tv):
+        h.update(k.encode())
+        h.update(tv[k].detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def test_vision_ridge_preserve_is_bit_identical_to_the_pre_decoder_implementation():
+    setup = _setup()
+    runs = {
+        "rho10_m6": _cfg(synthesis="ridge_preserve", rho_g=10.0, preserve_tokens=6),
+        "default": _cfg(synthesis=None, rho_g=None),  # the S0 default: ridge_preserve, rho_g = 0.1
+        "filter": _cfg(synthesis="ridge_preserve", rho_g=0.1, anchor_filter="norm", anchor_filter_k=1.5),
+        "rank": _cfg(synthesis="ridge_preserve", rho_g=0.5, update_rank=2),
+    }
+    for name, cfg in runs.items():
+        assert _tv_hash(_prepare(cfg, setup).unit_task_vector) == _VISION_D2_HASHES[name], name
+    spread = _cfg(synthesis="ridge_preserve", rho_g=0.1, depth_fit="spread", measure_depths=(1.0,))
+    assert _tv_hash(_prepare(spread, _setup(source_depth=2, target_depth=4)).unit_task_vector) == _VISION_D2_HASHES[
+        "spread"]
 
 
 # ---------------------------------------------------------------- O3: residual spread

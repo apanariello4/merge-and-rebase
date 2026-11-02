@@ -89,6 +89,7 @@ def _cfg(**kw):
         num_batches=3,
         components=("mlp.c_proj",),
         ridge_estimator="empirical_bayes",
+        synthesis="ridge",  # pinned: these tests pin the plain ridge (the S0 default is ridge_preserve)
         missing_bias="materialize",
     )
     base.update(kw)
@@ -282,6 +283,46 @@ def test_cross_tokenizer_fit_end_to_end(frame_map):
     assert meta["texts_sha256"] == state.frame["pool"]["units"]["texts_sha256"]
     if frame_map == "gpa":
         assert prepared.extra["anchors"]["gpa_universe"]["fit_models"] == ["A", "B"]
+
+
+def test_cross_tokenizer_ridge_preserve_uses_every_target_content_token():
+    """D2 (the S0 default) on word units: G = the target base's down_proj inputs on ALL content tokens of the anchor
+    sequences in the target's own tokenization (not only the word-final tokens the units use); rho_g = 0 is the
+    plain ridge, rho_g > 0 lowers the change on G at every block."""
+    from merge_and_rebase.rebase.methods._ariadne.capture import paired_calibration
+
+    a, b = tokenizer_a(), tokenizer_b()
+    src = tiny_llama(layers=2, hidden=32, seed=0)
+    ft = perturbed_copy(src, scale=0.05, seed=1)
+    tgt_raw = tiny_qwen2(layers=3, hidden=48, heads=4, kv_heads=2, inter=96, vocab=len(b), seed=2)
+    fam = infer_family(tgt_raw)
+    tgt, sd = _with_bias(tgt_raw, fam)
+    pairing = DiscreteLayerPairing.compute(2, 3)
+    common = dict(text_units="word", anchor_batches=4, num_anchors=40, rescale_target=False, frame_map="gpa",
+                  gpa_rank=24)
+    kw = dict(src_tok=a, tgt_tok=b, words=True, tgt_max_length=24)
+    plain = _prepare(_cfg(**common), src, ft, tgt, sd, fam, pairing, **kw).unit_task_vector
+    zero = _prepare(_cfg(**{**common, "synthesis": "ridge_preserve", "rho_g": 0.0}), src, ft, tgt, sd, fam, pairing,
+                    **kw)
+    for key, v in plain.items():
+        torch.testing.assert_close(zero.unit_task_vector[key], v, rtol=1e-4, atol=1e-6)
+    default = parse_anchors_config({**common, "anchor_pool": "wikitext103", "num_batches": 3,
+                                    "ridge_estimator": "empirical_bayes", "missing_bias": "materialize",
+                                    "registration_batches": 2})
+    assert (default.synthesis, default.rho_g) == ("ridge_preserve", 0.1)
+    strong = _prepare(replace(default, rho_g=10.0), src, ft, tgt, sd, fam, pairing, **kw)
+    rows = [r for r in strong.diagnostics if "generic_change" in r]
+    assert len(rows) == 3 and all(r["generic_change"] < r["generic_change_ridge"] for r in rows)
+    assert all(torch.isfinite(v).all() for v in strong.unit_task_vector.values())
+    # G's rows: every content token of the target's anchor sequences (padding and first token dropped)
+    loader = _loader(b, POOL_TEXTS, max_length=24)
+    batches, _, meta = paired_calibration(loader, loader, num_batches=6, seed=0, family_adapter=fam,
+                                          exclude_first_token=True)
+    n_tokens = sum(int(bt[ROW_MASK_KEY].sum()) for bt in batches[:4])
+    assert all(r["generic_tokens"] == n_tokens for r in rows)
+    # B splits words into <= 3-character pieces and whitespace tokens: far more rows than the words (units) there
+    n_words = sum(len(POOL_TEXTS[i].split()) for i in meta["indices"][:16])
+    assert n_tokens > n_words
 
 
 def test_cross_tokenizer_task_rows_map():

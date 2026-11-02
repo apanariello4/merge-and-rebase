@@ -1460,7 +1460,7 @@
     "preserve_tokens": 32768,
     "registration_batches": 10,
     "rescale_target": true,
-    "rho_g": 0.0,
+    "rho_g": 0.1,
     "ridge_estimator": "empirical_bayes",
     "ridge_relative": 0.01,
     "seed": 89,
@@ -1468,7 +1468,7 @@
     "spectral_rank": null,
     "state_dir": "results/anchors_state/tiny_imagenet_T512",
     "strength": 1.0,
-    "synthesis": "ridge",
+    "synthesis": "ridge_preserve",
     "target_calibration": "same",
     "text_units": "token",
     "update_rank": null

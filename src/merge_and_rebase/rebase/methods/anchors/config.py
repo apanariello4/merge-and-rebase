@@ -156,12 +156,23 @@ class AnchorsConfig:
     operator_fusion: str = "sum"
     operator_fusion_weights: tuple[float, ...] = ()
     operator_decode_rows: str = "task"
-    # Update synthesis (AGENT_NEXT_PHASE.md O2). 'ridge': Ariadne's ridge (unchanged). 'ridge_preserve' (D2): weight
-    # and bias solved jointly with an extra (rho_g / m)||G dW + 1 beta^T||^2 term, G = the target base's c_proj inputs
-    # on the Tiny-ImageNet anchor images (preserve_tokens tokens per block, high-norm tokens dropped when the anchor
-    # filter is on); rho_g = 0 is Ariadne's ridge (anchors/synthesis.py).
-    synthesis: str = "ridge"
-    rho_g: float = 0.0
+    # Update synthesis (AGENT_NEXT_PHASE.md O2; the default since AGENT_SHARED_SPACE.md S0). 'ridge': Ariadne's ridge
+    # (unchanged). 'ridge_preserve' (D2): weight and bias solved jointly with an extra (rho_g / m)||G dW + 1 beta^T||^2
+    # term, G = the target base's c_proj (decoders: mlp.down_proj) inputs on the frame's anchor data: the anchor images
+    # of the Tiny-ImageNet pool (vision: preserve_tokens tokens per block, high-norm tokens dropped when the anchor
+    # filter is on) or the content tokens of the anchor sequences of the text pool (decoders, any text_units: BOS /
+    # first token and padding excluded, at most preserve_tokens per block, G^T G built one block at a time inside the
+    # solve; anchors/synthesis.py). rho_g = 0 is Ariadne's ridge.
+    # Default rule (None = not given, preserve_by_default): synthesis resolves to 'ridge_preserve' wherever it is
+    # implemented (preserve_supported: components = (mlp.c_proj,), depth_fit 'independent' or 'spread', anchor_pool
+    # 'tiny_imagenet' or 'wikitext103'; decoders also need depth_fit 'independent') except on the bridge to Ariadne
+    # map_rows='task' (stays Ariadne by default; explicit ridge_preserve there = Ariadne + O2), and to 'ridge'
+    # elsewhere (depth_fit 'sequential', attn.out_proj, the mixed Vision8 pool). rho_g resolves to DEFAULT_RHO_G = 0.1
+    # under 'ridge_preserve' and to 0 under 'ridge'. The resolved values are the ones stored by to_dict(). An explicit
+    # 'ridge_preserve' on an unsupported combination, or an explicit nonzero rho_g with 'ridge', is an error that
+    # names the fix (synthesis: ridge).
+    synthesis: str | None = None
+    rho_g: float | None = None
     preserve_tokens: int = 32768
     # D5 (O4): the compiled c_proj update reduced to update_rank by the data-weighted projection dW V_r V_r^T (V_r
     # from the fitted displacement's scatter dW^T H~^T H~ dW), intercept recomputed; None: full rank.
@@ -204,6 +215,13 @@ class AnchorsConfig:
     # Analysis-only: per-position coverage of E by the source anchors (one d x d scatter per position).
     coverage_diagnostics: bool = True
 
+    def __post_init__(self) -> None:
+        # Resolve the S0 defaults (see the synthesis comment); frozen dataclass, hence object.__setattr__.
+        if self.synthesis is None:
+            object.__setattr__(self, "synthesis", "ridge_preserve" if preserve_by_default(self) else "ridge")
+        if self.rho_g is None:
+            object.__setattr__(self, "rho_g", DEFAULT_RHO_G if self.synthesis == "ridge_preserve" else 0.0)
+
     def frame(self) -> dict[str, Any]:
         out = {name: getattr(self, name) for name in FRAME_FIELDS}
         if out["anchor_sampling"] == "random":
@@ -238,6 +256,29 @@ class AnchorsConfig:
         out["operator_fusion_entries"] = list(self.operator_fusion_entries)
         out["operator_fusion_weights"] = [float(x) for x in self.operator_fusion_weights]
         return out
+
+
+#: rho_g of the default synthesis (AGENT_SHARED_SPACE.md S0).
+DEFAULT_RHO_G = 0.1
+#: Anchor pools whose anchor data serve as the generic inputs G of ridge_preserve (Vision8's mix holds task images).
+PRESERVE_POOLS = ("tiny_imagenet", "wikitext103")
+
+
+def preserve_supported(cfg: AnchorsConfig) -> bool:
+    """Whether ``synthesis='ridge_preserve'`` is implemented for ``cfg`` (decoders additionally refuse depth_fit
+    'spread' in ``validate_text_config``: spread is vision-only)."""
+    return (
+        tuple(cfg.components) == ("mlp.c_proj",)
+        and cfg.depth_fit in {"independent", "spread"}
+        and cfg.anchor_pool in PRESERVE_POOLS
+    )
+
+
+def preserve_by_default(cfg: AnchorsConfig) -> bool:
+    """The S0 default rule: ridge_preserve wherever it is implemented, except the bridge to Ariadne
+    (``map_rows='task'``), which keeps Ariadne's plain ridge unless ridge_preserve is asked for explicitly
+    (Ariadne + O2, the second Ariadne reference of S0, uses the frame's anchor data as G)."""
+    return preserve_supported(cfg) and cfg.map_rows == "frame"
 
 
 _ALLOWED = {f.name for f in fields(AnchorsConfig)}
@@ -310,12 +351,13 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("agreement_tau must be >= 1")
     if cfg.synthesis not in {"ridge", "ridge_preserve"}:
         raise ValueError("synthesis must be 'ridge' or 'ridge_preserve'")
-    if cfg.synthesis == "ridge_preserve" and (
-        cfg.depth_fit == "sequential" or tuple(cfg.components) != ("mlp.c_proj",) or cfg.anchor_pool != "tiny_imagenet"
-    ):
-        raise ValueError("ridge_preserve needs depth_fit 'independent'/'spread', mlp.c_proj and the tiny pool")
+    if cfg.synthesis == "ridge_preserve" and not preserve_supported(cfg):
+        raise ValueError(
+            "synthesis='ridge_preserve' needs components=('mlp.c_proj',), depth_fit 'independent'/'spread' "
+            f"and anchor_pool in {PRESERVE_POOLS}: set synthesis: ridge for this configuration"
+        )
     if cfg.synthesis == "ridge" and float(cfg.rho_g) != 0.0:
-        raise ValueError("rho_g applies to synthesis='ridge_preserve' only")
+        raise ValueError("rho_g applies to synthesis='ridge_preserve' only (this configuration resolves to 'ridge')")
     if cfg.update_rank is not None and (
         isinstance(cfg.update_rank, bool) or not isinstance(cfg.update_rank, int) or cfg.update_rank < 1
         or cfg.depth_fit == "sequential" or tuple(cfg.components) != ("mlp.c_proj",)
@@ -428,7 +470,6 @@ _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("anchor_positions", "all"),
     ("anchor_sampling", "random"),
     ("library", "data"),
-    ("synthesis", "ridge"),
     ("update_rank", None),
     ("map_rows_per_image", None),
     ("components", ("mlp.c_proj",)),
@@ -437,9 +478,11 @@ _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
 
 def validate_text_config(cfg: AnchorsConfig) -> None:
     """Decoder (text) guard. Rows are the content tokens of the pool sequences (BOS and padding excluded), so the
-    grid / CLS / centroid options do not apply; the operator library, the synthesis variants and the spread compile
-    are vision-only for now. depth_fit 'sequential' (Ariadne's sequential streaming fit, the anchor decode as
-    desired_fn) needs token rows: source and target must read the same token sequence."""
+    grid / CLS / centroid options do not apply; the operator library, update_rank (D5) and the spread compile are
+    vision-only for now. synthesis 'ridge_preserve' (D2, the default) runs with depth_fit 'independent' and either
+    text_units; with depth_fit 'sequential' the default resolves to 'ridge'. depth_fit 'sequential' (Ariadne's
+    sequential streaming fit, the anchor decode as desired_fn) needs token rows: source and target must read the same
+    token sequence."""
     for name, required in _TEXT_REQUIRED:
         got = getattr(cfg, name)
         if got != required:

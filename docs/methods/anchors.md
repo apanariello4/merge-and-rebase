@@ -19,6 +19,14 @@ Per target block `j`, with source block `i = round(j (L_A - 1) / (L_B - 1))` (Ar
 | Decode | `D = c_B · R (K_B + εI)⁻¹ P_B`, `ε = eps_rel · tr(K_B) / T` | `core.decode_rows` |
 | Compile | ridge on the target base inputs of `mlp.c_proj` (bias recovers the mean of `D`) | `fit_direct_residual` |
 
+**Default compile (S0): ridge with conservation.** `synthesis: ridge_preserve`, `rho_g: 0.1` adds
+`(rho_g / m)‖G ΔW + 1βᵀ‖²` to the ridge, with `G` the target base's `mlp.c_proj` (decoders: `mlp.down_proj`)
+inputs on the frame's own anchor data (the anchor images; on decoders every content token of the anchor
+sequences). It needs no data beyond what the frame already requires; `rho_g = 0` is Ariadne's ridge. Where it is
+not implemented (`depth_fit: sequential`, `attn.out_proj`, the `vision8_mix` pool) the default resolves to
+`synthesis: ridge`, and so does the bridge to Ariadne (`map_rows: task`), where `synthesis: ridge_preserve` must be
+asked for explicitly (Ariadne + O2). The resolved value is stored with the run config.
+
 Token rows live on a canonical grid (`canonical_tokens`, default CLS + 14×14). Each model's tokens are
 bilinearly resampled to it, and `D` is resampled back to the target's native grid before the ridge. All of these
 maps are linear row maps, so their order does not matter.

@@ -13,7 +13,13 @@ with X = [H 1], X_G = [G 1], Lambda = diag(lambda', ..., lambda', 0):
 lambda' = lambda_Ariadne / n (Ariadne's rule on the unnormalised sums), so rho_G = 0 is exactly Ariadne's ridge.
 H, D come from Ariadne's accumulated statistics (uncentred sums); G = inputs of the target base's ``c_proj`` on the
 Tiny-ImageNet anchor images (never the mixed Vision8 pool), high-norm tokens dropped as in the anchor filter, a
-seeded subsample of ``preserve_tokens`` tokens per block.
+seeded subsample of ``preserve_tokens`` tokens per block, all blocks captured in one sweep before the fit.
+
+Decoders (AGENT_SHARED_SPACE.md S0, LLM track): G = inputs of the target base's ``mlp.down_proj`` on the content
+tokens of the frame's anchor sequences (WikiText-103 pool; padding and the first token of every sequence excluded,
+as everywhere on decoders; any ``text_units``: all content tokens of the target's own tokenization), the same seeded
+``preserve_tokens`` cap per block (default 32768; the LLM pools of the runs hold ~8k anchor content tokens, so all
+are used). ``G^T G`` is built one block at a time inside the solve (``LazyGenericInputs``) to bound host memory.
 """
 
 from __future__ import annotations
@@ -60,25 +66,33 @@ def capture_generic_inputs(
     seed: int,
     device,
     norm_filter: Mapping[str, Any] | None = None,
+    blocks: list[int] | None = None,
+    family_adapter=None,
 ) -> dict[int, GenericInputStats]:
     """``{j: GenericInputStats}`` of the target base's ``component`` inputs on ``batches`` (one streamed sweep).
 
     Tokens are subsampled with a seeded per-batch draw of ``ceil(tokens_per_block / len(batches))`` rows (the same
     token rows at every block). ``norm_filter`` (a stored ``AnchorState.norm_filter``): tokens whose block output
     norm ``||x - mu_j||`` exceeds ``k * median_j`` are dropped first (the anchor filter's rule).
+
+    ``blocks``: only these blocks (default: all ``depth``); the draw depends on the batches' row counts only, so
+    every subset of blocks sees the same token rows. ``family_adapter``: decoders (``mlp.c_proj`` read as
+    ``mlp.down_proj``); batches carrying a row mask (``paired_calibration(family_adapter=...)``) yield their
+    content rows only, as one ``[1, N, d]`` bank, and the draw is over those rows.
     """
     kind = COMPONENT_INPUT_KIND[component]
-    requests = {f"{j}.h": (j, kind) for j in range(depth)}
+    blocks = list(range(depth)) if blocks is None else [int(j) for j in blocks]
+    requests = {f"{j}.h": (j, kind) for j in blocks}
     if norm_filter is not None:
-        requests.update({f"{j}.out": (j, "boundary") for j in range(depth)})
+        requests.update({f"{j}.out": (j, "boundary") for j in blocks})
     per_batch = -(-int(tokens_per_block) // max(len(batches), 1))
     gen = torch.Generator().manual_seed(int(seed))
-    stats = {j: GenericInputStats() for j in range(depth)}
-    for values in iter_capture_tokens(target_model, batches, requests, device):
-        h0 = values["0.h"]
+    stats = {j: GenericInputStats() for j in blocks}
+    for values in iter_capture_tokens(target_model, batches, requests, device, family_adapter=family_adapter):
+        h0 = values[f"{blocks[0]}.h"]
         n_rows = h0.shape[0] * h0.shape[1]
         pick = torch.randperm(n_rows, generator=gen)[: min(per_batch, n_rows)]
-        for j in range(depth):
+        for j in blocks:
             rows = values[f"{j}.h"].reshape(n_rows, -1)[pick.to(values[f"{j}.h"].device)]
             if norm_filter is not None:
                 out = values[f"{j}.out"].reshape(n_rows, -1)[pick.to(values[f"{j}.out"].device)].to(torch.float64)
@@ -87,6 +101,43 @@ def capture_generic_inputs(
                 rows = rows[keep.to(rows.device)]
             stats[j].update(rows)
     return stats
+
+
+class LazyGenericInputs:
+    """``{j: GenericInputStats}`` for decoders, built one block at a time when the solve hook first asks for it.
+
+    Memory (AGENT_SHARED_SPACE.md S0 on LLMs): a decoder's ``down_proj`` input is wide (Qwen2.5-1.5B: 8960,
+    Llama-3.2-3B: 8192, 28 blocks), so the float64 ``G^T G`` of every block at once would take ~18 GB of host RAM.
+    Here only the block being solved is held (one ``d x d`` float64 matrix, 0.64 GB at d = 8960), captured by one
+    extra target sweep over the anchor sequences that requests that block's input only (``capture_generic_inputs``
+    with ``blocks=[j]``; same seeded rows at every block). Peak addition over the plain ridge: that matrix plus the
+    ``(d+1) x (d+1)`` float64 system of ``solve_preserve`` (~3 GB at d = 8960), freed before the next block.
+
+    ``before_capture(j)`` (optional) runs before each sweep (the caller checks that the target is at its base weights:
+    the shared ridge of the independent fit keeps it there while the hook runs).
+    """
+
+    def __init__(self, target_model, batches, *, component: str, tokens_per_block: int, seed: int, device,
+                 norm_filter: Mapping[str, Any] | None = None, family_adapter=None, before_capture=None) -> None:
+        self._model = target_model
+        self._batches = batches
+        self._kw = dict(component=component, tokens_per_block=tokens_per_block, seed=seed, device=device,
+                        norm_filter=norm_filter, family_adapter=family_adapter)
+        self._before = before_capture
+        self._block: int | None = None
+        self._stats: GenericInputStats | None = None
+        self.captures = 0
+
+    def __getitem__(self, j: int) -> GenericInputStats:
+        j = int(j)
+        if self._block != j:
+            self._block, self._stats = None, None  # release the previous block before capturing the next
+            if self._before is not None:
+                self._before(j)
+            stats = capture_generic_inputs(self._model, self._batches, j + 1, blocks=[j], **self._kw)[j]
+            self._block, self._stats = j, stats
+            self.captures += 1
+        return self._stats
 
 
 def solve_preserve(
@@ -107,11 +158,13 @@ def solve_preserve(
     xtx[:d, :d], xtx[:d, d], xtx[d, :d], xtx[d, d] = s, sa, sa, n
     xtd = torch.cat([b, se[None]], dim=0)
     a = xtx / n
+    del xtx  # (d+1)^2 float64 buffers are large on decoders (d = 8960): keep at most three alive
     if rho_g > 0.0:
         m = float(generic.m)
         xg = torch.zeros(d + 1, d + 1, dtype=torch.float64)
         xg[:d, :d], xg[:d, d], xg[d, :d], xg[d, d] = generic.gg, generic.sg, generic.sg, m
         a = a + (float(rho_g) / m) * xg
+        del xg
     a[torch.arange(d), torch.arange(d)] += float(lam) / n
     theta = torch.linalg.solve(a, xtd / n)
     dw, beta = theta[:d], theta[d]

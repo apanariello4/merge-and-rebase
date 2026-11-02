@@ -34,7 +34,7 @@ from .._ariadne.capture import (
 )
 from .._ariadne.fit import fit_direct_residual
 from .._ariadne.streaming import fit_direct_residual_sequential_streaming, prepare_direct_residual_streaming
-from .config import TEXT_ANCHOR_POOLS, AnchorsConfig, validate_text_config
+from .config import TEXT_ANCHOR_POOLS, AnchorsConfig, preserve_supported, validate_text_config
 from .core import (
     CoverageAccumulator,
     decode_rows,
@@ -756,6 +756,9 @@ class AnchorsRebase:
             validate_text_config(config)
         elif config.anchor_pool in TEXT_ANCHOR_POOLS:
             raise ValueError(f"anchor_pool={config.anchor_pool!r} is a text pool: it needs a decoder family adapter")
+        if config.synthesis == "ridge_preserve" and not preserve_supported(config):
+            # e.g. dataclasses.replace() of a resolved config: the sequential / task-row paths would ignore D2 silently
+            raise ValueError("synthesis='ridge_preserve' is not implemented for this configuration: set synthesis='ridge'")
         if state is None:
             state = self.open_state(config)
         kwargs = dict(
@@ -1150,7 +1153,8 @@ def _prepare_body(
         solve_hook = None
         if config.synthesis == "ridge_preserve" or config.update_rank is not None:
             solve_hook = _synthesis_hook(
-                state, target, target_model, target_base_sd, target_anchor_loader, config=config, device=device
+                state, target, target_model, target_base_sd, target_anchor_loader, config=config, device=device,
+                family_adapter=family_adapter,
             )
         if config.depth_fit == "spread":
             from .synthesis import fit_spread, measure_blocks
@@ -1256,22 +1260,50 @@ def _pool_draw(state, source_anchor_loader, target_anchor_loader) -> tuple[list[
     return s_b[: frame.anchor_batches], t_b[: frame.anchor_batches]
 
 
-def _synthesis_hook(state, target, target_model, target_base_sd, target_anchor_loader, *, config, device):
-    """D2 / D5 solve hook. For D2, the G statistics of the target base on the frame's anchor images (the first
-    anchor_batches of the pool draw); the target is loaded at its base weights for the capture and restored."""
-    from .synthesis import capture_generic_inputs, make_synthesis_hook
+def _synthesis_hook(
+    state, target, target_model, target_base_sd, target_anchor_loader, *, config, device, family_adapter=None
+):
+    """D2 / D5 solve hook. For D2, the G statistics of the target base on the frame's anchor data (the first
+    anchor_batches of the pool draw). Vision: all blocks in one sweep before the fit, the target loaded at its base
+    weights for the capture and restored. Decoders (``family_adapter``): the content tokens of the anchor sequences
+    (padding and the first token of every sequence dropped, as in the frame; with ``text_units='word'`` still all
+    content tokens of the target's own tokenization, not only the word-final ones), one block at a time inside the
+    solve (``LazyGenericInputs``), while the independent fit holds the target at its base weights."""
+    from .synthesis import LazyGenericInputs, capture_generic_inputs, make_synthesis_hook
 
     if config.synthesis != "ridge_preserve":
         return make_synthesis_hook(rank=config.update_rank)
     frame = state.config
+    kwargs = {} if family_adapter is None else {"family_adapter": family_adapter, "exclude_first_token": True}
     batches, _, _ = paired_calibration(
         target_anchor_loader, target_anchor_loader,
-        num_batches=frame.anchor_batches + frame.registration_batches, seed=frame.pool_seed,
+        num_batches=frame.anchor_batches + frame.registration_batches, seed=frame.pool_seed, **kwargs,
     )
     norm = None
     if config.anchor_filter is not None:
         flt = target.extras[f"norm_k{float(config.anchor_filter_k):g}"]
         norm = {"mu": target.mu, "k": float(flt["k"]), "median": flt["median"]}
+    if family_adapter is not None:
+        if config.depth_fit != "independent":
+            raise ValueError("ridge_preserve on decoders needs depth_fit='independent'")
+        from .._ariadne.layouts import _layout_for
+
+        shim = _layout_for(family_adapter)
+        keys = {j: shim.component_key(j, "mlp.c_proj", prefixed=True) for j in range(target.depth)}
+        weights = {j: target_base_sd[keys[j]] for j in range(target.depth)}
+
+        def at_base(j: int) -> None:
+            live = target_model.get_parameter(keys[j])
+            if not torch.equal(live.detach().to("cpu"), weights[j].detach().to("cpu", live.dtype)):
+                raise RuntimeError(f"ridge_preserve: target block {j} is not at its base weights during the solve")
+
+        generic = LazyGenericInputs(
+            target_model, batches[: frame.anchor_batches], component="mlp.c_proj",
+            tokens_per_block=config.preserve_tokens, seed=config.seed, device=device, norm_filter=norm,
+            family_adapter=family_adapter, before_capture=at_base,
+        )
+        return make_synthesis_hook(generic=generic, rho_g=float(config.rho_g), base_weights=weights,
+                                   rank=config.update_rank)
     current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     try:
         target_model.load_state_dict(dict(target_base_sd), strict=True)
