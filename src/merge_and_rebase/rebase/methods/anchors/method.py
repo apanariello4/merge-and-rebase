@@ -638,9 +638,12 @@ class SequentialDecoder:
         target: RegisteredModel,
         config: AnchorsConfig,
         gpa_maps: Mapping[int, tuple[Tensor, Tensor]] | None = None,
+        text: bool = False,
     ) -> None:
         self.source, self.target, self.config = source, target, config
         self.gpa_maps = gpa_maps
+        # decoders: rows are the tokens of one shared token sequence, no canonical patch grid to resample
+        self.text = text
         self._maps: dict[int, tuple[Any, Any, dict[str, float]]] = {}
         self._norms: dict[int, list[float]] = {}
         self._coverage_acc: dict[int, CoverageAccumulator] = {}
@@ -653,12 +656,20 @@ class SequentialDecoder:
             self._norms[pos] = [0.0, 0.0]
             self._source_of[pos] = i
         fn = self._maps[pos][0]
-        e = to_canonical(f - b, cfg.canonical_tokens)
-        batch, _, d_m = e.shape
+        if self.text:
+            if (f - b).shape[1] != out.shape[1]:
+                raise ValueError("anchors sequential fit on decoders needs source and target on the same token sequence")
+            e = f - b
+        else:
+            e = to_canonical(f - b, cfg.canonical_tokens)
+        batch, n_tok, d_m = e.shape
         rows = e.reshape(-1, d_m)
         if cfg.coverage_diagnostics and self._owner(i) == pos:
             self._coverage_acc.setdefault(i, CoverageAccumulator()).update(rows)
-        d = to_canonical(fn(rows).reshape(batch, cfg.canonical_tokens, -1).float(), int(out.shape[1]))
+        if self.text:
+            d = fn(rows).reshape(batch, n_tok, -1).float()
+        else:
+            d = to_canonical(fn(rows).reshape(batch, cfg.canonical_tokens, -1).float(), int(out.shape[1]))
         self._norms[pos][0] += float((rows.double() ** 2).sum().item())
         self._norms[pos][1] += float((d.double() ** 2).sum().item())
         return d
@@ -1040,6 +1051,8 @@ def _prepare_body(
             seed=config.seed,
             device=device,
             source_ft_model=source_ft_model,
+            # decoders: padding and the first token of every sequence leave every bank, as in the independent fit
+            **({} if family_adapter is None else {"family_adapter": family_adapter, "exclude_first_token": True}),
         )
         calibration = prepared_stream["calibration"]
     elif config.operator_fusion_entries:
@@ -1119,7 +1132,7 @@ def _prepare_body(
     fit_mark = recorder.mark()
     started = time.perf_counter()
     if config.depth_fit == "sequential":
-        decoder = SequentialDecoder(source, target, config, gpa_maps=gpa_maps)
+        decoder = SequentialDecoder(source, target, config, gpa_maps=gpa_maps, text=family_adapter is not None)
         corrections, rows = fit_direct_residual_sequential_streaming(
             target_model,
             target_base_sd,
@@ -1130,6 +1143,7 @@ def _prepare_body(
             config=config.ridge_config(),
             device=device,
             desired_fn=decoder,
+            **({} if family_adapter is None else {"family_adapter": family_adapter}),
         )
         position_diag = decoder.diagnostics()
     else:

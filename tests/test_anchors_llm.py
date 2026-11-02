@@ -270,6 +270,42 @@ def test_text_permuted_target_receives_the_permuted_task_vector(frame_map):
         assert all(row["anchors_kernel_rel_err"] < 1e-5 for row in b.diagnostics)
 
 
+@pytest.mark.parametrize("frame_map", ["pairwise", "gpa"])
+def test_text_sequential_fit_block0_is_the_independent_fit(frame_map):
+    """Ariadne's sequential fit leaves block 0 (no upstream) equal to the independent fit; with the anchor decode as
+    desired_fn the same holds on decoders (streaming vs resident capture: equal up to float reordering)."""
+    src, ft, tgt, sd, fam, pairing = _setup()
+    kw = dict(frame_map="gpa", anchor_batches=4, num_anchors=48) if frame_map == "gpa" else {}
+    indep = _prepare(_cfg(**kw), src, ft, tgt, sd, fam, pairing).unit_task_vector
+    seq = _prepare(_cfg(depth_fit="sequential", **kw), src, ft, tgt, sd, fam, pairing).unit_task_vector
+    assert set(seq) == set(indep)
+    for key in (k for k in indep if ".layers.0." in k):
+        torch.testing.assert_close(seq[key], indep[key], rtol=1e-4, atol=1e-6)
+    assert all(torch.isfinite(v).all() for v in seq.values())
+    assert any(float((seq[k] - indep[k]).abs().max()) > 0 for k in seq if ".layers.0." not in k)
+
+
+@pytest.mark.parametrize("frame_map", ["pairwise", "gpa"])
+def test_text_sequential_permuted_target_receives_the_permuted_task_vector(frame_map):
+    src = tiny_llama(layers=2, seed=0)
+    ft = perturbed_copy(src, scale=0.05, seed=1)
+    fam = infer_family(src)
+    perm = torch.randperm(32, generator=torch.Generator().manual_seed(4))
+    same, sd_same = _with_bias(src, fam)
+    moved, sd_moved = _with_bias(_permuted(src, perm), fam)
+    pairing = DiscreteLayerPairing.compute(2, 2)
+    kw = dict(frame_map="gpa", anchor_batches=4, num_anchors=48) if frame_map == "gpa" else {}
+    cfg = _cfg(depth_fit="sequential", **kw)
+    state = AnchorState(cfg)
+    a = _prepare(cfg, src, ft, same, sd_same, fam, pairing, state=state, source_id="A", target_id="A")
+    b = _prepare(cfg, src, ft, moved, sd_moved, fam, pairing, state=state, source_id="A", target_id="A_perm")
+    for j in range(2):
+        w, bias = f"model.layers.{j}.mlp.down_proj.weight", f"model.layers.{j}.mlp.down_proj.bias"
+        torch.testing.assert_close(b.unit_task_vector[w], a.unit_task_vector[w][perm], rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(b.unit_task_vector[bias], a.unit_task_vector[bias][perm], rtol=1e-4, atol=1e-6)
+    assert any(float(v.abs().max()) > 0 for v in a.unit_task_vector.values())
+
+
 def test_text_norm_filter_with_no_flagged_rows_is_the_unfiltered_transport():
     src, ft, tgt, sd, fam, pairing = _setup()
     plain = _prepare(_cfg(), src, ft, tgt, sd, fam, pairing).unit_task_vector
@@ -290,7 +326,7 @@ def test_decoder_config_defaults_and_rejections():
         {"library": "operator", "frame_map": "gpa"},
         {"synthesis": "ridge_preserve"},
         {"update_rank": 4},
-        {"depth_fit": "sequential"},
+        {"depth_fit": "sequential", "text_units": "word"},
         {"depth_fit": "spread", "measure_depths": [0.5]},
         {"anchor_unit": "cls"},
         {"anchor_positions": "patch"},

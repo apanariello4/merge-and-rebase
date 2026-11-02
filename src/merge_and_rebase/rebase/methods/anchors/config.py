@@ -430,7 +430,6 @@ _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("library", "data"),
     ("synthesis", "ridge"),
     ("update_rank", None),
-    ("depth_fit", "independent"),
     ("map_rows_per_image", None),
     ("components", ("mlp.c_proj",)),
 )
@@ -438,12 +437,17 @@ _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
 
 def validate_text_config(cfg: AnchorsConfig) -> None:
     """Decoder (text) guard. Rows are the content tokens of the pool sequences (BOS and padding excluded), so the
-    grid / CLS / centroid options do not apply; the operator library, the synthesis variants and the sequential /
-    spread compiles are vision-only for now (L1: data library, independent shared ridge on mlp.down_proj)."""
+    grid / CLS / centroid options do not apply; the operator library, the synthesis variants and the spread compile
+    are vision-only for now. depth_fit 'sequential' (Ariadne's sequential streaming fit, the anchor decode as
+    desired_fn) needs token rows: source and target must read the same token sequence."""
     for name, required in _TEXT_REQUIRED:
         got = getattr(cfg, name)
         if got != required:
             raise ValueError(f"anchors on decoder models does not support {name}={got!r} (must be {required!r})")
+    if cfg.depth_fit not in {"independent", "sequential"}:
+        raise ValueError(f"anchors on decoder models supports depth_fit 'independent' or 'sequential': {cfg.depth_fit!r}")
+    if cfg.depth_fit == "sequential" and cfg.text_units != "token":
+        raise ValueError("anchors depth_fit='sequential' on decoder models needs text_units='token' (same tokenizer)")
     if cfg.anchor_pool not in TEXT_ANCHOR_POOLS:
         raise ValueError(f"anchors on decoder models needs a text anchor_pool {TEXT_ANCHOR_POOLS}: {cfg.anchor_pool!r}")
 
