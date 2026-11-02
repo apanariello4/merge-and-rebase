@@ -383,8 +383,8 @@ class ResidualSufficientStatistics:
         # field is shared schema surface, and relaxing the check would let an invalid value pass silently.
         if isinstance(ridge_relative, bool) or ridge_relative <= 0 or not math.isfinite(float(ridge_relative)):
             raise ValueError("ridge_relative must be finite and > 0")
-        if ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
-            raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
+        if ridge_estimator not in {"fixed_relative", "empirical_bayes", "none", "frob_trace"}:
+            raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes', 'none' or 'frob_trace'")
         if ridge_mode not in {"trace_normalized", "absolute"}:
             raise ValueError("ridge_mode must be 'trace_normalized' or 'absolute'")
         if ridge_mode == "absolute":
@@ -441,10 +441,24 @@ class ResidualSufficientStatistics:
             # so the scalar ridge is trace(S_c) / (N - 1) (relative parameterization with d_in / (N - 1)).
             effective_ridge_relative = float(self.m_source) / float(self.n_rows - 1)
             base = trace_sc / float(self.n_rows - 1)
+        elif ridge_estimator == "frob_trace":
+            # PatchKV (arXiv 2609.39329, Eq. 7): lam0 * ||S_c||_F^2 / tr(S_c), the eigenvalue-weighted mean eigenvalue
+            # of S_c; the output side uses the same ratio of G (1 for an identity output map). In the relative
+            # parameterization above (lam / (tr(S_c)/m)) this is lam0 * m / r_eff, r_eff = tr(S_c)^2 / ||S_c||_F^2.
+            frob_sq_sc = float((sc * sc).sum().item())
+            frob_sq_g = float((g * g).sum().item())
+            feature_effective_rank = trace_sc**2 / frob_sq_sc if frob_sq_sc > 0 else 0.0
+            effective_ridge_relative = (
+                float(ridge_relative) * float(self.m_source) / feature_effective_rank if feature_effective_rank else 0.0
+            )
+            base = float(ridge_relative) * frob_sq_sc / trace_sc if trace_sc > 0 else 0.0
         else:
             effective_ridge_relative = float(ridge_relative)
             base = effective_ridge_relative * trace_sc / float(self.m_source)
-        trace_normalized_lam = base * (trace_g / float(self.d_source)) if exact_form else base
+        if ridge_estimator == "frob_trace":
+            trace_normalized_lam = base * (frob_sq_g / trace_g if trace_g > 0 else 0.0) if exact_form else base
+        else:
+            trace_normalized_lam = base * (trace_g / float(self.d_source)) if exact_form else base
         # ridge_mode="absolute" is validated to require ridge_estimator="fixed_relative".
         lam = float(ridge_absolute) if ridge_mode == "absolute" else trace_normalized_lam
 
@@ -502,6 +516,11 @@ class ResidualSufficientStatistics:
             # (t_out.T @ bias_correction, matching theseus._transport_bias's `delta_vec @ t_out`).
             "bias_correction": beta.to(torch.float32),
         }
+        if ridge_estimator == "frob_trace":
+            # Only on the opt-in estimator, so the default rows (and the golden structure) are unchanged.
+            diag["frobenius_sq_centered_feature_gram"] = frob_sq_sc
+            diag["frobenius_sq_output_transport_gram"] = frob_sq_g
+            diag["feature_effective_rank"] = feature_effective_rank
         return x.T.to(torch.float32), diag
 
 

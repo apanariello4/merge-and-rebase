@@ -37,6 +37,9 @@ def order_components(components) -> tuple[str, ...]:
 class DirectResidualConfig:
     ridge_relative: float = 0.01
     # Read unconditionally by the shared solver (mirrors ResidualCompletionConfig); 'fixed_relative' = historical ridge.
+    # Opt-in 'frob_trace' (PatchKV, arXiv 2609.39329 Eq. 7): lam = ridge_relative * ||S_c||_F^2 / tr(S_c) (times
+    # ||G||_F^2 / tr(G) for the output map, 1 for c_proj), i.e. lam0 times the eigenvalue-weighted mean eigenvalue of
+    # the centred feature Gram; no 1/N factor, so lam scales with the rows like S_c (closed_form solves only).
     ridge_estimator: str = "fixed_relative"
     strength: float = 1.0
     num_batches: int = 10
@@ -381,8 +384,10 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("ridge_relative must be finite")
     if cfg.ridge_relative <= 0:
         raise ValueError("ridge_relative must be > 0")
-    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
-        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
+    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none", "frob_trace"}:
+        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes', 'none' or 'frob_trace'")
+    if cfg.ridge_estimator == "frob_trace" and cfg.component_fit != "closed_form":
+        raise ValueError("ridge_estimator='frob_trace' is implemented for component_fit='closed_form' only")
     if isinstance(cfg.strength, bool) or not isinstance(cfg.strength, (int, float)):
         raise ValueError("strength must be a finite real number")
     if not math.isfinite(float(cfg.strength)):
