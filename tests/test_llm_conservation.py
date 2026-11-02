@@ -85,7 +85,7 @@ def test_zero_update_gives_exactly_zero_difference_and_the_base_is_cached(tmp_pa
     # the harness call: ARC (0-shot, full test) and the MMLU subjects (5-shot) with their fixed doc indices
     assert calls[0]["tasks"] == [lc.ARC_TASK, "mmlu_anatomy", "mmlu_virology"]
     assert calls[0]["num_fewshot"] == {lc.ARC_TASK: 0, "mmlu_anatomy": 5, "mmlu_virology": 5}
-    assert calls[0]["samples"] == SUBSET and calls[0]["batch_size"] == 8
+    assert calls[0]["samples"] == SUBSET and calls[0]["batch_size"] == 2
     # mmlu500_acc pools the questions: subject accuracies weighted by their question counts
     by = zero["base"]["mmlu500_acc_by_subject"]
     assert zero["base"]["mmlu500_acc"] == pytest.approx((2 * by["mmlu_anatomy"] + by["mmlu_virology"]) / 3)
