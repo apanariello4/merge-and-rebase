@@ -10,7 +10,8 @@ The dataset is ``method.params.anchor_pool`` (``wikitext103``: WikiText-103 raw,
     batch_size   None  (None: calibration_batch_size)
 
 Every model registered in one anchors state must see this same pool: the frame stores the draw identity (the
-loader's sample ids hash the texts) and the sha256 of its content token rows, and refuses a model that differs.
+loader's sample ids hash the texts) and the sha256 of its content token rows (``text_units='word'``: of its raw
+texts, the tokenizers may differ), and refuses a model that differs.
 """
 
 from __future__ import annotations
@@ -71,9 +72,14 @@ def load_pool_texts(pool: Mapping[str, Any]) -> list[str]:
     return [paragraphs[i] for i in sorted(order[: int(pool["n_sequences"])].tolist())]
 
 
-def build_anchor_pool_loaders(source_tokenizer: Any, target_tokenizer: Any, pool: Mapping[str, Any]):
-    """``(source loader, target loader)``: the same pool texts under each model's tokenizer."""
+def build_anchor_pool_loaders(
+    source_tokenizer: Any, target_tokenizer: Any, pool: Mapping[str, Any], *, word_units: bool = False
+):
+    """``(source loader, target loader)``: the same pool texts under each model's tokenizer (``word_units``: the
+    loaders also carry the per-token word index, ``text_units='word'``)."""
     kwargs = dict(texts=load_pool_texts(pool), batch_size=int(pool["batch_size"]), max_length=int(pool["max_length"]))
+    if word_units:
+        kwargs["word_units"] = True
     return (
         build_text_calibration_loader(tokenizer=source_tokenizer, **kwargs),
         build_text_calibration_loader(tokenizer=target_tokenizer, **kwargs),

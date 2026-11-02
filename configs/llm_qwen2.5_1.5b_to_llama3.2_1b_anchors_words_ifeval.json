@@ -1,0 +1,59 @@
+{
+  "method": {
+    "name": "anchors",
+    "params": {
+      "anchor_pool": "wikitext103",
+      "text_units": "word",
+      "num_anchors": 4096,
+      "anchor_batches": 4,
+      "registration_batches": 12,
+      "pool_seed": 0,
+      "anchor_seed": 0,
+      "library": "data",
+      "num_batches": 100,
+      "seed": 0,
+      "missing_bias": "materialize",
+      "ridge_estimator": "fixed_relative",
+      "ridge_relative": 0.01,
+      "state_dir": "/data/merge_and_rebase_results/anchors_llm/state_xfamily_qwen15_llama1_words",
+      "frame_map": "gpa",
+      "gpa_rank": 512,
+      "rescale_target": false
+    }
+  },
+  "anchors_pool": {
+    "min_chars": 600,
+    "max_length": 128,
+    "batch_size": 16,
+    "seed": 0
+  },
+  "alpha": {
+    "search": true
+  },
+  "hyperparam_search": {
+    "strategy": "sequential",
+    "alpha": [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2]
+  },
+  "source_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+  "target_model_name_or_path": "meta-llama/Llama-3.2-1B",
+  "model_kind": "causal_lm",
+  "model_arch": "auto",
+  "tuned_bodies": {
+    "it": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "seed": 0,
+  "harness_tasks": ["ifeval"],
+  "harness_num_fewshot": 0,
+  "harness_batch_size": 4,
+  "calibration_batch_size": 4,
+  "calibration_max_length": 448,
+  "calibration_generated_answer": {
+    "max_new_tokens": 256,
+    "batch_size": 16,
+    "model": null,
+    "cache_path": null
+  },
+  "source_task_models_on_cpu": true,
+  "device": "cuda",
+  "dtype": "bf16"
+}

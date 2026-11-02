@@ -796,13 +796,23 @@ def build_text_calibration_loader(
     max_length: int = 128,
     add_special_tokens: bool | None = None,
     fit_mask: str | None = None,
+    word_units: bool = False,
 ) -> DataLoader:
+    """Padded (``max_length``) calibration batches of ``texts`` under ``tokenizer``.
+
+    ``word_units`` (opt-in, ``anchors`` with ``text_units='word'``): every batch also carries ``word_unit`` (long
+    ``[B, T]``: the index of the word whose last token sits at that position, -1 elsewhere; ``data/text_units.py``),
+    and the dataset records ``texts_sha256``, the identity of the raw texts the units are defined on.
+    """
     # None: follow the corpus (``CalibrationTextList``: False for chat-template-rendered text, else True).
     if add_special_tokens is None:
         add_special_tokens = getattr(texts, "add_special_tokens", True)
     prompt_list = list(texts)
     if not prompt_list:
         raise ValueError("Calibration loader needs at least one text sequence.")
+    unit_ids = None
+    if word_units and fit_mask is not None:
+        raise ValueError("word_units cannot be combined with a calibration fit_mask yet.")
     # Default (True) keeps the historical call (tokenizer's own default add_special_tokens) untouched.
     if fit_mask is not None:
         # Opt-in ``calibration_fit_mask``: one extra per-token ``fit_mask`` (1 = inside a message content).
@@ -814,6 +824,13 @@ def build_text_calibration_loader(
         enc = _tokenize_for_loader(tokenizer, prompt_list, max_length, add_special_tokens, True)
         fit_masks = _content_token_masks(enc, spans)
         enc.pop("offset_mapping")
+    elif word_units:
+        from .text_units import tokenize_word_units
+
+        fit_masks = None
+        enc, unit_ids = tokenize_word_units(
+            tokenizer, prompt_list, max_length=int(max_length), add_special_tokens=bool(add_special_tokens)
+        )
     else:
         fit_masks = None
         special_kwargs = {} if add_special_tokens else {"add_special_tokens": False}
@@ -829,21 +846,27 @@ def build_text_calibration_loader(
         feat = {k: v[i] for k, v in enc.items()}
         if fit_masks is not None:
             feat["fit_mask"] = fit_masks[i]
+        if unit_ids is not None:
+            feat["word_unit"] = unit_ids[i]
         features.append(feat)
 
     # Stable across processes: str.__hash__ is salted per interpreter, which
     # would make these ids non-reproducible if they were ever persisted.
     sample_ids = [f"{i}:{hashlib.sha1(t.encode()).hexdigest()[:12]}" for i, t in enumerate(prompt_list)]
     dataset = TokenizedPromptDataset(features, sample_ids=sample_ids)
+    if unit_ids is not None:
+        dataset.texts_sha256 = hashlib.sha256(json.dumps(prompt_list).encode()).hexdigest()
 
     def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        feats = [{k: v for k, v in row.items() if k not in ("labels", "fit_mask")} for row in batch]
+        feats = [{k: v for k, v in row.items() if k not in ("labels", "fit_mask", "word_unit")} for row in batch]
         padded = tokenizer.pad(feats, return_tensors="pt", padding="max_length", max_length=int(max_length))
         padded["labels"] = padded["input_ids"].clone()
         if "attention_mask" in padded:
             padded["labels"][padded["attention_mask"] == 0] = -100
         if fit_masks is not None:  # same length as input_ids (tokenized to max_length), padding already 0
             padded["fit_mask"] = torch.tensor([row["fit_mask"] for row in batch], dtype=torch.bool)
+        if unit_ids is not None:  # same length as input_ids (tokenized to max_length), -1 on padding
+            padded["word_unit"] = torch.tensor([row["word_unit"] for row in batch], dtype=torch.long)
         return padded
 
     return DataLoader(

@@ -56,6 +56,7 @@ from .core import (
     whitened_transport_map,
 )
 from .state import AnchorState, RegisteredModel, to_canonical, to_rows
+from .text_units import capture_paired_word_activations, paired_word_calibration
 from .universe import fit_universe
 
 Tensor = torch.Tensor
@@ -736,6 +737,9 @@ class AnchorsRebase:
         ``family_adapter`` (HF decoders sharing one tokenizer, AGENT_NEXT_PHASE.md L1): the anchor rows are tokens
         of a generic text pool, identical token ids in every model (checked by hash), the first token of every
         sequence (BOS / attention sink) and the padding excluded; the shared ridge fits ``mlp.down_proj``.
+        ``config.text_units='word'``: the rows are words of the raw texts, each model reading a word at the last
+        token of its own tokenization, so source and target tokenizers may differ (``text_units.py``); the
+        loaders must be built with ``build_text_calibration_loader(word_units=True)``.
         """
         if family_adapter is not None:
             validate_text_config(config)
@@ -816,6 +820,7 @@ def _register_pair(
         device=device,
         model_meta=source_model_meta,
         family_adapter=family_adapter,
+        frame_loaders=(target_anchor_loader,),  # word units: anchors among the words present in both tokenizations
     )
     # The target must be at its base weights when registered (the frame describes the base model).
     current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
@@ -869,10 +874,15 @@ def task_map_frames(
     """
     n_batches = config.map_num_batches or config.num_batches
     text = family_adapter is not None
-    text_kwargs = {"family_adapter": family_adapter, "exclude_first_token": True} if text else {}
-    source_batches, target_batches, _ = paired_calibration(
-        source_loader, target_loader, num_batches=n_batches, seed=config.seed, **text_kwargs
-    )
+    if text and config.text_units == "word":  # each model's banks hold the words present in both, in one order
+        source_batches, target_batches, _ = paired_word_calibration(
+            source_loader, target_loader, num_batches=n_batches, seed=config.seed, family_adapter=family_adapter
+        )
+    else:
+        text_kwargs = {"family_adapter": family_adapter, "exclude_first_token": True} if text else {}
+        source_batches, target_batches, _ = paired_calibration(
+            source_loader, target_loader, num_batches=n_batches, seed=config.seed, **text_kwargs
+        )
     canonical = config.canonical_tokens
     src_requests = {str(i): (i, "boundary") for i in range(pairing.source_depth)}
     tgt_requests = {str(j): (j, "boundary") for j in range(pairing.target_depth)}
@@ -1063,6 +1073,24 @@ def _prepare_body(
             if config.operator_input_map == "pool_ridge" else None,
         )
         calibration = captured["calibration"]
+    elif family_adapter is not None and config.text_units == "word":
+        # word units: each model on its own tokenization, rows = the words present in both (anchors/text_units.py)
+        captured = capture_paired_word_activations(
+            source_base_model,
+            source_ft_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+            family_adapter=family_adapter,
+        )
+        calibration = captured["calibration"]
+        desired, position_diag = decode_desired_effects(
+            captured, pairing, source, target, config=config, gpa_maps=gpa_maps, family_adapter=family_adapter
+        )
     else:
         captured = capture_paired_boundary_activations(
             source_base_model,
@@ -1153,11 +1181,15 @@ def _prepare_body(
                 "source_model_id": source_model_id,
                 "target_model_id": target_model_id,
                 "gpa_universe": universe_meta,
-                **({} if family_adapter is None else {"rows": "tokens", "exclude_first_token": True}),
+                **({} if family_adapter is None else {"rows": _text_rows(config), "exclude_first_token": True}),
             },
         },
         config=config,
     )
+
+
+def _text_rows(config: AnchorsConfig) -> str:
+    return "words" if config.text_units == "word" else "tokens"
 
 
 _BLOCK_KEY = re.compile(r"(?:^|\.)(?:resblocks|layers)\.(\d+)\.")

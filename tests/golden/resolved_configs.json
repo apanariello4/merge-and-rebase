@@ -1470,6 +1470,7 @@
     "strength": 1.0,
     "synthesis": "ridge",
     "target_calibration": "same",
+    "text_units": "token",
     "update_rank": null
    },
    "ariadne_cfg": {

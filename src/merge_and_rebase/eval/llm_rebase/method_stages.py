@@ -233,6 +233,11 @@ class DirectFitStage:
         # Opt-in calibration_fit_mask: the loaders add a per-token ``fit_mask`` (message contents only); None = off.
         fit_mask = rt.cfg.get("calibration_fit_mask")
         mask_kwargs = {} if fit_mask is None else {"fit_mask": fit_mask}
+        if anchors_cfg is not None and anchors_cfg.text_units == "word":
+            # word units: each loader records, per token, the word it ends (its own tokenizer's offsets)
+            if fit_mask is not None:
+                raise ValueError("anchors text_units='word' cannot be combined with calibration_fit_mask yet")
+            mask_kwargs = {"word_units": True}
         source_loader = _build_text_calibration_loader(
             tokenizer=rt.source_llm.tokenizer, texts=texts, batch_size=rt.calib_batch_size,
             max_length=rt.calib_max_length, **mask_kwargs,
@@ -320,7 +325,8 @@ class DirectFitStage:
                 rt.cfg, cfg, calib_batch_size=rt.calib_batch_size, calib_max_length=rt.calib_max_length
             )
             self._anchors_loaders = build_anchor_pool_loaders(
-                rt.source_llm.tokenizer, rt.target_llm.tokenizer, self._anchors_pool
+                rt.source_llm.tokenizer, rt.target_llm.tokenizer, self._anchors_pool,
+                word_units=cfg.text_units == "word",
             )
             self._anchors_state = AnchorsRebase.open_state(cfg)
         ids = {}

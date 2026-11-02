@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy  # noqa: F401
 from dataclasses import replace
 from typing import Any
@@ -353,6 +353,8 @@ def build_runtime(
         source_meta,
         target_meta,
         allow_depth_mismatch=bool(depth_prestep_method and block_extension_enabled and depth_mismatch),
+        # anchors on word units pairs rows across tokenizers itself: source and target may be different families
+        allow_cross_family=anchors_word_units(method_name, method_params),
     )
     print(f"Capability check passed for {method_name}")
 
@@ -391,6 +393,7 @@ def build_runtime(
         if _ariadne_params(cfg):
             raise ValueError("method 'anchors' takes method.params / method_params, not ariadne_params")
         anchors_cfg = resolve_anchors_decoder_config(method_params, target_family or source_family)
+        check_anchors_family_pair(source_family, target_family, anchors_cfg)
         resolved = replace(
             resolved,
             anchors_cfg=anchors_cfg,
@@ -789,6 +792,34 @@ def _task_contexts(
             stacklevel=2,
         )
     return contexts
+
+
+def anchors_word_units(method_name: str, method_params: Mapping[str, Any]) -> bool:
+    """True for an ``anchors`` run on word units (``method.params.text_units='word'``): tokenizers may differ."""
+    return method_name == "anchors" and str((method_params or {}).get("text_units", "token")) == "word"
+
+
+def check_anchors_family_pair(source_family: Any, target_family: Any, anchors_cfg: Any) -> None:
+    """Source and target of different families (Qwen2 -> Llama, ...) are accepted for ``anchors`` on word units
+    only, and only when one decoder layout serves both (the capture runs with one family adapter: same layer
+    prefix, ``mlp.down_proj`` writing the residual directly, no post-MLP norm)."""
+    if source_family is None or target_family is None:
+        return
+    if getattr(source_family, "name", None) == getattr(target_family, "name", None):
+        return
+    if anchors_cfg.text_units != "word":
+        raise ValueError(
+            f"anchors across model families ({source_family.name} -> {target_family.name}) needs "
+            "text_units='word' (the tokenizers differ, so token rows cannot be paired)"
+        )
+    for fam in (source_family, target_family):
+        if bool(getattr(fam, "HAS_POST_MLP_NORM", False)):
+            raise NotImplementedError(f"anchors on {fam.name} (post-MLP norm) is not supported yet")
+    if getattr(source_family, "LAYER_PREFIX", None) != getattr(target_family, "LAYER_PREFIX", None):
+        raise ValueError(
+            f"anchors across families needs one decoder layout: layer prefixes {source_family.LAYER_PREFIX!r} vs "
+            f"{target_family.LAYER_PREFIX!r}"
+        )
 
 
 def _ariadne_params(cfg) -> dict:

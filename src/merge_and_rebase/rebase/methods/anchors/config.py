@@ -34,7 +34,10 @@ FRAME_FIELDS = (
     "anchor_positions",
     "anchor_sampling",
     "anchor_unit",
+    "text_units",
 )
+#: Row units of a decoder (text) frame and calibration: tokens (identical tokenizers) or text-defined words.
+TEXT_UNITS = ("token", "word")
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,13 @@ class AnchorsConfig:
     # patch grid to 4 x 4 regions of 3-4 patches). Centroid rows are drawn at random over (image, region) and centred
     # by the mean of the same unit over the registration images; c stays the token spread (the scale of E).
     anchor_unit: str = "token"
+    # Decoder rows (text pools only). 'token': one row per content token, every model must see identical token ids
+    # (hash guard). 'word': one row per word of the raw text (maximal non-whitespace run), represented in each model
+    # by the last token of the word in its own tokenization (character offsets); a word whose last token crosses the
+    # word boundary, or is cut by truncation, is missing in that model only. Tokenizers may then differ: the anchors
+    # are drawn among the words present in every model registered with the frame, the calibration rows are the
+    # words present in both source and target (anchors/text_units.py).
+    text_units: str = "token"
     # ---- per run
     # eps = eps_rel * tr(K) / T in the decode solve.
     eps_rel: float = 1e-3
@@ -200,6 +210,8 @@ class AnchorsConfig:
             del out["anchor_sampling"]  # the default leaves the frame of existing states unchanged
         if out["anchor_unit"] == "token":
             del out["anchor_unit"]
+        if out["text_units"] == "token":
+            del out["text_units"]
         return out
 
     def ridge_config(self) -> DirectResidualConfig:
@@ -261,6 +273,10 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
             raise ValueError(f"{name} must be >= 1")
     if cfg.anchor_positions not in {"all", "patch"}:
         raise ValueError("anchor_positions must be 'all' or 'patch'")
+    if cfg.text_units not in TEXT_UNITS:
+        raise ValueError(f"text_units must be one of {TEXT_UNITS}, got {cfg.text_units!r}")
+    if cfg.text_units != "token" and cfg.anchor_pool not in TEXT_ANCHOR_POOLS:
+        raise ValueError("text_units='word' applies to decoder (text) anchor pools only")
     if cfg.anchor_unit not in ANCHOR_UNITS:
         raise ValueError(f"anchor_unit must be one of {ANCHOR_UNITS}")
     if cfg.anchor_unit != "token" and (cfg.anchor_sampling != "random" or cfg.anchor_filter is not None):

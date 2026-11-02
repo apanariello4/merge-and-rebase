@@ -130,7 +130,13 @@ def check_pair(
     target_state_dict: Mapping[str, torch.Tensor] | None = None,
     allow_depth_mismatch: bool = False,
     block_extension_params: Mapping[str, object] | None = None,
+    allow_cross_family: bool = False,
 ) -> None:
+    """Refuse a (method, source, target) combination the decoder path cannot run.
+
+    ``allow_cross_family`` lifts the same-family rule for a caller that pairs rows across tokenizers itself (``anchors``
+    with ``text_units='word'``); every other check is unchanged.
+    """
     support = method_traits(method_name)
     if support is None:
         raise ValueError(
@@ -161,7 +167,7 @@ def check_pair(
 
     if source_meta.family != target_meta.family:
         pair = frozenset({source_meta.family, target_meta.family})
-        if pair not in _COMPATIBLE_CROSS_FAMILY_PAIRS:
+        if pair not in _COMPATIBLE_CROSS_FAMILY_PAIRS and not allow_cross_family:
             raise ValueError(
                 f"Model family mismatch: source='{source_meta.family}', target='{target_meta.family}'. "
                 "Cross-family rebasing is not supported in v1."

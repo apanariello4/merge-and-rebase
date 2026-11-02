@@ -5,7 +5,10 @@ Layout of ``state_dir``::
     frame.json                  # AnchorsConfig.frame() + pool draw (dataset identity, indices, batch size)
                                 #   + the anchor rows (image, canonical position); written once, never rewritten
                                 #   (decoders: rows (sequence, token position), pool["tokens"] = sha256 of the
-                                #   content token ids, so every registered model must see identical tokens)
+                                #   content token ids, so every registered model must see identical tokens;
+                                #   text_units='word': rows (sequence, word index), pool["units"] = sha256 of the
+                                #   raw texts, tokenizers may differ: the anchors are words present in every model
+                                #   registered with the frame, text_units.py)
     models/<model_id>/meta.json # architecture, block count, widths, sha256 of blocks.pt
     models/<model_id>/blocks.pt # per block j: P_j [T, d] float32, mu_j [d] float64, c_j
     models/<model_id>/norm_filter_k<k>.pt  # optional (anchor_filter='norm'): per block the median norm of the
@@ -31,6 +34,7 @@ from .._ariadne.layouts import _layout_for
 from .._shared import _interp_2d_tokens
 from .config import AnchorsConfig
 from .core import MomentAccumulator, anchor_frame, kernel
+from .text_units import WORD_UNIT_KEY, own_unit_batch, texts_sha256, unit_keys
 
 Tensor = torch.Tensor
 
@@ -97,6 +101,12 @@ def text_pool_tokens(batches: list[Any], family_adapter) -> dict[str, Any]:
         h.update(ids[mask].to(torch.int64).contiguous().numpy().tobytes())
         rows += int(mask.sum())
     return {"token_rows_sha256": h.hexdigest(), "content_rows": rows, "exclude_first_token": True}
+
+
+def text_pool_units(pool_loader) -> dict[str, Any]:
+    """Identity of a word-unit pool (``text_units='word'``): the sha256 of its raw texts. Units are defined on the
+    text alone, so it is the same under every tokenizer; which units a model has is checked anchor by anchor."""
+    return {"unit": "word", "texts_sha256": texts_sha256(pool_loader), "exclude_first_token": True}
 
 
 _POOL_GRID = {"pool2": 2, "pool4": 4}
@@ -186,11 +196,15 @@ class AnchorState:
         *,
         text_masks: list[Tensor] | None = None,
         tokens: dict[str, Any] | None = None,
+        unit_candidates: list[list[int]] | None = None,
     ) -> None:
-        if text_masks is None:
+        if unit_candidates is not None:
+            rows = self._draw_text_rows(unit_candidates, "anchor-batch words present in every registered tokenization")
+        elif text_masks is None:
             rows = self._image_anchor_rows(batch_sizes)
         else:
             rows = self._text_anchor_rows(text_masks)
+        identity_key = "units" if unit_candidates is not None else "tokens"
         self.frame = {
             "config": self.config.frame(),
             "pool": {
@@ -198,7 +212,7 @@ class AnchorState:
                 "indices": list(pool_meta["indices"]),
                 "batch_size": int(pool_meta["batch_size"]),
                 "batch_sizes": list(batch_sizes),
-                **({} if tokens is None else {"tokens": tokens}),
+                **({} if tokens is None else {identity_key: tokens}),
             },
             "anchor_rows": rows,
         }
@@ -215,11 +229,13 @@ class AnchorState:
         for mask in masks:
             candidates += [[offset + s, p] for s, p in torch.nonzero(mask.bool().cpu()).tolist()]
             offset += int(mask.shape[0])
+        return self._draw_text_rows(candidates, f"content token rows of the {offset} anchor sequences")
+
+    def _draw_text_rows(self, candidates: list[list[int]], what: str) -> list[list[int]]:
+        """``num_anchors`` rows drawn uniformly (``anchor_seed``) among the ordered ``candidates``, kept in order."""
+        cfg = self.config
         if cfg.num_anchors > len(candidates):
-            raise ValueError(
-                f"num_anchors={cfg.num_anchors} exceeds the {len(candidates)} content token rows of the "
-                f"{offset} anchor sequences"
-            )
+            raise ValueError(f"num_anchors={cfg.num_anchors} exceeds the {len(candidates)} {what}")
         gen = torch.Generator().manual_seed(int(cfg.anchor_seed))
         chosen = sorted(int(i) for i in torch.randperm(len(candidates), generator=gen)[: cfg.num_anchors])
         return [candidates[i] for i in chosen]
@@ -269,17 +285,81 @@ class AnchorState:
             raise ValueError("anchor pool dataset differs from the one the frame was built on")
         if list(pool_meta["indices"]) != pool["indices"] or list(batch_sizes) != pool["batch_sizes"]:
             raise ValueError("anchor pool draw (indices / batch sizes) differs from the frame's")
+        if self.config.text_units == "word":
+            if tokens != pool.get("units"):
+                raise ValueError(
+                    "anchor pool texts differ from the frame's (word units are defined on the raw texts, so every "
+                    "model must read the same pool texts)"
+                )
+            return
         if (tokens is None) != ("tokens" not in pool) or (tokens is not None and tokens != pool["tokens"]):
             raise ValueError(
                 "anchor pool token rows differ from the frame's (tokenizer, max_length, padding or modality): "
                 "anchors pairs token rows by position, so every model must see identical tokens"
             )
 
-    def _draw(self, pool_loader, family_adapter) -> tuple[list[Any], list[int], dict[str, Any] | None]:
+    def _word_draw(self, pool_loader, family_adapter):
+        """Word-unit pool draw: the seeded batches, each with the row mask of ALL this tokenization's own units, the
+        pool metadata, and the ``[sequence, word]`` keys of the anchor batches' units (global sequence, row-major)."""
+        cfg = self.config
+        raw, _, pool_meta = paired_calibration(
+            pool_loader, pool_loader, num_batches=cfg.anchor_batches + cfg.registration_batches, seed=cfg.pool_seed
+        )
+        if len(raw) != cfg.anchor_batches + cfg.registration_batches:
+            raise ValueError(
+                f"anchor pool too small: {len(raw)} batches drawn, "
+                f"{cfg.anchor_batches + cfg.registration_batches} required"
+            )
+        batches, keys, offset = [], [], 0
+        for b, batch in enumerate(raw):
+            wrapped, own = own_unit_batch(batch, family_adapter)
+            batches.append(wrapped)
+            if b < cfg.anchor_batches:
+                keys += [[offset + s, w] for s, w in own]
+            offset += _batch_size(wrapped)
+        return batches, pool_meta, keys
+
+    def _draw_words(self, pool_loader, family_adapter, frame_loaders) -> tuple[list[Any], list[int], dict[str, Any]]:
+        """``_draw`` for ``text_units='word'`` (see there)."""
+        batches, pool_meta, keys = self._word_draw(pool_loader, family_adapter)
+        batch_sizes = [_batch_size(b) for b in batches]
+        units = text_pool_units(pool_loader)
+        if self.frame is None:
+            present = {tuple(k) for k in keys}
+            for other in frame_loaders:
+                if text_pool_units(other) != units:
+                    raise ValueError("frame_loaders: a pool loader was built on different texts")
+                _, other_meta, other_keys = self._word_draw(other, family_adapter)
+                if list(other_meta["indices"]) != list(pool_meta["indices"]):
+                    raise ValueError("frame_loaders: a pool loader gives a different pool draw")
+                present &= {tuple(k) for k in other_keys}
+            candidates = [k for k in keys if tuple(k) in present]
+            self._establish_frame(pool_meta, batch_sizes, tokens=units, unit_candidates=candidates)
+        else:
+            self._check_pool(pool_meta, batch_sizes, units)
+            missing = sorted({tuple(r) for r in self.frame["anchor_rows"]} - {tuple(k) for k in keys})
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} of the frame's {len(self.frame['anchor_rows'])} anchor words have no last token "
+                    f"in this model's tokenization (first (sequence, word): {missing[:3]}); the anchors are drawn "
+                    "among the words of the models registered with the frame (register them together: frame_loaders)"
+                )
+        return batches, batch_sizes, units
+
+    def _draw(
+        self, pool_loader, family_adapter, frame_loaders=()
+    ) -> tuple[list[Any], list[int], dict[str, Any] | None]:
         """The frame's pool draw (``anchor_batches + registration_batches`` batches, ``pool_seed``), checked against
         the frame when it exists (else the frame is established by the caller). Decoders: row masks attached (padding
-        and the first token of every sequence dropped) and the token identity of the draw."""
+        and the first token of every sequence dropped) and the token identity of the draw.
+
+        ``text_units='word'``: each model's row mask holds its own word units (``text_units.py``); the identity is
+        the sha256 of the pool texts. When this call establishes the frame, the anchors are drawn among the
+        anchor-batch words present in this tokenization AND in the pool under every loader of ``frame_loaders``
+        (the other models' tokenizers); a model registered later must have a last token for every anchor word."""
         cfg = self.config
+        if family_adapter is not None and cfg.text_units == "word":
+            return self._draw_words(pool_loader, family_adapter, frame_loaders)
         kwargs = {} if family_adapter is None else {"family_adapter": family_adapter, "exclude_first_token": True}
         batches, _, pool_meta = paired_calibration(
             pool_loader,
@@ -426,18 +506,21 @@ class AnchorState:
         device,
         model_meta: dict[str, Any] | None = None,
         family_adapter=None,
+        frame_loaders=(),
     ) -> RegisteredModel:
         """Step 1: place the anchors in ``model`` (base weights) at every block; two passes over the pool draw.
 
         Idempotent: an already registered ``model_id`` is returned as stored, without any forward pass.
         ``family_adapter=None``: vision (OpenCLIP layout, canonical token grid). With a decoder family adapter the
-        rows are the content tokens of the pool sequences (padding and first token dropped), never resampled.
+        rows are the content tokens of the pool sequences (padding and first token dropped), never resampled;
+        ``text_units='word'``: the last tokens of the pool words (``frame_loaders``: see ``_draw``).
         """
         if self.has_model(model_id):
             return self.model(model_id)
         cfg = self.config
         text = family_adapter is not None
-        batches, batch_sizes, _ = self._draw(pool_loader, family_adapter)
+        words = text and cfg.text_units == "word"
+        batches, batch_sizes, _ = self._draw(pool_loader, family_adapter, frame_loaders)
         depth = block_count(model, family_adapter)
         requests = {str(j): (j, "boundary") for j in range(depth)}
         rows = self.frame["anchor_rows"]
@@ -457,7 +540,12 @@ class AnchorState:
                 sel = [(img - lo, pos) for img, pos in rows if lo <= img < hi]
                 if not sel:
                     continue
-                if text:  # (sequence, position) -> index in the [1, N, d] content-row bank (row-major mask order)
+                if words:  # (sequence, word) -> index in the [1, N, d] bank of this model's own unit rows
+                    mask = batches[b][ROW_MASK_KEY].bool().cpu()
+                    bank = {key: n for n, key in enumerate(unit_keys(mask, batches[b][WORD_UNIT_KEY]))}
+                    img_idx = torch.zeros(len(sel), dtype=torch.long)
+                    pos_idx = torch.tensor([bank[(s, w)] for s, w in sel])
+                elif text:  # (sequence, position) -> index in the [1, N, d] content-row bank (row-major mask order)
                     mask = batches[b][ROW_MASK_KEY].bool().cpu()
                     bank_index = torch.full(mask.shape, -1, dtype=torch.long)
                     bank_index[mask] = torch.arange(int(mask.sum()))
@@ -499,7 +587,11 @@ class AnchorState:
             "registration_rows_per_block": moments[0].n,
             **({"anchor_unit": cfg.anchor_unit, "mu_kind": "unit_mean"} if centroid else {}),
             # decoders: native_tokens is the content-row count of the last pool batch, not a grid
-            **({"rows": "tokens", "max_length": int(batches[0][ROW_MASK_KEY].shape[1])} if text else {}),
+            **(
+                {"rows": "words" if words else "tokens", "max_length": int(batches[0][ROW_MASK_KEY].shape[1])}
+                if text
+                else {}
+            ),
             **(model_meta or {}),
         }
         reg = RegisteredModel(model_id, meta, p_blocks, mu_blocks, c_blocks)
