@@ -30,7 +30,7 @@ Budget (one 16 GB GPU, 1.5B model, bf16, batch 8): ARC-Challenge 0-shot is ~4.7k
 
     python -m merge_and_rebase.eval.diagnostics.llm_conservation RUN_SUMMARY.json [--out OUT.json]
     python -m merge_and_rebase.eval.diagnostics.llm_conservation --tv TV.pt --alpha A --target HF_ID --out OUT.json
-        [--dtype bfloat16] [--device cuda] [--batch-size 8] [--arc-fewshot 0] [--mmlu-fewshot 5] [--cache-dir DIR]
+        [--dtype bfloat16] [--device cuda] [--batch-size 2] [--arc-fewshot 0] [--mmlu-fewshot 5] [--cache-dir DIR]
 
 Default output: ``<summary dir>/<summary stem>_conservation.json``.
 """
@@ -53,7 +53,7 @@ MMLU_SUBSET_PATH = Path(__file__).resolve().with_name("llm_conservation_mmlu500.
 MMLU_SUBSET_SIZE = 500
 MMLU_SUBSET_SEED = 0
 ARC_TEST_SIZE = 1172  # allenai/ai2_arc ARC-Challenge test
-DEFAULTS = {"arc_fewshot": 0, "mmlu_fewshot": 5, "batch_size": 8}
+DEFAULTS = {"arc_fewshot": 0, "mmlu_fewshot": 5, "batch_size": 2}  # 8: CUDA OOM on 16 GB (5-shot MMLU, 151k Qwen vocab)
 
 
 # ---------------------------------------------------------------- the fixed MMLU subset
