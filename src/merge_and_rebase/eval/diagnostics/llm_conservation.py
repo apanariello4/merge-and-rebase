@@ -261,7 +261,11 @@ def run_inputs(summary_path: Path) -> dict[str, Any]:
     if target is None:
         raise ValueError(f"{summary_path}: cannot read the target model (resolved_config or sidecar refs)")
     return {"tv": tv, "alpha": float(summary["best_alpha"]), "target": target,
-            "dtype": str(cfg.get("dtype") or "bfloat16"), "tv_sha256": summary["transported_tv"].get("sha256")}
+            "dtype": _DTYPE_ALIASES.get(str(cfg.get("dtype") or "bfloat16"), str(cfg.get("dtype") or "bfloat16")),
+            "tv_sha256": summary["transported_tv"].get("sha256")}
+
+
+_DTYPE_ALIASES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}  # llm_rebase config spellings
 
 
 def load_target(target: str, dtype: str, device: str):
