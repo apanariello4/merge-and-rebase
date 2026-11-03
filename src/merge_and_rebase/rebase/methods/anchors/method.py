@@ -20,6 +20,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import torch
@@ -57,7 +58,7 @@ from .core import (
 )
 from .state import AnchorState, RegisteredModel, to_canonical, to_rows
 from .text_units import capture_paired_word_activations, paired_word_calibration
-from .universe import fit_universe
+from .universe import fit_consensus, fit_universe
 
 Tensor = torch.Tensor
 
@@ -136,6 +137,12 @@ def transport_map(
     """
     p_m, c_m, p_k, c_k = pair_frames(source, source_block, target, target_block, config=config)
     scale = c_k if config.rescale_target else c_m
+    if config.frame_map == "consensus":
+        if gpa_maps is None:
+            raise ValueError("frame_map='consensus' needs the universe maps (fit_consensus)")
+        a_m, b_k = gpa_maps[target_block]
+        phi = gpa_transport_map(a_m, b_k, c_m, scale=scale)
+        return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, {}
     if config.frame_map == "gpa":
         if gpa_maps is not None:
             a_m, a_k = gpa_maps[target_block]
@@ -1010,23 +1017,26 @@ def _prepare_body(
             )
         finally:
             target_model.load_state_dict(current, strict=True)
-        if config.frame_map == "gpa":  # models in the universe that are not live in this run: stored filters
+        if config.frame_map in ("gpa", "consensus"):  # models in the universe not live in this run: stored filters
             for extra in (*config.gpa_models, *config.gpa_add_models):
                 if extra not in (source_model_id, target_model_id):
                     state.load_norm_filter(extra, k=k)
     gpa_maps = None
     universe_meta = None
-    if config.frame_map == "gpa":
+    if config.frame_map in ("gpa", "consensus"):
         # gpa_add_models are added to the fixed G after the fit, even when one of them is the run's source/target.
         added = set(config.gpa_add_models)
         fit_models = [m for m in (source_model_id, target_model_id, *config.gpa_models) if m not in added]
         if len(set(fit_models)) < 2 and source_model_id != target_model_id:
-            raise ValueError("frame_map='gpa' needs at least two fitted models besides gpa_add_models")
-        universe = fit_universe(
+            raise ValueError(f"frame_map={config.frame_map!r} needs at least two fitted models besides gpa_add_models")
+        universe_fit = fit_universe if config.frame_map == "gpa" else partial(
+            fit_consensus, k=config.consensus_k, construction=config.consensus, register=config.consensus_register,
+            eps=config.consensus_eps)
+        universe = universe_fit(
             state,
             fit_models,
             n_grid=target.depth,
-            d_u=config.gpa_dim,
+            **({"d_u": config.gpa_dim} if config.frame_map == "gpa" else {}),
             add_models=config.gpa_add_models,
             filter_k=None if config.anchor_filter is None else float(config.anchor_filter_k),
             dedup=None

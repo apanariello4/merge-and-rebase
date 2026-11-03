@@ -21,6 +21,7 @@ import torch
 
 from ...discrete_layer_match import DiscreteLayerPairing
 from .core import dedup_mask, gpa, procrustes_to_universe, row_normalize
+from .core import consensus_frame, consensus_kernel, consensus_register, kernel_stats_to_consensus
 from .state import AnchorState
 
 Tensor = torch.Tensor
@@ -36,9 +37,14 @@ class Universe:
     maps: dict[str, list[Tensor]]  # model id -> per grid point [d_U, d_m]
     info: list[dict[str, Any]]  # per grid point (fit diagnostics)
     added: list[str] = field(default_factory=list)
+    # decode maps ([d_U, d_m]) where they differ from the encode maps (consensus 'correct' / 'zca_rot'); None = maps
+    dec: dict[str, list[Tensor]] | None = None
 
     def block_maps(self, j: int, source_id: str, target_id: str) -> tuple[Tensor, Tensor]:
-        return self.maps[source_id][j], self.maps[target_id][j]
+        """``(encode map of the source, decode map of the target)``: a row h goes to ``h A_m^T``, ``u`` back to
+        ``u B_k``; ``B_k = A_k`` for GPA and for the isometric consensus registrations."""
+        dec = self.maps if self.dec is None else self.dec
+        return self.maps[source_id][j], dec[target_id][j]
 
 
 def _block(state: AnchorState, model_id: str, n_grid: int, j: int) -> int:
@@ -175,4 +181,118 @@ def fit_universe(
             for j in range(n_grid)
         ]
         uni.added.append(m)
+    return uni
+
+
+def consensus_version(state: AnchorState, fit_models: Sequence[str], n_grid: int, options: dict[str, Any],
+                      filter_k: float | None = None, dedup: tuple | None = None, row_norm: bool = False) -> str:
+    payload = {
+        "frame": state.config.frame(),
+        "models": {m: state.model_meta_hash(m) for m in sorted(fit_models)},
+        "n_grid": int(n_grid),
+        "consensus": dict(sorted(options.items())),
+    }
+    if filter_k is not None:
+        payload["norm_filter_k"] = float(filter_k)
+    if dedup is not None:
+        payload["dedup"] = [dedup[0], float(dedup[1]), dedup[2], int(dedup[3])]
+    if row_norm:
+        payload["row_norm"] = True
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def fit_consensus(
+    state: AnchorState,
+    fit_models: Sequence[str],
+    *,
+    n_grid: int,
+    k: int,
+    construction: str = "mean",
+    register: str = "rot",
+    eps: float = 1e-2,
+    add_models: Sequence[str] = (),
+    filter_k: float | None = None,
+    dedup: tuple | None = None,
+    row_norm: bool = False,
+) -> Universe:
+    """Consensus-kernel universe (AGENT_ADDENDUM_CONSENSUS section 2), in the shape of the GPA ``Universe``.
+
+    Per grid point: ``K*`` of the fitted models (``core.consensus_kernel``), ``g[j] = Z* = V_k Lambda_k^(1/2)``,
+    encode maps ``maps[m][j]`` and decode maps ``dec[m][j]`` (``[k, d_m]``, ``core.consensus_register``). Stored and
+    FROZEN under ``<state_dir>/universes/<version>/``: ``universe.pt``, ``k_star.pt`` (K* per grid point, float32)
+    and ``consensus_stats.json`` (per model and grid point: 1 - CKA to K*, mutual 10-NN with K*, the map residual and
+    condition number; K* spectrum). ``add_models`` are registered against the stored ``Z*``: it does not change.
+    """
+    fit_models = sorted(set(fit_models))
+    options = {"construction": construction, "k": int(k), "register": register, "eps": float(eps)}
+    version = consensus_version(state, fit_models, n_grid, options, filter_k, dedup, row_norm)
+    keeps = _keep_masks(state, fit_models, n_grid, filter_k)
+    root = None if state.state_dir is None else state.state_dir / "universes" / version
+    path = None if root is None else root / "universe.pt"
+    isometric = register != "correct" and register != "zca_rot"
+
+    def frames_of(models, j):
+        return _processed_frames(state, list(models), n_grid, j, keeps[j], filter_k, dedup, row_norm)
+
+    if path is not None and path.exists():
+        stored = torch.load(path, map_location="cpu")
+        uni = Universe(version, stored["fit_models"], stored["n_grid"], stored["d_u"],
+                       [g.to(torch.float64) for g in stored["g"]], {m: list(a) for m, a in stored["maps"].items()},
+                       stored["info"], dec=None if stored.get("dec") is None
+                       else {m: list(b) for m, b in stored["dec"].items()})
+        stats = json.loads((root / "consensus_stats.json").read_text())
+        spectra = None
+    else:
+        gs, info, k_stars, spectra = [], [], [], []
+        maps: dict[str, list[Tensor]] = {m: [] for m in fit_models}
+        dec: dict[str, list[Tensor]] = {m: [] for m in fit_models}
+        stats = {"options": options, "fit_models": fit_models, "per_grid": []}
+        d_u = None
+        for j in range(n_grid):
+            frames = frames_of(fit_models, j)
+            k_star, k_info = consensus_kernel([frames[m] for m in fit_models], construction=construction)
+            z, lam = consensus_frame(k_star, k)
+            d_u = int(z.shape[1])
+            gs.append(z)
+            k_stars.append(k_star.to(torch.float32))
+            per_model = {}
+            for m in fit_models:
+                a, b, r_info = consensus_register(frames[m], z, lam, register=register, eps=eps)
+                maps[m].append(a)
+                dec[m].append(b)
+                per_model[m] = {**r_info, **kernel_stats_to_consensus(frames[m], k_star)}
+            info.append({"consensus": {**options, **k_info, "d_u": d_u},
+                         "gpa_residual_per_model": {m: v["map_residual"] for m, v in per_model.items()}})
+            stats["per_grid"].append({"j": j, "spectrum_top64": [float(x) for x in lam[:64]],
+                                      "k_star_effective_rank": k_info["effective_rank"], "models": per_model})
+        uni = Universe(version, fit_models, n_grid, int(d_u), gs, maps, info, dec=None if isometric else dec)
+        if root is not None:
+            root.mkdir(parents=True, exist_ok=True)
+            torch.save({"fit_models": fit_models, "n_grid": n_grid, "d_u": uni.d_u, "g": gs, "maps": maps,
+                        "dec": uni.dec, "info": info, "consensus": options}, path)
+            torch.save(k_stars, root / "k_star.pt")
+            (root / "consensus_stats.json").write_text(json.dumps(stats, indent=1))
+    k_star_cache = None
+    for m in add_models:
+        if m in uni.maps:
+            continue
+        if k_star_cache is None:
+            k_star_cache = torch.load(root / "k_star.pt") if root is not None and (root / "k_star.pt").exists() else None
+        enc_m, dec_m = [], []
+        for j in range(n_grid):
+            frame = frames_of([m], j)[m]
+            z = uni.g[j]
+            lam = (z * z).sum(0)  # Z*^T Z* = Lambda_k (orthogonal columns)
+            a, b, r_info = consensus_register(frame, z, lam, register=register, eps=eps)
+            enc_m.append(a)
+            dec_m.append(b)
+            if k_star_cache is not None:
+                r_info.update(kernel_stats_to_consensus(frame, k_star_cache[j].to(torch.float64)))
+            stats["per_grid"][j]["models"][m] = {**r_info, "added": True}
+        uni.maps[m] = enc_m
+        if uni.dec is not None:
+            uni.dec[m] = dec_m
+        uni.added.append(m)
+    if add_models and root is not None:
+        (root / "consensus_stats.json").write_text(json.dumps(stats, indent=1))
     return uni

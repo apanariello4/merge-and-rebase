@@ -506,3 +506,147 @@ def gpa_transport_map(a_m: Tensor, a_k: Tensor, c_m: float, *, scale: float, ran
     """``Phi = (scale / c_m) A_m[:r]^T A_k[:r]`` (``[d_m, d_k]``): source -> top-``r`` axes of G -> target."""
     r = a_m.shape[0] if rank is None else min(int(rank), int(a_m.shape[0]))
     return (float(scale) / float(c_m)) * (a_m[:r].to(torch.float64).T @ a_k[:r].to(torch.float64))
+
+
+# ---------------------------------------------------------------- consensus kernel K* (AGENT_ADDENDUM_CONSENSUS s. 2)
+#
+# Every frame P_m ([T, d_m]) is centred on the anchors and scaled so that its kernel is Frobenius-normalised:
+# X_m = H P_m / n_m, K^_m = X_m X_m^T = H K_m H / ||H K_m H||_F (n_m = ||H K_m H||_F^(1/2)). K* is built from the K^_m,
+# re-centred and normalised to ||K*||_F = 1, and Z* = V_k Lambda_k^(1/2) are its top-k axes.
+
+
+def normalised_frame(p: Tensor) -> tuple[Tensor, float]:
+    """``(X, n)``: ``X = (P - mean_rows P) / n`` with ``n = ||Pc^T Pc||_F^(1/2)``, so ``||X X^T||_F = 1``."""
+    pc = p.to(torch.float64) - p.to(torch.float64).mean(0, keepdim=True)
+    n = float(torch.linalg.norm(pc.T @ pc)) ** 0.5
+    return pc / n, n
+
+
+def _centre(k: Tensor) -> Tensor:
+    k = 0.5 * (k + k.T)
+    return k - k.mean(0, keepdim=True) - k.mean(1, keepdim=True) + k.mean()
+
+
+def consensus_kernel(frames: list[Tensor], *, construction: str = "mean", log_eps: float = 1e-3) -> tuple[Tensor, dict]:
+    """``K*`` (``[T, T]``, centred, ``||K*||_F = 1``) of the normalised kernels of ``frames``.
+
+    ``mean``: ``(1/M) sum K^_m``. ``logeuclid``: ``exp((1/M) sum log(K^_m + e_m I))``, ``e_m = log_eps tr(K^_m) / T``,
+    then centred. ``robust``: weights ``w_m`` proportional to ``1 / (1 - mean_{k != m} CKA(K^_m, K^_k))``.
+    """
+    xs = [normalised_frame(p)[0] for p in frames]
+    t = int(xs[0].shape[0])
+    kh = [x @ x.T for x in xs]
+    m = len(kh)
+    info: dict[str, Any] = {"n_models": m}
+    if construction == "mean":
+        k_star = sum(kh) / m
+    elif construction == "robust":
+        if m < 2:
+            raise ValueError("consensus 'robust' needs at least two models")
+        cka = torch.tensor([[float((a * b).sum()) for b in kh] for a in kh], dtype=torch.float64)
+        mean_other = (cka.sum(1) - cka.diagonal()) / (m - 1)
+        w = 1.0 / (1.0 - mean_other).clamp_min(1e-12)
+        w = w / w.sum()
+        k_star = sum(float(wi) * k for wi, k in zip(w, kh, strict=True))
+        info["weights"] = [float(x) for x in w]
+    elif construction == "logeuclid":
+        acc = torch.zeros(t, t, dtype=torch.float64)
+        for k in kh:
+            e = log_eps * float(torch.trace(k)) / t
+            lam, v = torch.linalg.eigh(k + e * torch.eye(t, dtype=torch.float64))
+            acc += (v * torch.log(lam.clamp_min(1e-300))) @ v.T
+        lam, v = torch.linalg.eigh(0.5 * (acc + acc.T) / m)
+        k_star = (v * torch.exp(lam)) @ v.T
+    else:
+        raise ValueError(f"unknown consensus construction {construction!r}")
+    k_star = _centre(k_star)
+    k_star = k_star / torch.linalg.norm(k_star)
+    lam = torch.linalg.eigvalsh(k_star).clamp_min(0.0)
+    info["effective_rank"] = float(lam.sum() ** 2 / (lam * lam).sum())
+    return k_star, info
+
+
+def consensus_frame(k_star: Tensor, k: int) -> tuple[Tensor, Tensor]:
+    """``(Z*, Lambda_k)``: ``Z* = V_k Lambda_k^(1/2)`` on the top-``k`` eigenpairs of ``K*`` with positive eigenvalue."""
+    lam, v = torch.linalg.eigh(k_star.to(torch.float64))
+    lam, v = lam.flip(0), v.flip(1)
+    keep = int(min(int(k), int((lam > PINV_RTOL * lam[0]).sum())))
+    lam = lam[:keep]
+    return v[:, :keep] * lam.sqrt(), lam
+
+
+def _polar(m: Tensor) -> Tensor:
+    u, _, vt = torch.linalg.svd(m, full_matrices=False)
+    return u @ vt
+
+
+def _sym_power(a: Tensor, power: float) -> Tensor:
+    lam, v = torch.linalg.eigh(0.5 * (a + a.T))
+    return (v * lam.clamp_min(1e-300).pow(power)) @ v.T
+
+
+def consensus_register(p: Tensor, z: Tensor, lam: Tensor, *, register: str = "rot", eps: float = 1e-2
+                       ) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """``(A, B, info)`` with ``A, B`` of shape ``[k, d]``: a frame row ``h`` goes to ``u = h A^T``, ``u`` back to ``u B``.
+
+    With ``X = H P / n`` (``normalised_frame``) and ``e = eps tr(X X^T) / T``:
+
+    - ``rot``: ``A = B = polar(X^T Z*)^T`` (orthonormal rows, isometric; the GPA step towards a fixed centre);
+    - ``correct``: ``A = ((X^T X + e I)^-1 X^T Z*)^T / n`` (the anchors land on ``Z*`` up to ``e``), and ``B = n
+      diag(1 / (lambda + e*)) Z*^T X`` (least squares from ``Z*`` back to the frame, ``e* = eps sum(lambda) / T``);
+    - ``zca_rot``: ``W = (X^T X + e I)^(-1/2)``, ``R = polar((X W)^T V_k)`` with ``V_k = Z* Lambda^(-1/2)``; ``A = (W
+      R)^T / n``, ``B = n R^T W^-1`` (a rotation between the whitened frame and the whitened consensus).
+
+    ``info``: ``map_residual`` (``||X A^T n - target|| / ||target||``, target ``Z*`` or ``V_k`` for zca_rot) and
+    ``map_cond`` (condition number of ``A``).
+    """
+    x, n = normalised_frame(p)
+    z = z.to(torch.float64)
+    t, d = x.shape
+    e = float(eps) * float((x * x).sum()) / t
+    if register == "rot":
+        a = _polar(x.T @ z).T
+        b = a
+        target, enc = z, x @ a.T
+    elif register == "correct":
+        phi_t = torch.linalg.solve(x.T @ x + e * torch.eye(d, dtype=torch.float64), x.T @ z)  # [d, k]
+        a = phi_t.T / n
+        e_star = float(eps) * float(lam.sum()) / t
+        b = n * (z.T @ x) / (lam.to(torch.float64) + e_star)[:, None]
+        target, enc = z, x @ phi_t
+    elif register == "zca_rot":
+        g = x.T @ x + e * torch.eye(d, dtype=torch.float64)
+        w = _sym_power(g, -0.5)
+        vk = z / lam.to(torch.float64).sqrt()
+        r = _polar((x @ w).T @ vk)  # [d, k]
+        a = (w @ r).T / n
+        b = n * r.T @ _sym_power(g, 0.5)
+        target, enc = vk, x @ w @ r
+    else:
+        raise ValueError(f"unknown consensus_register {register!r}")
+    s = torch.linalg.svdvals(a)
+    info = {"map_residual": float(torch.linalg.norm(enc - target) / torch.linalg.norm(target)),
+            "map_cond": float(s[0] / s[-1]) if float(s[-1]) > 0 else float("inf")}
+    return a, b, info
+
+
+def mutual_knn(k_a: Tensor, k_b: Tensor, k: int = 10) -> float:
+    """Mutual k-NN alignment (Huh et al. 2024) of two kernels on the same anchors: mean overlap of the ``k`` nearest
+    anchors of every anchor (largest kernel entries, self excluded), divided by ``k``."""
+    t = k_a.shape[0]
+    big = torch.finfo(torch.float64).max
+    eye = torch.eye(t, dtype=torch.bool)
+    na = k_a.to(torch.float64).masked_fill(eye, -big).topk(k, dim=1).indices
+    nb = k_b.to(torch.float64).masked_fill(eye, -big).topk(k, dim=1).indices
+    hit = torch.zeros(t, t, dtype=torch.bool)
+    hit.scatter_(1, na, True)
+    return float(hit.gather(1, nb).float().mean())
+
+
+def kernel_stats_to_consensus(p: Tensor, k_star: Tensor) -> dict[str, float]:
+    """``1 - CKA(K^_m, K*)`` (both centred) and the mutual 10-NN of ``K^_m`` with ``K*``."""
+    x, _ = normalised_frame(p)
+    kh = x @ x.T
+    ks = k_star.to(torch.float64)
+    cka = float((kh * ks).sum() / (torch.linalg.norm(kh) * torch.linalg.norm(ks)))
+    return {"one_minus_cka": 1.0 - cka, "mutual_knn10": mutual_knn(kh, ks, 10)}

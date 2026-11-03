@@ -96,6 +96,16 @@ class AnchorsConfig:
     gpa_rank: int | None = None
     gpa_models: tuple[str, ...] = ()
     gpa_add_models: tuple[str, ...] = ()
+    # frame_map='consensus' (AGENT_ADDENDUM_CONSENSUS section 2, universe.fit_consensus): the centre is the consensus
+    # kernel K* of the double-centred, Frobenius-normalised anchor kernels of the fitted models (gpa_models with source
+    # and target; gpa_add_models are registered afterwards against the FROZEN K*). consensus: mean | logeuclid | robust.
+    # Z* = V_k Lambda_k^(1/2) (consensus_k axes). consensus_register: rot (polar(P^T Z*), isometric) | correct
+    # (P^T (K + eps I)^-1 Z*: the anchors land on Z*; decode by least squares from Z*) | zca_rot (rotation between the
+    # ZCA-whitened frame and the whitened consensus V_k). consensus_eps: relative to tr(K)/T.
+    consensus: str = "mean"
+    consensus_k: int = 512
+    consensus_register: str = "rot"
+    consensus_eps: float = 1e-2
     # Spectral filter of the decode: 'tikhonov' (eps above) or a hard cut at spectral_rank directions,
     # 'truncate_target' | 'truncate_cross' | 'procrustes_cross' (core.spectral_transport_map). None = full rank.
     spectral_filter: str = "tikhonov"
@@ -420,16 +430,31 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("anchor_filter_k must be > 0")
     if cfg.anchor_filter is not None and cfg.map_rows != "frame":
         raise ValueError("anchor_filter applies to the registered frame (map_rows='frame')")
-    if cfg.frame_map not in {"pairwise", "gpa"}:
-        raise ValueError("frame_map must be 'pairwise' or 'gpa'")
+    if cfg.frame_map not in {"pairwise", "gpa", "consensus"}:
+        raise ValueError("frame_map must be 'pairwise', 'gpa' or 'consensus'")
+    if cfg.consensus not in {"mean", "logeuclid", "robust"} or cfg.consensus_register not in {"rot", "correct", "zca_rot"}:
+        raise ValueError("consensus must be mean|logeuclid|robust, consensus_register rot|correct|zca_rot")
+    if isinstance(cfg.consensus_k, bool) or not isinstance(cfg.consensus_k, int) or cfg.consensus_k < 1 \
+            or not float(cfg.consensus_eps) > 0.0:
+        raise ValueError("consensus_k must be a positive integer and consensus_eps > 0")
+    if cfg.frame_map != "consensus" and (
+        cfg.consensus != "mean" or cfg.consensus_k != 512 or cfg.consensus_register != "rot" or cfg.consensus_eps != 1e-2
+    ):
+        raise ValueError("consensus / consensus_k / consensus_register / consensus_eps apply to frame_map='consensus' only")
+    if cfg.frame_map == "consensus" and (
+        cfg.map_rows != "frame" or cfg.spectral_filter != "tikhonov" or cfg.library != "data"
+        or cfg.gpa_dim is not None or cfg.gpa_rank is not None
+    ):
+        raise ValueError("frame_map='consensus' needs map_rows='frame', spectral_filter='tikhonov', library='data' "
+                         "and no gpa_dim / gpa_rank (the rank is consensus_k)")
     for name in ("gpa_dim", "gpa_rank"):
         value = getattr(cfg, name)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError(f"{name} must be None or a positive integer")
-    if cfg.frame_map != "gpa" and (
+    if cfg.frame_map == "pairwise" and (
         cfg.gpa_dim is not None or cfg.gpa_rank is not None or cfg.gpa_models or cfg.gpa_add_models
     ):
-        raise ValueError("gpa_dim / gpa_rank / gpa_models / gpa_add_models apply to frame_map='gpa' only")
+        raise ValueError("gpa_dim / gpa_rank / gpa_models / gpa_add_models apply to frame_map='gpa'|'consensus' only")
     if cfg.frame_map == "gpa" and cfg.map_rows != "frame":
         raise ValueError("frame_map='gpa' needs the registered frame (map_rows='frame')")
     if cfg.frame_map == "gpa" and cfg.spectral_filter != "tikhonov":
