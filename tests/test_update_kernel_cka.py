@@ -1040,7 +1040,9 @@ def test_single_chunk_null_draws_are_accepted_and_memory_counts_them(monkeypatch
 def test_merge_ignores_object_addresses_in_reprs_but_not_real_differences():
     def part(addr, size, block):
         pre = f"Compose(\n    Resize(size={size})\n    <function _convert_to_rgb at {addr}>\n)"
-        return {"setting": {"preprocess": {"source": pre}, "images": {"task": {"preprocess": pre}}, "seconds": 1.0},
+        sha = f"sha-of-{addr}"  # old runs hashed the repr with the address: it differs between the two parts
+        return {"setting": {"preprocess": {"source": pre}, "images": {"task": {"preprocess": pre, "preprocess_sha256": sha}},
+                            "seconds": 1.0},
                 "blocks": [{"target_block": block}]}
 
     merged = uk.merge_summaries([part("0x7d1ab976c3b0", 224, 0), part("0x704759f403b0", 224, 1)])

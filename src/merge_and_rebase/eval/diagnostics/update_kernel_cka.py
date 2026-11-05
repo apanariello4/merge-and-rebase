@@ -1363,7 +1363,7 @@ def _eval_batches(cfg: UpdateKernelCkaConfig, task: str, clf) -> tuple[list[tupl
     identity = image_identity(ds, idx)
     meta = {
         **identity, "preprocess": repr(clf.preprocess),
-        "preprocess_sha256": hashlib.sha256(repr(clf.preprocess).encode()).hexdigest(),
+        "preprocess_sha256": hashlib.sha256(_ADDR_RE.sub(" at 0x?", repr(clf.preprocess)).encode()).hexdigest(),
         "task": task, "split": cfg.split, "n_images": len(labels), "n_batches": len(batches),
         "labels_sha256": hashlib.sha256(repr(labels).encode()).hexdigest(),
         "image_indices_sha256": hashlib.sha256(repr(abs_idx).encode()).hexdigest(), "index_source": idx_source,
@@ -2209,6 +2209,14 @@ _ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
 MERGE_IGNORED_SETTING_KEYS = ("config", "seconds", "ram_estimate_accumulators", "blocks_run", "code", "control_info")
 
 
+def _drop_keys(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_keys(v, key) for k, v in value.items() if k != key}
+    if isinstance(value, list):
+        return [_drop_keys(v, key) for v in value]
+    return value
+
+
 def merge_summaries(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Concatenate the ``blocks`` of summaries of runs that differ only in ``blocks`` (A_B halves). The settings must
     agree (images, models, frame, controls, seeds, ...) except the keys of ``MERGE_IGNORED_SETTING_KEYS``; block
@@ -2218,8 +2226,12 @@ def merge_summaries(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         raise ValueError("nothing to merge")
     # Object addresses in reprs (e.g. "<function _convert_to_rgb at 0x7d1a...>" in the preprocess text) differ between
     # processes; they are blanked before comparing so identical preprocessing is not reported as a difference.
-    keep = lambda st: json.loads(_ADDR_RE.sub(" at 0x?", json.dumps(  # noqa: E731
-        {k: v for k, v in st.items() if k not in MERGE_IGNORED_SETTING_KEYS}, sort_keys=True, default=str)))
+    # The preprocess hashes of runs made before the hash ignored addresses differ for the same reason: they are
+    # dropped here, and the (address-blanked) preprocess text itself is compared instead.
+    def keep(st):
+        out = json.loads(_ADDR_RE.sub(" at 0x?", json.dumps(
+            {k: v for k, v in st.items() if k not in MERGE_IGNORED_SETTING_KEYS}, sort_keys=True, default=str)))
+        return _drop_keys(out, "preprocess_sha256")
     ref = keep(parts[0]["setting"])
     for i, part in enumerate(parts[1:], 1):
         other = keep(part["setting"])
