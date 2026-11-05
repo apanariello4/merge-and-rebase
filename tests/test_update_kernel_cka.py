@@ -1035,3 +1035,15 @@ def test_single_chunk_null_draws_are_accepted_and_memory_counts_them(monkeypatch
     side, pair = 2 * 5 * 10 + 5 + 1, 5 * 10 + 5
     got = uk.estimate_accumulator_gb(fr, random_draws=19, **kw)["components_gb"]["direct"]
     assert got == pytest.approx(8.0 * ((2 * side + pair) * 16 + (side + pair) * (16 + 18)) / 1e9, abs=1e-12)
+
+
+def test_merge_ignores_object_addresses_in_reprs_but_not_real_differences():
+    def part(addr, size, block):
+        pre = f"Compose(\n    Resize(size={size})\n    <function _convert_to_rgb at {addr}>\n)"
+        return {"setting": {"preprocess": {"source": pre}, "images": {"task": {"preprocess": pre}}, "seconds": 1.0},
+                "blocks": [{"target_block": block}]}
+
+    merged = uk.merge_summaries([part("0x7d1ab976c3b0", 224, 0), part("0x704759f403b0", 224, 1)])
+    assert [b["target_block"] for b in merged["blocks"]] == [0, 1]
+    with pytest.raises(ValueError, match="preprocess"):
+        uk.merge_summaries([part("0x7d1ab976c3b0", 224, 0), part("0x704759f403b0", 256, 1)])

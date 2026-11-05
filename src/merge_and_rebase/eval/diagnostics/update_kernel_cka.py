@@ -43,6 +43,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -2204,6 +2205,7 @@ def write_outputs(summary: Mapping[str, Any], out_dir: Path) -> None:
     (out_dir / "summary.md").write_text(render_md(summary))
 
 
+_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
 MERGE_IGNORED_SETTING_KEYS = ("config", "seconds", "ram_estimate_accumulators", "blocks_run", "code", "control_info")
 
 
@@ -2214,7 +2216,10 @@ def merge_summaries(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     estimate of each part)."""
     if not parts:
         raise ValueError("nothing to merge")
-    keep = lambda st: {k: v for k, v in st.items() if k not in MERGE_IGNORED_SETTING_KEYS}  # noqa: E731
+    # Object addresses in reprs (e.g. "<function _convert_to_rgb at 0x7d1a...>" in the preprocess text) differ between
+    # processes; they are blanked before comparing so identical preprocessing is not reported as a difference.
+    keep = lambda st: json.loads(_ADDR_RE.sub(" at 0x?", json.dumps(  # noqa: E731
+        {k: v for k, v in st.items() if k not in MERGE_IGNORED_SETTING_KEYS}, sort_keys=True, default=str)))
     ref = keep(parts[0]["setting"])
     for i, part in enumerate(parts[1:], 1):
         other = keep(part["setting"])
