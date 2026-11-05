@@ -27,6 +27,8 @@ class RunRecord:
     base_construction: Any
     hierarchical_premerge_alpha_curve: Any
     global_alpha_curve: Any
+    alpha_curve_val: Any = None
+    alpha_curve_test: Any = None
     alpha_selection: Any
     selected_validation_results: Any
     baseline_label: Any
@@ -119,6 +121,8 @@ class RunRecord:
             base_construction=resolved.merge.base_construction,
             hierarchical_premerge_alpha_curve=alpha.hierarchical_premerge_alpha_curve,
             global_alpha_curve=alpha.global_alpha_curve,
+            alpha_curve_val=alpha.alpha_curve_val,
+            alpha_curve_test=alpha.alpha_curve_test,
             alpha_selection=resolved.alpha.selection,
             selected_validation_results=alpha.selected_validation_results,
             baseline_label=alpha.baseline_label,
@@ -364,6 +368,10 @@ def assemble_summary(record: RunRecord) -> dict[str, Any]:
     }
     if record.save_policy is not None:
         summary["save_policy"] = record.save_policy
+    if record.alpha_curve_test is not None:
+        # Opt-in (alpha_test_curve): full val and test curves over the swept alphas; absent otherwise.
+        summary["alpha_curve_val"] = record.alpha_curve_val
+        summary["alpha_curve_test"] = record.alpha_curve_test
     if record.precomputed_tvs is not None:
         # Opt-in eval-only path (precomputed_tv_dir): provenance + per-task rank truncation; absent otherwise.
         summary["precomputed_tvs"] = record.precomputed_tvs["provenance"]

@@ -21,6 +21,7 @@ Everything here is linear in ``E`` / ``R`` row by row, so it commutes with any r
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -348,7 +349,10 @@ def dedup_mask(p: Tensor, cos_max: float, *, max_count: int | None = None, seed:
 
 # ---------------------------------------------------------------- whitened kernel decodes (AGENT_KERNEL.md V2, V3)
 
-KERNEL_DECODES = ("tikhonov", "zca", "agreement")
+#: Decoders of the unified canonical family (``canonical_transport_map``): F = Y_r Z_r^T (hard) / Y g(Gamma) Z^T (soft).
+CANONICAL_DECODES = ("canonical_hard", "canonical_soft")
+KERNEL_DECODES = ("tikhonov", "zca", "agreement", *CANONICAL_DECODES)
+_WHITENED_DECODES = ("zca", "agreement")  # the modes of whitened_transport_map
 PINV_RTOL = 1e-10  # relative eigenvalue threshold of the pseudo-inverses (eps = 0)
 
 
@@ -388,8 +392,8 @@ def whitened_transport_map(
       with ``1/tau <= gamma_i <= tau`` (``W_S``) are kept: ``Phi = (scale / c_m) Q_m^T W_S W_S^T Q_k``. Built with
       ``T x T`` matrices; with ``T > d`` the directions outside the range of ``M`` (``gamma = 0``) are never kept.
     """
-    if mode not in KERNEL_DECODES[1:]:
-        raise ValueError(f"whitened decode must be one of {KERNEL_DECODES[1:]}, got {mode!r}")
+    if mode not in _WHITENED_DECODES:
+        raise ValueError(f"whitened decode must be one of {_WHITENED_DECODES}, got {mode!r}")
     pm = p_m.to(torch.float64)
     pk = p_k.to(torch.float64)
     t = pm.shape[0]
@@ -434,6 +438,273 @@ def whitened_transport_map(
         }
     )
     return phi, info
+
+
+# ---------------------------------------------------------------- unified canonical decoder (PIANO_METODO_K section 1)
+#
+# With P_m = U_m S_m V_m^T (thin SVD, numerical rank r_m) and M = U_m^T U_k = Y Gamma Z^T, the canonical correlations
+# Gamma are the singular values of Sigma_mm^(-1/2) Sigma_mk Sigma_kk^(-1/2) (Sigma_ab = P_a^T P_b, NOT divided by T).
+# Every pairwise decode is Phi = (scale / c_m) V_m F V_k^T with a different [r_m, r_k] core F:
+#   V0 Tikhonov  F = S_m M S_k (S_k^2 + eps)^-1        ZCA (eps = 0)   F = M
+#   cross-cov.   F = S_m M S_k / eps                   Procrustes      F = polar(S_m M S_k)
+#   canonical_hard  F = Y_r Z_r^T                      canonical_soft  F = Y g(Gamma) Z^T,  g(G) = G * (G >= threshold)
+# V_m, V_k and M may also be built from Sigma alone (streaming statistics, canonical_stats.py): V S^2 V^T = eigh(Sigma_mm),
+# M = S_m^-1 V_m^T Sigma_mk V_k S_k^-1.
+# Degenerate case: inside R^T the column spaces span(U_m) and span(U_k) intersect in at least r_m + r_k - T dimensions,
+# so for T < r_m + r_k at least that many canonical correlations equal 1 from noise alone (forced_unit_pairs); at
+# T <= max(d) M is orthogonal and Gamma == 1 identically (hard == soft == ZCA). The canonical decoders are refused for
+# T <= r_m + r_k (numerical ranks; widths d_m + d_k where the ranks are not known yet).
+
+
+@dataclass(frozen=True)
+class CanonicalFactors:
+    """``V_m [d_m, r_m]``, ``S_m [r_m]``, ``V_k``, ``S_k`` (decreasing, numerical rank) and ``M = U_m^T U_k`` ``[r_m, r_k]``."""
+
+    v_m: Tensor
+    s_m: Tensor
+    v_k: Tensor
+    s_k: Tensor
+    m: Tensor
+    n_rows: int
+
+
+def forced_unit_pairs(n_rows: int, r_m: int, r_k: int) -> int:
+    """Canonical correlations forced to 1 by the geometry alone: ``max(0, r_m + r_k - T)``."""
+    return max(0, int(r_m) + int(r_k) - int(n_rows))
+
+
+def check_canonical_widths(n_rows: int, r_m: int, r_k: int) -> None:
+    """Refuse ``T <= r_m + r_k`` (``r`` = numerical rank of a frame; pass the widths ``d_m``, ``d_k`` where only
+    those are known): the two column spaces of a ``T``-row frame pair then share at least ``r_m + r_k - T`` dimensions
+    (``T = r_m + r_k`` leaves none to spare and the sample estimate is saturated), so those canonical correlations are 1
+    from noise alone and the decoder is degenerate (== zca for ``T <= max(d)``)."""
+    if int(n_rows) <= int(r_m) + int(r_k):
+        raise ValueError(
+            f"canonical decoders need more anchors than the sum of the frame ranks: T={int(n_rows)} <= "
+            f"r_m + r_k = {int(r_m)} + {int(r_k)}. Then at least {forced_unit_pairs(n_rows, r_m, r_k)} canonical "
+            "correlations are 1 from noise alone (the column spaces of the frames intersect in R^T) and "
+            "canonical_hard / canonical_soft are degenerate; raise num_anchors above r_m + r_k"
+        )
+
+
+def canonical_factors_from_frames(p_m: Tensor, p_k: Tensor, *, check: bool = True) -> CanonicalFactors:
+    """Factors from the anchor frames ``P_m [T, d_m]``, ``P_k [T, d_k]`` (thin SVDs; directions below
+    ``PINV_RTOL * s_max^2`` are dropped, like the pseudo-inverse of the whitened decodes)."""
+    pm = p_m.to(torch.float64)
+    pk = p_k.to(torch.float64)
+    t = int(pm.shape[0])
+    if int(pk.shape[0]) != t:
+        raise ValueError(f"frames must share the anchor set, got {t} vs {pk.shape[0]} anchors")
+    u_m, s_m, vt_m = torch.linalg.svd(pm, full_matrices=False)
+    u_k, s_k, vt_k = torch.linalg.svd(pk, full_matrices=False)
+    keep_m = s_m * s_m > PINV_RTOL * s_m[0] ** 2
+    keep_k = s_k * s_k > PINV_RTOL * s_k[0] ** 2
+    if check:
+        check_canonical_widths(t, int(keep_m.sum()), int(keep_k.sum()))
+    m = u_m[:, keep_m].T @ u_k[:, keep_k]
+    return CanonicalFactors(vt_m[keep_m].T, s_m[keep_m], vt_k[keep_k].T, s_k[keep_k], m, t)
+
+
+def canonical_factors_from_sigma(
+    sigma_mm: Tensor, sigma_kk: Tensor, sigma_mk: Tensor, n_rows: int, *, check: bool = True
+) -> CanonicalFactors:
+    """Same factors from ``Sigma_mm = P_m^T P_m``, ``Sigma_kk``, ``Sigma_mk = P_m^T P_k`` (``eigh``; precision of the
+    small directions is that of the Gram, ``eps_mach * lambda_max / lambda_i``)."""
+    smm = sigma_mm.to(torch.float64)
+    skk = sigma_kk.to(torch.float64)
+    smk = sigma_mk.to(torch.float64)
+    lam_m, v_m = torch.linalg.eigh(0.5 * (smm + smm.T))
+    lam_k, v_k = torch.linalg.eigh(0.5 * (skk + skk.T))
+    lam_m, v_m, lam_k, v_k = lam_m.flip(0), v_m.flip(1), lam_k.flip(0), v_k.flip(1)
+    keep_m = lam_m > PINV_RTOL * lam_m[0]
+    keep_k = lam_k > PINV_RTOL * lam_k[0]
+    if check:  # the rule applies to whatever rows the Sigma were accumulated from (n_rows of a half for a half)
+        check_canonical_widths(n_rows, int(keep_m.sum()), int(keep_k.sum()))
+    v_m, v_k = v_m[:, keep_m], v_k[:, keep_k]
+    s_m, s_k = lam_m[keep_m].sqrt(), lam_k[keep_k].sqrt()
+    m = (v_m.T @ smk @ v_k) / s_m[:, None] / s_k[None, :]
+    return CanonicalFactors(v_m, s_m, v_k, s_k, m, int(n_rows))
+
+
+def canonical_correlations(factors: CanonicalFactors) -> Tensor:
+    """Gamma (decreasing, ``min(r_m, r_k)`` values): singular values of ``M``. Per-block input of the diagnostics
+    (Gamma on a held-out half, r* against a null)."""
+    return torch.linalg.svdvals(factors.m)
+
+
+_GAMMA_OUT_RTOL = 1e-12  # relative tolerance of the half-B variance check in canonical_correlations_out
+
+
+def canonical_correlations_out(
+    factors_a: CanonicalFactors, sigma_b: tuple[Tensor, Tensor, Tensor]
+) -> Tensor:
+    """Held-out canonical correlations ``Gamma_out`` (one per pair, in the order of ``canonical_correlations``).
+
+    The canonical directions are estimated on half A (``factors_a``: ``M = Y Gamma Z^T``, ``a_i = V_m S_m^-1 y_i``,
+    ``b_i = V_k S_k^-1 z_i`` in feature space) and their correlation is measured on half B from B's
+    ``(Sigma_mm, Sigma_kk, Sigma_mk)`` (``PairSigmaAccumulator.sigma(1)[:3]``):
+    ``Gamma_out,i = a_i^T Sigma_mk^B b_i / sqrt(a_i^T Sigma_mm^B a_i * b_i^T Sigma_kk^B b_i)``.
+    Only half-B quantities enter (half B may have a different size; positive rescaling of its Sigma leaves the result
+    unchanged). Raises ``ValueError`` if half B has no variance along a direction of half A (rank-deficient half B).
+    Signed (a direction whose correlation flips sign on B is negative); with half B = half A it equals Gamma. A caller
+    that wants ``canonical_soft`` weights thresholds it (``g = Gamma_out * (Gamma_out >= thr)``) and passes ``weights``.
+    """
+    smm, skk, smk = (x.to(torch.float64) for x in sigma_b)
+    y, _, zt = torch.linalg.svd(factors_a.m, full_matrices=False)
+    a = factors_a.v_m @ (y / factors_a.s_m[:, None])  # [d_m, q]
+    b = factors_a.v_k @ (zt.T / factors_a.s_k[:, None])  # [d_k, q]
+    num = (a * (smk @ b)).sum(0)
+    var_a = (a * (smm @ a)).sum(0)
+    var_b = (b * (skk @ b)).sum(0)
+    # every denominator is a half-B quantity (the result is invariant to a positive rescaling of half B's Sigma); a
+    # direction of half A with no variance on half B means half B is rank-deficient there: refuse, never nan/inf
+    tol_a = _GAMMA_OUT_RTOL * float(torch.trace(smm).abs()) * (a * a).sum(0)
+    tol_b = _GAMMA_OUT_RTOL * float(torch.trace(skk).abs()) * (b * b).sum(0)
+    if not bool(((var_a > tol_a) & (var_b > tol_b)).all()):
+        raise ValueError(
+            "canonical_correlations_out: half B is rank-deficient along a canonical direction of half A "
+            "(a^T Sigma_mm^B a or b^T Sigma_kk^B b <= tolerance); Gamma_out is undefined, use a larger half B"
+        )
+    return num / (var_a * var_b).sqrt()
+
+
+def canonical_core(
+    factors: CanonicalFactors,
+    mode: str,
+    *,
+    rank: int | None = None,
+    null_threshold: float | Tensor = 0.0,
+    weights: Tensor | None = None,
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """``(F [r_m, r_k], Gamma, info)`` of ``canonical_hard`` (``F = Y_r Z_r^T``, ``rank`` None = every pair) or
+    ``canonical_soft`` (``F = Y g Z^T``). Default ``g(Gamma) = Gamma`` where ``Gamma >= null_threshold`` else 0 (in-sample;
+    the threshold is a float or a tensor with one entry per canonical pair). With ``weights`` (``soft`` only, one entry
+    per canonical pair, e.g. the held-out ``canonical_correlations_out`` thresholded by the caller) ``g = weights`` as
+    given and ``null_threshold`` must be left at its default. ``weights`` must be >= 0: a negative ``g_i`` would make
+    ``F = Y g Z^T`` anti-transport that direction (ValueError). A caller using the held-out ``Gamma_out`` maps it with
+    ``g = Gamma_out * (Gamma_out >= thr)``, ``thr >= 0``, so a sign flip between the halves gives 0.
+
+    ``info['canonical_soft_weights']`` (soft only) is ``'explicit'`` with ``weights`` and ``'in_sample'`` otherwise; the
+    in-sample soft decode (``g`` from the same rows that fit the directions) is NOT plan decoder D3 (held-out
+    ``Gamma_out``) and emits a ``UserWarning``."""
+    if mode not in CANONICAL_DECODES:
+        raise ValueError(f"canonical decode must be one of {CANONICAL_DECODES}, got {mode!r}")
+    y, gamma, zt = torch.linalg.svd(factors.m, full_matrices=False)
+    q = int(gamma.numel())
+    if mode == "canonical_hard":
+        r = q if rank is None else min(int(rank), q)
+        if r < 1:
+            raise ValueError("canonical rank must be >= 1")
+        f = y[:, :r] @ zt[:r]
+        used = float(r)
+    elif weights is not None:
+        if not (isinstance(null_threshold, (int, float)) and float(null_threshold) == 0.0):
+            raise ValueError("weights and null_threshold are mutually exclusive")
+        g = torch.as_tensor(weights, dtype=torch.float64)
+        if tuple(g.shape) != (q,):
+            raise ValueError(f"weights must have one entry per canonical pair ({q}), got {tuple(g.shape)}")
+        if bool((g < 0).any()):
+            raise ValueError(
+                "weights must be >= 0 (a negative weight anti-transports that direction); map Gamma_out with "
+                "g = Gamma_out * (Gamma_out >= thr), thr >= 0"
+            )
+        f = (y * g) @ zt
+        used = float((g != 0).sum().item())
+    else:
+        warnings.warn(
+            "canonical_soft with in-sample weights g(Gamma) (Gamma estimated on the rows that fit the directions) is "
+            "NOT plan decoder D3, which needs the held-out Gamma_out (canonical_correlations_out)",
+            UserWarning,
+            stacklevel=2,
+        )
+        thr = torch.as_tensor(null_threshold, dtype=torch.float64)
+        if thr.ndim > 0 and tuple(thr.shape) != (q,):
+            raise ValueError(f"null_threshold array must have one entry per canonical pair ({q}), got {tuple(thr.shape)}")
+        gate = gamma >= thr
+        f = (y * (gamma * gate)) @ zt
+        used = float(gate.sum().item())
+    if weights is not None and mode != "canonical_soft":
+        raise ValueError("weights are allowed with canonical_soft only")
+    info = {
+        "canonical_rank_source": float(factors.s_m.numel()),
+        "canonical_rank_target": float(factors.s_k.numel()),
+        "canonical_n_rows": float(factors.n_rows),
+        "forced_unit_pairs": float(forced_unit_pairs(factors.n_rows, factors.s_m.numel(), factors.s_k.numel())),
+        "canonical_pairs_total": float(q),
+        "canonical_pairs_used": used,
+        "canonical_gamma_max": float(gamma[0].item()),
+        "canonical_gamma_min": float(gamma[-1].item()),
+        "canonical_gamma_mean": float(gamma.mean().item()),
+    }
+    if mode == "canonical_soft":
+        info["canonical_soft_weights"] = "explicit" if weights is not None else "in_sample"
+    return f, gamma, info
+
+
+def canonical_phi(factors: CanonicalFactors, f: Tensor, *, scale: float, c_m: float) -> Tensor:
+    """``Phi = (scale / c_m) V_m F V_k^T`` (``[d_m, d_k]``, ``D = E Phi``)."""
+    return (float(scale) / float(c_m)) * (factors.v_m @ f @ factors.v_k.T)
+
+
+def canonical_transport_map(
+    p_m: Tensor,
+    c_m: float,
+    p_k: Tensor,
+    *,
+    scale: float,
+    mode: str,
+    rank: int | None = None,
+    null_threshold: float | Tensor = 0.0,
+    weights: Tensor | None = None,
+) -> tuple[Tensor, dict[str, float]]:
+    """``Phi`` of ``canonical_hard`` / ``canonical_soft`` from the anchor frames (see ``canonical_core``)."""
+    factors = canonical_factors_from_frames(p_m, p_k)
+    f, _, info = canonical_core(factors, mode, rank=rank, null_threshold=null_threshold, weights=weights)
+    return canonical_phi(factors, f, scale=scale, c_m=c_m), info
+
+
+def canonical_transport_map_from_sigma(
+    sigma_mm: Tensor,
+    sigma_kk: Tensor,
+    sigma_mk: Tensor,
+    n_rows: int,
+    c_m: float,
+    *,
+    scale: float,
+    mode: str,
+    rank: int | None = None,
+    null_threshold: float | Tensor = 0.0,
+    weights: Tensor | None = None,
+) -> tuple[Tensor, dict[str, float]]:
+    """Same ``Phi`` built from the streaming statistics alone (``anchors.canonical_stats``)."""
+    factors = canonical_factors_from_sigma(sigma_mm, sigma_kk, sigma_mk, n_rows)
+    f, _, info = canonical_core(factors, mode, rank=rank, null_threshold=null_threshold, weights=weights)
+    return canonical_phi(factors, f, scale=scale, c_m=c_m), info
+
+
+CORE_CONTROLS = ("tikhonov", "zca", "cross", "procrustes_cross")
+
+
+def control_core(factors: CanonicalFactors, kind: str, *, eps: float | None = None) -> Tensor:
+    """``F`` of the existing decoders in the unified form (controls): ``tikhonov`` ``S_m M S_k (S_k^2 + eps)^-1``,
+    ``zca`` ``M`` (eps = 0), ``cross`` ``S_m M S_k / eps``, ``procrustes_cross`` ``polar(S_m M S_k)`` (the singular
+    directions kept as in ``spectral_transport_map``). ``eps`` is absolute (``eps_rel * ||P_k||_F^2 / T``)."""
+    if kind not in CORE_CONTROLS:
+        raise ValueError(f"control must be one of {CORE_CONTROLS}, got {kind!r}")
+    if kind == "zca":
+        return factors.m
+    c = factors.s_m[:, None] * factors.m * factors.s_k[None, :]
+    if kind == "tikhonov":
+        if eps is None:
+            raise ValueError("tikhonov control needs eps")
+        return c / (factors.s_k * factors.s_k + float(eps))[None, :]
+    if kind == "cross":
+        if eps is None or not eps > 0.0:
+            raise ValueError("cross control needs eps > 0")
+        return c / float(eps)
+    u, sv, wt = torch.linalg.svd(c, full_matrices=False)
+    valid = int((sv > sv[0] * max(c.shape) * torch.finfo(torch.float64).eps).sum().item())
+    return u[:, :valid] @ wt[:valid]
 
 
 # ---------------------------------------------------------------- generalized Procrustes (GPA) on the anchors

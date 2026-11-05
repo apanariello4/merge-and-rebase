@@ -186,6 +186,8 @@ class AlphaSearchSpec:
     merge_weights: list[float]
     method_label: str
     run_logger: Any
+    #: Evaluate test at every swept alpha after selection and return val + test curves (default off).
+    test_curve: bool = False
 
     @classmethod
     def from_run(
@@ -210,6 +212,7 @@ class AlphaSearchSpec:
             merge_weights=merge_weights,
             method_label=method_label,
             run_logger=run_logger,
+            test_curve=bool(resolved.cfg.get("alpha_test_curve", False)),
         )
 
 
@@ -237,6 +240,48 @@ class AlphaResult:
     single_tv_val_best_acc: list[float] | None
     #: Deltas of the final evaluator (the merged direction after a hierarchical pass 2).
     rebased_deltas: list[dict[str, torch.Tensor]]
+    #: Full val / test curves over the swept alphas (``None`` unless ``alpha_test_curve``; test never used for selection).
+    alpha_curve_val: list[dict[str, Any]] | None = None
+    alpha_curve_test: list[dict[str, Any]] | None = None
+
+
+def _curve_rows(per_task: list[dict[str, Any]], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Val curve rows from ``sweep_results`` (inactive / not-evaluated tasks, stored as -inf, are omitted)."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        idxs = row.get("active_indices", list(range(len(per_task))))
+        primary = set(row.get("primary_active", idxs))
+        rebased = {
+            per_task[i]["task"]: float(a)
+            for i, a in zip(idxs, row["rebase_accs"], strict=True)
+            if i in primary and a != float("-inf")
+        }
+        baseline = {
+            per_task[i]["task"]: float(a) for i, a in zip(idxs, row["baseline_accs"], strict=True) if a != float("-inf")
+        }
+        out.append({"alpha": float(row["alpha"]), "per_task_rebased": rebased, "per_task_baseline": baseline})
+    return out
+
+
+def _test_curve(
+    ev: TargetEvaluator, per_task: list[dict[str, Any]], rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Test accuracy at every alpha of the val sweep (same tasks as the val row). Read-only: runs after selection."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        idxs = row.get("active_indices", list(range(len(per_task))))
+        primary = [i for i in idxs if i in set(row.get("primary_active", idxs))]
+        alpha = float(row["alpha"])
+        rebased = ev.eval_rebased_indices("test", primary, alpha)
+        baseline = ev.eval_baseline_indices("test", list(idxs), alpha)
+        out.append(
+            {
+                "alpha": alpha,
+                "per_task_rebased": {per_task[i]["task"]: float(v) for i, v in rebased.items()},
+                "per_task_baseline": {per_task[i]["task"]: float(v) for i, v in baseline.items()},
+            }
+        )
+    return out
 
 
 def run_alpha_search(spec: AlphaSearchSpec, evaluator: TargetEvaluator, merge_plan: MergePlan) -> AlphaResult:
@@ -745,6 +790,20 @@ def run_alpha_search(spec: AlphaSearchSpec, evaluator: TargetEvaluator, merge_pl
 
     norm_accs = [_norm_acc(r, b) for r, b in zip(rebase_test_accs, baseline_test_accs, strict=True)]
 
+    # Optional full curves. Runs strictly after every selection above, so the chosen alpha cannot depend on test.
+    alpha_curve_val: list[dict[str, Any]] | None = None
+    alpha_curve_test: list[dict[str, Any]] | None = None
+    if spec.test_curve:
+        print("\nEvaluating the test split at every swept alpha (full curve; selection already fixed on val).")
+        alpha_curve_val = _curve_rows(per_task, sweep_results)
+        alpha_curve_test = _test_curve(ev, per_task, sweep_results)
+        for row in alpha_curve_test:
+            run_logger.log_event(
+                "alpha_test_curve_point",
+                metrics={"alpha/value": float(row["alpha"])},
+                context={"per_task_rebased": row["per_task_rebased"], "per_task_baseline": row["per_task_baseline"]},
+            )
+
     single_tv_test_accs: list[float] | None = None
     single_tv_test_alpha_by_task: list[float] | None = None
     if single_tv_diagnostic_enabled and single_tv_val_best_alpha is not None:
@@ -800,4 +859,6 @@ def run_alpha_search(spec: AlphaSearchSpec, evaluator: TargetEvaluator, merge_pl
         single_tv_val_best_alpha=single_tv_val_best_alpha,
         single_tv_val_best_acc=single_tv_val_best_acc,
         rebased_deltas=ev.rebased_deltas,
+        alpha_curve_val=alpha_curve_val,
+        alpha_curve_test=alpha_curve_test,
     )

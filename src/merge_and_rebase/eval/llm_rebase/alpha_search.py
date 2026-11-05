@@ -20,6 +20,7 @@ from .common import (
     resolve_task_mask_class,
     to_unit_acc,
 )
+from .harness_split import resolve_harness_split
 from .summary import RunRecord
 
 
@@ -116,7 +117,8 @@ def score_harness_test_slice(
     harness_samples: Any,
     best_alpha: float,
     harness_render: Any = None,
-) -> tuple[dict[str, float] | None, dict[str, list[int]] | None]:
+    alphas: Any = None,
+) -> tuple[dict[str, float] | None, dict[str, list[int]] | None, dict[float, dict[str, float]] | None]:
     from .harness import run as run_harness
 
     # Optional held-out test slice. The alpha search above selects on
@@ -127,8 +129,15 @@ def score_harness_test_slice(
     # configured, the winning alpha is re-scored once on those disjoint
     # documents and that is the number to quote. Costs one extra pass,
     # not one per alpha.
+    #
+    # Opt-in `harness_test_curve: true` scores the test slice at EVERY alpha of
+    # the grid (`alphas`) instead, giving the full test curve; the number at
+    # best_alpha is then the curve's value at best_alpha (the same computation,
+    # not repeated). Off by default; the summary format is unchanged when off.
     harness_test_results: dict[str, float] | None = None
-    test_samples_cfg = cfg.get("harness_test_samples", None)
+    split = resolve_harness_split(cfg)
+    test_samples_cfg = split[1] if split is not None else cfg.get("harness_test_samples", None)
+    harness_test_curve: dict[float, dict[str, float]] | None = None
     if test_samples_cfg is not None:
         if not isinstance(test_samples_cfg, dict):
             raise ValueError("config['harness_test_samples'] must map task names to index lists.")
@@ -150,25 +159,40 @@ def score_harness_test_slice(
                 f"{ {t: len(v) for t, v in leaking.items()} }; the reported number would be "
                 "selected on documents it is scored on."
             )
-        scaled = {k: v * best_alpha for k, v in merged_delta.items()}
-        load_into_model(target_llm.model, apply_delta(target_base_sd, scaled), strict=False)
-        print(f"\nScoring held-out test slice at alpha={best_alpha:.3f}...")
-        harness_test_results = run_harness(
-            tasks=list(harness_tasks_resolved),
-            model=target_llm.model,
-            tokenizer=target_llm.tokenizer,
-            device=device,
-            num_fewshot=harness_num_fewshot,
-            batch_size=harness_batch_size,
-            limit=None,
-            samples=test_samples,
-            **(harness_render or {}),
-        )
+        def _score_test(alpha: float) -> dict[str, float]:
+            scaled = {k: v * alpha for k, v in merged_delta.items()}
+            load_into_model(target_llm.model, apply_delta(target_base_sd, scaled), strict=False)
+            return run_harness(
+                tasks=list(harness_tasks_resolved),
+                model=target_llm.model,
+                tokenizer=target_llm.tokenizer,
+                device=device,
+                num_fewshot=harness_num_fewshot,
+                batch_size=harness_batch_size,
+                limit=None,
+                samples=test_samples,
+                **(harness_render or {}),
+            )
+
+        if bool(cfg.get("harness_test_curve", False)):
+            grid = sorted({float(a) for a in (alphas or ())} | {float(best_alpha)})
+            harness_test_curve = {}
+            for a in grid:
+                print(f"\nScoring held-out test slice at alpha={a:.3f}...")
+                harness_test_curve[a] = _score_test(a)
+            harness_test_results = harness_test_curve[float(best_alpha)]
+        else:
+            print(f"\nScoring held-out test slice at alpha={best_alpha:.3f}...")
+            harness_test_results = _score_test(best_alpha)
         print("=== Harness results (held-out test slice) ===")
         for task_name, acc in harness_test_results.items():
             print(f"  {task_name}: {acc:.4f}")
 
-    return harness_test_results, (test_samples if test_samples_cfg is not None else None)
+    return (
+        harness_test_results,
+        (test_samples if test_samples_cfg is not None else None),
+        harness_test_curve,
+    )
 
 
 def nli_alpha_search(
@@ -342,7 +366,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
         for task_name, acc in best_harness_results.items():
             print(f"  {task_name}: {acc:.4f}")
 
-        harness_test_results, test_samples = score_harness_test_slice(
+        harness_test_results, test_samples, harness_test_curve = score_harness_test_slice(
             cfg=cfg,
             merged_delta=merged_delta,
             target_base_sd=target_base_sd,
@@ -354,6 +378,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             harness_samples=harness_samples,
             best_alpha=best_alpha,
             harness_render=harness_render,
+            alphas=list(harness_results_by_alpha),
         )
 
         if cfg.get("save_merged", None) is not None:
@@ -381,6 +406,8 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
                 best_harness_results=best_harness_results,
                 harness_test_results=harness_test_results,
                 test_samples=test_samples,
+                harness_test_results_by_alpha=harness_test_curve,
+                harness_split=(resolve_harness_split(cfg) or (None, None, None))[2],
                 baseline_harness_results=baseline_harness_results,
                 run_block_extension_prestep=run_block_extension_prestep,
                 harness_results_by_alpha=harness_results_by_alpha,

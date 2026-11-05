@@ -107,6 +107,10 @@ def _reject_removed_lmc_keys(cfg: Mapping[str, Any]) -> None:
         )
 
 
+#: Patience value meaning "never early-stop" (``alpha_patience: null``).
+ALPHA_PATIENCE_DISABLED = 10**9
+
+
 @dataclass(frozen=True)
 class AlphaSpec:
     search: bool
@@ -568,8 +572,11 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
     grad_num_batches = int(cfg["grad_num_batches"]) if cfg.get("grad_num_batches") is not None else None
 
     alpha_search = bool(cfg.get("alpha_search", False))
-    alpha_patience_raw = cfg.get("alpha_patience", 0)
-    alpha_patience = int(alpha_patience_raw) if alpha_patience_raw is not None else 0
+    # Key absent -> 0 (legacy default). Key present and null -> early stop disabled (full alpha curve).
+    if "alpha_patience" in cfg and cfg["alpha_patience"] is None:
+        alpha_patience = ALPHA_PATIENCE_DISABLED
+    else:
+        alpha_patience = int(cfg.get("alpha_patience", 0))
     if alpha_patience < 0:
         raise ValueError("alpha_patience must be >= 0")
 

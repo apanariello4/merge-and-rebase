@@ -10,7 +10,7 @@ Canonical layout (every block optional; unlisted keys pass through unchanged)::
     depth_alignment: {rule, enabled, defaults, brace: {..., correction_endpoint, data: {...}}}
     models:          {source: {model, pretrained}, target: {model, pretrained}, tuned_checkpoints}
     merge:           {mode, method, params, weights, base_construction, global_alpha_search}
-    alpha:           {value, search, min, max, step, selection, split, patience}
+    alpha:           {value, search, min, max, step, selection, split, patience, test_curve}
     save:            {merged, transported_task_vectors, transported_task_vectors_policy,
                       transported_artifacts, legacy_task_vector_layouts}
     load:            {transported_task_vectors}
@@ -58,6 +58,7 @@ LEGACY_KEYS: tuple[tuple[str, str], ...] = (
     ("alpha.selection", "alpha_selection"),
     ("alpha.split", "alpha_search_split"),
     ("alpha.patience", "alpha_patience"),
+    ("alpha.test_curve", "alpha_test_curve"),
     ("save.merged", "save_merged"),
     ("save.transported_task_vectors", "save_transported_tvs_dir"),
     ("save.transported_task_vectors_policy", "save_transported_tvs"),

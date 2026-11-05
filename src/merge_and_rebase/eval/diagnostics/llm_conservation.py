@@ -15,6 +15,17 @@ For a finished ``eval.llm_rebase`` run (its summary JSON: ``transported_tv.path`
   estimate of the full test accuracy (binomial standard error ~2.2 points at 50 %). The doc indices per subject are
   stored in ``llm_conservation_mmlu500.json`` next to this file and never recomputed at run time.
 
+- **Perplexity on generic text** (``wikitext103_ppl``): token-level perplexity, exp(total NLL / total predicted
+  tokens), on a FIXED slice of WikiText-103 raw: ``PPL_DOCS`` = 256 paragraphs of >= 600 characters of the TEST split
+  (seeded ``torch.randperm``, seed 0, in dataset order), each truncated to ``PPL_MAX_LENGTH`` = 512 tokens (the
+  tokenizer's own special tokens, BOS where it adds one; the first token of a document without BOS is not
+  predicted). Disjointness from the anchors frame: an ``anchors`` LLM run draws its generic text from the
+  VALIDATION split of the same dataset (``eval/llm_rebase/anchors_pool.POOL_DATASETS``); this slice comes from a
+  different split, and any paragraph whose text also occurs in the validation split is dropped (count recorded as
+  ``n_overlap_removed``), so no anchor text can be a perplexity document. Docs, max length, split, seed and the
+  sha256 of the texts are recorded under ``ppl_corpus`` in the output. Reported: base and rebased perplexity and
+  their ratio (rebased / base) and the difference of mean NLL per token (nats).
+
 Reported: both accuracies, the difference in points (rebased - base), and the binomial standard error of each
 accuracy (the difference is paired on the same questions, so its own error is smaller; per-question outcomes are not
 returned by the harness wrapper).
@@ -54,6 +65,12 @@ MMLU_SUBSET_SIZE = 500
 MMLU_SUBSET_SEED = 0
 ARC_TEST_SIZE = 1172  # allenai/ai2_arc ARC-Challenge test
 DEFAULTS = {"arc_fewshot": 0, "mmlu_fewshot": 5, "batch_size": 2}  # 8: CUDA OOM on 16 GB (5-shot MMLU, 151k Qwen vocab)
+PPL_DOCS = 256
+PPL_MAX_LENGTH = 512
+PPL_MIN_CHARS = 600
+PPL_SEED = 0
+PPL_SPLIT = "test"  # the anchors pool reads "validation" (anchors_pool.POOL_DATASETS): a different split
+PPL_DATASET = "wikitext103"
 
 
 # ---------------------------------------------------------------- the fixed MMLU subset
@@ -86,6 +103,63 @@ def load_mmlu_subset(path: Path = MMLU_SUBSET_PATH) -> dict[str, list[int]]:
     if samples != mmlu_subset(data["sizes"], n=int(data["n"]), seed=int(data["seed"])):
         raise ValueError(f"{path}: stored MMLU subset does not match its definition (sizes, n, seed)")
     return samples
+
+
+# ---------------------------------------------------------------- perplexity corpus
+
+
+def load_ppl_texts(*, n_docs: int = PPL_DOCS, seed: int = PPL_SEED, min_chars: int = PPL_MIN_CHARS) -> tuple[list[str], dict[str, Any]]:
+    """The fixed perplexity paragraphs and their record (see the module docstring): ``n_docs`` paragraphs of at least
+    ``min_chars`` characters of the WikiText-103 TEST split, chosen by a seeded permutation, minus any paragraph that
+    also occurs in the split the anchors pool draws from."""
+    import datasets
+
+    from ..llm_rebase.anchors_pool import POOL_DATASETS
+
+    path, name, pool_split, column = POOL_DATASETS[PPL_DATASET]
+    if PPL_SPLIT == pool_split:
+        raise ValueError(f"perplexity split {PPL_SPLIT!r} equals the anchors pool split; they must differ")
+    pool_texts = {t for t in datasets.load_dataset(path, name, split=pool_split)[column] if isinstance(t, str)}
+    ds = datasets.load_dataset(path, name, split=PPL_SPLIT)
+    paragraphs = [t for t in ds[column] if isinstance(t, str) and len(t) >= min_chars]
+    kept = [t for t in paragraphs if t not in pool_texts]
+    if len(kept) < n_docs:
+        raise ValueError(f"perplexity corpus: {len(kept)} paragraphs of >= {min_chars} chars, need {n_docs}")
+    order = torch.randperm(len(kept), generator=torch.Generator().manual_seed(int(seed)))
+    texts = [kept[i] for i in sorted(order[:n_docs].tolist())]
+    return texts, ppl_corpus_record(texts, n_overlap_removed=len(paragraphs) - len(kept), seed=seed, min_chars=min_chars)
+
+
+def ppl_corpus_record(texts, *, n_overlap_removed: int | None = None, seed: int = PPL_SEED, min_chars: int = PPL_MIN_CHARS) -> dict[str, Any]:
+    return {"dataset": PPL_DATASET, "split": PPL_SPLIT, "excluded_split": "validation (anchors pool)",
+            "min_chars": min_chars, "seed": seed, "n_docs": len(texts), "max_length": PPL_MAX_LENGTH,
+            "n_overlap_removed": n_overlap_removed,
+            "texts_sha256": hashlib.sha256(json.dumps(list(texts)).encode()).hexdigest()}
+
+
+@torch.no_grad()
+def perplexity(model, tokenizer, texts, *, max_length: int = PPL_MAX_LENGTH, batch_size: int = DEFAULTS["batch_size"],
+               device: str = "cpu") -> dict[str, float]:
+    """Token-level perplexity: ``exp(sum NLL / n_tokens)`` over every predicted token of every text (each text truncated to
+    ``max_length`` tokens, right-padded, pad positions masked). Returns ``ppl``, ``nll`` (mean per token, nats), ``tokens``."""
+    was_training = model.training
+    model.eval()
+    total, count = 0.0, 0
+    try:
+        for i in range(0, len(texts), int(batch_size)):
+            rows = tokenizer(list(texts[i:i + int(batch_size)]), truncation=True, max_length=int(max_length))["input_ids"]
+            width = max(len(r) for r in rows)  # manual right padding: independent of the tokenizer's pad token / side
+            ids = torch.tensor([r + [0] * (width - len(r)) for r in rows], device=device)
+            mask = torch.tensor([[1] * len(r) + [0] * (width - len(r)) for r in rows], device=device)
+            logits = model(input_ids=ids, attention_mask=mask).logits[:, :-1].float()
+            nll = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1),
+                                                    reduction="none").reshape(ids[:, 1:].shape)
+            valid = mask[:, 1:].bool()
+            total += float(nll.double()[valid].sum())
+            count += int(valid.sum())
+    finally:
+        model.train(was_training)
+    return {"nll": total / count, "ppl": math.exp(total / count), "tokens": count}
 
 
 # ---------------------------------------------------------------- model and update
@@ -134,20 +208,26 @@ class ScaledUpdate:
 
 
 def score(harness: Callable[..., dict[str, float]], model, tokenizer, *, subset: Mapping[str, list[int]],
-          settings: Mapping[str, Any], device: str) -> dict[str, Any]:
-    """ARC-Challenge (full test) and MMLU-500 in one harness call; ``mmlu500_acc`` pools the 500 questions."""
+          settings: Mapping[str, Any], device: str, ppl_texts=None) -> dict[str, Any]:
+    """ARC-Challenge (full test) and MMLU-500 in one harness call; ``mmlu500_acc`` pools the 500 questions. With
+    ``ppl_texts`` also the token-level perplexity on them (``wikitext103_ppl``, ``wikitext103_nll``)."""
     mmlu_tasks = sorted(subset)
     fewshot = {ARC_TASK: int(settings["arc_fewshot"]), **{t: int(settings["mmlu_fewshot"]) for t in mmlu_tasks}}
     raw = harness(tasks=[ARC_TASK, *mmlu_tasks], model=model, tokenizer=tokenizer, device=device,
                   num_fewshot=fewshot, batch_size=int(settings["batch_size"]), samples=dict(subset))
     n_mmlu = sum(len(v) for v in subset.values())
     per_subject = {t: float(raw[f"{t}_acc"]) for t in mmlu_tasks}
-    return {
+    out = {
         "arc_challenge_acc": float(raw[f"{ARC_TASK}_acc"]),
         "arc_challenge_acc_norm": float(raw[f"{ARC_TASK}_acc_norm"]),
         "mmlu500_acc": sum(per_subject[t] * len(subset[t]) for t in mmlu_tasks) / n_mmlu,
         "mmlu500_acc_by_subject": per_subject,
     }
+    if ppl_texts is not None:
+        p = perplexity(model, tokenizer, ppl_texts, max_length=int(settings.get("ppl_max_length", PPL_MAX_LENGTH)),
+                       batch_size=int(settings["batch_size"]), device=device)
+        out.update({"wikitext103_ppl": p["ppl"], "wikitext103_nll": p["nll"], "wikitext103_tokens": p["tokens"]})
+    return out
 
 
 HEADLINE = ("arc_challenge_acc_norm", "arc_challenge_acc", "mmlu500_acc")
@@ -161,15 +241,20 @@ def compare(base: Mapping[str, Any], rebased: Mapping[str, Any], n: Mapping[str,
     def se(p: float, k: int) -> float:
         return 100.0 * math.sqrt(max(p * (1.0 - p), 0.0) / k) if k else float("nan")
 
-    return {
+    out = {
         "delta_points": {m: 100.0 * (float(rebased[m]) - float(base[m])) for m in HEADLINE},
         "se_points_base": {m: se(float(base[m]), count[m]) for m in HEADLINE},
         "se_points_rebased": {m: se(float(rebased[m]), count[m]) for m in HEADLINE},
     }
+    if "wikitext103_ppl" in base and "wikitext103_ppl" in rebased:
+        out["ppl"] = {"base": float(base["wikitext103_ppl"]), "rebased": float(rebased["wikitext103_ppl"]),
+                      "ratio_rebased_over_base": float(rebased["wikitext103_ppl"]) / float(base["wikitext103_ppl"]),
+                      "delta_nll_nats": float(rebased["wikitext103_nll"]) - float(base["wikitext103_nll"])}
+    return out
 
 
 def base_cache_key(target: str, dtype: str, settings: Mapping[str, Any], subset: Mapping[str, list[int]],
-                   bias_keys: list[str]) -> dict[str, Any]:
+                   bias_keys: list[str], ppl_texts=None) -> dict[str, Any]:
     try:
         import lm_eval
 
@@ -178,8 +263,12 @@ def base_cache_key(target: str, dtype: str, settings: Mapping[str, Any], subset:
         version = None
     subset_sha = hashlib.sha256(json.dumps(subset, sort_keys=True).encode()).hexdigest()
     biases_sha = hashlib.sha256(json.dumps(sorted(bias_keys)).encode()).hexdigest()
-    return {"target": target, "dtype": dtype, **{k: settings[k] for k in sorted(DEFAULTS)}, "mmlu_subset": subset_sha,
-            "tau_bias_keys": biases_sha, "lm_eval": version}
+    key = {"target": target, "dtype": dtype, **{k: settings[k] for k in sorted(DEFAULTS)}, "mmlu_subset": subset_sha,
+           "tau_bias_keys": biases_sha, "lm_eval": version}
+    if ppl_texts is not None:  # absent without perplexity: the keys (and caches) of runs without it are unchanged
+        key["ppl"] = {"texts_sha256": hashlib.sha256(json.dumps(list(ppl_texts)).encode()).hexdigest(),
+                      "max_length": int(settings.get("ppl_max_length", PPL_MAX_LENGTH))}
+    return key
 
 
 def evaluate_conservation(
@@ -195,17 +284,26 @@ def evaluate_conservation(
     cache_dir: Path,
     subset: Mapping[str, list[int]] | None = None,
     harness: Callable[..., dict[str, float]] | None = None,
+    ppl_texts: Any = "default",
+    ppl_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Score the target base (cached) and ``target + alpha * tau`` and compare them (see the module docstring)."""
+    """Score the target base (cached) and ``target + alpha * tau`` and compare them (see the module docstring).
+
+    ``ppl_texts``: "default" loads the fixed WikiText-103 test slice (``load_ppl_texts``); a list of texts replaces
+    it (tests); None skips perplexity."""
     if harness is None:
         from ..llm_rebase.harness import run as harness
     settings = {**DEFAULTS, **dict(settings or {})}
+    if isinstance(ppl_texts, str) and ppl_texts == "default":
+        ppl_texts, ppl_record = load_ppl_texts()
+    elif ppl_texts is not None and ppl_record is None:
+        ppl_record = ppl_corpus_record(ppl_texts, n_overlap_removed=None)
     subset = load_mmlu_subset() if subset is None else {t: list(v) for t, v in subset.items()}
     biases = attach_zero_biases(model, tau)
     update = ScaledUpdate(model, tau)
     # keyed on every bias key of tau (whether added now or by an earlier call on this model object): the zero-bias
     # layout of the base model, identical for every vector of one method family on one target
-    key = base_cache_key(target, dtype, settings, subset, sorted(k for k in tau if k.endswith(".bias")))
+    key = base_cache_key(target, dtype, settings, subset, sorted(k for k in tau if k.endswith(".bias")), ppl_texts)
     digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:12]
     cache_dir = Path(cache_dir)
     cache_path = cache_dir / f"llm_conservation_base_{digest}.json"
@@ -215,7 +313,7 @@ def evaluate_conservation(
         base_cached = True
     else:
         update.load(0.0)
-        base = score(harness, model, tokenizer, subset=subset, settings=settings, device=device)
+        base = score(harness, model, tokenizer, subset=subset, settings=settings, device=device, ppl_texts=ppl_texts)
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps({"key": key, "scores": base}, indent=1) + "\n")
         base_cached = False
@@ -223,7 +321,7 @@ def evaluate_conservation(
     started = time.perf_counter()
     update.load(alpha)
     try:
-        rebased = score(harness, model, tokenizer, subset=subset, settings=settings, device=device)
+        rebased = score(harness, model, tokenizer, subset=subset, settings=settings, device=device, ppl_texts=ppl_texts)
     finally:
         update.load(0.0)
     n = {"arc_challenge": ARC_TEST_SIZE, "mmlu500": sum(len(v) for v in subset.values())}
@@ -232,7 +330,9 @@ def evaluate_conservation(
         "dtype": dtype,
         "alpha": float(alpha),
         "settings": {**settings, "arc_split": "test", "mmlu_subset": str(MMLU_SUBSET_PATH.name),
-                     "mmlu_subset_seed": MMLU_SUBSET_SEED},
+                     "mmlu_subset_seed": MMLU_SUBSET_SEED,
+                     **({"ppl_max_length": int(settings.get("ppl_max_length", PPL_MAX_LENGTH))} if ppl_texts is not None else {})},
+        "ppl_corpus": dict(ppl_record) if ppl_texts is not None else None,
         "n_questions": n,
         "zero_biases_added": len(biases),
         "base": base,
@@ -289,6 +389,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
     ap.add_argument("--arc-fewshot", type=int, default=DEFAULTS["arc_fewshot"])
     ap.add_argument("--mmlu-fewshot", type=int, default=DEFAULTS["mmlu_fewshot"])
+    ap.add_argument("--no-ppl", action="store_true", help="skip the WikiText-103 perplexity")
     args = ap.parse_args(argv)
 
     inputs: dict[str, Any] = run_inputs(Path(args.summary)) if args.summary else {"dtype": "bfloat16"}
@@ -310,7 +411,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     model, tok = load_target(inputs["target"], inputs["dtype"], args.device)
     settings = {"arc_fewshot": args.arc_fewshot, "mmlu_fewshot": args.mmlu_fewshot, "batch_size": args.batch_size}
     result = evaluate_conservation(model, tok, tau, inputs["alpha"], target=inputs["target"], dtype=inputs["dtype"],
-                                   device=args.device, settings=settings, cache_dir=cache_dir)
+                                   device=args.device, settings=settings, cache_dir=cache_dir,
+                                   ppl_texts=None if args.no_ppl else "default")
     result = {"summary": None if not args.summary else str(Path(args.summary).resolve()), "tv": str(inputs["tv"]),
               "tv_sha256": inputs.get("tv_sha256"), **result}
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,7 +420,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     d = result["delta_points"]
     print(f"[llm_conservation] alpha {result['alpha']:g} | ARC-C acc_norm {100 * result['rebased']['arc_challenge_acc_norm']:.2f} "
           f"({d['arc_challenge_acc_norm']:+.2f}) | MMLU-500 {100 * result['rebased']['mmlu500_acc']:.2f} "
-          f"({d['mmlu500_acc']:+.2f}) -> {out_path}", flush=True)
+          f"({d['mmlu500_acc']:+.2f})"
+          + (f" | wikitext103 ppl {result['ppl']['rebased']:.3f} (x{result['ppl']['ratio_rebased_over_base']:.4f})"
+             if "ppl" in result else "") + f" -> {out_path}", flush=True)
     return result
 
 

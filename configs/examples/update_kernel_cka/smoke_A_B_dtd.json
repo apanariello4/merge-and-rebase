@@ -1,0 +1,57 @@
+{
+ "source": {
+  "model": "ViT-B-16",
+  "pretrained": "datacomp_xl_s13b_b90k",
+  "experts": {
+   "EuroSAT": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
+   "GTSRB": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+   "DTD": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt"
+  }
+ },
+ "target": {
+  "model": "ViT-L-14",
+  "pretrained": "datacomp_xl_s13b_b90k",
+  "experts": {
+   "EuroSAT": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/eurosat/best.pt",
+   "GTSRB": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+   "DTD": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/dtd/best.pt"
+  }
+ },
+ "suite": "vision8",
+ "task": "DTD",
+ "other_task": "EuroSAT",
+ "state_dir": "/data/merge_and_rebase_results/anchors_state_main/tiny_imagenet_A16_T2048",
+ "anchor_filter": "norm",
+ "anchor_filter_k": 3.0,
+ "num_images": 64,
+ "val_size": 1000,
+ "seed": 89,
+ "batch_size": 16,
+ "device": "cuda",
+ "compute_dtype": "float32",
+ "out_dir": "/data/merge_and_rebase_results/update_kernel_cka/smoke_A_B_dtd",
+ "controls": [
+  "null",
+  "other_task",
+  "other_task_other_images",
+  "random_update",
+  "base_reference"
+ ],
+ "permutations": 20,
+ "image_permutations": 4,
+ "control_seed": 0,
+ "random_draws": 19,
+ "random_antithetic": false,
+ "grid_match": "auto",
+ "grid_reference": "canonical",
+ "split": "test",
+ "jackknife_chunks": 4,
+ "ci": true,
+ "m1_center_rows": true,
+ "m2": false,
+ "blocks": [
+  0,
+  11,
+  23
+ ]
+}

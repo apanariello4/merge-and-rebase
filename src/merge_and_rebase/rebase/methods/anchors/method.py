@@ -37,7 +37,9 @@ from .._ariadne.fit import fit_direct_residual
 from .._ariadne.streaming import fit_direct_residual_sequential_streaming, prepare_direct_residual_streaming
 from .config import TEXT_ANCHOR_POOLS, AnchorsConfig, preserve_supported, validate_text_config
 from .core import (
+    CANONICAL_DECODES,
     CoverageAccumulator,
+    canonical_transport_map,
     decode_rows,
     dedup_mask,
     encode_rows,
@@ -87,6 +89,37 @@ def filtered_frame(reg: RegisteredModel, block: int, keep: Tensor, k: float) -> 
     s_rows = reg.p[block].to(torch.float64) * float(reg.c[block]) + reg.mu[block].to(torch.float64)
     c_f = float(flt["c"][block])
     return (s_rows[keep] - flt["mu"][block].to(torch.float64)) / c_f, c_f
+
+
+def filtered_pair_inputs(
+    source: RegisteredModel, source_block: int, target: RegisteredModel, target_block: int, k: float
+) -> tuple[Tensor, float, Tensor, float, Tensor]:
+    """``(mu_m, c_m, mu_k, c_k, keep)`` of the norm filter, i.e. exactly the centring / scale / row mask under which
+    ``filtered_frame`` builds ``P' = (S - mu) / c`` (``keep``: ``[T]`` bool, anchors flagged in neither model).
+    ``PairSigmaAccumulator(mu_m, c_m, mu_k, c_k)`` fed the raw rows ``S[keep]`` (or ``update(..., mask=keep[rows])``)
+    then holds ``Sigma = P'^T P'`` of the frame the decoder uses (before the optional R2 dedup / R3 row norm)."""
+    flt_m, flt_k = source.extras[f"norm_k{k:g}"], target.extras[f"norm_k{k:g}"]
+    return (
+        flt_m["mu"][source_block].to(torch.float64),
+        float(flt_m["c"][source_block]),
+        flt_k["mu"][target_block].to(torch.float64),
+        float(flt_k["c"][target_block]),
+        anchor_keep([(source, source_block), (target, target_block)], k),
+    )
+
+
+def decoder_scales(
+    source: RegisteredModel, source_block: int, target: RegisteredModel, target_block: int, config: AnchorsConfig
+) -> tuple[float, float]:
+    """``(c_m, c_k)`` the decoder of ``pair_frames`` uses: the registration ``c``, or the high-norm-filtered ``c``
+    (``AnchorState.norm_filter``) under ``anchor_filter``."""
+    if config.anchor_filter is None:
+        return float(source.c[source_block]), float(target.c[target_block])
+    k = float(config.anchor_filter_k)
+    return (
+        float(source.extras[f"norm_k{k:g}"]["c"][source_block]),
+        float(target.extras[f"norm_k{k:g}"]["c"][target_block]),
+    )
 
 
 def anchor_keep(regs_blocks: list[tuple[RegisteredModel, int]], k: float) -> Tensor:
@@ -155,6 +188,12 @@ def transport_map(
     if config.spectral_filter != "tikhonov":
         phi, info = spectral_transport_map(
             p_m, c_m, p_k, scale=scale, mode=config.spectral_filter, rank=config.spectral_rank
+        )
+        return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
+    if config.kernel_decode in CANONICAL_DECODES:
+        phi, info = canonical_transport_map(
+            p_m, c_m, p_k, scale=scale, mode=config.kernel_decode, rank=config.canonical_rank,
+            null_threshold=0.0 if config.canonical_null_threshold is None else config.canonical_null_threshold,
         )
         return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
     if config.kernel_decode != "tikhonov":
@@ -620,6 +659,7 @@ def decode_desired_effects(
             "anchors_source_block": i,
             "anchors_c_source": source.c[i],
             "anchors_c_target": target.c[j],
+            **dict(zip(("anchors_c_source_used", "anchors_c_target_used"), decoder_scales(source, i, target, j, config), strict=True)),
             "anchors_eps": eps,
             **{f"anchors_{k}": v for k, v in spectral.items()},
             "anchors_e_norm": e_sq**0.5,
@@ -698,6 +738,10 @@ class SequentialDecoder:
                 "anchors_source_block": i,
                 "anchors_c_source": self.source.c[i],
                 "anchors_c_target": self.target.c[pos],
+                **dict(zip(
+                    ("anchors_c_source_used", "anchors_c_target_used"),
+                    decoder_scales(self.source, i, self.target, pos, self.config), strict=True,
+                )),
                 "anchors_eps": eps,
                 **{f"anchors_{k}": v for k, v in spectral.items()},
                 "anchors_e_norm": e_sq**0.5,

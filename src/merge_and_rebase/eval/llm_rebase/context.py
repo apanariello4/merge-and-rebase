@@ -46,6 +46,7 @@ from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.methods.anchors import resolve_anchors_decoder_config
 from ...rebase.model_families import infer_family
 from .common import resolve_eval_mode, resolve_suite_name, resolve_tasks
+from .harness_split import check_calibration_disjoint, resolve_harness_split
 from .pipeline import LlmRuntime
 from .run_config import bind_llm_plan, resolve_llm_run_config
 from .stages import LlmTaskContext
@@ -648,7 +649,9 @@ def build_runtime(
     _calibration = _calibration_cache.get
     _calibration_provenance = _calibration_cache.provenance
 
-    configured_harness_samples_raw = cfg.get("harness_samples", None)
+    # `harness_split: <name>` (eval/llm_rebase/harness_split.py): fixed selection/test slices of one task.
+    harness_split = resolve_harness_split(cfg)
+    configured_harness_samples_raw = harness_split[0] if harness_split is not None else cfg.get("harness_samples", None)
     configured_harness_samples: dict[str, list[int]] | None = None
     if configured_harness_samples_raw is not None:
         if not isinstance(configured_harness_samples_raw, dict):
@@ -667,7 +670,11 @@ def build_runtime(
     # The eval slice must be known before the first before-rebase eval, so
     # resolve up front whenever this run will calibrate at all.
     calibration_eval_samples = _calibration().eval_samples or None if needs_calibration else None
-    if (
+    if harness_split is not None and calibration_eval_samples is not None:
+        # the split slices need not equal the calibration hold-out, but must lie inside it (no calibration doc scored)
+        check_calibration_disjoint({t: harness_split[0][t] + harness_split[1][t] for t in harness_split[0]},
+                                   calibration_eval_samples)
+    elif (
         configured_harness_samples is not None
         and calibration_eval_samples is not None
         and configured_harness_samples != calibration_eval_samples

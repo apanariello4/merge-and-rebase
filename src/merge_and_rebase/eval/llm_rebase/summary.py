@@ -26,6 +26,8 @@ def assemble_harness_summary(
     harness_search_results: Any,
     saved_merged_path: Any,
     transported_tv: Any = None,
+    harness_test_results_by_alpha: dict[float, Any] | None = None,
+    harness_split: Any = None,
 ) -> dict[str, Any]:
     summary = {
         "ignored_block_extension_fields": ignored_block_extension_fields,
@@ -51,6 +53,12 @@ def assemble_harness_summary(
     }
     if transported_tv is not None:  # additive: key absent unless save_transported_tvs_dir was given
         summary["transported_tv"] = transported_tv
+    if harness_test_results_by_alpha is not None:  # additive: only with `harness_test_curve: true`
+        summary["harness_results_test_by_alpha"] = {
+            f"{a:g}": r for a, r in sorted(harness_test_results_by_alpha.items())
+        }
+    if harness_split is not None:  # additive: only with `harness_split: <name>`
+        summary["harness_split"] = harness_split
     return summary
 
 

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from merge_and_rebase.cli_args import build_logging_overrides
 from merge_and_rebase.run_logging import merge_logging_config, render_config_args, start_run, summary_events_path
 
@@ -203,3 +205,27 @@ def test_start_run_prints_compact_resolved_config(tmp_path: Path, capsys):
     assert "tasks=a,b" in captured.out
     assert "config=demo.json" in captured.out
     assert "resolved_config." not in captured.out
+
+
+def test_code_fingerprint_does_not_depend_on_the_cwd(tmp_path: Path, monkeypatch):
+    """A run launched from outside the repository (e.g. a /data results dir) must still record the commit."""
+    import subprocess
+
+    from merge_and_rebase import run_logging
+
+    repo = Path(run_logging.__file__).resolve().parent
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    if not head:
+        pytest.skip("package not inside a git checkout")
+    outside = tmp_path / "not_a_repo"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    run_logging._code_fingerprint.cache_clear()
+    try:
+        fingerprint = run_logging._code_fingerprint()
+    finally:
+        run_logging._code_fingerprint.cache_clear()
+    assert fingerprint["git_commit"] == head
+    assert isinstance(fingerprint["git_dirty"], bool)

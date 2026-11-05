@@ -17,11 +17,14 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 from .._ariadne.config import DirectResidualConfig
+from .core import KERNEL_DECODES
 
 ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix", "wikitext103")
 #: Generic text pools of a decoder (LLM) frame, whose anchor rows are tokens (AGENT_NEXT_PHASE.md L1).
 TEXT_ANCHOR_POOLS = ("wikitext103",)
 ANCHOR_UNITS = ("token", "image_mean", "cls", "pool2", "pool4")
+K_SAMPLINGS = ("k_per_image", "k_per_document")
+ANCHOR_SAMPLINGS = ("random", "whole_images", "one_per_image", *K_SAMPLINGS)
 
 FRAME_FIELDS = (
     "anchor_pool",
@@ -33,6 +36,7 @@ FRAME_FIELDS = (
     "canonical_tokens",
     "anchor_positions",
     "anchor_sampling",
+    "anchor_tokens_per_image",
     "anchor_unit",
     "text_units",
 )
@@ -61,7 +65,12 @@ class AnchorsConfig:
     # How the T anchor rows are drawn from the anchor images x positions. 'random': T rows uniformly at random
     # (a few tokens from each of many images). 'whole_images': every position of T / n_positions images (seeded
     # image choice; T must be a multiple of n_positions). 'one_per_image': one random position from each of T images.
+    # 'k_per_image' (vision) / 'k_per_document' (decoder): exactly anchor_tokens_per_image = k rows from each of T / k
+    # seeded images (documents), the k rows drawn at random within the image (document); T must be a multiple of k, and
+    # a document needs >= k candidate rows. The rows then carry the image / document id used by the half splits of
+    # canonical_stats (a split is by id, never by row).
     anchor_sampling: str = "random"
+    anchor_tokens_per_image: int | None = None
     # What one anchor row is (AGENT_KERNEL.md R1). 'token': one canonical token (image, position). Centroid anchors,
     # the same members in every model: 'image_mean' (mean of the image's patch tokens), 'cls' (the CLS token),
     # 'pool2' (mean over 2 x 2 patch regions: a 7 x 7 grid on 14 x 14), 'pool4' (adaptive average pooling of the
@@ -117,6 +126,15 @@ class AnchorsConfig:
     # 1/agreement_tau <= gamma_i <= agreement_tau (core.whitened_transport_map).
     kernel_decode: str = "tikhonov"
     agreement_tau: float | None = None
+    # 'canonical_hard' / 'canonical_soft' (core.canonical_transport_map): Phi = (scale / c_m) V_m F V_k^T with
+    # M = U_m^T U_k = Y Gamma Z^T (P = U S V^T); hard F = Y_r Z_r^T (canonical_rank = r, None = all pairs), soft
+    # F = Y g(Gamma) Z^T with g(G) = G for G >= canonical_null_threshold and 0 below. Refused when T <= r_m + r_k
+    # (>= r_m + r_k - T canonical correlations are 1 from noise alone); the ranks are only known at the block pair
+    # (core.check_canonical_widths). The config path of canonical_soft is IN-SAMPLE (g from Gamma of the fitting rows;
+    # info 'canonical_soft_weights' = 'in_sample', UserWarning): it is NOT plan decoder D3 (held-out Gamma_out, passed
+    # as core.canonical_core(weights=...), 'explicit'), which is not wired into the config.
+    canonical_rank: int | None = None
+    canonical_null_threshold: float | None = None
     # Anchor post-processing (AGENT_KERNEL.md K1b), applied to the stored frames at use time (no new registration).
     # anchor_row_norm (R3): the centred anchor rows of every model scaled to unit norm before P, K and any rotation;
     # E is not normalised and the decode scale stays c_k / c_m. anchor_dedup_cos (R2): keep only anchors whose pairwise
@@ -236,6 +254,8 @@ class AnchorsConfig:
         out = {name: getattr(self, name) for name in FRAME_FIELDS}
         if out["anchor_sampling"] == "random":
             del out["anchor_sampling"]  # the default leaves the frame of existing states unchanged
+        if out["anchor_tokens_per_image"] is None:
+            del out["anchor_tokens_per_image"]  # None leaves the frame of existing states unchanged
         if out["anchor_unit"] == "token":
             del out["anchor_unit"]
         if out["text_units"] == "token":
@@ -332,8 +352,14 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError(f"anchor_unit must be one of {ANCHOR_UNITS}")
     if cfg.anchor_unit != "token" and (cfg.anchor_sampling != "random" or cfg.anchor_filter is not None):
         raise ValueError("centroid anchor_unit needs anchor_sampling='random' and no anchor_filter (token semantics)")
-    if cfg.anchor_sampling not in {"random", "whole_images", "one_per_image"}:
-        raise ValueError("anchor_sampling must be 'random', 'whole_images' or 'one_per_image'")
+    if cfg.anchor_sampling not in ANCHOR_SAMPLINGS:
+        raise ValueError(f"anchor_sampling must be one of {ANCHOR_SAMPLINGS}")
+    if (cfg.anchor_sampling in K_SAMPLINGS) != (cfg.anchor_tokens_per_image is not None):
+        raise ValueError("anchor_tokens_per_image is required by, and only allowed with, anchor_sampling 'k_per_image' / 'k_per_document'")
+    if cfg.anchor_tokens_per_image is not None:
+        k = cfg.anchor_tokens_per_image
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1 or cfg.num_anchors % k:
+            raise ValueError("anchor_tokens_per_image must be a positive integer dividing num_anchors")
     if not cfg.eps_rel >= 0.0:
         raise ValueError("eps_rel must be >= 0")
     if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
@@ -351,10 +377,20 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
             raise ValueError("spectral_rank applies to the truncating spectral filters only")
         if isinstance(cfg.spectral_rank, bool) or not isinstance(cfg.spectral_rank, int) or cfg.spectral_rank < 1:
             raise ValueError("spectral_rank must be None or a positive integer")
-    if cfg.kernel_decode not in {"tikhonov", "zca", "agreement"}:
-        raise ValueError("kernel_decode must be 'tikhonov', 'zca' or 'agreement'")
+    if cfg.kernel_decode not in KERNEL_DECODES:
+        raise ValueError(f"kernel_decode must be one of {KERNEL_DECODES}")
     if cfg.kernel_decode != "tikhonov" and (cfg.frame_map != "pairwise" or cfg.spectral_filter != "tikhonov"):
-        raise ValueError("kernel_decode 'zca'/'agreement' needs frame_map='pairwise' and spectral_filter='tikhonov'")
+        raise ValueError("kernel_decode 'zca'/'agreement'/canonical needs frame_map='pairwise' and spectral_filter='tikhonov'")
+    if cfg.canonical_rank is not None and (
+        cfg.kernel_decode != "canonical_hard"
+        or isinstance(cfg.canonical_rank, bool) or not isinstance(cfg.canonical_rank, int) or cfg.canonical_rank < 1
+    ):
+        raise ValueError("canonical_rank must be a positive integer and is allowed with kernel_decode='canonical_hard' only")
+    if cfg.canonical_null_threshold is not None and (
+        cfg.kernel_decode != "canonical_soft" or isinstance(cfg.canonical_null_threshold, bool)
+        or not 0.0 <= float(cfg.canonical_null_threshold) <= 1.0
+    ):
+        raise ValueError("canonical_null_threshold must lie in [0, 1] and is allowed with kernel_decode='canonical_soft' only")
     if (cfg.kernel_decode == "agreement") != (cfg.agreement_tau is not None):
         raise ValueError("agreement_tau is required by, and only allowed with, kernel_decode='agreement'")
     if cfg.agreement_tau is not None and not float(cfg.agreement_tau) >= 1.0:
@@ -493,7 +529,6 @@ DECODER_DEFAULTS: dict[str, Any] = {"anchor_pool": "wikitext103", "missing_bias"
 _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("anchor_unit", "token"),
     ("anchor_positions", "all"),
-    ("anchor_sampling", "random"),
     ("library", "data"),
     ("update_rank", None),
     ("map_rows_per_image", None),
@@ -508,6 +543,11 @@ def validate_text_config(cfg: AnchorsConfig) -> None:
     text_units; with depth_fit 'sequential' the default resolves to 'ridge'. depth_fit 'sequential' (Ariadne's
     sequential streaming fit, the anchor decode as desired_fn) needs token rows: source and target must read the same
     token sequence."""
+    if cfg.anchor_sampling not in {"random", "k_per_document"}:
+        raise ValueError(
+            f"anchors on decoder models does not support anchor_sampling={cfg.anchor_sampling!r} "
+            "(must be 'random' or 'k_per_document')"
+        )
     for name, required in _TEXT_REQUIRED:
         got = getattr(cfg, name)
         if got != required:

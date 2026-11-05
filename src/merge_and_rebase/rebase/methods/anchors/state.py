@@ -237,6 +237,23 @@ class AnchorState:
         if cfg.num_anchors > len(candidates):
             raise ValueError(f"num_anchors={cfg.num_anchors} exceeds the {len(candidates)} {what}")
         gen = torch.Generator().manual_seed(int(cfg.anchor_seed))
+        if cfg.anchor_sampling == "k_per_document":  # k rows from each of T / k documents (candidate[0] = document id)
+            k = int(cfg.anchor_tokens_per_image)
+            by_doc: dict[int, list[list[int]]] = {}
+            for cand in candidates:
+                by_doc.setdefault(int(cand[0]), []).append(cand)
+            docs = sorted(d for d, rows in by_doc.items() if len(rows) >= k)
+            need = cfg.num_anchors // k
+            if need > len(docs):
+                raise ValueError(
+                    f"anchor_sampling='k_per_document' needs {need} documents with >= {k} candidate rows, got {len(docs)}"
+                )
+            picked = sorted(docs[int(i)] for i in torch.randperm(len(docs), generator=gen)[:need])
+            out: list[list[int]] = []
+            for d in picked:
+                rows = by_doc[d]
+                out += [rows[int(i)] for i in sorted(torch.randperm(len(rows), generator=gen)[:k].tolist())]
+            return out
         chosen = sorted(int(i) for i in torch.randperm(len(candidates), generator=gen)[: cfg.num_anchors])
         return [candidates[i] for i in chosen]
 
@@ -249,6 +266,8 @@ class AnchorState:
         elif cfg.anchor_positions == "patch":
             positions = positions[1:]
         n_candidates = n_images * len(positions)
+        if cfg.anchor_sampling == "k_per_document":
+            raise ValueError("anchor_sampling='k_per_document' applies to decoder (text) pools; use 'k_per_image'")
         if cfg.num_anchors > n_candidates:
             raise ValueError(
                 f"num_anchors={cfg.num_anchors} exceeds the {n_candidates} candidate rows "
@@ -263,6 +282,18 @@ class AnchorState:
                 )
             images = sorted(int(i) for i in torch.randperm(n_images, generator=gen)[: cfg.num_anchors // len(positions)])
             rows = [[img, pos] for img in images for pos in positions]
+        elif cfg.anchor_sampling == "k_per_image":
+            k = int(cfg.anchor_tokens_per_image)
+            if k > len(positions) or cfg.num_anchors // k > n_images:
+                raise ValueError(
+                    f"anchor_sampling='k_per_image' needs k={k} <= {len(positions)} positions and "
+                    f"num_anchors / k = {cfg.num_anchors // k} <= {n_images} anchor images"
+                )
+            images = sorted(int(i) for i in torch.randperm(n_images, generator=gen)[: cfg.num_anchors // k])
+            rows = []
+            for img in images:
+                picks = sorted(int(i) for i in torch.randperm(len(positions), generator=gen)[:k])
+                rows += [[img, positions[i]] for i in picks]
         elif cfg.anchor_sampling == "one_per_image":
             if cfg.num_anchors > n_images:
                 raise ValueError(

@@ -22,10 +22,15 @@ def _code_fingerprint() -> dict[str, Any]:
     should be the first thing checked when two "identical" runs disagree,
     not something reconstructed after the fact from file mtimes and job
     logs. Cached per process since the repo state doesn't change mid-run.
+
+    The lookup runs in the directory of this package's source (``git -C``), not in the cwd: a run launched
+    from outside the repository (e.g. from a /data results directory) still records the commit of the code
+    it executes. If the package is not inside a git checkout (a non-editable install) both fields are None.
     """
+    repo = str(Path(__file__).resolve().parent)
     try:
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", repo, "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -33,7 +38,7 @@ def _code_fingerprint() -> dict[str, Any]:
         ).stdout.strip()
         dirty = bool(
             subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "-C", repo, "status", "--porcelain"],
                 capture_output=True,
                 text=True,
                 timeout=5,

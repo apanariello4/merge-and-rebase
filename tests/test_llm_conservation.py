@@ -4,6 +4,7 @@ base cache, summary parsing and the CLI, with a toy decoder and a deterministic 
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 import torch
@@ -77,7 +78,7 @@ def test_zero_update_gives_exactly_zero_difference_and_the_base_is_cached(tmp_pa
     original = {k: v.clone() for k, v in model.state_dict().items()}
     calls = []
     kw = dict(target="toy/llama", dtype="float32", device="cpu", cache_dir=tmp_path, subset=SUBSET,
-              harness=_fake_harness(calls))
+              harness=_fake_harness(calls), ppl_texts=None)
     zero = lc.evaluate_conservation(model, tok, _tau(model, 0.0), 0.7, **kw)
     assert zero["zero_biases_added"] == 2 and not zero["base_cached"]
     assert all(v == 0.0 for v in zero["delta_points"].values())
@@ -138,6 +139,7 @@ def test_main_reads_the_run_summary_and_writes_next_to_it(tmp_path, monkeypatch)
     calls = []
     monkeypatch.setattr(harness_mod, "run", _fake_harness(calls))
     monkeypatch.setattr(lc, "load_mmlu_subset", lambda: dict(SUBSET))
+    monkeypatch.setattr(lc, "load_ppl_texts", lambda: (list(CALIB_TEXTS[:3]), lc.ppl_corpus_record(CALIB_TEXTS[:3], n_overlap_removed=0)))
     result = lc.main([str(summary), "--device", "cpu"])
     out = tmp_path / "run_conservation.json"
     assert out.exists() and json.loads(out.read_text())["alpha"] == 0.3
@@ -151,3 +153,51 @@ def test_main_reads_the_run_summary_and_writes_next_to_it(tmp_path, monkeypatch)
         bad = tmp_path / "bad.json"
         bad.write_text(json.dumps({"best_alpha": 1.0}))
         lc.run_inputs(bad)
+
+
+def test_perplexity_matches_a_manual_token_level_computation_and_ignores_padding():
+    model = tiny_llama(layers=2, seed=0).eval()
+    tok = local_tokenizer(CALIB_TEXTS)
+    texts = list(CALIB_TEXTS[:4])
+    got = lc.perplexity(model, tok, texts, max_length=16, batch_size=2, device="cpu")
+    total, n = 0.0, 0
+    for t in texts:  # one text at a time, no padding at all
+        ids = torch.tensor([tok(t, truncation=True, max_length=16)["input_ids"]])
+        with torch.no_grad():
+            lp = torch.log_softmax(model(input_ids=ids).logits[0, :-1].float(), -1)
+        total += float(-lp.gather(1, ids[0, 1:, None]).sum())
+        n += ids.shape[1] - 1
+    assert got["tokens"] == n and got["nll"] == pytest.approx(total / n, rel=1e-5)
+    assert got["ppl"] == pytest.approx(math.exp(total / n), rel=1e-5)
+    # batch size does not change the token-level number (padding is masked); a shorter max_length does
+    assert lc.perplexity(model, tok, texts, max_length=16, batch_size=4, device="cpu")["nll"] == pytest.approx(got["nll"], rel=1e-5)
+    assert lc.perplexity(model, tok, texts, max_length=5, batch_size=2, device="cpu")["tokens"] < got["tokens"]
+
+
+def test_conservation_reports_perplexity_with_its_corpus_record(tmp_path):
+    model = tiny_llama(layers=2, seed=0).eval()
+    tok = local_tokenizer(CALIB_TEXTS)
+    texts = list(CALIB_TEXTS[:4])
+    kw = dict(target="toy/llama", dtype="float32", device="cpu", cache_dir=tmp_path, subset=SUBSET,
+              harness=_fake_harness([]), ppl_texts=texts)
+    zero = lc.evaluate_conservation(model, tok, _tau(model, 0.0), 0.7, **kw)
+    assert zero["base"]["wikitext103_ppl"] == zero["rebased"]["wikitext103_ppl"]
+    assert zero["ppl"]["ratio_rebased_over_base"] == 1.0 and zero["ppl"]["delta_nll_nats"] == 0.0
+    rec = zero["ppl_corpus"]
+    assert rec["split"] == "test" == lc.PPL_SPLIT and rec["n_docs"] == 4 and rec["max_length"] == lc.PPL_MAX_LENGTH
+    assert (lc.PPL_DOCS, lc.PPL_MAX_LENGTH) == (256, 512) and zero["settings"]["ppl_max_length"] == 512
+    moved = lc.evaluate_conservation(model, tok, _tau(model, 0.05), 0.7, **kw)
+    assert moved["base_cached"] and moved["ppl"]["base"] == zero["ppl"]["base"]
+    assert moved["ppl"]["ratio_rebased_over_base"] != 1.0
+    # a different corpus is a different base cache entry; without perplexity the report has no ppl keys
+    other = lc.evaluate_conservation(model, tok, _tau(model, 0.05), 0.7, **{**kw, "ppl_texts": texts[:2]})
+    assert not other["base_cached"]
+    none = lc.evaluate_conservation(model, tok, _tau(model, 0.05), 0.7, **{**kw, "ppl_texts": None})
+    assert "ppl" not in none and none["ppl_corpus"] is None and "wikitext103_ppl" not in none["base"]
+
+
+def test_ppl_split_differs_from_the_anchors_pool_split():
+    from merge_and_rebase.eval.llm_rebase.anchors_pool import POOL_DATASETS
+
+    path, name, pool_split, _ = POOL_DATASETS[lc.PPL_DATASET]
+    assert lc.PPL_SPLIT != pool_split and pool_split == "validation"
