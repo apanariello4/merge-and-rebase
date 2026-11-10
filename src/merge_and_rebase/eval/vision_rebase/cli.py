@@ -29,7 +29,7 @@ from ...rebase.depth_report import describe_depth_handling
 from ...rebase.run_config import resolve_run_config
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
-from .memory import memory_efficient_enabled, park_on_cpu
+from .memory import check_memory_efficient_supported, memory_efficient_enabled, park_on_cpu
 from .merge import _VALID_MERGE_MODES
 from .pipeline import VisionRuntime, run_rebase
 
@@ -200,6 +200,7 @@ def main() -> None:
             cfg["block_extension_enabled"] = True
 
         resolved = resolve_run_config(cfg, suites=SUITES)
+        check_memory_efficient_supported(cfg, resolved)  # before any model is built
         suite_name = resolved.suite_name
         tasks = resolved.tasks
         device = resolved.device

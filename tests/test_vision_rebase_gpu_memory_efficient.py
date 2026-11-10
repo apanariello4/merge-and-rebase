@@ -285,3 +285,62 @@ def test_stage_flag_hands_visual_only_copies_with_identical_weights(monkeypatch,
 def test_stage_flag_rejects_modes_that_read_the_full_source_clip(monkeypatch, tmp_path, kwargs):
     with pytest.raises(NotImplementedError, match="gpu_memory_efficient"):
         _stage_run(monkeypatch, tmp_path, flag=True, ariadne_cfg=DirectResidualConfig(num_batches=3, **kwargs))
+
+
+# ---- early guard (before any model is built) ----
+
+
+def _resolved(direct_fit, **ariadne_kwargs):
+    return SimpleNamespace(direct_fit=direct_fit, ariadne_cfg=DirectResidualConfig(num_batches=3, **ariadne_kwargs))
+
+
+def test_early_guard_noop_without_flag_even_for_unsupported_runs():
+    from merge_and_rebase.eval.vision_rebase.memory import check_memory_efficient_supported
+
+    check_memory_efficient_supported({}, _resolved(False))
+    check_memory_efficient_supported({"gpu_memory_efficient": False}, _resolved(True, procrustes_source="gradient"))
+
+
+def test_early_guard_accepts_plain_ariadne():
+    from merge_and_rebase.eval.vision_rebase.memory import check_memory_efficient_supported
+
+    check_memory_efficient_supported({"gpu_memory_efficient": True}, _resolved(True))
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        _resolved(False),
+        _resolved(True, procrustes_source="gradient"),
+        _resolved(True, residual_target="native_oracle", activation_storage="streaming"),
+    ],
+)
+def test_early_guard_rejects_unsupported_runs(resolved):
+    from merge_and_rebase.eval.vision_rebase.memory import check_memory_efficient_supported
+
+    with pytest.raises(ValueError, match="gpu_memory_efficient"):
+        check_memory_efficient_supported({"gpu_memory_efficient": True}, resolved)
+
+
+def test_main_fails_before_building_models_for_non_ariadne(monkeypatch, tmp_path):
+    import json
+
+    from merge_and_rebase.eval import vision_rebase
+    from merge_and_rebase.eval.vision_rebase import cli
+
+    def _boom(*_a, **_k):
+        raise AssertionError("model build reached")
+
+    monkeypatch.setattr(cli.OpenClipClassifier, "build", staticmethod(_boom))
+    cfg = {
+        "method": "identity",
+        "gpu_memory_efficient": True,
+        "tuned_ckpts": {"Cars": "x.pt"},
+        "tasks": "Cars",
+        "logging": {"local_log_dir": str(tmp_path / "logs")},
+    }
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr("sys.argv", ["vision_rebase", "--config", str(path)])
+    with pytest.raises(ValueError, match="gpu_memory_efficient"):
+        vision_rebase.main()

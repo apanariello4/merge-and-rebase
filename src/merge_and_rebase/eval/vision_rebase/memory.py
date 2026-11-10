@@ -33,6 +33,26 @@ def memory_efficient_enabled(cfg: Mapping[str, Any]) -> bool:
     return bool(cfg.get(CONFIG_KEY, False))
 
 
+def check_memory_efficient_supported(cfg: Mapping[str, Any], resolved: Any) -> None:
+    """Fail before any model is built if ``gpu_memory_efficient`` is set for a run it does not support.
+
+    Supported: the Ariadne direct fit only (the parked source CLIP and visual-only copies are consumed by
+    ``DirectFitStage``); not with ``procrustes_source='gradient'`` or ``residual_target='native_oracle'``.
+    """
+    if not memory_efficient_enabled(cfg):
+        return
+    if not resolved.direct_fit:
+        raise ValueError(
+            f"{CONFIG_KEY} is only supported for the Ariadne direct fit (method 'ariadne'/'direct_residual'); "
+            "other methods, depth prestep and transfusion paths use the source CLIP on the GPU."
+        )
+    ariadne_cfg = resolved.ariadne_cfg
+    if ariadne_cfg.procrustes_source == "gradient" or ariadne_cfg.residual_target == "native_oracle":
+        raise ValueError(
+            f"{CONFIG_KEY} is not supported with procrustes_source='gradient' or residual_target='native_oracle'."
+        )
+
+
 def release_cuda_cache() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
