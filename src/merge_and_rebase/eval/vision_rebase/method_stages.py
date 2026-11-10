@@ -32,6 +32,7 @@ from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from ..utils import to_cpu_fp32
 from .artifacts import _load_precomputed_tv, _load_saved_sequential_tv, _state_dict_sha256, truncate_tv_rank
 from .context import _TaskContext
+from .memory import memory_efficient_enabled, source_fit_copy
 from .merge import _merge_direction
 from .stages import _visual_only_filter
 
@@ -412,6 +413,18 @@ class DirectFitStage:
         self._merged_correction: dict[str, torch.Tensor] | None = None
         self._merged_timing: dict[str, dict[str, float]] | None = None
 
+    def _memory_efficient(self, env: StageEnv) -> bool:
+        """Opt-in ``gpu_memory_efficient``: visual-only source fit copies (default off, nothing changes)."""
+        if not memory_efficient_enabled(env.cfg):
+            return False
+        if self.cfg.procrustes_source == "gradient" or self.cfg.residual_target == "native_oracle":
+            # These read the full source CLIP (text tower / full state dict) during the fit.
+            raise NotImplementedError(
+                "gpu_memory_efficient is not supported with procrustes_source='gradient' or "
+                "residual_target='native_oracle'."
+            )
+        return True
+
     def pairing(self, env: StageEnv) -> DiscreteLayerPairing:
         """The depth pairing, computed once per run (both legacy call sites yielded the identical value)."""
         if self._pairing_cache is None:
@@ -466,13 +479,18 @@ class DirectFitStage:
             weights=merge_in_source_weights,
             merge_params=resolved.merge.params,
         )
-        source_base_model_merged = deepcopy(env.clf_source.model)
-        source_ft_model_merged = deepcopy(env.clf_source.model)
-        load_into_model(source_base_model_merged, source_base_sd, strict=True)
-        load_into_model(
-            source_ft_model_merged,
-            axpy_state_dict(source_base_sd, merged_direction, alpha=1.0),
-            strict=True,
+        memory_efficient = self._memory_efficient(env)
+        source_base_model_merged = source_fit_copy(
+            env.clf_source.model,
+            memory_efficient=memory_efficient,
+            loaders=(lambda m: load_into_model(m, source_base_sd, strict=True),),
+        )
+        source_ft_model_merged = source_fit_copy(
+            env.clf_source.model,
+            memory_efficient=memory_efficient,
+            loaders=(
+                lambda m: load_into_model(m, axpy_state_dict(source_base_sd, merged_direction, alpha=1.0), strict=True),
+            ),
         )
         # The once-only merged fit has no single task to draw loaders from: it uses the shared Ariadne
         # calibration context when one is configured, else the first contributing task's train loaders.
@@ -563,11 +581,20 @@ class DirectFitStage:
             result.correction_fit = dict(self._merged_timing["correction_fit"])
             result.cost_phases = dict(self._merged_timing["cost_phases"])
         else:
-            source_base_model_native = deepcopy(env.clf_source.model)
-            source_ft_model_native = deepcopy(env.clf_source.model)
-            load_into_model(source_base_model_native, env.source_base_sd, strict=True)
-            load_into_model(source_ft_model_native, env.source_base_sd, strict=True)
-            load_into_model(source_ft_model_native, load_ckpt(str(env.tuned_by_task[t])), strict=False)
+            memory_efficient = self._memory_efficient(env)
+            source_base_model_native = source_fit_copy(
+                env.clf_source.model,
+                memory_efficient=memory_efficient,
+                loaders=(lambda m: load_into_model(m, env.source_base_sd, strict=True),),
+            )
+            source_ft_model_native = source_fit_copy(
+                env.clf_source.model,
+                memory_efficient=memory_efficient,
+                loaders=(
+                    lambda m: load_into_model(m, env.source_base_sd, strict=True),
+                    lambda m: load_into_model(m, load_ckpt(str(env.tuned_by_task[t])), strict=False),
+                ),
+            )
             if self.calibration_ctx is not None:
                 # Task-independent calibration: the same paired
                 # images for every task (see calibration_data).

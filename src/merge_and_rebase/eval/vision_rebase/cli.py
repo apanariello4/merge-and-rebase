@@ -29,6 +29,7 @@ from ...rebase.depth_report import describe_depth_handling
 from ...rebase.run_config import resolve_run_config
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
+from .memory import memory_efficient_enabled, park_on_cpu
 from .merge import _VALID_MERGE_MODES
 from .pipeline import VisionRuntime, run_rebase
 
@@ -254,6 +255,10 @@ def main() -> None:
 
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
+        if memory_efficient_enabled(cfg):
+            # Opt-in: the source CLIP is only a template for the fit copies (and, briefly, for text features).
+            park_on_cpu(clf_source.model)
+            print("gpu_memory_efficient: source CLIP parked on the CPU.")
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))

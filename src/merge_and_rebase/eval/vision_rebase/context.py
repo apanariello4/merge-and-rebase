@@ -23,6 +23,7 @@ from ...data.vision_loaders import (
 from ...eval.utils import humanize
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase.block_extension.config import select_loader
+from .memory import memory_efficient_enabled, temporarily_on
 
 
 @dataclass(frozen=True)
@@ -176,9 +177,13 @@ def _build_balanced_calibration_context(
     for task in sorted(by_task):
         item = by_task[task]
         names = list(item["classnames"])
-        source_features.append(
-            clf_source._compute_zeroshot_text_features(names, item["source_build_cfg_task"]).detach().cpu()
-        )
+        # Opt-in gpu_memory_efficient: the parked source CLIP visits the GPU only for this call (same device kernels).
+        with temporarily_on(
+            clf_source.model, next(clf_target.model.parameters()).device, enabled=memory_efficient_enabled(cfg)
+        ):
+            source_features.append(
+                clf_source._compute_zeroshot_text_features(names, item["source_build_cfg_task"]).detach().cpu()
+            )
         target_features.append(clf_target._compute_zeroshot_text_features(names, item["build_cfg_task"]).detach().cpu())
 
     first = by_task[sorted(by_task)[0]]
