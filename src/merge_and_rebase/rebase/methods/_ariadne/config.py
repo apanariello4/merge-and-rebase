@@ -98,6 +98,14 @@ class DirectResidualConfig:
     # host-RAM accumulators (float64 addition is exact-rounded on both, so sums are bitwise those of the default); each
     # position's statistics return to the compute device only for its solve. Bounds GPU memory for wide MLPs.
     stats_device: str | None = None
+    # Opt-in one-pass fit (vision, independent block-boundary c_proj fit only; see _ariadne/onepass.py): the Gram, cross and
+    # moment statistics are accumulated from ONE sweep (source base, source FT, target base) instead of Pass A + diagnostics
+    # sweep + Pass B. Exactly equivalent in exact arithmetic to the streaming fit (effect = 0 at the base target, so the
+    # regression target is (f - b) Q_j and Q_j is only needed at the end). False (default): the streaming fit, unchanged.
+    onepass: bool = False
+    # Dtype of the one-pass Gram / cross statistics: 'float64' (as the streaming fit) or 'float32' (TF32 forced off for the
+    # accumulation matmuls; the solve is float64 either way). Read only when onepass=True.
+    onepass_stats_dtype: str = "float64"
     # Decoder families whose block writes post_mlp_norm(down_proj(h)) into the residual (Gemma-2): how the block-
     # boundary target E_j reaches down_proj. y = W h (target base down_proj output), r = sqrt(mean(y^2) + eps),
     # g = norm gain; the norm's linearization is (1/r) diag(g) (I - y y^T / (d r^2)), whose rank-one term (the
@@ -247,6 +255,8 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "gradient_ridge": "eb_input",
     "v_fit": None,
     "stats_device": None,
+    "onepass": False,
+    "onepass_stats_dtype": "float64",
     "post_mlp_norm": None,
     "block_target": "total",
     "sequential_subtract": "all",
@@ -338,6 +348,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "activation_storage",
         "streaming_position_chunk",
         "stats_device",
+        "onepass",
+        "onepass_stats_dtype",
         "post_mlp_norm",
         "block_target",
         "sequential_subtract",
@@ -623,6 +635,7 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
         if cfg.block_split != "none" and not (cfg.block_split == "backfit" and cfg.depth_fit == "sequential"):
             raise ValueError("activation_storage='streaming' requires block_split='none'")
+    _validate_onepass(cfg, components)
     if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix"}:
         raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet' or 'vision8_mix'")
     if cfg.calibration_data != "task_local" and cfg.procrustes_source != "activation":
@@ -749,6 +762,52 @@ _GRADIENT_FIT_GROUPS: frozenset[frozenset[str]] = frozenset(
         ("mlp.c_proj",),
     )
 )
+
+
+def _validate_onepass(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of the opt-in one-pass fit (``onepass``): only the plain streaming c_proj fit is supported."""
+    if not isinstance(cfg.onepass, bool):
+        raise TypeError("onepass must be bool")
+    if cfg.onepass_stats_dtype not in {"float64", "float32"}:
+        raise ValueError("onepass_stats_dtype must be 'float64' or 'float32'")
+    if not cfg.onepass:
+        if cfg.onepass_stats_dtype != "float64":
+            raise ValueError("onepass_stats_dtype requires onepass=true")
+        return
+    need = {
+        "depth_fit": "independent",
+        "block_split": "none",
+        "procrustes_source": "activation",
+        "alignment_map": "polar",
+        "alignment_row_weighting": "uniform",
+        "procrustes_rank": None,
+        "procrustes_energy": None,
+        "residual_target": "transported_delta",
+        "component_target": "block_boundary",
+        "realization_diagnostics": False,
+        "fidelity_holdout": False,
+        "activation_storage": "streaming",
+        "component_fit": "closed_form",
+        "block_target": "total",
+        "pair_target_split": "none",
+        "tv_scaling": "none",
+        "endpoint_construction": "native_delta",
+        "fit_blocks": None,
+        "v_fit": None,
+        "post_mlp_norm": None,
+        "stats_device": None,
+        "sequential_points": "single",
+        "exclude_first_token": False,
+        "cascade_order": "independent",
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if tuple(components) != ("mlp.c_proj",):
+        bad["components"] = tuple(components)
+    if bad:
+        raise ValueError(
+            f"onepass=true is implemented for the vision independent block-boundary mlp.c_proj streaming fit only; "
+            f"it requires {need} and components=('mlp.c_proj',); got incompatible {bad}"
+        )
 
 
 def _validate_joint(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
@@ -975,6 +1034,7 @@ _DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("alignment_row_weighting", "uniform"),
     ("endpoint_construction", "native_delta"),
     ("calibration_data", "task_local"),
+    ("onepass", False),
 )
 
 

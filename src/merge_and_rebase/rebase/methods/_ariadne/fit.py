@@ -250,12 +250,21 @@ def fit_sequential_source_endpoints(
 _RIDGE_NONE_CONDITION_THRESHOLD = 1e8
 
 
+def _clamped_eigh(sym: Tensor) -> tuple[Tensor, Tensor]:
+    """Return ``(eigvals_clamped, eigvecs)`` of a symmetric PSD matrix."""
+    vals, vecs = torch.linalg.eigh(sym)
+    return vals.clamp_min(0.0), vecs
+
+
+def _pinv_from_eigh(vals: Tensor, vecs: Tensor, *, eps: float = 1e-12) -> Tensor:
+    """Pseudo-inverse from the clamped eigendecomposition of `_clamped_eigh`."""
+    return vecs @ torch.diag(torch.where(vals > eps, 1.0 / vals, torch.zeros_like(vals))) @ vecs.T
+
+
 def _clamped_eigh_inverse(sym: Tensor, *, eps: float = 1e-12) -> tuple[Tensor, Tensor, Tensor]:
     """Return ``(eigvals_clamped, eigvecs, pseudo_inverse)`` of a symmetric PSD matrix."""
-    vals, vecs = torch.linalg.eigh(sym)
-    vals = vals.clamp_min(0.0)
-    inv = vecs @ torch.diag(torch.where(vals > eps, 1.0 / vals, torch.zeros_like(vals))) @ vecs.T
-    return vals, vecs, inv
+    vals, vecs = _clamped_eigh(sym)
+    return vals, vecs, _pinv_from_eigh(vals, vecs, eps=eps)
 
 
 class ResidualSufficientStatistics:
@@ -376,7 +385,15 @@ class ResidualSufficientStatistics:
         exact_form: bool = True,
         ridge_mode: str = "trace_normalized",
         ridge_absolute: float | None = None,
+        diagnostics: bool = True,
     ) -> tuple[Tensor, dict[str, Any]]:
+        """Solve the centred ridge problem.
+
+        ``diagnostics=False`` (opt-in, used by the one-pass fit) skips the analysis-only work that never feeds the
+        returned slope or bias: the ridge-free reference solve (explicit pseudo-inverse of ``S_c``), the two
+        ``_residual_sq`` evaluations. The residual/reachability fields of the returned dict are then ``None``.
+        ``True`` (default) is the unchanged computation.
+        """
         if self.s is None or self.g is None or self.b is None or self.n_rows == 0:
             raise ValueError("cannot solve empty residual statistics")
         # ridge_relative must be finite and positive even for ridge_estimator="none" (which never reads it): the
@@ -462,7 +479,10 @@ class ResidualSufficientStatistics:
         # ridge_mode="absolute" is validated to require ridge_estimator="fixed_relative".
         lam = float(ridge_absolute) if ridge_mode == "absolute" else trace_normalized_lam
 
-        es, us, sc_inv = _clamped_eigh_inverse(sc)
+        if diagnostics:
+            es, us, sc_inv = _clamped_eigh_inverse(sc)
+        else:
+            es, us = _clamped_eigh(sc)
         eg, ug, g_inv = _clamped_eigh_inverse(g)
 
         if trace_sc == 0.0 or trace_g == 0.0:
@@ -480,17 +500,18 @@ class ResidualSufficientStatistics:
             # _residual_sq does t_out64.T @ beta; only exact_form=False reaches this branch.
             beta = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
 
-        residual_sq = self._residual_sq(x, beta, t_out64, mu_a, mu_e)
+        if diagnostics:
+            residual_sq = self._residual_sq(x, beta, t_out64, mu_a, mu_e)
 
-        # Ridge-free (best possible) reference solve, for the reachable/unreachable split.
-        x0 = sc_inv @ bc @ g_inv
-        if exact_form:
-            beta0 = g_inv @ (t_out64 @ mu_e - g @ (x0.T @ mu_a))
-        else:
-            beta0 = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
-        best_possible_sq = self._residual_sq(x0, beta0, t_out64, mu_a, mu_e)
-        reachable_sq = max(0.0, self.sum_e2 - best_possible_sq)
-        unreachable_sq = best_possible_sq
+            # Ridge-free (best possible) reference solve, for the reachable/unreachable split.
+            x0 = sc_inv @ bc @ g_inv
+            if exact_form:
+                beta0 = g_inv @ (t_out64 @ mu_e - g @ (x0.T @ mu_a))
+            else:
+                beta0 = torch.zeros(self.d_source, dtype=torch.float64, device=t_out64.device)
+            best_possible_sq = self._residual_sq(x0, beta0, t_out64, mu_a, mu_e)
+            reachable_sq = max(0.0, self.sum_e2 - best_possible_sq)
+            unreachable_sq = best_possible_sq
 
         diag: dict[str, Any] = {
             "n_rows": self.n_rows,
@@ -505,10 +526,10 @@ class ResidualSufficientStatistics:
             "ridge_trace_normalized": trace_normalized_lam,
             "trace_centered_feature_gram": trace_sc,
             "trace_output_transport_gram": trace_g,
-            "residual_norm_before": self.sum_e2**0.5,
-            "residual_norm_after": residual_sq**0.5,
-            "reachable_residual_norm": reachable_sq**0.5,
-            "unreachable_residual_norm": unreachable_sq**0.5,
+            "residual_norm_before": self.sum_e2**0.5 if diagnostics else None,
+            "residual_norm_after": residual_sq**0.5 if diagnostics else None,
+            "reachable_residual_norm": reachable_sq**0.5 if diagnostics else None,
+            "unreachable_residual_norm": unreachable_sq**0.5 if diagnostics else None,
             "correction_norm": float(torch.linalg.norm(x).item()),
             "bias_norm": float(torch.linalg.norm(beta).item()),
             "exact_form": exact_form,
@@ -653,6 +674,7 @@ def _finalize_independent_component(
     position_corrections,
     block_rows,
     h_batches=None,
+    diagnostics=True,
 ):
     """Everything after one component's accumulation loop in ``_fit_all_positions_independent``: pristine-effect
     check, ridge solve, state/bookkeeping updates, missing-bias handling and the block_row diagnostic (plus optional
@@ -668,6 +690,7 @@ def _finalize_independent_component(
         ridge_relative=config.ridge_relative,
         ridge_estimator=config.ridge_estimator,
         exact_form=config.exact_form,
+        **({} if diagnostics else {"diagnostics": False}),
     )
     correction = correction.cpu()
     diag["bias_correction"] = diag["bias_correction"].cpu()
@@ -722,9 +745,13 @@ def _finalize_independent_component(
         "effect_before_norm": effect_sq**0.5,
         "relative_residual_before": (diag["residual_norm_before"] / desired_norm) if desired_norm else 0.0,
         "relative_residual_after": (diag["residual_norm_after"] / desired_norm) if desired_norm else 0.0,
-        "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()),
+        "correction_rank": int(torch.linalg.matrix_rank(correction.double()).item()) if diagnostics else None,
         **diag,
     }
+    if not diagnostics:
+        # One-pass fit: no desired/effect/residual statistics were measured (analysis-only fields).
+        for name in ("desired_norm", "effect_before_norm", "relative_residual_before", "relative_residual_after"):
+            block_row[name] = None
     if bool(getattr(config, "realization_diagnostics", False)):
         bias_for_pred = bias_correction if not skip_bias else torch.zeros(correction.shape[0])
         block_row.update(

@@ -63,6 +63,7 @@ from ._ariadne.fit import (
 )
 from ._ariadne.gradient_fit import fit_direct_residual_gradient_streaming
 from ._ariadne.joint import fit_direct_residual_joint_streaming
+from ._ariadne.onepass import fit_onepass
 from ._ariadne.output_total import (
     fit_output_total_independent_streaming,
     fit_output_total_sequential_streaming,
@@ -187,6 +188,20 @@ def _fit_body(
                 source_base_model.state_dict(),
                 config.native_target_ckpt_template.format(task=task_name),
             ).to(device)
+    if config.onepass:
+        return _fit_body_onepass(
+            recorder,
+            source_base_model=source_base_model,
+            source_ft_model=source_ft_model,
+            target_model=target_model,
+            target_base_sd=target_base_sd,
+            source_loader=source_loader,
+            target_loader=target_loader,
+            pairing=pairing,
+            config=config,
+            device=device,
+            family_adapter=family_adapter,
+        )
     alignment_mark = recorder.mark()
     alignment_started = time.perf_counter()
     streaming = config.activation_storage == "streaming"
@@ -546,6 +561,111 @@ def _fit_body(
     }
     if endpoint_diagnostics is not None:
         extra["sequential_endpoints"] = endpoint_diagnostics
+    return (
+        scaled_delta,
+        {"alignment_calibration": alignment_timing, "correction_fit": fit_timing},
+        diagnostics,
+        extra,
+        target_corrections,
+    )
+
+
+def _fit_body_onepass(
+    recorder: PhaseCostRecorder,
+    *,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    target_base_sd: dict[str, torch.Tensor],
+    source_loader: Any,
+    target_loader: Any,
+    pairing: DiscreteLayerPairing,
+    config: DirectResidualConfig,
+    device: str,
+    family_adapter: Any = None,
+):
+    """Opt-in one-pass fit (``config.onepass``): same return contract as `_fit_body`, see `_ariadne.onepass`.
+
+    There is no separate alignment/calibration bracket: ``alignment_calibration_seconds`` is 0.0 and
+    ``correction_fit_seconds`` is the whole one-pass time (also written as ``onepass_fit_seconds``), so the existing
+    timing readers need no change. (Pass A's untimed diagnostics sweep was already `cost_excluded`; skipping it saves wall time but not the timed cost.) Forwards + accumulation are charged to ``activation_collection``, the SVD and solves
+    to ``transformation`` (``timing["cost_phases"]`` when this call owns the recorder).
+    """
+    if family_adapter is not None:
+        raise NotImplementedError("onepass is vision-only")
+    cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    # Outside the timed bracket: the fit regresses against the live target model, so it must be the native base (the
+    # streaming fit reloads target_base_sd itself and checks Pass-A fingerprints; one-pass has neither).
+    live = target_model.state_dict()
+    if set(live) != set(target_base_sd) or any(
+        not torch.equal(live[k].detach().cpu(), target_base_sd[k].detach().cpu()) for k in target_base_sd
+    ):
+        raise ValueError(
+            "onepass requires target_model to hold exactly target_base_sd (the native target base): "
+            "the state dict differs, so the fitted correction would not be against the base"
+        )
+    fit_mark = recorder.mark()
+    started = time.perf_counter()
+    target_corrections, diagnostics, calibration, info = fit_onepass(
+        target_model,
+        target_base_sd,
+        source_base_model,
+        source_ft_model,
+        source_loader,
+        target_loader,
+        pairing,
+        config=config,
+        device=device,
+    )
+    seconds = time.perf_counter() - started
+    fit_peak_memory_bytes, fit_host_peak = recorder.peaks_since(fit_mark)
+    non_unique = sorted(int(r["position"]) for r in diagnostics if r.get("procrustes_q_non_unique"))
+    if non_unique:
+        logger.warning(
+            "Ariadne: the Procrustes cross-covariance is rank-deficient at target position(s) %s "
+            "(rank < min(d_source, d_target), see the procrustes_rank / procrustes_min_dim row fields), so the "
+            "polar factor Q is not unique there; the fitted Q is unchanged (diagnostic flag only).",
+            non_unique,
+        )
+    fit_timing: dict[str, Any] = {
+        "correction_fit_seconds": seconds,
+        "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
+        "correction_fit_peak_host_rss_bytes": fit_host_peak,
+        "onepass_fit_seconds": seconds,
+        **info,
+        # Work the streaming correction_fit bracket pays that one-pass does not (timing comparison provenance).
+        "onepass_skipped_work": [
+            "target state_dict clone + load_state_dict (entry and restore copies)",
+            "target-boundary fingerprint checks (float64 sum / sum of squares per block and batch)",
+            "CPU resize/alignment and CPU fp32 D_j = (f-b)@Q products (one-pass resizes on the compute device)",
+            "second sweep: separate source-base/source-FT/target forwards per position chunk "
+            "(streaming_position_chunk) and Pass A's target+source-base forward",
+            "ridge-free reference solve, residual norms and matrix_rank (diagnostics=False)",
+        ],
+    }
+    if cuda:
+        # The recorder resets torch's peak counter per segment and keeps the running maximum: its value IS the
+        # exact max_memory_allocated over the bracket (a bare torch.cuda.max_memory_allocated() would see only the last segment).
+        fit_timing["onepass_max_memory_allocated_bytes"] = int(fit_peak_memory_bytes)
+    alignment_timing = {
+        "alignment_calibration_seconds": 0.0,
+        # None, not 0: there is no alignment bracket, and readers that sum/max the brackets must not read a measured 0.
+        "alignment_calibration_peak_memory_bytes": None,
+        "alignment_calibration_peak_host_rss_bytes": None,
+    }
+    strength = float(config.strength)
+    with cost_phase("transport"):
+        scaled_delta = (
+            {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
+        )
+    extra = {
+        "realization_by_position": None,
+        "task_vector_stats": None,
+        "alignment_diagnostics": None,
+        "calibration": calibration,
+        "tv_scaling": None,
+        "fidelity_holdout": None,
+    }
     return (
         scaled_delta,
         {"alignment_calibration": alignment_timing, "correction_fit": fit_timing},
