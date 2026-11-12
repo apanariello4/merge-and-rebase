@@ -32,6 +32,7 @@ from ..datasets.vision8_14_20 import SUITES
 from .memory import check_memory_efficient_supported, memory_efficient_enabled, park_on_cpu
 from .merge import _VALID_MERGE_MODES
 from .pipeline import VisionRuntime, run_rebase
+from .precomputed_calibration import check_precomputed_supported
 
 
 def _set_deterministic_seed(seed: int) -> None:
@@ -201,6 +202,7 @@ def main() -> None:
 
         resolved = resolve_run_config(cfg, suites=SUITES)
         check_memory_efficient_supported(cfg, resolved)  # before any model is built
+        check_precomputed_supported(cfg, resolved)  # idem (calibration_data='precomputed')
         suite_name = resolved.suite_name
         tasks = resolved.tasks
         device = resolved.device

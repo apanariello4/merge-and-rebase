@@ -429,7 +429,13 @@ def build_run_calibration(
     # change; each task's alpha search and evaluation keep its own splits.
     direct_residual_calibration_ctx: _TaskContext | None = None
     direct_residual_calibration_meta: dict[str, Any] = {"calibration_data": "task_local"}
-    if direct_fit and direct_residual_cfg.calibration_data != "task_local":
+    if direct_fit and direct_residual_cfg.calibration_data == "precomputed":
+        # Per-task stored images are attached in DirectFitStage.run (precomputed_calibration.py); no shared context.
+        direct_residual_calibration_meta = {
+            "calibration_data": "precomputed",
+            "calibration_images_dir": str(cfg.get("calibration_images_dir")),
+        }
+    elif direct_fit and direct_residual_cfg.calibration_data != "task_local":
         direct_residual_calibration_ctx, direct_residual_calibration_meta = _build_direct_residual_calibration(
             direct_residual_cfg.calibration_data,
             per_task=[item for item in per_task if item["task"] not in native_tasks],
