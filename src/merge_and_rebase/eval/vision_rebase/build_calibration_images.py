@@ -33,6 +33,7 @@ from ...data.calibration_retrieval import (
     load_or_build_pool_embeddings,
     load_pool_datasets,
     locate_pool_row,
+    parse_extra_pool,
     select_class_balanced,
 )
 from ...data.templates import get_templates
@@ -83,21 +84,48 @@ def build_retrieval(
     seed: int,
     device: str,
     pool_workers: int = 8,
+    extra_pool: list[dict[str, str]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    """``extra_pool`` (opt-in, default None = unchanged): datasets appended after the generic pool. The generic
+    embeddings keep their own cache file; each extra dataset gets its own cache file, so the generic cache is never
+    rewritten and pool rows = generic rows followed by the extra datasets in the given order."""
     t0 = time.time()
-    datasets_ = load_pool_datasets(pool)
-    sizes = [len(d) for d in datasets_]
+    extra_pool = list(extra_pool or [])
+    base_pool = list(pool)
+    pool = base_pool + extra_pool
+    datasets_all = load_pool_datasets(pool)
+    datasets_ = datasets_all[: len(base_pool)]
+    sizes = [len(d) for d in datasets_all]
     model_tag = f"{target_build_cfg.model_name}_{target_build_cfg.pretrained}".replace("/", "-")
-    cache_path = cache_dir / f"pool_embeddings_{model_tag}.pt"
 
-    def build() -> torch.Tensor:
+    def _embed(ds_list: list[Any]) -> torch.Tensor:
         return embed_pool(
-            datasets_, clf_target.model.encode_image, clf_target.preprocess, device=device, num_workers=pool_workers
+            ds_list, clf_target.model.encode_image, clf_target.preprocess, device=device, num_workers=pool_workers
         )
 
+    cache_path = cache_dir / f"pool_embeddings_{model_tag}.pt"
     emb, from_cache = load_or_build_pool_embeddings(
-        cache_path, pool, datasets_, model=target_build_cfg.model_name, pretrained=target_build_cfg.pretrained, build=build
+        cache_path,
+        base_pool,
+        datasets_,
+        model=target_build_cfg.model_name,
+        pretrained=target_build_cfg.pretrained,
+        build=lambda: _embed(datasets_),
     )
+    extra_caches: list[str] = []
+    for spec, ds in zip(extra_pool, datasets_all[len(base_pool) :], strict=True):
+        ecache = cache_dir / f"pool_embeddings_extra_{spec['name']}_{model_tag}.pt"
+        e_emb, e_cached = load_or_build_pool_embeddings(
+            ecache,
+            [spec],
+            [ds],
+            model=target_build_cfg.model_name,
+            pretrained=target_build_cfg.pretrained,
+            build=lambda ds=ds: _embed([ds]),
+        )
+        emb = torch.cat([emb, e_emb], dim=0)
+        from_cache = from_cache and e_cached
+        extra_caches.append(str(ecache))
     t_embed = time.time() - t0
     with torch.no_grad():
         text = clf_target._compute_zeroshot_text_features(classnames, target_build_cfg).float().cpu()
@@ -107,7 +135,7 @@ def build_retrieval(
     images, picks = [], []
     for pos, (row, cls, score, rnd) in enumerate(zip(sel.pool_rows, sel.class_ids, sel.scores, sel.round_index, strict=True)):
         k, idx = locate_pool_row(row, sizes)
-        img = datasets_[k][idx]["image"].convert("RGB")
+        img = datasets_all[k][idx]["image"].convert("RGB")
         images.append(clf_target.preprocess(img))
         picks.append(
             {
@@ -139,6 +167,8 @@ def build_retrieval(
         },
         "pool": [{**spec, "size": size} for spec, size in zip(pool, sizes, strict=True)],
         "pool_embedding_cache": str(cache_path),
+        "extra_pool": [spec["name"] for spec in extra_pool],
+        "extra_pool_embedding_caches": extra_caches,
         "pool_embeddings_from_cache": from_cache,
         "pool_embedding_seconds": t_embed,
         "seed": seed,
@@ -266,6 +296,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--calib-seed", type=int, default=None)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
+    ap.add_argument(
+        "--extra-pool",
+        action="append",
+        default=[],
+        help="retrieval only, opt-in: append a dataset to the generic pool, name=hf_path:split[@cache_dir] "
+        "(own embedding cache; default none = unchanged pool)",
+    )
     ap.add_argument("--pool-workers", type=int, default=8)
     ap.add_argument("--iters", type=int, default=2000, help="inversion iterations")
     ap.add_argument("--micro-batch", type=int, default=16)
@@ -295,6 +332,8 @@ def main(argv: list[str] | None = None) -> None:
             forbidden = [resolved.suite.resolver(t)[0] for t in resolved.suite.tasks]
             pool = [dict(s) for s in POOL_SPECS if s["path"].lower() not in {f.lower() for f in forbidden}]
             assert_pool_disjoint_from(pool, forbidden)
+            extra_pool = parse_extra_pool(args.extra_pool)
+            assert_pool_disjoint_from(extra_pool, forbidden)
             images, manifest = build_retrieval(
                 task=task,
                 classnames=classnames,
@@ -307,6 +346,7 @@ def main(argv: list[str] | None = None) -> None:
                 seed=seed,
                 device=device,
                 pool_workers=args.pool_workers,
+                extra_pool=extra_pool,
             )
         else:
             clf_source = OpenClipClassifier.build(OpenClipBuildConfig(model_name=src_m, pretrained=src_p, device=device, dtype=dtype))

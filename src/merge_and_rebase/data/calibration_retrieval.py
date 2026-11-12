@@ -35,6 +35,22 @@ POOL_SPECS: tuple[dict[str, str], ...] = (
 IMAGE_KEY = "image"
 
 
+def parse_extra_pool(items: Sequence[str]) -> list[dict[str, str]]:
+    """Parse ``name=hf_path:split[@cache_dir]`` strings (opt-in extra pool datasets) into pool specs."""
+    out = []
+    for item in items:
+        name, _, rest = item.partition("=")
+        rest, _, cache_dir = rest.partition("@")
+        path, _, split = rest.rpartition(":")
+        if not (name and path and split):
+            raise ValueError(f"extra pool spec must be name=hf_path:split[@cache_dir], got {item!r}")
+        spec = {"name": name, "path": path, "split": split}
+        if cache_dir:
+            spec["cache_dir"] = cache_dir
+        out.append(spec)
+    return out
+
+
 def assert_pool_disjoint_from(pool: Sequence[Mapping[str, str]], forbidden_paths: Sequence[str]) -> None:
     """Refuse a pool that contains any of the ``forbidden_paths`` (the HF paths of the evaluated suite)."""
     banned = {str(p).lower() for p in forbidden_paths}
@@ -151,7 +167,11 @@ def load_pool_datasets(pool: Sequence[Mapping[str, str]]) -> list[Any]:
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     from datasets import load_dataset
 
-    return [load_dataset(spec["path"], split=spec["split"]) for spec in pool]
+    # optional per-spec "cache_dir" (extra pool datasets may live outside the default HF cache)
+    return [
+        load_dataset(spec["path"], split=spec["split"], **({"cache_dir": spec["cache_dir"]} if spec.get("cache_dir") else {}))
+        for spec in pool
+    ]
 
 
 class _PoolImages(torch.utils.data.Dataset):

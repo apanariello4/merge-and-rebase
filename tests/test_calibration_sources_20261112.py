@@ -213,3 +213,74 @@ def test_inversion_reduces_ce_on_toy_model():
         lr=0.1, jitter=0, warmup=5, micro_batch=4,
     )
     assert torch.equal(again, images)
+
+
+# ------------------------------------------------------------------------------------------ extra retrieval pool
+
+
+def test_parse_extra_pool_and_vision8_guard():
+    from merge_and_rebase.data.calibration_retrieval import parse_extra_pool
+
+    spec = parse_extra_pool(["uc=blanchon/UC_Merced:train@/tmp/c"])
+    assert spec == [{"name": "uc", "path": "blanchon/UC_Merced", "split": "train", "cache_dir": "/tmp/c"}]
+    assert parse_extra_pool(["a=x/y:test"]) == [{"name": "a", "path": "x/y", "split": "test"}]
+    with pytest.raises(ValueError, match="name=hf_path:split"):
+        parse_extra_pool(["nonsense"])
+    paths = [SUITES["vision8"].resolver(t)[0] for t in SUITES["vision8"].tasks]
+    with pytest.raises(ValueError, match="overlaps"):
+        assert_pool_disjoint_from(parse_extra_pool([f"e={paths[2]}:test"]), paths)
+
+
+def test_build_retrieval_extra_pool_default_unchanged_and_separate_cache(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from merge_and_rebase.eval.vision_rebase import build_calibration_images as bci
+
+    g = torch.Generator().manual_seed(0)
+    feats = {}  # image id (red pixel value) -> embedding
+
+    def make_ds(n, off):
+        ims = []
+        for i in range(n):
+            ims.append({"image": Image.new("RGB", (4, 4), (off + i, 0, 0))})
+            feats[off + i] = torch.randn(8, generator=g)
+        return ims
+
+    store = {"g1": make_ds(30, 0), "g2": make_ds(20, 50), "x1": make_ds(25, 100)}
+    monkeypatch.setattr(bci, "load_pool_datasets", lambda pool: [store[s["name"]] for s in pool])
+
+    def preprocess(img):
+        return torch.tensor(float(img.getpixel((0, 0))[0])).reshape(1, 1, 1).expand(3, 2, 2).clone()
+
+    class Model:
+        def encode_image(self, x):
+            return torch.stack([feats[int(v)] for v in x[:, 0, 0, 0].tolist()])
+
+    clf = types.SimpleNamespace(
+        model=Model(),
+        preprocess=preprocess,
+        _compute_zeroshot_text_features=lambda names, cfg: torch.randn(
+            len(names), 8, generator=torch.Generator().manual_seed(3)
+        ),
+    )
+    cfg = types.SimpleNamespace(model_name="M", pretrained="p")
+    base = [{"name": "g1", "path": "a/g1", "split": "s"}, {"name": "g2", "path": "a/g2", "split": "s"}]
+    extra = [{"name": "x1", "path": "a/x1", "split": "s"}]
+    kw = dict(
+        task="T", classnames=["c0", "c1", "c2"], clf_target=clf, target_build_cfg=cfg, cache_dir=tmp_path,
+        n_images=9, batch_size=3, seed=5, device="cpu", pool_workers=0,
+    )
+    t0, m0 = bci.build_retrieval(pool=base, **kw)
+    assert m0["extra_pool"] == [] and [p["name"] for p in m0["pool"]] == ["g1", "g2"]
+    base_cache = tmp_path / "pool_embeddings_M_p.pt"
+    mtime = base_cache.stat().st_mtime_ns
+    t1, m1 = bci.build_retrieval(pool=base, **kw)
+    assert torch.equal(t0, t1) and m1["pool_embeddings_from_cache"]
+    t2, m2 = bci.build_retrieval(pool=base, extra_pool=extra, **kw)
+    assert [p["name"] for p in m2["pool"]] == ["g1", "g2", "x1"] and m2["pool"][2]["size"] == 25
+    assert m2["extra_pool"] == ["x1"] and (tmp_path / "pool_embeddings_extra_x1_M_p.pt").is_file()
+    assert base_cache.stat().st_mtime_ns == mtime  # generic cache untouched
+    assert sum(m2["picked_by_pool_dataset"].values()) == 9
+    assert all(p["pool_dataset"] in {"g1", "g2", "x1"} for p in m2["picks"])
+    _, m3 = bci.build_retrieval(pool=base, extra_pool=extra, **kw)
+    assert m3["pool_embeddings_from_cache"]
