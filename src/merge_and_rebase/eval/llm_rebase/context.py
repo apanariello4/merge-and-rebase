@@ -418,6 +418,8 @@ def _resolve_calibration_settings(cfg: dict[str, Any], method_name: str) -> Cali
         raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
     return CalibrationSettings(
         prompts=calibration_prompts_cfg,
+        # explicit HF corpus, decoupled from the evaluated task (no eval hold-out); a list of specs mixes several
+        # corpora round-robin with equal quotas (data/llm_calibration)
         dataset=cfg.get("calibration_dataset"),
         n_sequences=int(n_sequences) if n_sequences is not None else None,
         include_target=bool(cfg.get("calibration_include_target", False)),

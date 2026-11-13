@@ -437,7 +437,9 @@ def test_first_token_realization_matches_direct_computation():
     req = {"0": (0, "boundary"), "3": (3, "boundary")}
     sq = {0: 0.0, 3: 0.0}
     for t0, t1 in zip(
-        iter_capture_tokens(inp.target_model, batches, req, "cpu"), iter_capture_tokens(mounted, batches, req, "cpu")
+        iter_capture_tokens(inp.target_model, batches, req, "cpu"),
+        iter_capture_tokens(mounted, batches, req, "cpu"),
+        strict=True,
     ):
         for j in (0, 3):
             sq[j] += float(((t1[str(j)][:, 0, :] - t0[str(j)][:, 0, :]).double() ** 2).sum())

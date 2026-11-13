@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,8 @@ from ..datasets.vision8_14_20 import SUITES
 from ..utils import humanize
 from .precomputed_calibration import assert_same_preprocessing, tensor_sha256
 
-DEFAULT_CACHE_DIR = "/data/merge_and_rebase_results/calibsrc_cache"
+# pool-embedding cache; a different location only means the embeddings are recomputed
+DEFAULT_CACHE_DIR = os.environ.get("CALIBSRC_CACHE_DIR", "calibsrc_cache")
 
 
 def task_classnames(task: str, suite: Any, *, humanized: bool) -> list[str]:
