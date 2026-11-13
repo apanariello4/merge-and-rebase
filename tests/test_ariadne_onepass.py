@@ -44,7 +44,7 @@ def _single_thread():
     torch.set_num_threads(previous)
 
 
-def _fit(depths, tokens, overrides, *, width=WIDTH, tweak=None, base_sd_hook=None):
+def _fit(depths, tokens, overrides, *, width=WIDTH, tweak=None, base_sd_hook=None, loaders=None):
     """One ``AriadneRebase().prepare`` on the tiny stacks; ``depths=(source, target)``, ``tokens=(source, target)``."""
     source_depth, target_depth = depths
     torch.manual_seed(5)
@@ -56,10 +56,11 @@ def _fit(depths, tokens, overrides, *, width=WIDTH, tweak=None, base_sd_hook=Non
     n = BATCH_SIZE * NUM_BATCHES
     gen = torch.Generator().manual_seed(7)
     labels = torch.arange(n) % N_CLASSES
-    loaders = [
-        DataLoader(_Images(torch.randn(n, t, 4, generator=gen), labels), batch_size=BATCH_SIZE, shuffle=False)
-        for t in tokens
-    ]
+    if loaders is None:
+        loaders = [
+            DataLoader(_Images(torch.randn(n, t, 4, generator=gen), labels), batch_size=BATCH_SIZE, shuffle=False)
+            for t in tokens
+        ]
     cfg = parse_direct_residual_config({**MAIN, "activation_storage": "streaming", **overrides})
     return AriadneRebase().prepare(
         source_base_model=source_base,
@@ -243,3 +244,44 @@ def test_onepass_warns_on_ignored_options(caplog):
     assert any("ignores" in r.message for r in caplog.records)
     assert one.timing["alignment_calibration"]["alignment_calibration_peak_memory_bytes"] is None
     assert one.timing["correction_fit"]["onepass_skipped_work"]
+
+
+def test_onepass_matches_streaming_on_precomputed_calibration(tmp_path):
+    """onepass + calibration_data='precomputed': same images as streaming, same fit (merge of the two branches)."""
+    from merge_and_rebase.eval.vision_rebase.context import _TaskContext
+    from merge_and_rebase.eval.vision_rebase.precomputed_calibration import build_precomputed_context
+
+    n, tokens = BATCH_SIZE * NUM_BATCHES, 12  # [N, 3, 4, 4] images -> (N, 12, 4) inputs of the tiny stack
+    images = torch.randn(n + 5, 3, 4, 4, generator=torch.Generator().manual_seed(11))
+    torch.save({"images": images}, tmp_path / "DTD.pt")
+    template = _TaskContext(
+        loaders=None, source_loaders=None, classnames=["a"], build_cfg_task=None, source_build_cfg_task=None
+    )
+    ctx, meta = build_precomputed_context(
+        "DTD",
+        cfg={"calibration_images_dir": str(tmp_path)},
+        num_batches=NUM_BATCHES,
+        batch_size=BATCH_SIZE,
+        template=template,
+    )
+    assert meta["n_used"] == n
+
+    def collate(batch):
+        x = torch.stack([b[0] for b in batch]).reshape(len(batch), tokens, 4)
+        return x, torch.tensor([b[1] for b in batch])
+
+    def loaders():
+        return [
+            DataLoader(ctx.source_loaders.train.dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate),
+            DataLoader(ctx.loaders.train.dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate),
+        ]
+
+    for direction in DIRECTIONS.values():
+        common = {"calibration_data": "precomputed", "num_batches": NUM_BATCHES}
+        ref = _fit(direction, (tokens, tokens), common, loaders=loaders())
+        one = _fit(direction, (tokens, tokens), {**common, "onepass": True}, loaders=loaders())
+        assert ref.extra["calibration"]["indices"] == list(range(n))
+        assert one.extra["calibration"]["indices"] == ref.extra["calibration"]["indices"]
+        assert set(one.unit_task_vector) == set(ref.unit_task_vector)
+        for key, value in ref.unit_task_vector.items():
+            torch.testing.assert_close(one.unit_task_vector[key], value, rtol=RTOL, atol=ATOL, msg=key)
