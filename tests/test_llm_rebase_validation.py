@@ -87,3 +87,42 @@ def test_structured_runtime_owns_immutable_model_bases(tmp_path, monkeypatch):
     assert isinstance(runtime.evaluation, LlmEvaluation)
     for key, value in runtime.models.target_base_sd.items():
         assert value.data_ptr() != runtime.models.target_llm.model.state_dict()[key].data_ptr()
+
+
+def _saved_qwen(tmp_path, name, **config_changes):
+    from _llm_fixtures import tiny_qwen2
+
+    model = tiny_qwen2()
+    for key, value in config_changes.items():
+        model.config.rope_parameters[key] = value
+    model.save_pretrained(tmp_path / name)
+    return str(tmp_path / name)
+
+
+@pytest.mark.parametrize("method", ["theseus", "bico"])
+def test_tuned_config_mismatch_is_rejected_before_model_loading(tmp_path, monkeypatch, method):
+    source = _saved_qwen(tmp_path, "src")
+    tuned = [_saved_qwen(tmp_path, "ft_a", rope_theta=500000.0), _saved_qwen(tmp_path, "ft_b")]
+    cfg = _base_cfg(tmp_path, method=method, source_model_name_or_path=source, tuned_bodies=tuned)
+    with pytest.raises(ValueError, match="allow_tuned_config_mismatch"):
+        _launch(cfg, tmp_path, monkeypatch, World())
+    assert not _launch.last_calls.builds and not _launch.last_calls.tuned
+
+
+def test_early_and_loaded_source_configs_give_the_same_overrides(tmp_path):
+    from transformers import AutoModelForCausalLM
+
+    from merge_and_rebase.eval.llm_rebase.context import _source_hf_config
+    from merge_and_rebase.models.text_lm import TextBuildConfig
+
+    source = _saved_qwen(tmp_path, "src")
+    tuned = [_saved_qwen(tmp_path, "ft_a", rope_theta=500000.0), _saved_qwen(tmp_path, "ft_b")]
+    early = _source_hf_config(TextBuildConfig(model_name_or_path=source))
+    loaded = AutoModelForCausalLM.from_pretrained(source).config
+    with pytest.warns(RuntimeWarning):
+        a = _task_contexts(["a", "b"], tuned, source_config=early, transports_delta=False)
+    with pytest.warns(RuntimeWarning):
+        b = _task_contexts(["a", "b"], tuned, source_config=loaded, transports_delta=False)
+    assert {k: v.config_overrides for k, v in a.items()} == {k: v.config_overrides for k, v in b.items()}
+    assert set(a["a"].config_overrides) == {"rope_theta"} and a["b"].config_overrides == {}
+    assert _source_hf_config(TextBuildConfig(model_name_or_path=str(tmp_path / "missing"))) is None

@@ -659,8 +659,34 @@ def build_runtime(
     """Validate inputs, load models, resolve geometry, then bind calibration and evaluation."""
     evaluation = _resolve_evaluation(cfg, method_params)
     settings = _resolve_calibration_settings(cfg, method_name)
+    transports_delta = method_family(method_name) is not MethodFamily.DIRECT_FIT
+    task_context_kwargs = {
+        "trust_remote_code": bool(source_build_cfg.trust_remote_code),
+        "transports_delta": transports_delta,
+        "allow_mismatch": bool(cfg.get("allow_tuned_config_mismatch", False)),
+    }
+    # The tuned-config check compares computation fields of the HF config files only (RoPE, window, norm eps, ...),
+    # so a refused pairing fails here, before either model or the calibration corpus is loaded. A source whose
+    # config cannot be read on its own falls back to the loaded model's config after _load_models.
+    early_source_config = _source_hf_config(source_build_cfg)
+    task_contexts = (
+        _task_contexts(
+            evaluation.tasks, evaluation.tuned_ref_list, source_config=early_source_config, **task_context_kwargs
+        )
+        if early_source_config is not None
+        else None
+    )
     models = _load_models(cfg, source_build_cfg, target_build_cfg, device, num_labels, method_name)
     resolved, plan, ignored = _resolve_plan(cfg, models, method_name, method, method_params)
+    if resolved.direct_fit == transports_delta:
+        raise RuntimeError(f"{method_name}: method family and resolved direct_fit disagree")
+    if task_contexts is None:
+        task_contexts = _task_contexts(
+            evaluation.tasks,
+            evaluation.tuned_ref_list,
+            source_config=getattr(models.source_llm.model, "config", None),
+            **task_context_kwargs,
+        )
     print(f"Using eval_mode={evaluation.eval_mode}")
     print("\nComputing task deltas...")
     if models.tp_keys:
@@ -674,15 +700,21 @@ def build_runtime(
         resolved=resolved,
         plan=plan,
         ignored_block_extension_fields=ignored,
-        task_contexts=_task_contexts(
-            evaluation.tasks,
-            evaluation.tuned_ref_list,
-            source_config=getattr(models.source_llm.model, "config", None),
-            trust_remote_code=bool(source_build_cfg.trust_remote_code),
-            transports_delta=not resolved.direct_fit,
-            allow_mismatch=bool(cfg.get("allow_tuned_config_mismatch", False)),
-        ),
+        task_contexts=task_contexts,
     )
+
+
+def _source_hf_config(build_cfg: TextBuildConfig) -> Any:
+    """The source base's HF config read from its config file (no weights), or None when it cannot be read alone."""
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            build_cfg.model_name_or_path, trust_remote_code=bool(build_cfg.trust_remote_code)
+        )
+    except Exception:
+        return None
+    return config if getattr(config, "model_type", None) is not None else None
 
 
 def _check_task_labels(tasks, tuned_ref_list) -> None:
