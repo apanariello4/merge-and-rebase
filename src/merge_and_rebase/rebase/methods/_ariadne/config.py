@@ -144,6 +144,8 @@ class DirectResidualConfig:
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
     # 'vision8_mix': one shared, exactly balanced Vision8 train context (batch_size / 8 per task per batch).
+    # 'precomputed' (vision, per task): stored preprocessed tensors <calibration_images_dir>/<Task>.pt (top-level config key),
+    # first num_batches*batch_size images in stored order (task-data-free sources, see precomputed_calibration.py).
     # Non-default values require procrustes_source='activation'. The context is built in vision_rebase.py.
     calibration_data: str = "task_local"
     # Ablation overriding the source block pi(j) paired with each target position j (affects both D_j and Q_j;
@@ -636,8 +638,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         if cfg.block_split != "none" and not (cfg.block_split == "backfit" and cfg.depth_fit == "sequential"):
             raise ValueError("activation_storage='streaming' requires block_split='none'")
     _validate_onepass(cfg, components)
-    if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix"}:
-        raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet' or 'vision8_mix'")
+    if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix", "precomputed"}:
+        raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet', 'vision8_mix' or 'precomputed'")
     if cfg.calibration_data != "task_local" and cfg.procrustes_source != "activation":
         raise ValueError(
             f"calibration_data={cfg.calibration_data!r} requires procrustes_source='activation': gradient "

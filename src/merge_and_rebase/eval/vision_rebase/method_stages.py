@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from ...data.vision_loaders import DEFAULT_NUM_WORKERS, DEFAULT_SEED
+from ...data.vision_loaders import DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS, DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
@@ -34,6 +34,7 @@ from .artifacts import _load_precomputed_tv, _load_saved_sequential_tv, _state_d
 from .context import _TaskContext
 from .memory import memory_efficient_enabled, source_fit_copy
 from .merge import _merge_direction
+from .precomputed_calibration import PRECOMPUTED, assert_same_preprocessing, build_precomputed_context
 from .stages import _visual_only_filter
 
 
@@ -595,7 +596,21 @@ class DirectFitStage:
                     lambda m: load_into_model(m, load_ckpt(str(env.tuned_by_task[t])), strict=False),
                 ),
             )
-            if self.calibration_ctx is not None:
+            if self.cfg.calibration_data == PRECOMPUTED:
+                # Task-data-free calibration: this task's stored images (same tensors for source and target).
+                precomputed_ctx, precomputed_meta = build_precomputed_context(
+                    t,
+                    cfg=cfg,
+                    num_batches=int(direct_residual_cfg.num_batches),
+                    batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+                    template=task.ctx,
+                )
+                assert_same_preprocessing(env.clf_source, env.clf_target)
+                self.record.calibration_meta.setdefault("by_task", {})[t] = precomputed_meta
+                print(f"Precomputed calibration for {t}: {precomputed_meta}")
+                direct_residual_source_loader = precomputed_ctx.source_loaders.train
+                direct_residual_target_loader = precomputed_ctx.loaders.train
+            elif self.calibration_ctx is not None:
                 # Task-independent calibration: the same paired
                 # images for every task (see calibration_data).
                 direct_residual_source_loader = self.calibration_ctx.source_loaders.train
