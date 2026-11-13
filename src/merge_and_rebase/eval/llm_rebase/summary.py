@@ -25,8 +25,9 @@ def assemble_harness_summary(
     search_planner: Any,
     harness_search_results: Any,
     saved_merged_path: Any,
+    transported_tv: Any = None,
 ) -> dict[str, Any]:
-    return {
+    summary = {
         "ignored_block_extension_fields": ignored_block_extension_fields,
         "calibration_provenance": calibration_provenance,
         "method": method_name,
@@ -48,6 +49,9 @@ def assemble_harness_summary(
         "search_results": summarize_search_results(harness_search_results),
         "saved_merged_path": saved_merged_path,
     }
+    if transported_tv is not None:  # additive: key absent unless save_transported_tvs_dir was given
+        summary["transported_tv"] = transported_tv
+    return summary
 
 
 def assemble_nli_summary(
@@ -63,8 +67,9 @@ def assemble_nli_summary(
     search_results: Any,
     best_vals: list[float],
     saved_merged_path: Any,
+    transported_tv: Any = None,
 ) -> dict[str, Any]:
-    return {
+    summary = {
         "ignored_block_extension_fields": ignored_block_extension_fields,
         "calibration_provenance": calibration_provenance,
         "method": method_name,
@@ -77,6 +82,9 @@ def assemble_nli_summary(
         "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
         "saved_merged_path": saved_merged_path,
     }
+    if transported_tv is not None:  # additive: key absent unless save_transported_tvs_dir was given
+        summary["transported_tv"] = transported_tv
+    return summary
 
 
 @dataclass

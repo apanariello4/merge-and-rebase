@@ -50,6 +50,13 @@ class CalibrationSettings:
     include_target: bool
     batch_size: int
     max_length: int
+    #: Opt-in calibration options (defaults reproduce the historical plain-text corpus).
+    generated_answer: Any = None
+    apply_chat_template: bool = False
+    system_instruction: str | None = None
+    num_fewshot: Any = 0
+    fit_mask: str | None = None
+    record_format: bool = False
 
 
 @dataclass
@@ -78,6 +85,8 @@ class LlmEvaluation:
     head_key_pattern: str
     task_heads_path: str | None
     search_planner: SearchPlanner
+    #: Opt-in lm-eval prompt/decoding options shared by every harness call (empty = the historical call).
+    harness_render: dict[str, Any] = field(default_factory=dict)
     baseline_results: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def baseline_summary(self) -> dict[str, Any] | None:
@@ -100,6 +109,7 @@ class LlmEvaluation:
             batch_size=self.harness_batch_size,
             limit=self.harness_limit,
             samples=self.slices.search,
+            **self.harness_render,
         )
         for task_name, acc in results.items():
             print(f"  [before rebase / {label}] {task_name}: {acc:.4f}")

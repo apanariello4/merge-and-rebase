@@ -5,11 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from ...data.text_loaders import NLITaskData, NLITokenizedData, build_nli_task_data, build_nli_tokenized_loader
-from ...hyperparam_search import SearchEvaluation, describe_candidate
+from ...hyperparam_search import SearchEvaluation, describe_candidate, summarize_search_results
 from ...io.ckpt import load_into_model
 from ...merge.runtime import apply_delta
 from ..print_utils import pretty_print_task_accuracies
-from .artifacts import save_merged_state
+from .artifacts import save_merged_state, save_transported_task_vector
 from .common import (
     default_prompt_for_task,
     head_class_ids_for_task,
@@ -36,6 +36,7 @@ def harness_alpha_search(
     harness_batch_size: Any,
     harness_limit: Any,
     harness_samples: Any,
+    harness_render: Any = None,
 ) -> tuple[SearchEvaluation, dict[float, dict[str, float]], list[SearchEvaluation]]:
     from .harness import run as run_harness
     from .harness import score_by_task
@@ -66,6 +67,7 @@ def harness_alpha_search(
                 batch_size=harness_batch_size,
                 limit=harness_limit,
                 samples=harness_samples,
+                **(harness_render or {}),
             )
             for task_name, acc in harness_results.items():
                 print(f"  {task_name}: {acc:.4f}")
@@ -114,6 +116,7 @@ def score_harness_test_slice(
     harness_batch_size: Any,
     harness_samples: Any,
     best_alpha: float,
+    harness_render: Any = None,
     slices: HarnessSlices | None = None,
 ) -> tuple[dict[str, float] | None, dict[str, list[int]] | None]:
     from .harness import run as run_harness
@@ -145,6 +148,7 @@ def score_harness_test_slice(
             batch_size=harness_batch_size,
             limit=None,
             samples=test_samples,
+            **(harness_render or {}),
         )
         print("=== Harness results (held-out test slice) ===")
         for task_name, acc in harness_test_results.items():
@@ -273,6 +277,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
     harness_batch_size = rt.evaluation.harness_batch_size
     harness_limit = rt.evaluation.harness_limit
     harness_samples = rt.evaluation.slices.search
+    harness_render = rt.evaluation.harness_render
     is_harness_only = rt.evaluation.is_harness_only
     ignored_block_extension_fields = rt.ignored_block_extension_fields
     _calibration_provenance = rt.calibration.cache.provenance
@@ -306,6 +311,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             harness_batch_size=harness_batch_size,
             harness_limit=harness_limit,
             harness_samples=harness_samples,
+            harness_render=harness_render,
         )
 
         best_alpha = float(best_harness_eval.candidate.alpha)
@@ -326,6 +332,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             harness_batch_size=harness_batch_size,
             harness_samples=harness_samples,
             best_alpha=best_alpha,
+            harness_render=harness_render,
             slices=rt.evaluation.slices,
         )
 
@@ -333,6 +340,16 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             save_merged_state(
                 cfg["save_merged"], merged_delta, best_alpha, target_base_sd, message="Saved rebased state to"
             )
+        transported_tv = save_transported_task_vector(
+            cfg,
+            merged_delta,
+            method_name=method_name,
+            best_alpha=best_alpha,
+            alpha_curve={
+                "search_results": summarize_search_results(harness_search_results),
+                "harness_results_by_alpha": {f"{a:g}": r for a, r in sorted(harness_results_by_alpha.items())},
+            },
+        )
 
         return RunRecord(
             "harness",
@@ -352,6 +369,7 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
                 search_planner=search_planner,
                 harness_search_results=harness_search_results,
                 saved_merged_path=cfg.get("save_merged"),
+                transported_tv=transported_tv,
             ),
         )
 
@@ -454,6 +472,13 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
         save_merged_state(
             cfg["save_merged"], merged_delta, best_alpha, target_base_sd, message="Saved best-alpha rebased state to"
         )
+    transported_tv = save_transported_task_vector(
+        cfg,
+        merged_delta,
+        method_name=method_name,
+        best_alpha=best_alpha,
+        alpha_curve=summarize_search_results(search_results),
+    )
 
     return RunRecord(
         "nli",
@@ -469,5 +494,6 @@ def run_alpha_search(rt: Any, outputs: Any) -> RunRecord:
             search_results=search_results,
             best_vals=best_vals,
             saved_merged_path=cfg.get("save_merged"),
+            transported_tv=transported_tv,
         ),
     )

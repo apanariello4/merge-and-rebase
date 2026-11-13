@@ -37,6 +37,9 @@ def order_components(components) -> tuple[str, ...]:
 class DirectResidualConfig:
     ridge_relative: float = 0.01
     # Read unconditionally by the shared solver (mirrors ResidualCompletionConfig); 'fixed_relative' = historical ridge.
+    # Opt-in 'frob_trace' (PatchKV, arXiv 2609.39329 Eq. 7): lam = ridge_relative * ||S_c||_F^2 / tr(S_c) (times
+    # ||G||_F^2 / tr(G) for the output map, 1 for c_proj), i.e. lam0 times the eigenvalue-weighted mean eigenvalue of
+    # the centred feature Gram; no 1/N factor, so lam scales with the rows like S_c (closed_form solves only).
     ridge_estimator: str = "fixed_relative"
     strength: float = 1.0
     num_batches: int = 10
@@ -90,10 +93,59 @@ class DirectResidualConfig:
     activation_storage: str = "resident"
     # Streaming only: fit target positions in chunks of this size (one capture sweep each) to bound host RAM; None = one chunk.
     streaming_position_chunk: int | None = None
+    # Streaming only: device holding the accumulated float64 statistics (S, B, G, sums) between batches. None (default):
+    # the compute device, as before. 'cpu': per-batch products are still computed on the compute device and added into
+    # host-RAM accumulators (float64 addition is exact-rounded on both, so sums are bitwise those of the default); each
+    # position's statistics return to the compute device only for its solve. Bounds GPU memory for wide MLPs.
+    stats_device: str | None = None
+    # Opt-in one-pass fit (vision, independent block-boundary c_proj fit only; see _ariadne/onepass.py): the Gram, cross and
+    # moment statistics are accumulated from ONE sweep (source base, source FT, target base) instead of Pass A + diagnostics
+    # sweep + Pass B. Exactly equivalent in exact arithmetic to the streaming fit (effect = 0 at the base target, so the
+    # regression target is (f - b) Q_j and Q_j is only needed at the end). False (default): the streaming fit, unchanged.
+    onepass: bool = False
+    # Dtype of the one-pass Gram / cross statistics: 'float64' (as the streaming fit) or 'float32' (TF32 forced off for the
+    # accumulation matmuls; the solve is float64 either way). Read only when onepass=True.
+    onepass_stats_dtype: str = "float64"
+    # Decoder families whose block writes post_mlp_norm(down_proj(h)) into the residual (Gemma-2): how the block-
+    # boundary target E_j reaches down_proj. y = W h (target base down_proj output), r = sqrt(mean(y^2) + eps),
+    # g = norm gain; the norm's linearization is (1/r) diag(g) (I - y y^T / (d r^2)), whose rank-one term (the
+    # direction that only rescales y, which the norm cancels) both modes drop.
+    # 'pre_norm': fit before the norm, min ||H dW^T - E * r / g|| (target pulled back per row; solver unchanged).
+    # 'linearized': the norm is part of the output map, min ||(H / r) dW^T diag(g) - E|| (rows of H scaled by 1/r,
+    # effective_out = diag(g)). None (default): the down_proj output enters the residual directly (Llama/Qwen).
+    post_mlp_norm: str | None = None
+    # Target each block of the independent block-boundary streaming fit is regressed on.
+    # 'total' (default): D_j = (f_i - b_i) Q_j, the whole accumulated source difference at block i = pairing[j]
+    #     (bit-identical to pre-field code; with every block mounted the upstream difference is counted again at each).
+    # 'increment': the part added since the previous target position's source reference, split equally over the run
+    #     of target blocks sharing one source block: ((f_i - b_i) - (f_p - b_p)) Q_j / g(j), p = source block paired
+    #     with the last target position before j's run (none for the first run), g(j) = size of j's run; needs a
+    #     non-decreasing pairing (see `increment_references`).
+    block_target: str = "total"
+    # What the sequential block-boundary streaming fit subtracts from D_j (depth_fit='sequential' only).
+    # 'all' (default): the whole upstream change, E_j = D_j - U_j (bit-identical to pre-field code).
+    # 'off_target': only the part of U_j orthogonal to D_j, E_j = D_j - (U_j - c_j D_j), c_j = <U_j, D_j> / ||D_j||^2
+    #     (global over all calibration rows; 0 if D_j = 0): the component of the upstream change along D_j is kept.
+    sequential_subtract: str = "all"
+    # Strength s at which the already-fitted upstream blocks are mounted during the sequential block-boundary fit
+    # (depth_fit='sequential' only). 1.0 (default): unit-strength updates, E_j = D_j - U_j (bit-identical to pre-field
+    # code). s != 1: blocks 0..j-1 are mounted at s times their unit update and block j is fitted to E_j = s D_j - U_j(s)
+    # (the network operating point of a final scaling alpha ~ s); the solved update is returned divided by s, so the
+    # task vector stays at unit scale for the alpha search. Linear in the limit: s -> 0 is the linearised sequential fit.
+    sequential_strength: float = 1.0
+    # depth_fit='joint' (J ~ I): all blocks solved together for the cumulative objective
+    # sum_j w_j ||S_j - D_j||^2 + sum_k lambda_k ||dW_k||^2, S_j = sum_{k<=j} (H_k dW_k + 1 b_k^T) L_k, by preconditioned
+    # conjugate gradients started from the independent solution (see joint.py). 'uniform': w_j = 1.
+    joint_weights: str = "uniform"
+    # Stop when ||r|| / ||b|| <= joint_tol (normal-equation residual) or after joint_max_iters iterations.
+    joint_tol: float = 1e-6
+    joint_max_iters: int = 50
     # Images the fit collects activations on (alpha search and evaluation always use each task's own splits):
     # 'task_local' (default): each task's own train loaders (first contributing task's under merge_in_source_then_fit); bit-identical to pre-field code.
     # 'tiny_imagenet': one shared task-independent context (zh-plus/tiny-imagenet, "valid").
     # 'vision8_mix': one shared, exactly balanced Vision8 train context (batch_size / 8 per task per batch).
+    # 'precomputed' (vision, per task): stored preprocessed tensors <calibration_images_dir>/<Task>.pt (top-level config key),
+    # first num_batches*batch_size images in stored order (task-data-free sources, see precomputed_calibration.py).
     # Non-default values require procrustes_source='activation'. The context is built in vision_rebase.py.
     calibration_data: str = "task_local"
     # Ablation overriding the source block pi(j) paired with each target position j (affects both D_j and Q_j;
@@ -117,11 +169,104 @@ class DirectResidualConfig:
     # Ablation (default off): besides the fit, also copy source task-vector deltas whose shapes match the target's
     # (decoder/LLM runs; by default the Ariadne task vector is only its own fit). Serialized only when True.
     copy_shape_matching_source_deltas: bool = False
+    # Ablation: how blocks are fitted across depth. 'independent' (default): every block fitted against the pristine
+    # target base (golden-hash pinned). 'sequential': blocks fitted in order, block j against the target already
+    # carrying the fitted updates of blocks < j (residual target D_j - U_j); streaming path only (see
+    # streaming.fit_direct_residual_sequential_streaming). Serialized only when non-default.
+    depth_fit: str = "independent"
+    # How depth_fit='sequential' is computed (same estimator, same fitted task vector). 'reference' (default): the
+    # original streaming code, four full forwards per position and batch. 'block_carry' (decoders only): every model
+    # stream carries its exact block input forward, so each position runs only its own block (see
+    # sequential_carry.py). Serialized only when non-default.
+    sequential_impl: str = "reference"
+    # Ablation (depth_fit='sequential', sequential_impl='reference', components attn.out_proj + mlp.c_proj): how many
+    # correction points each block gets. 'single' (default): the one component fit as before. 'end_end': O
+    # (attn.out_proj) is fitted first, then D (mlp.c_proj), both against the block-end target D_j (D fits what O left
+    # missing at the block end). 'mid_end': O is fitted against a mid-block target M_j (residual stream after the
+    # attention add) through its own polar Procrustes map, D against D_j (vision only). Serialized only when non-default.
+    sequential_points: str = "single"
+    # Ablation (polar map, procrustes_source='activation', streaming only; mutually exclusive, default None = full
+    # map): rank-truncate the Procrustes map Q_j = U V^T to its top-k singular pairs, Q_j^k = U[:, :k] Vh[:k].
+    # 'procrustes_rank': fixed k >= 1 (k >= min(d_source, d_target) is the full map). 'procrustes_energy': in (0, 1],
+    # per block the smallest k with sum(s[:k]) / sum(s) >= procrustes_energy, s the PLAIN singular values of the
+    # centered cross-covariance (NOT squared); 1.0 is the full map. Serialized only when set.
+    procrustes_rank: int | None = None
+    procrustes_energy: float | None = None
+    # Decoder-only ablation (default off): besides padding, drop the first non-padded position of every sequence (the
+    # attention sink, massive activations) from every statistic the fit consumes, for source and target alike.
+    # Serialized only when True; rejected on the vision path (reject_decoder_only_options).
+    exclude_first_token: bool = False
+    # Diagnostic (vision only): with residual_target='native_oracle' the target is D*_j = T^ft_j - T^base_j, the block-j
+    # output change of the NATIVE fine-tuned target model (own full forward) against the target base on the same target
+    # calibration images; no Procrustes map is used. 'native_target_ckpt_template' ("...{task}...") names that checkpoint
+    # (same loader as eval.diagnostics.ariadne_norm.readout). Streaming, depth_fit='independent', per-task fits only.
+    native_target_ckpt_template: str | None = None
+    # Ablation: target blocks to fit (sorted unique indices, None = all); every other block gets no update. Works for
+    # depth_fit='independent' and depth_fit='sequential' (sequential_impl='reference', sequential_points='single'): in a
+    # sequential fit an unfitted block is skipped (nothing mounted), later blocks still see the true drift U_j.
+    fit_blocks: tuple[int, ...] | None = None
+    # Ablation for extend (several target blocks share one source block pi(j)); target groups are the maximal runs of
+    # consecutive target blocks with the same pi(j) (size 1 under shrink / same depth: no-op). 'none' (default).
+    # 'per_block_share' (depth_fit='independent'): block j of a group of size m is fitted to D_j / m (each block's change
+    # persists in the residual stream, so the group delivers D once, not m times). 'interpolate' (depth_fit='sequential',
+    # reference, single point): the i-th block (i = 0..m-1) of a group starting at block j0 is fitted to
+    # D_prev + (i + 1) / m * (D_j - D_prev), D_prev the unsplit transported change of block j0 - 1 (0 for j0 = 0), so the last
+    # block of a group keeps D_j; the sequential error stays desired - U_j.
+    pair_target_split: str = "none"
+    # Ablation (vision only, depth_fit='independent', block_boundary, block_split='none'): how a component is fitted.
+    # 'closed_form' (default): the ridge solve on the component's input features. 'gradient_exact': minimise
+    # sum ||T_j(W + dW; x_j) - T_j(W; x_j) - D_j||^2 + lam ||dW||_F^2 (bias unpenalised) with the EXACT block forward T_j by
+    # full-batch L-BFGS from 0. 'gradient_linearized': the same with T_j replaced by its first-order expansion (a convex
+    # ridge problem, conjugate gradients on the normal equations, J never formed). Component groups (one per run):
+    # attn.v_proj; attn.q_proj + attn.k_proj; attn.q_proj + attn.k_proj + attn.v_proj; mlp.c_fc; attn.out_proj; mlp.c_proj.
+    # For mlp.c_proj both gradient arms equal the closed form; for attn.out_proj they include the MLP's reaction downstream.
+    component_fit: str = "closed_form"
+    gradient_fit_max_iters: int = 500
+    # Stop when the relative decrease of the (scaled) objective between iterations is below this.
+    gradient_fit_tol: float = 1e-9
+    # 'eb_input': lam = empirical-Bayes value of the component's own centred input features (as the closed form).
+    # 'match_norm': per block, lam found by bisection on log lam so ||dW_j||_F equals (1 %) that of the closed-form
+    # mlp.c_proj fit of the same block and task (computed internally).
+    gradient_ridge: str = "eb_input"
+    # Ablation (vision only): closed-form correction of the attention V projection instead of the usual out_proj / c_proj
+    # fits. None (default): off. 'preimage': per block and head h, with Z_h = A_h X (the attention-weighted ln_1 output), the
+    # V slice change (dV_h, db_h) moves the pre-out_proj rows EXACTLY by Z_h dV_h^T + 1 db_h^T (rows of A_h sum to 1); the
+    # block-end target D_j is pulled back through the (square) write map L = W_O^T diag(ls_1 gamma): T = D_j L^+, and each head
+    # solves its own ridge regression Z_h -> T_h with unpenalised intercept and the empirical-Bayes ridge of the O/D path.
+    # First order: the MLP is assumed not to react (as in the closed-form attn.out_proj fit). Requires components=['attn.v_proj'].
+    v_fit: str | None = None
 
 
 # Fields added after results were published: serialized only when non-default, so every historical summary,
 # artifact and golden hash of a default run stays byte-identical.
-_SERIALIZED_WHEN_NON_DEFAULT = {"streaming_fingerprint_tol": 1e-9, "copy_shape_matching_source_deltas": False}
+_SERIALIZED_WHEN_NON_DEFAULT = {
+    "streaming_fingerprint_tol": 1e-9,
+    "copy_shape_matching_source_deltas": False,
+    "depth_fit": "independent",
+    "sequential_impl": "reference",
+    "sequential_points": "single",
+    "procrustes_rank": None,
+    "procrustes_energy": None,
+    "exclude_first_token": False,
+    "native_target_ckpt_template": None,
+    "fit_blocks": None,
+    "pair_target_split": "none",
+    "component_fit": "closed_form",
+    "gradient_fit_max_iters": 500,
+    "gradient_fit_tol": 1e-9,
+    "gradient_ridge": "eb_input",
+    "v_fit": None,
+    "stats_device": None,
+    "onepass": False,
+    "onepass_stats_dtype": "float64",
+    "post_mlp_norm": None,
+    "block_target": "total",
+    "sequential_subtract": "all",
+    "sequential_strength": 1.0,
+    "joint_weights": "uniform",
+    "joint_tol": 1e-6,
+    "joint_max_iters": 50,
+}
 
 
 def direct_residual_config_dict(cfg: DirectResidualConfig) -> dict[str, Any]:
@@ -204,6 +349,16 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "tv_scaling_iters",
         "activation_storage",
         "streaming_position_chunk",
+        "stats_device",
+        "onepass",
+        "onepass_stats_dtype",
+        "post_mlp_norm",
+        "block_target",
+        "sequential_subtract",
+        "sequential_strength",
+        "joint_weights",
+        "joint_tol",
+        "joint_max_iters",
         "calibration_data",
         "depth_pairing",
         "alignment_seed",
@@ -211,6 +366,20 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "fidelity_holdout_batches",
         "streaming_fingerprint_tol",
         "copy_shape_matching_source_deltas",
+        "depth_fit",
+        "sequential_impl",
+        "sequential_points",
+        "procrustes_rank",
+        "procrustes_energy",
+        "exclude_first_token",
+        "native_target_ckpt_template",
+        "fit_blocks",
+        "pair_target_split",
+        "component_fit",
+        "gradient_fit_max_iters",
+        "gradient_fit_tol",
+        "gradient_ridge",
+        "v_fit",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -218,6 +387,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     payload = {**(_PRESETS[preset] if preset is not None else {}), **value}
     if "components" in payload and isinstance(payload["components"], list):
         payload["components"] = tuple(payload["components"])
+    if isinstance(payload.get("fit_blocks"), list):
+        payload["fit_blocks"] = tuple(payload["fit_blocks"])
     cfg = DirectResidualConfig(**payload)
     if isinstance(cfg.num_batches, bool) or not isinstance(cfg.num_batches, int) or cfg.num_batches <= 0:
         raise ValueError("num_batches must be a positive integer")
@@ -227,8 +398,10 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("ridge_relative must be finite")
     if cfg.ridge_relative <= 0:
         raise ValueError("ridge_relative must be > 0")
-    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none"}:
-        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes' or 'none'")
+    if cfg.ridge_estimator not in {"fixed_relative", "empirical_bayes", "none", "frob_trace"}:
+        raise ValueError("ridge_estimator must be 'fixed_relative', 'empirical_bayes', 'none' or 'frob_trace'")
+    if cfg.ridge_estimator == "frob_trace" and cfg.component_fit != "closed_form":
+        raise ValueError("ridge_estimator='frob_trace' is implemented for component_fit='closed_form' only")
     if isinstance(cfg.strength, bool) or not isinstance(cfg.strength, (int, float)):
         raise ValueError("strength must be a finite real number")
     if not math.isfinite(float(cfg.strength)):
@@ -239,13 +412,13 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise TypeError("exact_form must be bool")
     if not isinstance(cfg.copy_shape_matching_source_deltas, bool):
         raise TypeError("copy_shape_matching_source_deltas must be bool")
-    if cfg.component_target in {"output_local", "output_total"}:
+    if cfg.component_target == "output_local":
         raise ValueError(
-            f"component_target={cfg.component_target!r} was retired (closed dead end) in the release "
-            "cleanup; only 'block_boundary' is supported"
+            "component_target='output_local' was retired (closed dead end) in the release "
+            "cleanup; only 'block_boundary' and the opt-in 'output_total' are supported"
         )
-    if cfg.component_target != "block_boundary":
-        raise ValueError("component_target must be 'block_boundary'")
+    if cfg.component_target not in {"block_boundary", "output_total"}:
+        raise ValueError("component_target must be 'block_boundary' or 'output_total'")
     if not isinstance(cfg.realization_diagnostics, bool):
         raise TypeError("realization_diagnostics must be bool")
     components = cfg.components
@@ -256,9 +429,16 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("components must not be empty")
     if len(set(components)) != len(components):
         raise ValueError("components must not repeat a projection")
-    unsupported = set(components) - set(COMPONENT_FORWARD_ORDER)
+    if cfg.component_fit not in {"closed_form", "gradient_exact", "gradient_linearized"}:
+        raise ValueError("component_fit must be 'closed_form', 'gradient_exact' or 'gradient_linearized'")
+    supported = (
+        CANONICAL_COMPONENT_ORDER
+        if cfg.component_fit != "closed_form" or cfg.v_fit is not None
+        else COMPONENT_FORWARD_ORDER
+    )
+    unsupported = set(components) - set(supported)
     if unsupported:
-        raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(COMPONENT_FORWARD_ORDER)}")
+        raise ValueError(f"unknown components: {sorted(unsupported)}; supported: {sorted(supported)}")
     # Unlike parse_residual_completion_config (which needs 'mlp.c_proj' to anchor its cascade), nothing cascades
     # here (every position is fit independently against the pristine target base), so any non-empty,
     # repeat-free subset of COMPONENT_FORWARD_ORDER is legal, including {'attn.out_proj'} alone.
@@ -313,8 +493,8 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         raise ValueError("backfit_tol must be a finite real number")
     if not math.isfinite(float(cfg.backfit_tol)) or cfg.backfit_tol <= 0:
         raise ValueError("backfit_tol must be finite and > 0")
-    if cfg.residual_target not in {"transported_delta", "transported_endpoint"}:
-        raise ValueError("residual_target must be 'transported_delta' or 'transported_endpoint'")
+    if cfg.residual_target not in {"transported_delta", "transported_endpoint", "native_oracle"}:
+        raise ValueError("residual_target must be 'transported_delta', 'transported_endpoint' or 'native_oracle'")
     if cfg.residual_target == "transported_endpoint" and cfg.component_target != "block_boundary":
         raise ValueError("residual_target='transported_endpoint' requires component_target='block_boundary'")
     if cfg.procrustes_source not in {"activation", "gradient"}:
@@ -371,13 +551,95 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             raise ValueError("streaming_position_chunk must be None or a positive integer")
         if cfg.streaming_position_chunk <= 0:
             raise ValueError("streaming_position_chunk must be None or a positive integer")
+    if cfg.post_mlp_norm not in {None, "pre_norm", "linearized"}:
+        raise ValueError("post_mlp_norm must be None, 'pre_norm' or 'linearized'")
+    if cfg.post_mlp_norm is not None and (
+        cfg.activation_storage != "streaming"
+        or cfg.depth_fit != "independent"
+        or cfg.component_target != "block_boundary"
+        or cfg.v_fit is not None
+        or tuple(cfg.components) != ("mlp.c_proj",)
+    ):
+        raise ValueError(
+            "post_mlp_norm is implemented for the independent block-boundary streaming fit of mlp.c_proj only"
+        )
+    if cfg.block_target not in {"total", "increment"}:
+        raise ValueError("block_target must be 'total' or 'increment'")
+    if cfg.block_target == "increment" and (
+        cfg.activation_storage != "streaming"
+        or cfg.depth_fit != "independent"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.residual_target != "transported_delta"
+        or cfg.pair_target_split != "none"
+        or cfg.fit_blocks is not None
+        or cfg.component_fit != "closed_form"
+        or cfg.v_fit is not None
+    ):
+        raise ValueError(
+            "block_target='increment' is implemented for the independent block-boundary streaming fit only "
+            "(activation_storage='streaming', depth_fit='independent', block_split='none', "
+            "component_target='block_boundary', residual_target='transported_delta', pair_target_split='none', "
+            "fit_blocks unset, component_fit='closed_form', no v_fit)"
+        )
+    if isinstance(cfg.sequential_strength, bool) or not isinstance(cfg.sequential_strength, (int, float)):
+        raise ValueError("sequential_strength must be a positive finite number")
+    if not math.isfinite(float(cfg.sequential_strength)) or float(cfg.sequential_strength) <= 0:
+        raise ValueError("sequential_strength must be a positive finite number")
+    if float(cfg.sequential_strength) != 1.0 and (
+        cfg.depth_fit != "sequential"
+        or cfg.sequential_impl != "reference"
+        or cfg.sequential_points != "single"
+        or cfg.activation_storage != "streaming"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.endpoint_construction != "native_delta"
+    ):
+        raise ValueError(
+            "sequential_strength != 1 is implemented for the plain sequential block-boundary streaming fit only "
+            "(depth_fit='sequential', sequential_impl='reference', sequential_points='single', "
+            "activation_storage='streaming', block_split='none', component_target='block_boundary')"
+        )
+    if cfg.sequential_subtract not in {"all", "off_target"}:
+        raise ValueError("sequential_subtract must be 'all' or 'off_target'")
+    if cfg.sequential_subtract == "off_target" and (
+        cfg.depth_fit != "sequential"
+        or cfg.sequential_impl != "reference"
+        or cfg.sequential_points != "single"
+        or cfg.activation_storage != "streaming"
+        or cfg.block_split != "none"
+        or cfg.component_target != "block_boundary"
+        or cfg.residual_target != "transported_delta"
+        or cfg.block_target != "total"
+        or cfg.pair_target_split != "none"
+        or cfg.component_fit != "closed_form"
+        or cfg.v_fit is not None
+        or cfg.post_mlp_norm is not None
+    ):
+        raise ValueError(
+            "sequential_subtract='off_target' is implemented for the plain sequential block-boundary streaming fit "
+            "only (depth_fit='sequential', sequential_impl='reference', sequential_points='single', "
+            "activation_storage='streaming', block_split='none', component_target='block_boundary', "
+            "residual_target='transported_delta', block_target='total', pair_target_split='none', "
+            "component_fit='closed_form', no v_fit, no post_mlp_norm)"
+        )
+    if cfg.stats_device not in {None, "cpu"}:
+        raise ValueError("stats_device must be None (the compute device) or 'cpu'")
+    if cfg.stats_device is not None and cfg.activation_storage != "streaming":
+        raise ValueError("stats_device requires activation_storage='streaming'")
+    if cfg.stats_device is not None and (
+        cfg.depth_fit != "independent" or cfg.component_target != "block_boundary" or cfg.v_fit is not None
+    ):
+        # Only fit_direct_residual_streaming honours it; refuse rather than silently keep GPU statistics elsewhere.
+        raise ValueError("stats_device is implemented for the independent block-boundary streaming fit only")
     if cfg.activation_storage == "streaming":
-        if cfg.component_target != "block_boundary":
+        if cfg.component_target not in {"block_boundary", "output_total"}:
             raise ValueError("activation_storage='streaming' requires component_target='block_boundary'")
-        if cfg.block_split != "none":
+        if cfg.block_split != "none" and not (cfg.block_split == "backfit" and cfg.depth_fit == "sequential"):
             raise ValueError("activation_storage='streaming' requires block_split='none'")
-    if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix"}:
-        raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet' or 'vision8_mix'")
+    _validate_onepass(cfg, components)
+    if cfg.calibration_data not in {"task_local", "tiny_imagenet", "vision8_mix", "precomputed"}:
+        raise ValueError("calibration_data must be 'task_local', 'tiny_imagenet', 'vision8_mix' or 'precomputed'")
     if cfg.calibration_data != "task_local" and cfg.procrustes_source != "activation":
         raise ValueError(
             f"calibration_data={cfg.calibration_data!r} requires procrustes_source='activation': gradient "
@@ -404,7 +666,356 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
     tol = cfg.streaming_fingerprint_tol
     if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
         raise ValueError("streaming_fingerprint_tol must be a positive finite number")
+    rank, energy = cfg.procrustes_rank, cfg.procrustes_energy
+    if rank is not None and energy is not None:
+        raise ValueError("procrustes_rank and procrustes_energy are mutually exclusive")
+    if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 1):
+        raise ValueError("procrustes_rank must be an integer >= 1 or None")
+    if energy is not None and (
+        isinstance(energy, bool) or not isinstance(energy, (int, float)) or not 0.0 < float(energy) <= 1.0
+    ):
+        raise ValueError("procrustes_energy must be a real number in (0, 1] or None")
+    if rank is not None or energy is not None:
+        need = {"alignment_map": "polar", "procrustes_source": "activation", "activation_storage": "streaming"}
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"procrustes_rank/procrustes_energy require {need}; got incompatible {bad}")
+    if not isinstance(cfg.exclude_first_token, bool):
+        raise TypeError("exclude_first_token must be bool")
+    if cfg.depth_fit not in {"independent", "sequential", "joint"}:
+        raise ValueError("depth_fit must be 'independent', 'sequential' or 'joint'")
+    _validate_joint(cfg, components)
+    if cfg.sequential_impl not in {"reference", "block_carry"}:
+        raise ValueError("sequential_impl must be 'reference' or 'block_carry'")
+    if cfg.sequential_impl != "reference" and cfg.depth_fit != "sequential":
+        raise ValueError(f"sequential_impl={cfg.sequential_impl!r} requires depth_fit='sequential'")
+    if cfg.sequential_points not in {"single", "end_end", "mid_end"}:
+        raise ValueError("sequential_points must be 'single', 'end_end' or 'mid_end'")
+    if cfg.sequential_points != "single" and cfg.depth_fit != "sequential":
+        raise ValueError(f"sequential_points={cfg.sequential_points!r} requires depth_fit='sequential'")
+    if cfg.depth_fit == "sequential":
+        required = {
+            "activation_storage": "streaming",
+            "block_split": "none",
+            "tv_scaling": "none",
+            "endpoint_construction": "native_delta",
+            "merge_mode": "per_task_then_merge",
+            "procrustes_source": "activation",
+            "residual_target": "transported_delta",
+            "fidelity_holdout": False,
+            "realization_diagnostics": False,
+        }
+        # Opt-in: intra-block Gauss-Seidel backfit of attn.out_proj + mlp.c_proj inside the sequential depth loop
+        # (vision only; the shared full E_j target rules out any pair/two-point target split).
+        seq_backfit = cfg.block_split == "backfit"
+        if seq_backfit:
+            required = {
+                **required,
+                "block_split": "backfit",
+                "sequential_points": "single",
+                "pair_target_split": "none",
+                "component_fit": "closed_form",
+            }
+        bad = {name: getattr(cfg, name) for name, want in required.items() if getattr(cfg, name) != want}
+        two_points = cfg.sequential_points != "single"
+        if seq_backfit:
+            if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
+                bad["components"] = components
+        elif two_points:
+            if set(components) != {"attn.out_proj", "mlp.c_proj"} or len(components) != 2:
+                bad["components"] = components
+        elif len(components) != 1 and cfg.component_target != "output_total":
+            bad["components"] = components
+        if bad:
+            what = (
+                "exactly the components attn.out_proj and mlp.c_proj"
+                if two_points or seq_backfit
+                else "exactly one component"
+            )
+            raise ValueError(f"depth_fit='sequential' requires {required} and {what}; got incompatible {bad}")
+        if two_points:
+            if cfg.sequential_impl != "reference":
+                raise ValueError(f"sequential_points={cfg.sequential_points!r} requires sequential_impl='reference'")
+            if cfg.sequential_points == "mid_end":
+                need = {
+                    "alignment_map": "polar",
+                    "alignment_row_weighting": "uniform",
+                    "procrustes_source": "activation",
+                    "procrustes_rank": None,
+                    "procrustes_energy": None,
+                }
+                bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+                if bad:
+                    raise ValueError(f"sequential_points='mid_end' requires {need}; got incompatible {bad}")
+    _validate_component_ablations(cfg, components)
+    _validate_output_total(cfg, components)
     return cfg
+
+
+#: Component groups a gradient fit takes as ONE joint fit (the q/k/v slices share the packed in_proj and the ln_1 input).
+_GRADIENT_FIT_GROUPS: frozenset[frozenset[str]] = frozenset(
+    frozenset(g)
+    for g in (
+        ("attn.v_proj",),
+        ("attn.q_proj", "attn.k_proj"),
+        ("attn.q_proj", "attn.k_proj", "attn.v_proj"),
+        ("mlp.c_fc",),
+        ("attn.out_proj",),
+        ("mlp.c_proj",),
+    )
+)
+
+
+def _validate_onepass(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of the opt-in one-pass fit (``onepass``): only the plain streaming c_proj fit is supported."""
+    if not isinstance(cfg.onepass, bool):
+        raise TypeError("onepass must be bool")
+    if cfg.onepass_stats_dtype not in {"float64", "float32"}:
+        raise ValueError("onepass_stats_dtype must be 'float64' or 'float32'")
+    if not cfg.onepass:
+        if cfg.onepass_stats_dtype != "float64":
+            raise ValueError("onepass_stats_dtype requires onepass=true")
+        return
+    need = {
+        "depth_fit": "independent",
+        "block_split": "none",
+        "procrustes_source": "activation",
+        "alignment_map": "polar",
+        "alignment_row_weighting": "uniform",
+        "procrustes_rank": None,
+        "procrustes_energy": None,
+        "residual_target": "transported_delta",
+        "component_target": "block_boundary",
+        "realization_diagnostics": False,
+        "fidelity_holdout": False,
+        "activation_storage": "streaming",
+        "component_fit": "closed_form",
+        "block_target": "total",
+        "pair_target_split": "none",
+        "tv_scaling": "none",
+        "endpoint_construction": "native_delta",
+        "fit_blocks": None,
+        "v_fit": None,
+        "post_mlp_norm": None,
+        "stats_device": None,
+        "sequential_points": "single",
+        "exclude_first_token": False,
+        "cascade_order": "independent",
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if tuple(components) != ("mlp.c_proj",):
+        bad["components"] = tuple(components)
+    if bad:
+        raise ValueError(
+            f"onepass=true is implemented for the vision independent block-boundary mlp.c_proj streaming fit only; "
+            f"it requires {need} and components=('mlp.c_proj',); got incompatible {bad}"
+        )
+
+
+def _validate_joint(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of ``depth_fit='joint'`` and its solver fields (joint_tol / joint_max_iters stay default otherwise)."""
+    if cfg.joint_weights != "uniform":
+        raise ValueError("joint_weights must be 'uniform'")
+    tol, iters = cfg.joint_tol, cfg.joint_max_iters
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(float(tol)) or tol <= 0:
+        raise ValueError("joint_tol must be a positive finite number")
+    if isinstance(iters, bool) or not isinstance(iters, int) or iters < 1:
+        raise ValueError("joint_max_iters must be an integer >= 1")
+    if cfg.depth_fit != "joint":
+        if (cfg.joint_tol, cfg.joint_max_iters) != (1e-6, 50):
+            raise ValueError("joint_tol / joint_max_iters require depth_fit='joint'")
+        return
+    need = {
+        "activation_storage": "streaming",
+        "component_target": "block_boundary",
+        "block_split": "none",
+        "block_target": "total",
+        "residual_target": "transported_delta",
+        "component_fit": "closed_form",
+        "pair_target_split": "none",
+        "tv_scaling": "none",
+        "endpoint_construction": "native_delta",
+        "merge_mode": "per_task_then_merge",
+        "fidelity_holdout": False,
+        "realization_diagnostics": False,
+        "fit_blocks": None,
+        "v_fit": None,
+        "post_mlp_norm": None,
+        "stats_device": None,
+        "sequential_subtract": "all",
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if tuple(components) != ("mlp.c_proj",):
+        bad["components"] = tuple(components)
+    if cfg.ridge_estimator == "none":
+        bad["ridge_estimator"] = "none"
+    if bad:
+        raise ValueError(
+            f"depth_fit='joint' requires {need}, components=('mlp.c_proj',) and a ridge_estimator other than 'none' "
+            f"(the normal operator needs lambda_k > 0); got incompatible {bad}"
+        )
+
+
+def _validate_component_ablations(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of ``native_oracle`` / ``fit_blocks`` / ``v_fit`` (all opt-in, default off)."""
+    if cfg.v_fit is not None:
+        if cfg.v_fit != "preimage":
+            raise ValueError("v_fit must be None or 'preimage'")
+        need = {
+            "components": ("attn.v_proj",),
+            "component_fit": "closed_form",
+            "component_target": "block_boundary",
+            "depth_fit": "independent",
+            "block_split": "none",
+            "activation_storage": "streaming",
+            "residual_target": "transported_delta",
+            "pair_target_split": "none",
+            "fit_blocks": None,
+            "tv_scaling": "none",
+            "fidelity_holdout": False,
+            "exact_form": True,
+            "endpoint_construction": "native_delta",
+        }
+        got = {name: (tuple(components) if name == "components" else getattr(cfg, name)) for name in need}
+        bad = {name: got[name] for name, want in need.items() if got[name] != want}
+        if bad:
+            raise ValueError(f"v_fit='preimage' requires {need}; got incompatible {bad}")
+    if cfg.gradient_ridge not in {"eb_input", "match_norm"}:
+        raise ValueError("gradient_ridge must be 'eb_input' or 'match_norm'")
+    iters = cfg.gradient_fit_max_iters
+    if isinstance(iters, bool) or not isinstance(iters, int) or iters <= 0:
+        raise ValueError("gradient_fit_max_iters must be a positive integer")
+    gtol = cfg.gradient_fit_tol
+    if isinstance(gtol, bool) or not isinstance(gtol, (int, float)) or not math.isfinite(float(gtol)) or gtol <= 0:
+        raise ValueError("gradient_fit_tol must be a positive finite number")
+    if cfg.component_fit != "closed_form":
+        if frozenset(components) not in _GRADIENT_FIT_GROUPS:
+            raise ValueError(
+                "component_fit gradient arms fit one component group per run: attn.v_proj; attn.q_proj + attn.k_proj; "
+                "attn.q_proj + attn.k_proj + attn.v_proj; mlp.c_fc; attn.out_proj; or mlp.c_proj; "
+                f"got {sorted(components)}"
+            )
+        need = {
+            "depth_fit": "independent",
+            "component_target": "block_boundary",
+            "block_split": "none",
+            "ridge_estimator": "empirical_bayes",
+            "exact_form": True,
+            "endpoint_construction": "native_delta",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+            "procrustes_source": "activation",
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if cfg.residual_target == "transported_endpoint":
+            bad["residual_target"] = cfg.residual_target
+        if bad:
+            raise ValueError(f"component_fit={cfg.component_fit!r} requires {need}; got incompatible {bad}")
+    elif cfg.gradient_ridge != "eb_input":
+        raise ValueError("gradient_ridge='match_norm' needs component_fit='gradient_exact' or 'gradient_linearized'")
+    template = cfg.native_target_ckpt_template
+    if cfg.residual_target == "native_oracle":
+        if not isinstance(template, str) or "{task}" not in template:
+            raise ValueError("residual_target='native_oracle' requires native_target_ckpt_template containing '{task}'")
+        need = {
+            "depth_fit": "independent",
+            "component_target": "block_boundary",
+            "block_split": "none",
+            "procrustes_source": "activation",
+            "endpoint_construction": "native_delta",
+            "merge_mode": "per_task_then_merge",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"residual_target='native_oracle' requires {need}; got incompatible {bad}")
+    elif template is not None:
+        raise ValueError("native_target_ckpt_template is only used with residual_target='native_oracle'")
+    if cfg.pair_target_split not in {"none", "per_block_share", "interpolate"}:
+        raise ValueError("pair_target_split must be 'none', 'per_block_share' or 'interpolate'")
+    if cfg.pair_target_split != "none":
+        need = {
+            "depth_fit": "independent" if cfg.pair_target_split == "per_block_share" else "sequential",
+            "sequential_impl": "reference",
+            "sequential_points": "single",
+            "residual_target": "transported_delta",
+            "endpoint_construction": "native_delta",
+            "block_split": "none",
+            "tv_scaling": "none",
+            "realization_diagnostics": False,
+            "fidelity_holdout": False,
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"pair_target_split={cfg.pair_target_split!r} requires {need}; got incompatible {bad}")
+    blocks = cfg.fit_blocks
+    if blocks is not None:
+        if isinstance(blocks, str) or not isinstance(blocks, (list, tuple)) or not blocks:
+            raise ValueError("fit_blocks must be None or a non-empty list of block indices")
+        if any(isinstance(b, bool) or not isinstance(b, int) or b < 0 for b in blocks):
+            raise ValueError("fit_blocks must hold non-negative integers")
+        if any(b >= c for b, c in zip(blocks, blocks[1:], strict=False)):
+            raise ValueError("fit_blocks must be sorted and unique")
+        need = {
+            "endpoint_construction": "native_delta",
+            "tv_scaling": "none",
+            "sequential_impl": "reference",
+            "sequential_points": "single",
+        }
+        bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+        if bad:
+            raise ValueError(f"fit_blocks requires {need}; got incompatible {bad}")
+
+
+def _validate_output_total(cfg: DirectResidualConfig, components: tuple[str, ...]) -> None:
+    """Validation of the opt-in ``component_target='output_total'`` (vision only, streaming; see ``output_total.py``)."""
+    if cfg.component_target != "output_total":
+        return
+    need = {
+        "activation_storage": "streaming",
+        "block_split": "none",
+        "component_fit": "closed_form",
+        "procrustes_source": "activation",
+        "alignment_map": "polar",
+        "alignment_row_weighting": "uniform",
+        "tv_scaling": "none",
+        "residual_target": "transported_delta",
+        "endpoint_construction": "native_delta",
+        "merge_mode": "per_task_then_merge",
+        "depth_pairing": "relative",
+        "sequential_impl": "reference",
+        "sequential_points": "single",
+        "pair_target_split": "none",
+        "fit_blocks": None,
+        "v_fit": None,
+        "procrustes_rank": None,
+        "procrustes_energy": None,
+        "exclude_first_token": False,
+        "realization_diagnostics": False,
+        "fidelity_holdout": False,
+    }
+    bad = {name: getattr(cfg, name) for name, want in need.items() if getattr(cfg, name) != want}
+    if not set(components) <= set(COMPONENT_FORWARD_ORDER):
+        bad["components"] = components
+    if bad:
+        raise ValueError(
+            "component_target='output_total' (restored as an opt-in ablation after being retired; per-layer target in "
+            f"the projection-output space, components within {list(COMPONENT_FORWARD_ORDER)}, "
+            f"depth_fit independent or sequential) requires {need}; got incompatible {bad}"
+        )
+
+
+def resolve_fit_blocks(config: DirectResidualConfig, depth: int) -> list[int]:
+    """Target blocks a fit covers: ``config.fit_blocks`` (range-checked against ``depth``) or every block."""
+    if config.fit_blocks is None:
+        return list(range(depth))
+    blocks = [int(b) for b in config.fit_blocks]
+    if blocks and blocks[-1] >= depth:
+        raise ValueError(f"fit_blocks {blocks} out of range for a target with {depth} blocks")
+    return blocks
 
 
 #: Defaults applied to decoder (LLM) runs when the key is absent (dataclass defaults are unchanged).
@@ -425,7 +1036,19 @@ _DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("alignment_row_weighting", "uniform"),
     ("endpoint_construction", "native_delta"),
     ("calibration_data", "task_local"),
+    ("onepass", False),
 )
+
+
+def reject_decoder_only_options(cfg: DirectResidualConfig) -> None:
+    """Vision path guard: refuse options that are only defined on decoder (text) calibration."""
+    if cfg.post_mlp_norm is not None:
+        raise ValueError("Ariadne option post_mlp_norm is decoder-only (Gemma-2 post-MLP RMSNorm)")
+    if cfg.exclude_first_token:
+        raise ValueError(
+            "Ariadne option exclude_first_token=true is decoder-only (it needs the attention mask of text "
+            "calibration); the vision path does not support it"
+        )
 
 
 def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapter: Any) -> DirectResidualConfig:
@@ -448,4 +1071,67 @@ def resolve_ariadne_decoder_config(value: Mapping[str, Any] | None, family_adapt
                 f"Ariadne on decoder models does not support {name}={got!r} (must be {required!r}): "
                 "this option is vision-only"
             )
+    has_post_mlp_norm = bool(getattr(family_adapter, "HAS_POST_MLP_NORM", False))
+    if has_post_mlp_norm and cfg.post_mlp_norm is None:
+        raise ValueError(
+            f"{getattr(family_adapter, 'name', 'this family')} normalises the MLP output before the residual add "
+            "(post_feedforward_layernorm): set ariadne post_mlp_norm to 'pre_norm' or 'linearized'"
+        )
+    if not has_post_mlp_norm and cfg.post_mlp_norm is not None:
+        raise ValueError(f"post_mlp_norm={cfg.post_mlp_norm!r} needs a family with a post-MLP norm (e.g. gemma2)")
+    if cfg.residual_target == "native_oracle":
+        raise NotImplementedError("residual_target=native_oracle is vision-only")
+    if cfg.component_fit != "closed_form":
+        raise NotImplementedError("component_fit=gradient is vision-only")
+    if cfg.component_target == "output_total":
+        # A decoder port is a layout entry (layouts.COMPONENT_OUTPUT_KIND) plus the decoder projections.
+        raise NotImplementedError("component_target='output_total' is vision-only")
+    if cfg.v_fit is not None:
+        # GQA later: stack the Z_h rows of the query heads that share a key/value head.
+        raise NotImplementedError("v_fit='preimage' is vision-only")
+    if cfg.sequential_points == "mid_end":
+        # HF decoder layers receive hidden_states as a keyword argument, so the block_input capture (positional
+        # inputs[0]) does not see the block input there.
+        raise NotImplementedError("mid_end is vision-only")
     return cfg
+
+
+def target_groups(pairing) -> dict[int, tuple[int, int, int]]:
+    """``{j: (group_size, index_in_group, group_start)}``: groups are the maximal runs of consecutive target blocks
+    sharing one source block ``pairing[j]`` (size 1 when every target block has its own source block)."""
+    out: dict[int, tuple[int, int, int]] = {}
+    j = 0
+    n = len(pairing)
+    while j < n:
+        k = j
+        while k + 1 < n and pairing[k + 1] == pairing[j]:
+            k += 1
+        for t in range(j, k + 1):
+            out[t] = (k - j + 1, t - j, j)
+        j = k + 1
+    return out
+
+
+def increment_references(pairing) -> dict[int, int | None]:
+    """``{j: p(j)}`` for ``block_target='increment'``: p(j) is the last target position before j's run of consecutive
+    target blocks sharing one source block (``None`` for the first run). Raises if the pairing is not non-decreasing."""
+    if any(b < a for a, b in zip(pairing, pairing[1:], strict=False)):
+        raise ValueError("block_target='increment' needs a non-decreasing pairing (increment undefined)")
+    groups = target_groups(pairing)
+    return {j: (groups[j][2] - 1 if groups[j][2] > 0 else None) for j in groups}
+
+
+def annotate_target_split(rows, config: DirectResidualConfig, pairing) -> None:
+    """Record the per-block target scale / interpolation weight of ``pair_target_split`` in the diagnostics rows."""
+    if config.pair_target_split == "none":
+        return
+    groups = target_groups(pairing.pairing)
+    for row in rows:
+        size, index, _start = groups[int(row["position"])]
+        row["pair_target_split"] = config.pair_target_split
+        row["target_group_size"] = size
+        row["target_group_index"] = index
+        if config.pair_target_split == "per_block_share":
+            row["target_scale"] = 1.0 / size
+        else:
+            row["target_interp_weight"] = (index + 1) / size

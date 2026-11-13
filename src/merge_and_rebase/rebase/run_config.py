@@ -43,6 +43,7 @@ from .block_extension.config import (
 from .capabilities import MethodFamily, default_depth_prestep, depth_prestep_methods, method_family
 from .config_schema import canonicalize
 from .merge_modes import _SINGLE_TRANSPORT_MODES, _TRANSPORT_THEN_MERGE_MODES, _resolve_merge_mode_config
+from .methods._ariadne.config import reject_decoder_only_options
 from .methods.ariadne import DirectResidualConfig, parse_direct_residual_config, resolve_direct_residual_preset
 from .runtime import format_rebase_method_label, resolve_rebase_method_config
 
@@ -269,7 +270,7 @@ def _parse_depth_defaults(cfg: Mapping[str, Any]) -> str | None:
 def _meaning_changed_message(method_name: str, reason: str, old_fix: str) -> str:
     return (
         f"{method_name}: {reason}. The per-method depth defaults would change this run's result. "
-        f"Either keep the previous behaviour with {old_fix} (or \"depth_defaults\": \"legacy\"), "
+        f'Either keep the previous behaviour with {old_fix} (or "depth_defaults": "legacy"), '
         'or accept the new method default with "depth_defaults": "method".'
     )
 
@@ -427,6 +428,34 @@ def _resolve_depth_rule(cfg: Mapping[str, Any]) -> DepthRule:
     )
 
 
+def _validate_precomputed_tv_options(cfg, direct_residual_cfg) -> None:
+    """Opt-in eval-only path: evaluate saved transported vectors (optionally rank-truncated) without refitting."""
+    trunc = cfg.get("tv_rank_truncation")
+    if not cfg.get("precomputed_tv_dir"):
+        if trunc is not None or cfg.get("precomputed_tv_source_summary"):
+            raise ValueError("tv_rank_truncation / precomputed_tv_source_summary require precomputed_tv_dir")
+        return
+    if cfg.get("load_direct_residual_tvs_dir"):
+        raise ValueError("precomputed_tv_dir cannot be combined with load_direct_residual_tvs_dir")
+    if cfg.get("save_transported_artifacts") or cfg.get("save_transported_tvs_dir") or cfg.get("save_transported_tvs"):
+        raise ValueError("cannot save transported artifacts while evaluating precomputed vectors (precomputed_tv_dir)")
+    if direct_residual_cfg.merge_mode == "merge_in_source_then_fit":
+        raise ValueError("precomputed_tv_dir is per-task: incompatible with merge_mode='merge_in_source_then_fit'")
+    if cfg.get("fit_only"):
+        raise ValueError("precomputed_tv_dir cannot be combined with fit_only")
+    if trunc is not None:
+        if not isinstance(trunc, dict) or set(trunc) - {"energy", "blocks"} or "energy" not in trunc:
+            raise ValueError("tv_rank_truncation must be a dict with 'energy' and optional 'blocks'")
+        if not 0.0 < float(trunc["energy"]) <= 1.0:
+            raise ValueError("tv_rank_truncation.energy must be in (0, 1]")
+        if trunc.get("blocks", "all") not in ("all", "last_third"):
+            raise ValueError("tv_rank_truncation.blocks must be one of: all, last_third")
+    if cfg.get("precomputed_tv_source_summary"):
+        from ..eval.vision_rebase.artifacts import check_precomputed_source_summary
+
+        check_precomputed_source_summary(cfg["precomputed_tv_source_summary"], cfg)
+
+
 def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | None = None) -> ResolvedRunConfig:
     """Resolve and validate ``cfg`` into a ``ResolvedRunConfig`` (no models, no datasets).
 
@@ -464,7 +493,9 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
             cfg["ariadne_params"] if cfg.get("ariadne_params") is not None else cfg.get("direct_residual_params")
         )
         direct_residual_cfg = parse_direct_residual_config(direct_residual_raw_params)
+        reject_decoder_only_options(direct_residual_cfg)
         direct_residual_preset = resolve_direct_residual_preset(direct_residual_raw_params)
+        _validate_precomputed_tv_options(cfg, direct_residual_cfg)
         sequential_modes = {"sequential_source_endpoints", "sequential_delta_on_synthesized_base"}
         if (
             cfg.get("load_direct_residual_tvs_dir")
@@ -476,6 +507,8 @@ def resolve_run_config(cfg: Mapping[str, Any], *, suites: Mapping[str, Any] | No
         ):
             raise ValueError("cannot save transported artifacts while loading sequential DR vectors")
     else:
+        if cfg.get("precomputed_tv_dir") or cfg.get("tv_rank_truncation") or cfg.get("precomputed_tv_source_summary"):
+            raise ValueError("precomputed_tv_dir / tv_rank_truncation require the Ariadne (direct fit) method")
         method = get_method(method_name)
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
         direct_residual_cfg = None

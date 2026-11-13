@@ -124,6 +124,7 @@ def main() -> None:
             model_kind=str(cfg.get("model_kind", "causal_lm")),
             trust_remote_code=bool(cfg.get("trust_remote_code", False)),
             use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+            chat_template_from=cfg.get("chat_template_from", None),
         )
         print(f"Model: {model_name}")
         llm = TextLM.build(build_cfg)
@@ -138,6 +139,12 @@ def main() -> None:
             batch_size=str(cfg.get("harness_batch_size", "auto")),
             limit=cfg.get("harness_limit", None),
             samples=harness_samples,
+            apply_chat_template=bool(cfg.get("harness_apply_chat_template", False)),
+            system_instruction=cfg.get("harness_system_instruction", None),
+            dump_generations_dir=cfg.get("harness_dump_generations_dir", None),
+            decoding=str(cfg.get("harness_decoding", "model")),
+            confirm_run_unsafe_code=bool(cfg.get("harness_confirm_run_unsafe_code", False)),
+            include_path=cfg.get("harness_include_path", None),
         )
         print("\n=== Harness results ===")
         for name, value in harness_results.items():

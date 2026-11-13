@@ -46,6 +46,8 @@ from ._ariadne.config import (
     order_components,
     parse_direct_residual_config,
     resolve_direct_residual_preset,
+    resolve_fit_blocks,
+    target_groups,
 )
 from ._ariadne.diagnostics import (
     compute_direct_residual_task_vector_stats,
@@ -59,13 +61,24 @@ from ._ariadne.fit import (
     fit_direct_residual,
     fit_sequential_source_endpoints,
 )
+from ._ariadne.gradient_fit import fit_direct_residual_gradient_streaming
+from ._ariadne.joint import fit_direct_residual_joint_streaming
+from ._ariadne.onepass import fit_onepass
+from ._ariadne.output_total import (
+    fit_output_total_independent_streaming,
+    fit_output_total_sequential_streaming,
+    prepare_output_total_streaming,
+)
+from ._ariadne.sequential_carry import fit_direct_residual_sequential_block_carry
 from ._ariadne.streaming import (
     compute_alignment_diagnostics_streaming,
     compute_gradient_delta_disagreement_streaming,
+    fit_direct_residual_sequential_streaming,
     fit_direct_residual_streaming,
     measure_streaming_realization_for,
     prepare_direct_residual_streaming,
 )
+from ._ariadne.v_fit import fit_direct_residual_vfit_streaming
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +119,8 @@ def _fit_body(
     build_cfg_task: Any = None,
     source_text_features: torch.Tensor | None = None,
     target_text_features: torch.Tensor | None = None,
+    task_name: str | None = None,
+    native_target_model: torch.nn.Module | None = None,
 ) -> tuple[
     dict[str, torch.Tensor], dict[str, dict[str, float]], list[dict[str, Any]], dict[str, Any], dict[str, torch.Tensor]
 ]:
@@ -136,6 +151,57 @@ def _fit_body(
     ``config.activation_storage`` selects the resident path (full per-batch banks) or the streaming path
     (O(1)-in-``num_batches`` host RAM); ``realization_diagnostics`` is supported under both.
     """
+    output_total = config.component_target == "output_total"
+    if output_total:
+        if family_adapter is not None:
+            raise NotImplementedError("component_target='output_total' is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("component_target='output_total' needs activation_storage='streaming'")
+    if config.v_fit is not None:
+        if family_adapter is not None:
+            # GQA later: stack the Z_h rows of the query heads that share a key/value head.
+            raise NotImplementedError("v_fit='preimage' is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("v_fit='preimage' needs activation_storage='streaming'")
+    if config.component_fit != "closed_form":
+        if family_adapter is not None:
+            raise NotImplementedError("component_fit=gradient is vision-only")
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("component_fit=gradient needs activation_storage='streaming'")
+    native_model = None
+    if config.residual_target == "native_oracle":
+        if config.activation_storage != "streaming":
+            raise NotImplementedError("residual_target='native_oracle' needs activation_storage='streaming'")
+        if family_adapter is not None:
+            raise NotImplementedError("residual_target='native_oracle' is vision-only")
+        native_model = native_target_model
+        if native_model is None:
+            if task_name is None:
+                raise ValueError(
+                    "residual_target='native_oracle' needs task_name (to fill {task}) or native_target_model"
+                )
+            from ._ariadne.native_target import build_native_target_model
+
+            native_model = build_native_target_model(
+                target_model,
+                target_base_sd,
+                source_base_model.state_dict(),
+                config.native_target_ckpt_template.format(task=task_name),
+            ).to(device)
+    if config.onepass:
+        return _fit_body_onepass(
+            recorder,
+            source_base_model=source_base_model,
+            source_ft_model=source_ft_model,
+            target_model=target_model,
+            target_base_sd=target_base_sd,
+            source_loader=source_loader,
+            target_loader=target_loader,
+            pairing=pairing,
+            config=config,
+            device=device,
+            family_adapter=family_adapter,
+        )
     alignment_mark = recorder.mark()
     alignment_started = time.perf_counter()
     streaming = config.activation_storage == "streaming"
@@ -177,7 +243,21 @@ def _fit_body(
             device=device,
             text_features=target_text_features,
         )
-    if streaming:
+    if streaming and output_total:
+        # Per-layer target in the projection-output space: Q_j^c from component outputs (no block-boundary Q).
+        prepared = prepare_output_total_streaming(
+            source_base_model,
+            target_model,
+            source_loader,
+            target_loader,
+            pairing,
+            num_batches=config.num_batches,
+            seed=config.seed,
+            device=device,
+            components=config.components,
+            family_adapter=family_adapter,
+        )
+    elif streaming:
         prepared = prepare_direct_residual_streaming(
             source_base_model,
             target_model,
@@ -194,6 +274,10 @@ def _fit_body(
             alignment_row_weighting=config.alignment_row_weighting,
             alignment_seed=config.alignment_seed,
             fidelity_alignment_diagnostics=bool(config.fidelity_holdout),
+            procrustes_rank=config.procrustes_rank,
+            procrustes_energy=config.procrustes_energy,
+            exclude_first_token=config.exclude_first_token,
+            mid_alignment=config.sequential_points == "mid_end",
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )
@@ -213,6 +297,7 @@ def _fit_body(
             procrustes_source=config.procrustes_source,
             source_recipe=source_recipe,
             target_recipe=target_recipe,
+            exclude_first_token=config.exclude_first_token,
         )
         if config.endpoint_construction == "native_delta":
             desired = compute_desired_effects(
@@ -228,6 +313,12 @@ def _fit_body(
                 diagnostics_out=procrustes_diagnostics if (gradient_mode or config.fidelity_holdout) else None,
                 rank_out=rank_diagnostics,
             )
+            if config.pair_target_split == "per_block_share":
+                sizes = target_groups(pairing.pairing)
+                desired = {
+                    j: [d / sizes[j][0] for d in batches] if sizes[j][0] > 1 else batches
+                    for j, batches in desired.items()
+                }
     alignment_peak_memory_bytes, alignment_calibration_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - alignment_started,
@@ -257,7 +348,7 @@ def _fit_body(
                 family_adapter=family_adapter,
             ).items():
                 procrustes_diagnostics[j]["activation_gradient_delta_disagreement"] = value
-        if config.procrustes_source == "activation":
+        if config.procrustes_source == "activation" and not output_total:
             if streaming:
                 alignment_diagnostics = compute_alignment_diagnostics_streaming(
                     source_base_model,
@@ -292,7 +383,25 @@ def _fit_body(
             family_adapter=family_adapter,
         )
     elif streaming:
-        target_corrections, diagnostics = fit_direct_residual_streaming(
+        if output_total:
+            fit_streaming = (
+                fit_output_total_sequential_streaming
+                if config.depth_fit == "sequential"
+                else fit_output_total_independent_streaming
+            )
+        elif config.component_fit != "closed_form":
+            fit_streaming = fit_direct_residual_gradient_streaming
+        elif config.v_fit is not None:
+            fit_streaming = fit_direct_residual_vfit_streaming
+        elif config.depth_fit == "joint":
+            fit_streaming = fit_direct_residual_joint_streaming
+        elif config.depth_fit != "sequential":
+            fit_streaming = fit_direct_residual_streaming
+        elif config.sequential_impl == "block_carry":
+            fit_streaming = fit_direct_residual_sequential_block_carry
+        else:
+            fit_streaming = fit_direct_residual_sequential_streaming
+        target_corrections, diagnostics = fit_streaming(
             target_model,
             target_base_sd,
             source_base_model,
@@ -302,7 +411,9 @@ def _fit_body(
             config=config,
             device=device,
             family_adapter=family_adapter,
+            **({"native_model": native_model} if native_model is not None else {}),
         )
+        del native_model
     else:
         target_corrections, diagnostics = fit_direct_residual(
             target_model,
@@ -377,7 +488,7 @@ def _fit_body(
     task_vector_stats = None
     with cost_excluded():
         if bool(config.realization_diagnostics):
-            positions = list(range(pairing.target_depth))
+            positions = resolve_fit_blocks(config, pairing.target_depth)
             # Explicit, never the broad CANONICAL_COMPONENT_ORDER default: packed q/k/v share ONE state-dict key
             # (attn.in_proj_weight), so key presence cannot tell which of q/k/v were fit. Passing exactly
             # order_components(config.components) checks only the components actually requested.
@@ -459,6 +570,111 @@ def _fit_body(
     )
 
 
+def _fit_body_onepass(
+    recorder: PhaseCostRecorder,
+    *,
+    source_base_model: torch.nn.Module,
+    source_ft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    target_base_sd: dict[str, torch.Tensor],
+    source_loader: Any,
+    target_loader: Any,
+    pairing: DiscreteLayerPairing,
+    config: DirectResidualConfig,
+    device: str,
+    family_adapter: Any = None,
+):
+    """Opt-in one-pass fit (``config.onepass``): same return contract as `_fit_body`, see `_ariadne.onepass`.
+
+    There is no separate alignment/calibration bracket: ``alignment_calibration_seconds`` is 0.0 and
+    ``correction_fit_seconds`` is the whole one-pass time (also written as ``onepass_fit_seconds``), so the existing
+    timing readers need no change. (Pass A's untimed diagnostics sweep was already `cost_excluded`; skipping it saves wall time but not the timed cost.) Forwards + accumulation are charged to ``activation_collection``, the SVD and solves
+    to ``transformation`` (``timing["cost_phases"]`` when this call owns the recorder).
+    """
+    if family_adapter is not None:
+        raise NotImplementedError("onepass is vision-only")
+    cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    # Outside the timed bracket: the fit regresses against the live target model, so it must be the native base (the
+    # streaming fit reloads target_base_sd itself and checks Pass-A fingerprints; one-pass has neither).
+    live = target_model.state_dict()
+    if set(live) != set(target_base_sd) or any(
+        not torch.equal(live[k].detach().cpu(), target_base_sd[k].detach().cpu()) for k in target_base_sd
+    ):
+        raise ValueError(
+            "onepass requires target_model to hold exactly target_base_sd (the native target base): "
+            "the state dict differs, so the fitted correction would not be against the base"
+        )
+    fit_mark = recorder.mark()
+    started = time.perf_counter()
+    target_corrections, diagnostics, calibration, info = fit_onepass(
+        target_model,
+        target_base_sd,
+        source_base_model,
+        source_ft_model,
+        source_loader,
+        target_loader,
+        pairing,
+        config=config,
+        device=device,
+    )
+    seconds = time.perf_counter() - started
+    fit_peak_memory_bytes, fit_host_peak = recorder.peaks_since(fit_mark)
+    non_unique = sorted(int(r["position"]) for r in diagnostics if r.get("procrustes_q_non_unique"))
+    if non_unique:
+        logger.warning(
+            "Ariadne: the Procrustes cross-covariance is rank-deficient at target position(s) %s "
+            "(rank < min(d_source, d_target), see the procrustes_rank / procrustes_min_dim row fields), so the "
+            "polar factor Q is not unique there; the fitted Q is unchanged (diagnostic flag only).",
+            non_unique,
+        )
+    fit_timing: dict[str, Any] = {
+        "correction_fit_seconds": seconds,
+        "correction_fit_peak_memory_bytes": fit_peak_memory_bytes,
+        "correction_fit_peak_host_rss_bytes": fit_host_peak,
+        "onepass_fit_seconds": seconds,
+        **info,
+        # Work the streaming correction_fit bracket pays that one-pass does not (timing comparison provenance).
+        "onepass_skipped_work": [
+            "target state_dict clone + load_state_dict (entry and restore copies)",
+            "target-boundary fingerprint checks (float64 sum / sum of squares per block and batch)",
+            "CPU resize/alignment and CPU fp32 D_j = (f-b)@Q products (one-pass resizes on the compute device)",
+            "second sweep: separate source-base/source-FT/target forwards per position chunk "
+            "(streaming_position_chunk) and Pass A's target+source-base forward",
+            "ridge-free reference solve, residual norms and matrix_rank (diagnostics=False)",
+        ],
+    }
+    if cuda:
+        # The recorder resets torch's peak counter per segment and keeps the running maximum: its value IS the
+        # exact max_memory_allocated over the bracket (a bare torch.cuda.max_memory_allocated() would see only the last segment).
+        fit_timing["onepass_max_memory_allocated_bytes"] = int(fit_peak_memory_bytes)
+    alignment_timing = {
+        "alignment_calibration_seconds": 0.0,
+        # None, not 0: there is no alignment bracket, and readers that sum/max the brackets must not read a measured 0.
+        "alignment_calibration_peak_memory_bytes": None,
+        "alignment_calibration_peak_host_rss_bytes": None,
+    }
+    strength = float(config.strength)
+    with cost_phase("transport"):
+        scaled_delta = (
+            {} if strength == 0.0 else {key: strength * correction for key, correction in target_corrections.items()}
+        )
+    extra = {
+        "realization_by_position": None,
+        "task_vector_stats": None,
+        "alignment_diagnostics": None,
+        "calibration": calibration,
+        "tv_scaling": None,
+        "fidelity_holdout": None,
+    }
+    return (
+        scaled_delta,
+        {"alignment_calibration": alignment_timing, "correction_fit": fit_timing},
+        diagnostics,
+        extra,
+        target_corrections,
+    )
+
+
 @dataclass(frozen=True)
 class AriadneRebase:
     """Ariadne: fit the target task vector directly from paired activations.
@@ -492,6 +708,8 @@ class AriadneRebase:
         build_cfg_task: Any = None,
         source_text_features: torch.Tensor | None = None,
         target_text_features: torch.Tensor | None = None,
+        task_name: str | None = None,
+        native_target_model: torch.nn.Module | None = None,
     ) -> AriadnePrepared:
         """Fit Ariadne once; see ``_fit_body`` for the pipeline and its brackets.
 
@@ -519,6 +737,10 @@ class AriadneRebase:
             source_text_features=source_text_features,
             target_text_features=target_text_features,
         )
+        if task_name is not None:
+            kwargs["task_name"] = task_name
+        if native_target_model is not None:
+            kwargs["native_target_model"] = native_target_model
         if recorder is not None:
             scaled, timing, diagnostics, extra, unit = _fit_body(recorder, **kwargs)
         else:
@@ -586,6 +808,7 @@ __all__ = [
     "compute_fidelity_holdout_diagnostics",
     "draw_fidelity_holdout_calibration",
     "fit_direct_residual",
+    "fit_direct_residual_sequential_streaming",
     "fit_direct_residual_streaming",
     "fit_sequential_source_endpoints",
     "iter_capture_block_gradients",

@@ -22,6 +22,27 @@ class TextBuildConfig:
     num_labels: int = 3
     trust_remote_code: bool = False
     use_fast_tokenizer: bool = True
+    # Opt-in: repo/path whose tokenizer's chat_template is copied onto this tokenizer when it has none (base
+    # checkpoints such as SmolLM2-360M ship none). None (default) leaves the tokenizer untouched.
+    chat_template_from: str | None = None
+
+
+def apply_chat_template_donor(tokenizer: Any, donor: Any, donor_name: str) -> None:
+    """Give ``tokenizer`` the chat template of ``donor`` (same vocabulary required).
+
+    A tokenizer without a template receives the donor's; one with the identical template is left as is; one with a
+    different template raises, so an explicit template is never replaced silently.
+    """
+    template = getattr(donor, "chat_template", None)
+    if template is None:
+        raise ValueError(f"chat_template_from={donor_name!r}: that tokenizer has no chat_template")
+    if tokenizer.get_vocab() != donor.get_vocab():
+        raise ValueError(f"chat_template_from={donor_name!r}: vocabulary differs from the model's tokenizer")
+    own = getattr(tokenizer, "chat_template", None)
+    if own is None:
+        tokenizer.chat_template = template
+    elif own != template:
+        raise ValueError(f"chat_template_from={donor_name!r}: the model's tokenizer has a different chat_template")
 
 
 class TextLM(nn.Module):
@@ -80,6 +101,13 @@ class TextLM(nn.Module):
                 )
             else:
                 raise
+        if cfg.chat_template_from is not None:
+            donor = AutoTokenizer.from_pretrained(
+                cfg.chat_template_from,
+                trust_remote_code=bool(cfg.trust_remote_code),
+                use_fast=bool(cfg.use_fast_tokenizer),
+            )
+            apply_chat_template_donor(tokenizer, donor, cfg.chat_template_from)
         if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 

@@ -9,13 +9,14 @@ depth with the decoder block extension and keeps the exact source context for tr
 from __future__ import annotations
 
 from copy import copy, deepcopy
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from dataclasses import replace as dataclass_replace
 from typing import Any
 
 import torch
 
 from ...io.ckpt import load_into_model
+from ...io.text_checkpoints import build_model_with_tuned_config
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import TaskVector
 from ...rebase.block_extension.decoder import run_block_extension_llm
@@ -137,6 +138,26 @@ class LlmTaskContext:
 
     ckpt_ref: Any
     index: int
+    #: ``{config field: [source, tuned]}`` where the tuned ref's own HF config disagrees with the source base's
+    #: (RoPE, window, ...); empty (the usual case) when the two agree. Non-empty: the fine-tuned forward model is
+    #: built from the tuned config instead of a deepcopy of the source.
+    config_overrides: dict[str, list[Any]] = field(default_factory=dict)
+    #: Positional geometry read from the live models that run forward passes for this task (source base, source
+    #: fine-tuned, target), filled by ``build_task_models``: the run-time evidence that a tuned ref with its own
+    #: config really runs under it.
+    forward_geometry: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def model_geometry(model: torch.nn.Module) -> dict[str, Any]:
+    """``rope_theta`` / ``max_position_embeddings`` / ``use_sliding_window`` of a live HF model (transformers 4 or 5)."""
+    config = model.config
+    rope = getattr(config, "rope_parameters", None) or {}
+    return {
+        "name_or_path": getattr(config, "_name_or_path", None),
+        "rope_theta": rope.get("rope_theta", getattr(config, "rope_theta", None)),
+        "max_position_embeddings": getattr(config, "max_position_embeddings", None),
+        "use_sliding_window": getattr(config, "use_sliding_window", None),
+    }
 
 
 def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
@@ -149,22 +170,46 @@ def build_task_models(env: StageEnv, task: str) -> TaskModels | None:
         return None
     rt = env.runtime
     ckpt_ref = rt.task_contexts[task].ckpt_ref
+    # Opt-in (default off): park the source template on CPU while the task copies are made, then move only the copies
+    # to the device. Copies are bitwise either way; on a 64 GB GPU three 9B sources (template + base copy + ft) plus
+    # the target do not fit (gemma-2-9b -> 2b, job 61488501).
+    offload = bool((getattr(rt, "cfg", None) or {}).get("offload_source_original", False))
+    if offload:
+        rt.models.source_llm.model.to("cpu")
     # Each task starts from an immutable source template, then its
     # own copy is resized to the target depth before transport.
     # Keep that depth-matched source model alive below.
     source_base_model_task = deepcopy(rt.models.source_llm.model)
-    source_ft_model_task = deepcopy(rt.models.source_llm.model)
+    overrides = rt.task_contexts[task].config_overrides
+    # Equal configs: the source deepcopy carrying the tuned weights is exactly the fine-tuned model. Otherwise the
+    # tuned weights would run under the source's RoPE / window geometry, so build it from the tuned ref's own config.
+    source_ft_model_task = None if overrides else deepcopy(rt.models.source_llm.model)
 
     # Load tuned checkpoint into ft model
     aligned = rt.models.load_tuned(
         ckpt_ref=ckpt_ref,
         base_sd=rt.models.source_base_sd,
         build_cfg=rt.models.source_build_cfg,
-        model=source_ft_model_task,
+        model=source_ft_model_task if source_ft_model_task is not None else rt.models.source_llm.model,
         prefer_lora_view=False,
     )
     tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
-    load_into_model(source_ft_model_task, tuned_sd, strict=False)
+    if overrides:
+        changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
+        print(f"  '{task}': fine-tuned forward model built from the tuned ref's own config ({changed})")
+        source_ft_model_task = build_model_with_tuned_config(
+            str(ckpt_ref), rt.models.source_build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in rt.models.source_base_sd.items()}
+        )
+    else:
+        load_into_model(source_ft_model_task, tuned_sd, strict=False)
+    if offload:
+        source_base_model_task.to(rt.models.device)
+        source_ft_model_task.to(rt.models.device)
+    rt.task_contexts[task].forward_geometry = {
+        "source_base": model_geometry(source_base_model_task),
+        "source_ft": model_geometry(source_ft_model_task),
+        "target": model_geometry(rt.models.target_llm.model),
+    }
     return TaskModels(source_base=source_base_model_task, source_ft=source_ft_model_task)
 
 

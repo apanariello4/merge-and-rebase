@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from ...data.vision_loaders import DEFAULT_NUM_WORKERS, DEFAULT_SEED
+from ...data.vision_loaders import DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS, DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
 from ...merge.task_vectors import TaskVector
@@ -30,9 +30,11 @@ from ...rebase.orchestration import AriadneRunRecord, MethodResult
 from ...rebase.prestep import PrestepResult, StageEnv, TaskInputs
 from ...utils.cost_accounting import PhaseCostRecorder, cost_phase, recording
 from ..utils import to_cpu_fp32
-from .artifacts import _load_saved_sequential_tv
+from .artifacts import _load_precomputed_tv, _load_saved_sequential_tv, _state_dict_sha256, truncate_tv_rank
 from .context import _TaskContext
+from .memory import memory_efficient_enabled, source_fit_copy
 from .merge import _merge_direction
+from .precomputed_calibration import PRECOMPUTED, assert_same_preprocessing, build_precomputed_context
 from .stages import _visual_only_filter
 
 
@@ -412,6 +414,18 @@ class DirectFitStage:
         self._merged_correction: dict[str, torch.Tensor] | None = None
         self._merged_timing: dict[str, dict[str, float]] | None = None
 
+    def _memory_efficient(self, env: StageEnv) -> bool:
+        """Opt-in ``gpu_memory_efficient``: visual-only source fit copies (default off, nothing changes)."""
+        if not memory_efficient_enabled(env.cfg):
+            return False
+        if self.cfg.procrustes_source == "gradient" or self.cfg.residual_target == "native_oracle":
+            # These read the full source CLIP (text tower / full state dict) during the fit.
+            raise NotImplementedError(
+                "gpu_memory_efficient is not supported with procrustes_source='gradient' or "
+                "residual_target='native_oracle'."
+            )
+        return True
+
     def pairing(self, env: StageEnv) -> DiscreteLayerPairing:
         """The depth pairing, computed once per run (both legacy call sites yielded the identical value)."""
         if self._pairing_cache is None:
@@ -466,13 +480,18 @@ class DirectFitStage:
             weights=merge_in_source_weights,
             merge_params=resolved.merge.params,
         )
-        source_base_model_merged = deepcopy(env.clf_source.model)
-        source_ft_model_merged = deepcopy(env.clf_source.model)
-        load_into_model(source_base_model_merged, source_base_sd, strict=True)
-        load_into_model(
-            source_ft_model_merged,
-            axpy_state_dict(source_base_sd, merged_direction, alpha=1.0),
-            strict=True,
+        memory_efficient = self._memory_efficient(env)
+        source_base_model_merged = source_fit_copy(
+            env.clf_source.model,
+            memory_efficient=memory_efficient,
+            loaders=(lambda m: load_into_model(m, source_base_sd, strict=True),),
+        )
+        source_ft_model_merged = source_fit_copy(
+            env.clf_source.model,
+            memory_efficient=memory_efficient,
+            loaders=(
+                lambda m: load_into_model(m, axpy_state_dict(source_base_sd, merged_direction, alpha=1.0), strict=True),
+            ),
         )
         # The once-only merged fit has no single task to draw loaders from: it uses the shared Ariadne
         # calibration context when one is configured, else the first contributing task's train loaders.
@@ -514,7 +533,40 @@ class DirectFitStage:
         # Ariadne never resizes: capture runs on freshly built native (un-resized) source models. The
         # block-extension prestep never runs for Ariadne (it is not a depth_prestep_method).
         pairing = self.pairing(env)
-        if cfg.get("load_direct_residual_tvs_dir"):
+        if cfg.get("precomputed_tv_dir"):
+            # Eval-only: no fit, no calibration, no transport; the saved delta is the transported delta.
+            transported_delta, file_meta = _load_precomputed_tv(cfg["precomputed_tv_dir"], t, env.target_base_sd)
+            pre_rec = self.record.precomputed
+            if pre_rec is None:
+                pre_rec = self.record.precomputed = {
+                    "provenance": {
+                        "dir": str(cfg["precomputed_tv_dir"]),
+                        "source_summary": cfg.get("precomputed_tv_source_summary"),
+                        "files_by_task": {},
+                    },
+                    "truncation": None,
+                }
+            pre_rec["provenance"]["files_by_task"][t] = file_meta
+            trunc = cfg.get("tv_rank_truncation")
+            if trunc:
+                transported_delta, trunc_rec = truncate_tv_rank(
+                    transported_delta,
+                    energy=float(trunc["energy"]),
+                    blocks=str(trunc.get("blocks", "all")),
+                    depth=env.target_depth,
+                )
+                if pre_rec["truncation"] is None:
+                    pre_rec["truncation"] = {
+                        "energy": trunc_rec["energy"],
+                        "blocks": trunc_rec["blocks"],
+                        "by_task": {},
+                    }
+                pre_rec["truncation"]["by_task"][t] = trunc_rec["keys"]
+            pre_rec["provenance"].setdefault("transported_delta_sha256_by_task", {})[t] = _state_dict_sha256(
+                transported_delta
+            )
+            result.transported_delta = transported_delta
+        elif cfg.get("load_direct_residual_tvs_dir"):
             transported_delta, loaded_meta = _load_saved_sequential_tv(
                 cfg["load_direct_residual_tvs_dir"], t, env.target_base_sd, direct_residual_cfg
             )
@@ -530,12 +582,35 @@ class DirectFitStage:
             result.correction_fit = dict(self._merged_timing["correction_fit"])
             result.cost_phases = dict(self._merged_timing["cost_phases"])
         else:
-            source_base_model_native = deepcopy(env.clf_source.model)
-            source_ft_model_native = deepcopy(env.clf_source.model)
-            load_into_model(source_base_model_native, env.source_base_sd, strict=True)
-            load_into_model(source_ft_model_native, env.source_base_sd, strict=True)
-            load_into_model(source_ft_model_native, load_ckpt(str(env.tuned_by_task[t])), strict=False)
-            if self.calibration_ctx is not None:
+            memory_efficient = self._memory_efficient(env)
+            source_base_model_native = source_fit_copy(
+                env.clf_source.model,
+                memory_efficient=memory_efficient,
+                loaders=(lambda m: load_into_model(m, env.source_base_sd, strict=True),),
+            )
+            source_ft_model_native = source_fit_copy(
+                env.clf_source.model,
+                memory_efficient=memory_efficient,
+                loaders=(
+                    lambda m: load_into_model(m, env.source_base_sd, strict=True),
+                    lambda m: load_into_model(m, load_ckpt(str(env.tuned_by_task[t])), strict=False),
+                ),
+            )
+            if self.cfg.calibration_data == PRECOMPUTED:
+                # Task-data-free calibration: this task's stored images (same tensors for source and target).
+                precomputed_ctx, precomputed_meta = build_precomputed_context(
+                    t,
+                    cfg=cfg,
+                    num_batches=int(direct_residual_cfg.num_batches),
+                    batch_size=int(cfg.get("batch_size", DEFAULT_BATCH_SIZE)),
+                    template=task.ctx,
+                )
+                assert_same_preprocessing(env.clf_source, env.clf_target)
+                self.record.calibration_meta.setdefault("by_task", {})[t] = precomputed_meta
+                print(f"Precomputed calibration for {t}: {precomputed_meta}")
+                direct_residual_source_loader = precomputed_ctx.source_loaders.train
+                direct_residual_target_loader = precomputed_ctx.loaders.train
+            elif self.calibration_ctx is not None:
                 # Task-independent calibration: the same paired
                 # images for every task (see calibration_data).
                 direct_residual_source_loader = self.calibration_ctx.source_loaders.train
@@ -575,6 +650,8 @@ class DirectFitStage:
                 build_cfg_task=task.build_cfg_task,
                 source_text_features=task.ctx.source_text_features,
                 target_text_features=task.ctx.target_text_features,
+                # Only the native_oracle diagnostic needs the task (fills {task} of native_target_ckpt_template).
+                **({"task_name": t} if direct_residual_cfg.residual_target == "native_oracle" else {}),
             )
             result.transported_delta = transported_delta
             result.alignment_calibration = direct_residual_timing["alignment_calibration"]

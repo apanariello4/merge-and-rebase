@@ -23,6 +23,7 @@ from ...data.vision_loaders import (
 from ...eval.utils import humanize
 from ...models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ...rebase.block_extension.config import select_loader
+from .memory import memory_efficient_enabled, temporarily_on
 
 
 @dataclass(frozen=True)
@@ -176,9 +177,13 @@ def _build_balanced_calibration_context(
     for task in sorted(by_task):
         item = by_task[task]
         names = list(item["classnames"])
-        source_features.append(
-            clf_source._compute_zeroshot_text_features(names, item["source_build_cfg_task"]).detach().cpu()
-        )
+        # Opt-in gpu_memory_efficient: the parked source CLIP visits the GPU only for this call (same device kernels).
+        with temporarily_on(
+            clf_source.model, next(clf_target.model.parameters()).device, enabled=memory_efficient_enabled(cfg)
+        ):
+            source_features.append(
+                clf_source._compute_zeroshot_text_features(names, item["source_build_cfg_task"]).detach().cpu()
+            )
         target_features.append(clf_target._compute_zeroshot_text_features(names, item["build_cfg_task"]).detach().cpu())
 
     first = by_task[sorted(by_task)[0]]
@@ -424,7 +429,13 @@ def build_run_calibration(
     # change; each task's alpha search and evaluation keep its own splits.
     direct_residual_calibration_ctx: _TaskContext | None = None
     direct_residual_calibration_meta: dict[str, Any] = {"calibration_data": "task_local"}
-    if direct_fit and direct_residual_cfg.calibration_data != "task_local":
+    if direct_fit and direct_residual_cfg.calibration_data == "precomputed":
+        # Per-task stored images are attached in DirectFitStage.run (precomputed_calibration.py); no shared context.
+        direct_residual_calibration_meta = {
+            "calibration_data": "precomputed",
+            "calibration_images_dir": str(cfg.get("calibration_images_dir")),
+        }
+    elif direct_fit and direct_residual_cfg.calibration_data != "task_local":
         direct_residual_calibration_ctx, direct_residual_calibration_meta = _build_direct_residual_calibration(
             direct_residual_cfg.calibration_data,
             per_task=[item for item in per_task if item["task"] not in native_tasks],

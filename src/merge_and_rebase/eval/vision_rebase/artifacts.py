@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Any
 
 import torch
 
+from ...rebase.config_schema import canonicalize
 from ...rebase.methods._ariadne.config import direct_residual_config_dict, normalize_direct_residual_config_dict
 from ...rebase.methods._ariadne.fit import _task_vector_sha256
 from ...rebase.registry import canonical_method_name
@@ -69,6 +72,109 @@ def _load_saved_sequential_tv(directory, task, target_base_sd, config):
     if _state_dict_sha256(vector) != meta.get("vector_sha256"):
         raise ValueError(f"saved DR vector {path} failed its tensor hash check")
     return vector, {**meta, "path": str(path), "metadata_path": str(meta_path)}
+
+
+_SOURCE_SUMMARY_KEYS = (
+    "target_clip_model",
+    "target_clip_pretrained",
+    "source_clip_model",
+    "source_clip_pretrained",
+)
+_C_PROJ_WEIGHT = re.compile(r"(?:^|\.)resblocks\.(\d+)\.mlp\.c_proj\.weight$")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    t = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(
+        str(t.dtype).encode() + str(tuple(t.shape)).encode() + t.view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
+
+
+def check_precomputed_source_summary(summary_path, cfg) -> None:
+    """The run summary that produced the vectors must name the same source/target CLIP models as this run."""
+    data = json.loads(Path(summary_path).read_text())
+    resolved = data["run_logging"]["metadata"]["resolved_config"]
+    old = canonicalize(resolved)
+    new = canonicalize(cfg)
+    for key in _SOURCE_SUMMARY_KEYS:
+        if old.get(key) != new.get(key):
+            raise ValueError(
+                f"precomputed_tv_source_summary {summary_path}: {key}={old.get(key)!r}, this run has {new.get(key)!r}"
+            )
+
+
+def _load_precomputed_tv(directory, task, target_base_sd):
+    """Load one task's saved transported delta (no sidecar): validate keys/shapes/finiteness, return (vector, meta)."""
+    root = Path(directory)
+    names = list(dict.fromkeys((canonical_method_name("direct_residual"), "direct_residual")))
+    found = [root / f"{task}_{n}_transported_native.pt" for n in names]
+    found = [p for p in found if p.exists()]
+    if len(found) != 1:
+        raise FileNotFoundError(
+            f"precomputed_tv_dir {root}: expected exactly one of "
+            + " or ".join(f"{task}_{n}_transported_native.pt" for n in names)
+            + f", found {len(found)}"
+        )
+    path = found[0]
+    vector = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(vector, dict) or not vector:
+        raise ValueError(f"precomputed task vector {path} is empty or invalid")
+    for key, tensor in vector.items():
+        if key not in target_base_sd or tensor.shape != target_base_sd[key].shape:
+            raise ValueError(f"precomputed task vector {path}: key {key!r} missing from the target or shape mismatch")
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"precomputed task vector {path}: non-finite values in {key!r}")
+    return vector, {"path": str(path), "file_sha256": _file_sha256(path)}
+
+
+def truncate_tv_rank(vector, *, energy: float, blocks: str, depth: int):
+    """Rank-truncate the ``mlp.c_proj.weight`` deltas of the selected blocks to the smallest k holding ``energy``.
+
+    Returns ``(new_vector, record)``; ``energy == 1.0`` returns the tensors untouched (no SVD). Biases and unselected
+    blocks are never modified. The record lists, per truncated key, k, min_dim, kept energy fraction, Frobenius norms
+    before/after, plus the sha256 of every final tensor.
+    """
+    if not 0.0 < energy <= 1.0:
+        raise ValueError(f"tv_rank_truncation.energy must be in (0, 1], got {energy}")
+    if blocks not in ("all", "last_third"):
+        raise ValueError(f"tv_rank_truncation.blocks must be 'all' or 'last_third', got {blocks!r}")
+    first = 0 if blocks == "all" else depth - depth // 3
+    out = dict(vector)
+    keys: dict[str, Any] = {}
+    for key, tensor in vector.items():
+        match = _C_PROJ_WEIGHT.search(key)
+        if match is None or int(match.group(1)) < first:
+            continue
+        if energy < 1.0:
+            mat = tensor.detach().to(torch.float64)
+            u, s, vh = torch.linalg.svd(mat, full_matrices=False)
+            cum = torch.cumsum(s * s, dim=0)
+            total = cum[-1]
+            k = int(torch.searchsorted(cum, energy * total).item()) + 1 if total > 0 else 0
+            k = min(k, s.numel())
+            kept = float((cum[k - 1] / total).item()) if k > 0 else 1.0
+            recon = (u[:, :k] * s[:k]) @ vh[:k]
+            out[key] = recon.to(device=tensor.device, dtype=tensor.dtype)
+            min_dim = int(s.numel())
+        else:
+            k, min_dim, kept = min(tensor.shape), min(tensor.shape), 1.0
+        keys[key] = {
+            "k": k,
+            "min_dim": min_dim,
+            "kept_energy_fraction": kept,
+            "frobenius_before": float(torch.linalg.norm(tensor.double()).item()),
+            "frobenius_after": float(torch.linalg.norm(out[key].double()).item()),
+            "sha256": _tensor_sha256(out[key]),
+        }
+    return out, {"energy": energy, "blocks": blocks, "depth": depth, "keys": keys}
 
 
 def _legacy_visual_key(key: str) -> str | None:

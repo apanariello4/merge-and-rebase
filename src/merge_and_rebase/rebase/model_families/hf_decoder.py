@@ -309,3 +309,33 @@ class Qwen3DecoderAdapter(HfDecoderAdapter):
     # which have no Qwen2 counterpart. They're intentionally excluded from
     # _DECODER_TRANSPORTABLE_SUFFIXES, so they're simply left untouched (passthrough)
     # rather than transported.
+
+
+class Gemma2DecoderAdapter(HfDecoderAdapter):
+    """Gemma-2: Llama naming plus two MLP norms per block, ``r <- r + post_ffn_norm(down_proj(...))``.
+
+    Gemma RMSNorm scales by ``(1 + weight)`` and normalises in float32: ``y * rsqrt(mean(y^2) + eps) * (1 + w)``.
+    ``post_attention_layernorm`` normalises the attention OUTPUT (before its residual add), unlike Llama, so the
+    block-component semantics differ from the other decoders; ARIADNE only touches ``mlp.down_proj`` and reads the
+    post-MLP norm through ``post_mlp_norm``. The ``(1 + w)`` norm weights are passthrough for transport (not in the
+    transportable suffixes): a delta on ``w`` is not the delta of the gain the shared decoder suffixes assume.
+    """
+
+    name: str = "gemma2"
+    _MODEL_TYPES = frozenset({"gemma2"})
+    #: The MLP output is RMS-normalised before the residual add (ARIADNE needs an explicit post_mlp_norm mode).
+    HAS_POST_MLP_NORM: bool = True
+
+    def transportable_keys(self, state_dict: Mapping[str, torch.Tensor]) -> set[str]:
+        norms = {"input_layernorm.weight", "post_attention_layernorm.weight"}
+        return {
+            k
+            for k in super().transportable_keys(state_dict)
+            if not (self._is_layer_param(k) and self._layer_param_suffix(k) in norms) and k != self.FINAL_NORM_KEY + ".weight"
+        }
+
+    def post_mlp_norm(self, block: nn.Module) -> tuple[torch.Tensor, float]:
+        """``(gain, eps)`` of the block's post-MLP RMSNorm: gain = ``1 + weight`` (float32, CPU)."""
+        norm = block.post_feedforward_layernorm
+        return 1.0 + norm.weight.detach().float().cpu(), float(norm.eps)
+

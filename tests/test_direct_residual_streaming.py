@@ -370,3 +370,75 @@ def test_streaming_matches_resident_when_source_and_target_share_object():
     # The shared source_base/target object must come back pristine.
     for key, value in target_base_sd.items():
         assert torch.equal(target_base.state_dict()[key], value), key
+
+
+# ---- (e) stats_device: host-RAM statistics (2026-10-16) -----------------------
+
+_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("source_depth, target_depth", REGIMES)
+def test_stats_device_cpu_is_bitwise_identical(source_depth, target_depth, device):
+    """stats_device='cpu' (products on the compute device, sums in host RAM) gives the default fit bit for bit."""
+    source_base, source_ft, target_base, data, pairing, target_base_sd = _setup(source_depth, target_depth)
+    results = {}
+    for stats_device in (None, "cpu"):
+        config = DirectResidualConfig(
+            num_batches=3, ridge_relative=0.05, activation_storage="streaming", streaming_position_chunk=2,
+            stats_device=stats_device,
+        )
+        prepared = prepare_direct_residual_streaming(
+            source_base, target_base, data, data, pairing, num_batches=config.num_batches, seed=config.seed,
+            device=device,
+        )
+        corr, _diag = fit_direct_residual_streaming(
+            target_base, target_base_sd, source_base, source_ft, prepared, pairing, config=config, device=device,
+        )
+        results[stats_device] = corr
+    assert set(results[None]) == set(results["cpu"])
+    for key in results[None]:
+        assert torch.equal(results[None][key], results["cpu"][key]), key
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_residual_statistics_store_device_holds_sums_and_solve_matches(device):
+    from merge_and_rebase.rebase.methods._ariadne.fit import ResidualSufficientStatistics
+
+    torch.manual_seed(0)
+    batches = [(torch.randn(13, 7), torch.randn(13, 5)) for _ in range(4)]
+    t_out = torch.eye(5)
+    ref, off = ResidualSufficientStatistics(device=device), ResidualSufficientStatistics(device=device, store_device="cpu")
+    for h, e in batches:
+        ref.update(h, e, None, t_out)
+        off.update(h, e, None, t_out)
+    assert off.s.device.type == "cpu" and off.b.device.type == "cpu"
+    for name in ("s", "g", "b", "sum_a", "sum_e"):
+        assert torch.equal(getattr(ref, name).cpu(), getattr(off, name)), name
+    x_ref, d_ref = ref.solve(ridge_relative=0.01, exact_form=False)
+    x_off, d_off = off.solve(ridge_relative=0.01, exact_form=False)
+    assert torch.equal(x_ref, x_off)
+    assert off.s.device.type == torch.device(device).type
+    assert d_ref["residual_norm_after"] == d_off["residual_norm_after"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"stats_device": "cuda"},
+        {"stats_device": "bogus"},
+        {"stats_device": "cpu"},  # resident storage
+        {"stats_device": "cpu", "activation_storage": "streaming", "depth_fit": "sequential"},
+    ],
+)
+def test_stats_device_rejects_unsupported(overrides):
+    with pytest.raises(ValueError):
+        parse_direct_residual_config(overrides)
+
+
+def test_stats_device_default_not_serialized():
+    from merge_and_rebase.rebase.methods._ariadne.config import direct_residual_config_dict
+
+    assert "stats_device" not in direct_residual_config_dict(DirectResidualConfig())
+    cfg = parse_direct_residual_config({"activation_storage": "streaming", "stats_device": "cpu"})
+    assert direct_residual_config_dict(cfg)["stats_device"] == "cpu"

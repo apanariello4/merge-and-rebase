@@ -49,6 +49,8 @@ class AriadneRunRecord:
     fidelity_holdout: dict[str, Any] = field(default_factory=dict)
     sequential_endpoints: dict[str, dict[str, Any] | None] = field(default_factory=dict)
     loaded_vectors: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Opt-in eval-only path (``precomputed_tv_dir``): provenance of the loaded vectors and per-task rank truncation.
+    precomputed: dict[str, Any] | None = None
     #: The depth pairing actually used, recorded once per run (``None`` until the first Ariadne use).
     pairing: dict[str, Any] | None = None
 

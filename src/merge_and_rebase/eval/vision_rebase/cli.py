@@ -29,8 +29,10 @@ from ...rebase.depth_report import describe_depth_handling
 from ...rebase.run_config import resolve_run_config
 from ...run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..datasets.vision8_14_20 import SUITES
+from .memory import check_memory_efficient_supported, memory_efficient_enabled, park_on_cpu
 from .merge import _VALID_MERGE_MODES
 from .pipeline import VisionRuntime, run_rebase
+from .precomputed_calibration import check_precomputed_supported
 
 
 def _set_deterministic_seed(seed: int) -> None:
@@ -199,6 +201,8 @@ def main() -> None:
             cfg["block_extension_enabled"] = True
 
         resolved = resolve_run_config(cfg, suites=SUITES)
+        check_memory_efficient_supported(cfg, resolved)  # before any model is built
+        check_precomputed_supported(cfg, resolved)  # idem (calibration_data='precomputed')
         suite_name = resolved.suite_name
         tasks = resolved.tasks
         device = resolved.device
@@ -254,6 +258,10 @@ def main() -> None:
 
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
+        if memory_efficient_enabled(cfg):
+            # Opt-in: the source CLIP is only a template for the fit copies (and, briefly, for text features).
+            park_on_cpu(clf_source.model)
+            print("gpu_memory_efficient: source CLIP parked on the CPU.")
 
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))

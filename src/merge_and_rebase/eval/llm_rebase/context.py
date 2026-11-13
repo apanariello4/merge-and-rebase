@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import warnings
+from collections.abc import Callable, Sequence
 from copy import deepcopy  # noqa: F401
 from dataclasses import replace
 from typing import Any
@@ -11,18 +15,34 @@ import torch
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
 from ...data.llm_calibration import (
+    CalibrationTextList,
+    check_calibration_tokenizers,
+    fit_mask_provenance,
+    resolve_calibration_apply_chat_template,
+    resolve_calibration_fit_mask,
+    resolve_calibration_texts,
+    tokenization_stats,
+    tokenizer_chat_template_sha256,
+)
+from ...data.llm_calibration import (
     build_text_calibration_loader as _build_text_calibration_loader,
 )
-from ...data.llm_calibration import resolve_calibration_texts, tokenization_stats
+from ...data.llm_calibration_generate import (
+    GeneratedAnswerConfig,
+    build_generated_texts,
+    parse_generated_answer_cfg,
+    select_generator_ref,
+    truncated_count,
+)
 from ...hyperparam_search import build_search_planner
 from ...io.ckpt import load_ckpt, load_into_model
-from ...io.text_checkpoints import load_aligned_tuned_from_ref
+from ...io.text_checkpoints import build_model_with_tuned_config, load_aligned_tuned_from_ref, tuned_config_mismatch
 from ...merge.runtime import to_cpu_fp32
 from ...merge.task_vectors import default_key_filter
 from ...models.text_lm import TextBuildConfig, TextLM
 from ...rebase.base import FitMethod, TransportMethod
 from ...rebase.block_extension.config import resolve_block_extension_config, warn_decoder_ignored_fields
-from ...rebase.capabilities import check_pair, depth_prestep_methods, uses_calibration
+from ...rebase.capabilities import MethodFamily, check_pair, depth_prestep_methods, method_family, uses_calibration
 from ...rebase.depth_report import describe_depth_handling
 from ...rebase.methods._ariadne.config import resolve_ariadne_decoder_config
 from ...rebase.model_families import infer_family
@@ -58,7 +78,41 @@ class TextCalibrationCache:
         seed: int,
         include_target: bool,
         tokenizer: Any,
+        apply_chat_template: bool = False,
+        system_instruction: str | None = None,
+        num_fewshot: Any = 0,
+        target_tokenizer: Any = None,
+        generated_answer: GeneratedAnswerConfig | None = None,
+        tuned_refs: Sequence[str] = (),
+        generator_factory: Callable[[str], Any] | None = None,
+        dtype: str = "fp32",
+        device: str = "cpu",
+        fit_mask: str | None = None,
+        record_calibration_format: bool = False,
     ) -> None:
+        if fit_mask is not None and not apply_chat_template:
+            raise ValueError("calibration_fit_mask needs chat-rendered calibration text.")
+        self._fit_mask = fit_mask
+        if generated_answer is not None:
+            if include_target:
+                raise ValueError(
+                    "calibration_generated_answer cannot be combined with calibration_include_target: the gold "
+                    "target and the model's own answer would both be appended to the prompt."
+                )
+            if generator_factory is None:
+                raise ValueError("calibration_generated_answer needs a generator_factory.")
+            if generated_answer.generation_chat_template and apply_chat_template:
+                raise ValueError(
+                    "calibration_generated_answer.generation_chat_template cannot be combined with "
+                    "the chat-rendered calibration (harness_apply_chat_template / calibration_apply_chat_template): "
+                    "the corpus is already chat-rendered; use the existing coupled mode "
+                    "(drop generation_chat_template)."
+                )
+            self._generator_ref = select_generator_ref(generated_answer, tuned_refs)
+        self._generated_answer = generated_answer
+        self._generator_factory = generator_factory
+        self._dtype = dtype
+        self._device = device
         self._prompts = prompts
         self._calibration_dataset_cfg = calibration_dataset_cfg
         self._block_extension_cfg = block_extension_cfg
@@ -70,6 +124,12 @@ class TextCalibrationCache:
         self._seed = seed
         self._include_target = include_target
         self._tokenizer = tokenizer
+        self._apply_chat_template = bool(apply_chat_template)
+        #: True when ``calibration_apply_chat_template`` is set in the config (recorded in the provenance then).
+        self._calibration_format_recorded = bool(record_calibration_format)
+        self._system_instruction = system_instruction
+        self._num_fewshot = num_fewshot
+        self._target_tokenizer = target_tokenizer
         self._cache: list[Any] = []
 
     def get(self) -> Any:
@@ -91,12 +151,93 @@ class TextCalibrationCache:
                 ),
                 seed=self._seed,
                 include_target=self._include_target,
+                apply_chat_template=self._apply_chat_template,
+                system_instruction=self._system_instruction,
+                tokenizer=self._tokenizer,
+                num_fewshot=self._num_fewshot,
+                record_content_spans=self._fit_mask is not None,
             )
+            if self._generated_answer is not None:
+                self._append_generated_answers(resolved)
+            if self._fit_mask is not None:
+                bad = [n for n, t in (("source", self._tokenizer), ("target", self._target_tokenizer or self._tokenizer))
+                       if not getattr(t, "is_fast", False)]
+                if bad:
+                    raise ValueError(f"calibration_fit_mask needs fast tokenizers (offsets); slow: {bad}.")
+            if self._apply_chat_template:
+                # Source and target tokenize the same texts separately: they must yield identical ids.
+                resolved.chat_template["sha256"] = check_calibration_tokenizers(
+                    self._tokenizer,
+                    self._target_tokenizer if self._target_tokenizer is not None else self._tokenizer,
+                    resolved.texts,
+                    add_special_tokens=False,
+                    system_instruction=self._system_instruction,
+                )
             for note in resolved.notes:
                 print(f"Calibration note: {note}")
             print(f"Calibration corpus: {resolved.describe()}")
             self._cache.append(resolved)
         return self._cache[0]
+
+    def _append_generated_answers(self, resolved: Any) -> None:
+        """Replace every text by prompt + the source fine-tune's greedy answer (once, so every consumer, and both
+        the source and the target tokenisation, see the same corpus). Hold-out ids are untouched."""
+        cfg = self._generated_answer
+        prompts = list(resolved.texts)
+        add_special_tokens = getattr(resolved.texts, "add_special_tokens", True)
+        texts, record = build_generated_texts(
+            prompts,
+            cfg=cfg,
+            ref=self._generator_ref,
+            generator_factory=self._generator_factory,
+            tokenizer=self._tokenizer,
+            dtype=self._dtype,
+            device=self._device,
+            apply_chat_template=self._apply_chat_template,
+            system_instruction=self._system_instruction,
+            chat_template_sha256=(
+                tokenizer_chat_template_sha256(self._tokenizer)
+                if self._apply_chat_template or cfg.generation_chat_template
+                else None
+            ),
+        )
+        answers = record.get("answers")
+        if isinstance(resolved.texts, CalibrationTextList):
+            spans = getattr(resolved.texts, "content_spans", None)
+            if spans is not None and not cfg.include_prompt:
+                raise ValueError("calibration_generated_answer.include_prompt=false cannot be combined with a fit mask.")
+            if spans is not None:
+                # The appended separator + answer is content: a span from the end of the prompt to the end of the text.
+                spans = [[*sp, (len(p), len(t))] if len(t) > len(p) else list(sp) for sp, p, t in zip(spans, prompts, texts, strict=True)]
+            texts = CalibrationTextList(texts, add_special_tokens=add_special_tokens, content_spans=spans)
+        resolved.texts = texts
+        resolved.source += " + generated answers"
+        resolved.generated_answer = {
+            "model": self._generator_ref,
+            "max_new_tokens": cfg.max_new_tokens,
+            "n": record["n"],
+            "mean_response_tokens": record["mean_response_tokens"],
+            "n_hit_max_new_tokens": record["n_hit_max_new_tokens"],
+            "cached": record["cached"],
+            "texts_sha256": hashlib.sha256(json.dumps(list(texts)).encode()).hexdigest(),
+            "n_truncated_at_max_length": truncated_count(
+                self._tokenizer, texts, self._calib_max_length, add_special_tokens=add_special_tokens
+            ),
+            "max_length": self._calib_max_length,
+        }
+        if cfg.uses_extensions:  # additive keys only when a new option is used: defaults stay byte-identical
+            resolved.generated_answer.update(
+                {
+                    "generation_chat_template": cfg.generation_chat_template,
+                    "generation_system_instruction": cfg.generation_system_instruction,
+                    "separator": repr(cfg.separator),
+                    "shuffle_answers_seed": cfg.shuffle_answers_seed,
+                    "include_prompt": cfg.include_prompt,
+                    "answers_sha256": (
+                        None if answers is None else hashlib.sha256(json.dumps(answers).encode()).hexdigest()
+                    ),
+                }
+            )
 
     def provenance(self) -> dict[str, Any] | None:
         """Additive summary record (None when no calibration corpus was ever resolved)."""
@@ -109,7 +250,48 @@ class TextCalibrationCache:
             record["tokenization"] = tokenization_stats(self._tokenizer, self._cache[0].texts, self._calib_max_length)
         except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
             record["tokenization"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if self._calibration_format_recorded:  # additive keys only when a new option is set
+            record["calibration_apply_chat_template"] = self._apply_chat_template
+        if self._fit_mask is not None:
+            try:
+                record.update(
+                    fit_mask_provenance(
+                        self._tokenizer, self._cache[0].texts, mode=self._fit_mask, max_length=self._calib_max_length
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - provenance must never fail a finished run
+                record["calibration_fit_mask"] = {"mode": self._fit_mask, "error": f"{type(exc).__name__}: {exc}"}
         return record
+
+
+def tuned_generator_factory(
+    source_model: Any, source_base_sd: Any, build_cfg: TextBuildConfig, *, load_tuned: Any = load_aligned_tuned_from_ref
+) -> Callable[[str], Any]:
+    """ref -> the source fine-tuned model for that tuned ref, under the ref's OWN config when it differs.
+
+    Same rule as ``stages.build_task_models``: equal config -> a source-model copy carrying the tuned weights;
+    otherwise (RoPE, window, ... differ) the model is built from the ref's config with exactly the aligned tuned
+    weights, so it is the model the fine-tune actually is.
+    """
+
+    def build(ref: str) -> Any:
+        overrides = tuned_config_mismatch(
+            ref, getattr(source_model, "config", None), trust_remote_code=bool(build_cfg.trust_remote_code)
+        )
+        template = deepcopy(source_model)
+        aligned = load_tuned(ckpt_ref=ref, base_sd=source_base_sd, build_cfg=build_cfg, model=template)
+        tuned_sd = to_cpu_fp32(aligned) if isinstance(aligned, dict) else {k: v.cpu() for k, v in aligned.items()}
+        if overrides:
+            changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(overrides.items()))
+            print(f"  calibration generator built from the tuned ref's own config ({changed})")
+            del template
+            return build_model_with_tuned_config(
+                ref, build_cfg, tuned_sd, base_shapes={k: tuple(v.shape) for k, v in source_base_sd.items()}
+            )
+        load_into_model(template, tuned_sd, strict=False)
+        return template
+
+    return build
 
 
 def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> LlmEvaluation:
@@ -123,6 +305,20 @@ def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> L
     harness_num_fewshot = cfg.get("harness_num_fewshot", 0)
     harness_batch_size = str(cfg.get("harness_batch_size", "auto"))
     harness_limit = cfg.get("harness_limit", None)
+    # Prompt rendering shared by every harness call of the run (before-rebase reference, alpha search, test slice).
+    # Only options that are set are passed, so a run without them makes exactly the historical harness call.
+    harness_render = {
+        k: v
+        for k, v in (
+            ("apply_chat_template", bool(cfg.get("harness_apply_chat_template", False))),
+            ("system_instruction", cfg.get("harness_system_instruction", None)),
+            ("dump_generations_dir", cfg.get("harness_dump_generations_dir", None)),
+            ("decoding", cfg.get("harness_decoding", None)),
+            ("confirm_run_unsafe_code", bool(cfg.get("harness_confirm_run_unsafe_code", False))),
+            ("include_path", cfg.get("harness_include_path", None)),
+        )
+        if v
+    }
 
     # The "before rebase" reference is the SOURCE model exactly as transport
     # sees it: resized (and LMC-corrected) to the target depth by block
@@ -172,7 +368,7 @@ def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> L
             "Set --allow-prompt-eval (or config['allow_prompt_eval']=true)."
         )
 
-    _task_contexts(tasks, tuned_ref_list)
+    _check_task_labels(tasks, tuned_ref_list)
     return LlmEvaluation(
         tasks=tasks,
         tuned_ref_list=tuned_ref_list,
@@ -183,6 +379,7 @@ def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> L
         harness_batch_size=harness_batch_size,
         harness_limit=harness_limit,
         slices=resolve_harness_slices(cfg, harness_tasks_resolved),
+        harness_render=harness_render,
         run_before_rebase_eval=run_before_rebase_eval,
         eval_before_rebase_only=eval_before_rebase_only,
         eval_mode=eval_mode,
@@ -192,8 +389,15 @@ def _resolve_evaluation(cfg: dict[str, Any], method_params: dict[str, Any]) -> L
     )
 
 
-def _resolve_calibration_settings(cfg: dict[str, Any]) -> CalibrationSettings:
+def _resolve_calibration_settings(cfg: dict[str, Any], method_name: str) -> CalibrationSettings:
     """Validate the calibration inputs independently of model construction."""
+    # Calibration text format / fit mask: validated before any model is built (a bad combination is a config error).
+    apply_chat_template = resolve_calibration_apply_chat_template(cfg)
+    fit_mask = resolve_calibration_fit_mask(
+        cfg,
+        chat_rendered=apply_chat_template,
+        method_is_ariadne=method_family(method_name) is MethodFamily.DIRECT_FIT,
+    )
     calibration_prompts_cfg = cfg.get("calibration_prompts", None)
     if isinstance(calibration_prompts_cfg, str):
         # Allow pointing at a JSON file shaped {"prompts": [...]}, so a large
@@ -214,11 +418,26 @@ def _resolve_calibration_settings(cfg: dict[str, Any]) -> CalibrationSettings:
         raise ValueError("config['calibration_n_sequences'] must be > 0 when given.")
     return CalibrationSettings(
         prompts=calibration_prompts_cfg,
+        # explicit HF corpus, decoupled from the evaluated task (no eval hold-out); a list of specs mixes several
+        # corpora round-robin with equal quotas (data/llm_calibration)
         dataset=cfg.get("calibration_dataset"),
         n_sequences=int(n_sequences) if n_sequences is not None else None,
         include_target=bool(cfg.get("calibration_include_target", False)),
         batch_size=batch_size,
         max_length=max_length,
+        #   calibration_generated_answer {max_new_tokens, batch_size, model, cache_path, generation_chat_template,
+        #       generation_system_instruction, separator, shuffle_answers_seed}: each text becomes prompt + the
+        #       source fine-tune's own greedy answer (default off; see data/llm_calibration_generate)
+        generated_answer=parse_generated_answer_cfg(cfg.get("calibration_generated_answer", None)),
+        #   harness_apply_chat_template renders calibration text with the tokenizer's chat template (same prompt format
+        #       as the chat-template evaluation); calibration_apply_chat_template (bool | null = follow it) decouples
+        #       the calibration format from the evaluation format; calibration_fit_mask "user_content" (ARIADNE only,
+        #       needs chat-rendered calibration text) restricts the fit to message-content tokens
+        apply_chat_template=apply_chat_template,
+        system_instruction=cfg.get("harness_system_instruction", None),
+        num_fewshot=cfg.get("harness_num_fewshot", 0),
+        fit_mask=fit_mask,
+        record_format=cfg.get("calibration_apply_chat_template") is not None,
     )
 
 
@@ -398,6 +617,19 @@ def _build_calibration(
         seed=int(cfg.get("seed", 0)),
         include_target=settings.include_target,
         tokenizer=models.source_llm.tokenizer,
+        apply_chat_template=settings.apply_chat_template,
+        system_instruction=settings.system_instruction,
+        num_fewshot=settings.num_fewshot,
+        target_tokenizer=models.target_llm.tokenizer,
+        generated_answer=settings.generated_answer,
+        tuned_refs=evaluation.tuned_ref_list,
+        generator_factory=tuned_generator_factory(
+            models.source_llm.model, models.source_base_sd, models.source_build_cfg
+        ),
+        dtype=str(models.source_build_cfg.dtype),
+        device=str(models.source_build_cfg.device),
+        fit_mask=settings.fit_mask,
+        record_calibration_format=settings.record_format,
     )
     needs_calibration = plan.run_block_extension_prestep or uses_calibration(resolved.method_name)
     holdout = cache.get().eval_samples or None if needs_calibration else None
@@ -426,9 +658,35 @@ def build_runtime(
 ) -> LlmRuntime:
     """Validate inputs, load models, resolve geometry, then bind calibration and evaluation."""
     evaluation = _resolve_evaluation(cfg, method_params)
-    settings = _resolve_calibration_settings(cfg)
+    settings = _resolve_calibration_settings(cfg, method_name)
+    transports_delta = method_family(method_name) is not MethodFamily.DIRECT_FIT
+    task_context_kwargs = {
+        "trust_remote_code": bool(source_build_cfg.trust_remote_code),
+        "transports_delta": transports_delta,
+        "allow_mismatch": bool(cfg.get("allow_tuned_config_mismatch", False)),
+    }
+    # The tuned-config check compares computation fields of the HF config files only (RoPE, window, norm eps, ...),
+    # so a refused pairing fails here, before either model or the calibration corpus is loaded. A source whose
+    # config cannot be read on its own falls back to the loaded model's config after _load_models.
+    early_source_config = _source_hf_config(source_build_cfg)
+    task_contexts = (
+        _task_contexts(
+            evaluation.tasks, evaluation.tuned_ref_list, source_config=early_source_config, **task_context_kwargs
+        )
+        if early_source_config is not None
+        else None
+    )
     models = _load_models(cfg, source_build_cfg, target_build_cfg, device, num_labels, method_name)
     resolved, plan, ignored = _resolve_plan(cfg, models, method_name, method, method_params)
+    if resolved.direct_fit == transports_delta:
+        raise RuntimeError(f"{method_name}: method family and resolved direct_fit disagree")
+    if task_contexts is None:
+        task_contexts = _task_contexts(
+            evaluation.tasks,
+            evaluation.tuned_ref_list,
+            source_config=getattr(models.source_llm.model, "config", None),
+            **task_context_kwargs,
+        )
     print(f"Using eval_mode={evaluation.eval_mode}")
     print("\nComputing task deltas...")
     if models.tp_keys:
@@ -442,12 +700,25 @@ def build_runtime(
         resolved=resolved,
         plan=plan,
         ignored_block_extension_fields=ignored,
-        task_contexts=_task_contexts(evaluation.tasks, evaluation.tuned_ref_list),
+        task_contexts=task_contexts,
     )
 
 
-def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
-    """One context per tuned body; with named tasks the two lists must have equal length."""
+def _source_hf_config(build_cfg: TextBuildConfig) -> Any:
+    """The source base's HF config read from its config file (no weights), or None when it cannot be read alone."""
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            build_cfg.model_name_or_path, trust_remote_code=bool(build_cfg.trust_remote_code)
+        )
+    except Exception:
+        return None
+    return config if getattr(config, "model_type", None) is not None else None
+
+
+def _check_task_labels(tasks, tuned_ref_list) -> None:
+    """Unique task names and one tuned body per named task (no checkpoint is touched)."""
     if len(tasks) != len(set(tasks)):
         duplicates = sorted({task for task in tasks if tasks.count(task) > 1})
         raise ValueError(f"Task names must be unique; duplicate labels: {duplicates}.")
@@ -455,10 +726,50 @@ def _task_contexts(tasks, tuned_ref_list) -> dict[str, LlmTaskContext]:
         raise ValueError(
             f"{len(tuned_ref_list)} tuned bodies for {len(tasks)} tasks: every tuned body needs exactly one task name"
         )
-    return {
-        (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(ckpt_ref=ref, index=i)
+
+
+def _task_contexts(
+    tasks,
+    tuned_ref_list,
+    *,
+    source_config: Any = None,
+    trust_remote_code: bool = False,
+    transports_delta: bool = False,
+    allow_mismatch: bool = False,
+) -> dict[str, LlmTaskContext]:
+    """One context per tuned body; with named tasks the two lists must have equal length.
+
+    Each context records where the tuned ref's own HF config disagrees with the source base's (config_overrides).
+    Methods that transport the parameter delta (THESEUS, theseus_gqa, BiCo) refuse such a pairing unless
+    allow_tuned_config_mismatch; activation-based Ariadne just runs its fine-tuned forwards under the tuned config.
+    """
+    _check_task_labels(tasks, tuned_ref_list)
+    contexts = {
+        (tasks[i] if tasks else f"task_{i}"): LlmTaskContext(
+            ckpt_ref=ref,
+            index=i,
+            config_overrides=tuned_config_mismatch(ref, source_config, trust_remote_code=trust_remote_code),
+        )
         for i, ref in enumerate(tuned_ref_list)
     }
+    for task, ctx in contexts.items():
+        if not ctx.config_overrides:
+            continue
+        changed = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in sorted(ctx.config_overrides.items()))
+        if transports_delta and not allow_mismatch:
+            raise ValueError(
+                f"Tuned body {ctx.ckpt_ref!r} (task '{task}') has its own config, differing from the source base at "
+                f"[{changed}]. This method transports the parameter delta theta_ft - theta_base, which presumes a "
+                "fine-tune of the same architecture and positional geometry. Set allow_tuned_config_mismatch=true "
+                "to run anyway (the fine-tuned forwards then use the tuned config and the mismatch is recorded)."
+            )
+        warnings.warn(
+            f"Task '{task}': tuned body {ctx.ckpt_ref!r} differs from the source base config ({changed}); "
+            "its fine-tuned forwards use the tuned config.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return contexts
 
 
 def _ariadne_params(cfg) -> dict:

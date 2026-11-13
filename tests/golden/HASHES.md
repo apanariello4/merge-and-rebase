@@ -512,6 +512,19 @@ load log and every saved `.pt`; each case is run twice in-process and must be id
   timings). Additive: with that one key removed, each summary hashes to its previous value (verified case by case).
   Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.
 
+### Declared changes — 2026-10-07, LLM Table-3 rerun support, tests/golden/test_llm_main_golden.py
+- `summary` only, all 29 cases that record one: the LLM summary gains `calibration_provenance.{chat_template,
+  chat_template_applied, chat_template_sha256, rendered_texts_sha256}` (opt-in chat-template calibration, off here)
+  and `task_vectors.forward_geometry` (rope_theta / max_position_embeddings / use_sliding_window of the live source
+  base, source fine-tuned and target models). Additive: with exactly those keys removed every summary hashes to its
+  previous value (all 59 cases, via a pytest plugin that strips them before `hash_json`).
+  `tuned_config_overrides` is written only when a tuned body carries its own computation config (none here).
+  Evaluated weights (harness_calls), builds, tuned loads, resolved_config and saved files unchanged.
+- Then `summary` only, the 27 cases with a task-vector report: `task_vectors.depth_handling` (resolved depth rule
+  and its source, the prestep that actually executed, and for BRACE the extension_strategy / skip_correction it
+  used) plus `task_vectors.rebase_wall_seconds` / `rebase_peak_cuda_allocated_bytes` (volatile, not hashed).
+  Additive: with `depth_handling` removed all 59 cases hash to the values above.
+
 ### Declared changes — 2026-10-09, `skip_correction` defaults to true (tests/golden/)
 - `BlockExtensionConfig.skip_correction` (and every code path that defaulted it) flipped from `false` to `true`. The
   golden cases that pin the corrected arm now state `skip_correction: false` explicitly, so their behaviour is unchanged:
