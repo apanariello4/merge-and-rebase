@@ -21,6 +21,14 @@ from __future__ import annotations
 
 import torch
 
+from .core import (
+    CanonicalFactors,
+    canonical_core,
+    canonical_correlations_out,
+    canonical_factors_from_sigma,
+    canonical_phi,
+)
+
 Tensor = torch.Tensor
 
 
@@ -134,3 +142,82 @@ class PairSigmaAccumulator:
 
     def ids_seen(self, half: int) -> set[int]:
         return set(self._ids[half])
+
+
+def gamma_out_from_sigma(sig_a: tuple, sig_b: tuple) -> Tensor:
+    """``Gamma_out = (out_AB + out_BA) / 2`` from the per-half statistics ``(Sigma_mm, Sigma_kk, Sigma_mk, n_rows)``
+    (``PairSigmaAccumulator.sigma(h)``). The one place where the held-out estimate is computed: the row-based decoder
+    (stored anchors) and the streamed all-token decoder both call it."""
+    fa = canonical_factors_from_sigma(*sig_a)
+    fb = canonical_factors_from_sigma(*sig_b)
+    out_ab = canonical_correlations_out(fa, sig_b[:3])
+    out_ba = canonical_correlations_out(fb, sig_a[:3])
+    q = min(int(out_ab.numel()), int(out_ba.numel()))
+    return 0.5 * (out_ab[:q] + out_ba[:q])
+
+
+def heldout_soft_phi(
+    factors: CanonicalFactors, gamma_out: Tensor, *, c_m: float, scale: float, null_threshold: float | None = None
+) -> tuple[Tensor, dict[str, float]]:
+    """Plan decoder D3 from the factors of ALL rows and the held-out ``gamma_out``: ``g = clip(Gamma_out, 0, 1)`` (0 for
+    the pairs without a held-out estimate and below ``null_threshold``), ``Phi = (scale / c_m) V_m Y g Z^T V_k^T``.
+    Shared by the stored-row path (``factors`` from the frames' SVD) and the streamed-Sigma path (``factors`` from
+    ``canonical_factors_from_sigma`` of the summed halves). Info: the mean / min / max of Gamma_out and of g."""
+    q = min(int(factors.s_m.numel()), int(factors.s_k.numel()))
+    g = torch.zeros(q, dtype=torch.float64)
+    n = min(q, int(gamma_out.numel()))
+    g[:n] = gamma_out[:n].clamp(0.0, 1.0)
+    if null_threshold is not None:
+        g = g * (g >= float(null_threshold))
+    f, _, info = canonical_core(factors, "canonical_soft", weights=g)
+    info.update(
+        {
+            "canonical_soft_weights": "heldout",
+            "canonical_gamma_out_mean": float(gamma_out.mean()),
+            "canonical_gamma_out_min": float(gamma_out.min()),
+            "canonical_gamma_out_max": float(gamma_out.max()),
+            "canonical_weights_mean": float(g.mean()),
+            "canonical_pairs_without_heldout": float(q - n),
+        }
+    )
+    return canonical_phi(factors, f, scale=scale, c_m=c_m), info
+
+
+def heldout_soft_phi_from_sigma(
+    sig_a: tuple, sig_b: tuple, *, c_m: float, scale: float, null_threshold: float | None = None
+) -> tuple[Tensor, dict[str, float]]:
+    """D3 from streamed statistics alone (no stored rows): ``sig_a`` / ``sig_b`` = ``(Sigma_mm, Sigma_kk, Sigma_mk, n)`` of
+    the two id halves, accumulated by ``PairSigmaAccumulator(mu_m, c_m, mu_k, c_k, halves=...)`` over any number of rows
+    (e.g. every canonical token of every anchor image) with the registration ``mu`` / ``c``. The directions come from the
+    summed statistics (all rows), the weights from the held-out halves; same core as the row-based decoder."""
+    total = tuple(x + y for x, y in zip(sig_a[:3], sig_b[:3], strict=True)) + (int(sig_a[3]) + int(sig_b[3]),)
+    factors = canonical_factors_from_sigma(*total)
+    phi, info = heldout_soft_phi(factors, gamma_out_from_sigma(sig_a, sig_b), c_m=c_m, scale=scale,
+                                 null_threshold=null_threshold)
+    info.update({"heldout_rows_half_a": float(sig_a[3]), "heldout_rows_half_b": float(sig_b[3])})
+    return phi, info
+
+
+def heldout_gamma_out(p_m: Tensor, p_k: Tensor, ids: Tensor | list[int], seed: int) -> tuple[Tensor, dict[str, float]]:
+    """Held-out canonical correlations ``Gamma_out`` of the anchor frames ``P_m [T, d_m]``, ``P_k [T, d_k]`` (the Phase 1
+    estimate of ``eval/diagnostics/metodoK_phase1.analyze_cell``): the ids (image / document of each row) are split into
+    two seeded halves (``split_ids``, by id never by row); the canonical directions are fitted on one half and their
+    correlation measured on the other (``core.canonical_correlations_out``), in both directions, and averaged:
+    ``Gamma_out = (out_AB + out_BA) / 2`` (signed, ordered by the rank index of the half fit, ``min(q_A, q_B)`` values).
+
+    ``P`` is already centred and scaled (the anchor frames), so the Sigmas are accumulated with ``mu = 0``, ``c = 1``
+    (``PairSigmaAccumulator``). Returns ``(gamma_out, info)``; raises ``ValueError`` when a half has too few rows for the
+    canonical fit (``core.check_canonical_widths`` on the half) or is rank-deficient along a direction of the other.
+    """
+    ids = torch.as_tensor(ids, dtype=torch.long).reshape(-1)
+    if int(ids.shape[0]) != int(p_m.shape[0]) or int(p_k.shape[0]) != int(p_m.shape[0]):
+        raise ValueError("ids must give one id per anchor row of both frames")
+    halves = split_ids(ids, seed)
+    acc = PairSigmaAccumulator(
+        torch.zeros(p_m.shape[1], dtype=torch.float64), 1.0, torch.zeros(p_k.shape[1], dtype=torch.float64), 1.0, halves=halves
+    )
+    acc.update(p_m, p_k, ids)
+    sig = [acc.sigma(h) for h in (0, 1)]
+    info = {"heldout_rows_half_a": float(sig[0][3]), "heldout_rows_half_b": float(sig[1][3]),
+            "heldout_ids_half_a": float(halves[0].numel()), "heldout_ids_half_b": float(halves[1].numel())}
+    return gamma_out_from_sigma(sig[0], sig[1]), info

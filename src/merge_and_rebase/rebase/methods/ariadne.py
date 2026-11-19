@@ -263,6 +263,11 @@ def _fit_body(
             procrustes_energy=config.procrustes_energy,
             exclude_first_token=config.exclude_first_token,
             mid_alignment=config.sequential_points == "mid_end",
+            **(
+                {"alignment": "mlp", "alignment_mlp_init": config.alignment_mlp_init}
+                if config.alignment == "mlp"
+                else {}
+            ),
             source_recipe=source_recipe,
             target_recipe=target_recipe,
         )

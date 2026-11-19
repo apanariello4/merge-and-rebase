@@ -1,0 +1,64 @@
+{
+ "pair": "smoke_Ll1_Ll3",
+ "rows": "token",
+ "pool_split": "train",
+ "pool_min_chars": 600,
+ "pool_seed": 0,
+ "max_length": 64,
+ "registration_split": "validation",
+ "registration_docs": 32,
+ "registration_seed": 0,
+ "n_images": [
+  32,
+  128
+ ],
+ "ks": [
+  1,
+  "all"
+ ],
+ "seed": 0,
+ "n_null": 3,
+ "null_quantile": 0.95,
+ "prefix_frac": 0.95,
+ "nulls": [
+  "N1",
+  "N2"
+ ],
+ "anchor_filter": "norm",
+ "anchor_filter_k": 3.0,
+ "tasks": [
+  "ifeval"
+ ],
+ "ifeval_split": "ifeval_k_v1",
+ "ifeval_part": "selection",
+ "ifeval_max_length": 128,
+ "ifeval_batch_size": 4,
+ "batch_size": 16,
+ "device": "cuda",
+ "dtype": "bf16",
+ "acc_device": "cpu",
+ "compute_device": null,
+ "compute_dtype": null,
+ "linalg_device": "cpu",
+ "ram_budget_gb": 20.0,
+ "icc_top": 3,
+ "tol_g": 0.02,
+ "offline": true,
+ "overwrite": true,
+ "source": {
+  "model": "meta-llama/Llama-3.2-1B",
+  "arch": "llama",
+  "instruct": "meta-llama/Llama-3.2-1B-Instruct"
+ },
+ "target": {
+  "model": "meta-llama/Llama-3.2-3B",
+  "arch": "llama"
+ },
+ "out_dir": "/tmp/claude-1001/-home-fillo-merge-and-rebase/9846713a-06a7-4e15-a8b1-d7a59f534011/scratchpad/smoke_llm/Ll1_Ll3",
+ "ifeval_n": 8,
+ "blocks": [
+  0,
+  13,
+  27
+ ]
+}

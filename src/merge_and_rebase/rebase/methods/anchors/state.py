@@ -150,6 +150,9 @@ class RegisteredModel:
     mu: list[Tensor]  # per block, [d] float64
     c: list[float]  # per block
     extras: dict[str, Any] = field(default_factory=dict)  # optional per-model statistics (e.g. norm filters)
+    # image / document id of every anchor row of ``p`` ([T] int64), attached by AnchorState from the frame (not stored
+    # per model); None for a model built outside a state. Used by the held-out canonical weights (split by id).
+    anchor_ids: Tensor | None = field(default=None, compare=False, repr=False)
 
     @property
     def depth(self) -> int:
@@ -425,7 +428,14 @@ class AnchorState:
             if self.state_dir is None or not self.has_model(model_id):
                 raise KeyError(f"model {model_id!r} is not registered")
             self.models[model_id] = self._load_model(model_id)
+        self._attach_ids(self.models[model_id])
         return self.models[model_id]
+
+    def _attach_ids(self, reg: RegisteredModel) -> None:
+        """Row ids of the frame (first column of ``anchor_rows``; rows are drawn sorted by id, which is the row order of
+        ``p``: the registration pass concatenates the anchor batches in id order)."""
+        if reg.anchor_ids is None and self.frame is not None:
+            reg.anchor_ids = torch.tensor([int(r[0]) for r in self.frame["anchor_rows"]], dtype=torch.long)
 
     def model_meta_hash(self, model_id: str) -> str:
         """Content hash of a registered model's frame: the stored ``blocks_sha256``, else a hash of its tensors."""
@@ -594,7 +604,8 @@ class AnchorState:
                 canon = to_rows(tokens, cfg.canonical_tokens, text)
                 units = unit_features(canon, cfg.anchor_unit) if centroid else canon
                 if b < cfg.anchor_batches:
-                    anchor_rows[j].append(units[img_idx, pos_idx].to(torch.float64))
+                    # native (float32) rows: anchor_frame casts to float64, exactly; keeps T x d x depth x 4 B, not x 8 B
+                    anchor_rows[j].append(units[img_idx, pos_idx])
                 else:
                     moments[j].update(canon)
                     if centroid:
@@ -602,6 +613,7 @@ class AnchorState:
         p_blocks, mu_blocks, c_blocks = [], [], []
         for j in range(depth):
             s_anc = torch.cat(anchor_rows[j], dim=0)
+            anchor_rows[j] = []  # release block j's rows as soon as its frame is built (host RAM)
             if s_anc.shape[0] != cfg.num_anchors:
                 raise RuntimeError(f"collected {s_anc.shape[0]} anchor rows at block {j}, expected {cfg.num_anchors}")
             mu, c = moments[j].finalize()
@@ -629,4 +641,5 @@ class AnchorState:
         if self.state_dir is not None:
             self._save_model(reg)
         self.models[model_id] = reg
+        self._attach_ids(reg)
         return reg

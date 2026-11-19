@@ -164,8 +164,12 @@ def paired_calibration(
     n = len(source_loader.dataset)
     if not n:
         raise ValueError("Calibration set is empty")
+    # Opt-in datasets (precomputed calibration images) keep their stored order; every other dataset is unchanged.
+    stored_order = bool(getattr(source_loader.dataset, "calibration_stored_order", False))
     order = (
-        list(range(n)) if seed is None else torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+        list(range(n))
+        if seed is None or stored_order
+        else torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
     )
     order = order[: num_batches * source_loader.batch_size]
     kwargs = dict(batch_size=source_loader.batch_size, shuffle=False, num_workers=0, drop_last=False)

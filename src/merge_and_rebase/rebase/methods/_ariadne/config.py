@@ -135,6 +135,19 @@ class DirectResidualConfig:
     # 'vision8_mix': one shared, exactly balanced Vision8 train context (batch_size / 8 per task per batch).
     # Non-default values require procrustes_source='activation'. The context is built in vision_rebase.py.
     calibration_data: str = "task_local"
+    # Opt-in augmentation of the fit's calibration images (vision only; same indices/order as the default draw).
+    # 'none' (default): eval transform, bit-identical to pre-field code. 'openclip_train': the OpenCLIP train
+    # transform in BOTH views, with the random crop of each example fixed by (seed, dataset index) so source and
+    # target see the identical augmented image. Requires calibration_data='task_local'.
+    calibration_augment: str = "none"
+    # Opt-in non-linear alignment ceiling (rebuttal; vision only): 'procrustes' (default, bit-identical) or 'mlp'.
+    # 'mlp' replaces D_j = (f - b) Q_j of the INDEPENDENT streaming fit by g_j(f) - g_j(b), where g_j is a 2-layer MLP
+    # (Linear(d_s, d_t) -> GELU -> Linear(d_t, d_t)) fit on the centered BASE rows (source base after block pi(j) vs
+    # target base after block j) with a 280/40 train/held-out image split and early stopping (mlp_alignment.py).
+    # alignment_mlp_init: 'residual' (g(x) = x Q_j + MLP(x), last layer zero-initialised: starts exactly at Procrustes) or
+    # 'plain' (g = MLP, default torch init, seeded).
+    alignment: str = "procrustes"
+    alignment_mlp_init: str = "residual"
     # Ablation overriding the source block pi(j) paired with each target position j (affects both D_j and Q_j;
     # apply_depth_pairing_override, applied at pairing-construction time). Needs component_target='block_boundary'.
     # 'relative' (default): pairing as computed, untouched (bit-identical to pre-ablation code). 'reversed': D_s - 1 - pi(j).
@@ -251,6 +264,9 @@ _SERIALIZED_WHEN_NON_DEFAULT = {
     "joint_weights": "uniform",
     "joint_tol": 1e-6,
     "joint_max_iters": 50,
+    "calibration_augment": "none",
+    "alignment": "procrustes",
+    "alignment_mlp_init": "residual",
 }
 
 
@@ -343,6 +359,9 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
         "joint_tol",
         "joint_max_iters",
         "calibration_data",
+        "calibration_augment",
+        "alignment",
+        "alignment_mlp_init",
         "depth_pairing",
         "alignment_seed",
         "fidelity_holdout",
@@ -626,6 +645,39 @@ def parse_direct_residual_config(value: Mapping[str, Any] | None) -> DirectResid
             "Procrustes backpropagates the task's own labelled loss, which a task-independent calibration "
             "set does not provide"
         )
+    if cfg.calibration_augment not in {"none", "openclip_train"}:
+        raise ValueError("calibration_augment must be 'none' or 'openclip_train'")
+    if cfg.calibration_augment != "none" and cfg.calibration_data != "task_local":
+        raise ValueError("calibration_augment requires calibration_data='task_local'")
+    if cfg.alignment not in {"procrustes", "mlp"}:
+        raise ValueError("alignment must be 'procrustes' or 'mlp'")
+    if cfg.alignment_mlp_init not in {"residual", "plain"}:
+        raise ValueError("alignment_mlp_init must be 'residual' or 'plain'")
+    if cfg.alignment == "mlp":
+        required = {
+            "activation_storage": "streaming",
+            "depth_fit": "independent",
+            "component_target": "block_boundary",
+            "residual_target": "transported_delta",
+            "procrustes_source": "activation",
+            "alignment_map": "polar",
+            "alignment_row_weighting": "uniform",
+            "block_split": "none",
+            "block_target": "total",
+            "pair_target_split": "none",
+            "component_fit": "closed_form",
+            "endpoint_construction": "native_delta",
+            "fidelity_holdout": False,
+            "procrustes_rank": None,
+            "procrustes_energy": None,
+            "post_mlp_norm": None,
+            "v_fit": None,
+        }
+        bad = {k: getattr(cfg, k) for k, v in required.items() if getattr(cfg, k) != v}
+        if bad:
+            raise ValueError(f"alignment='mlp' requires {required}; got {bad}")
+    elif cfg.alignment_mlp_init != "residual":
+        raise ValueError("alignment_mlp_init only applies to alignment='mlp'")
     if cfg.depth_pairing == "brace_ancestry":
         raise ValueError("depth_pairing 'brace_ancestry' was renamed to 'spread_duplicate'")
     if cfg.depth_pairing not in {"relative", "reversed", "shift_plus1", "shift_minus1", "spread_duplicate"}:
@@ -970,6 +1022,8 @@ _DECODER_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("alignment_row_weighting", "uniform"),
     ("endpoint_construction", "native_delta"),
     ("calibration_data", "task_local"),
+    ("calibration_augment", "none"),
+    ("alignment", "procrustes"),
 )
 
 

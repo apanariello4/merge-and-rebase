@@ -8,6 +8,8 @@ The dataset is ``method.params.anchor_pool`` (``wikitext103``: WikiText-103 raw,
     seed         0     seeded choice of the paragraphs
     max_length   None  tokens per sequence, BOS included (None: calibration_max_length)
     batch_size   None  (None: calibration_batch_size)
+    split        None  dataset split (None: the POOL_DATASETS default, "validation": ~1.4k paragraphs of >= 300 chars;
+                       "train" for a larger pool). Omitting the key leaves the pool record unchanged.
 
 Every model registered in one anchors state must see this same pool: the frame stores the draw identity (the
 loader's sample ids hash the texts) and the sha256 of its content token rows (``text_units='word'``: of its raw
@@ -24,7 +26,8 @@ from ...data.llm_calibration import build_text_calibration_loader
 #: anchor_pool name -> (HF dataset path, config, split, text column).
 POOL_DATASETS = {"wikitext103": ("Salesforce/wikitext", "wikitext-103-raw-v1", "validation", "text")}
 
-_KEYS = {"min_chars", "n_sequences", "seed", "max_length", "batch_size"}
+_SPLITS = {"train", "validation", "test"}
+_KEYS = {"min_chars", "n_sequences", "seed", "max_length", "batch_size", "split"}
 
 
 def resolve_anchors_pool(
@@ -43,6 +46,10 @@ def resolve_anchors_pool(
     if n_sequences < draw:
         raise ValueError(f"anchors_pool.n_sequences={n_sequences} is smaller than the frame's draw of {draw}")
     path, name, split, column = POOL_DATASETS[anchors_cfg.anchor_pool]
+    if raw.get("split") is not None:
+        split = str(raw["split"])
+        if split not in _SPLITS:
+            raise ValueError(f"anchors_pool.split must be one of {sorted(_SPLITS)}, got {split!r}")
     return {
         "dataset": anchors_cfg.anchor_pool,
         "hf_path": path,

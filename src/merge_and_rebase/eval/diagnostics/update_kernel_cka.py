@@ -335,6 +335,124 @@ def image_derangement(n: int, generator: torch.Generator) -> Tensor:
     return sigma
 
 
+def class_derangement(labels: Sequence[int] | Tensor, generator: torch.Generator, *, max_swaps: int = 64) -> Tensor:
+    """A random permutation ``sigma`` of the ``n`` images of a batch such that image ``i`` is paired with an image
+    ``sigma[i]`` of a DIFFERENT class (so also without fixed points), positions kept by the caller. Start from a random
+    permutation and repair every same-label pair by swapping its target with the target of a random partner position
+    that makes neither pair same-label (the number of bad pairs never grows). Exists iff no class has more than ``n / 2``
+    images in the batch; when the repair fails (or there are fewer than 2 classes) the cyclic shift of the class-sorted
+    order (``s`` in ``[max class size, n - max class size]``, the minimum number of same-class pairs when infeasible) or,
+    with one class, ``image_derangement`` is used. Seeded through ``generator`` only."""
+    lab = torch.as_tensor(labels).long().flatten()
+    n = int(lab.numel())
+    classes, inv = torch.unique(lab, return_inverse=True)
+    if n < 2 or classes.numel() < 2:
+        return image_derangement(n, generator)
+    sigma = torch.randperm(n, generator=generator)
+    for _ in range(max_swaps * n):
+        bad = (lab[sigma] == lab).nonzero().flatten()
+        if bad.numel() == 0:
+            return sigma
+        i = int(bad[int(torch.randint(0, bad.numel(), (1,), generator=generator))])
+        ok = ((lab[sigma] != lab[i]) & (lab != lab[sigma[i]])).nonzero().flatten()
+        ok = ok[ok != i]
+        if ok.numel() == 0:
+            break
+        k = int(ok[int(torch.randint(0, ok.numel(), (1,), generator=generator))])
+        sigma[i], sigma[k] = sigma[k].clone(), sigma[i].clone()
+    counts = torch.bincount(inv)
+    max_l = int(counts.max())
+    hi = max(max_l, n - max_l)
+    shift = max_l + int(torch.randint(0, hi - max_l + 1, (1,), generator=generator))
+    crank = torch.randperm(classes.numel(), generator=generator)
+    key = crank[inv] * n + torch.randperm(n, generator=generator)
+    order = torch.argsort(key)
+    out = torch.empty(n, dtype=torch.long)
+    out[order] = order.roll(-shift)
+    return out
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# sampling design: seeded shuffle + class-stratified jackknife chunks
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def chunk_image_counts(batch_sizes: Sequence[int], n_chunks: int) -> list[int]:
+    """Images per jackknife chunk (``chunk_of_batch`` over the batches of the given sizes)."""
+    n_b = len(batch_sizes)
+    counts = [0] * max(1, min(int(n_chunks), n_b))
+    for b, n in enumerate(batch_sizes):
+        counts[chunk_of_batch(b, n_b, n_chunks)] += int(n)
+    return counts
+
+
+def stratified_chunk_order(
+    labels: Sequence[int], batch_sizes: Sequence[int], n_chunks: int, seed: int
+) -> tuple[list[int], list[int]]:
+    """Order of the images (``order[new_position] = old_position``) such that every jackknife chunk (the consecutive
+    batches ``chunk_of_batch`` assigns to it) holds the class proportions of the whole sample (every class count within
+    one image of ``n_class * chunk_size / n`` for equal chunks, two images otherwise) and the images inside a chunk (so inside the batches) are in random order.
+    Also returns the chunk id of every new position. Construction: the images are sorted by (random class order, random
+    image order); the i-th of them goes to the chunk of the i-th entry of the chunk-size-proportional interleaving of
+    the chunk ids (round robin for equal chunks); each chunk is then shuffled. Seeded (``seed``) and a pure function of
+    the labels, so two models that load the same images get the same order."""
+    n = len(labels)
+    if sum(int(b) for b in batch_sizes) != n:
+        raise ValueError(f"batch sizes sum to {sum(batch_sizes)}, expected {n}")
+    sizes = chunk_image_counts(batch_sizes, n_chunks)
+    gen = torch.Generator().manual_seed(int(seed))
+    lab = torch.as_tensor(list(labels)).long()
+    classes, inv = torch.unique(lab, return_inverse=True)
+    crank = torch.randperm(classes.numel(), generator=gen)
+    key = crank[inv] * n + torch.randperm(n, generator=gen)
+    by_class = torch.argsort(key)  # old positions, class-sorted, random inside a class
+    # interleaving of the chunk ids proportional to the sizes: the k-th slot of chunk c sits at (k + 1/2) / size_c
+    pos = torch.cat([(torch.arange(s, dtype=torch.float64) + 0.5) / s for s in sizes])
+    cid = torch.cat([torch.full((s,), c, dtype=torch.long) for c, s in enumerate(sizes)])
+    slot = cid[torch.argsort(pos, stable=True)]  # ties (equal sizes) keep the chunk order: round robin
+    order: list[int] = []
+    chunk_ids: list[int] = []
+    for c in range(len(sizes)):
+        members = by_class[slot == c]
+        members = members[torch.randperm(members.numel(), generator=gen)]
+        order += [int(i) for i in members]
+        chunk_ids += [c] * int(members.numel())
+    return order, chunk_ids
+
+
+def reorder_batches(
+    batches: Sequence[tuple[Tensor, Tensor]], idx: Sequence[int], n_chunks: int, seed: int, *, stratified: bool
+) -> tuple[list[tuple[Tensor, Tensor]], list[int], list[int]]:
+    """The loaded ``batches`` (images of the positions ``idx``) in the sampling design's order, same batch sizes:
+    ``stratified``: seeded shuffle with class-stratified chunks (``stratified_chunk_order``), images, labels and ``idx``
+    permuted together; otherwise unchanged. Returns ``(batches, idx, chunk_id of every image in the new order)``."""
+    sizes = [int(x.shape[0]) for x, _ in batches]
+    if not stratified:
+        return list(batches), list(idx), [chunk_of_batch(b, len(sizes), n_chunks) for b, n in enumerate(sizes) for _ in range(n)]
+    labels0 = torch.cat([y for _, y in batches]).tolist()
+    order, chunk_ids = stratified_chunk_order(labels0, sizes, n_chunks, seed)
+    xs, ys = torch.cat([x for x, _ in batches])[order], torch.cat([y for _, y in batches])[order]
+    offs = [sum(sizes[:i]) for i in range(len(sizes))]
+    return [(xs[o:o + n], ys[o:o + n]) for o, n in zip(offs, sizes, strict=True)], [idx[i] for i in order], chunk_ids
+
+
+def chunk_class_balance(labels: Sequence[int], chunk_ids: Sequence[int]) -> dict[str, Any]:
+    """How far the chunks are from the class proportions of the sample: the largest ``|count_{chunk, class} - n_class
+    * size_chunk / n|`` (images), the mean number of classes per chunk and the number of classes."""
+    lab = torch.as_tensor(list(labels)).long()
+    cid = torch.as_tensor(list(chunk_ids)).long()
+    classes, inv = torch.unique(lab, return_inverse=True)
+    g = int(cid.max()) + 1
+    table = torch.zeros(g, classes.numel(), dtype=torch.float64)
+    table.index_put_((cid, inv), torch.ones(len(lab), dtype=torch.float64), accumulate=True)
+    expected = table.sum(1, keepdim=True) * table.sum(0, keepdim=True) / float(len(lab))
+    return {
+        "n_classes": int(classes.numel()), "n_chunks": g,
+        "max_abs_dev_from_proportional": float((table - expected).abs().max()),
+        "mean_classes_per_chunk": float((table > 0).sum(1).double().mean()),
+    }
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # per-block-pair accumulators and their finalisation
 # ----------------------------------------------------------------------------------------------------------------
@@ -558,6 +676,117 @@ class DirectBlock:
     pairs: dict[str, list[PairCross]]
     pair_tags: dict[str, tuple[str, str]]
     perm: PermCross | None = None
+
+
+# --- mean-shift agreement: where the dataset lands / how it is displaced, in anchor coordinates -----------------------
+
+MS_GROUPS = ("cls", "patch", "all")
+MS_KINDS = ("displacement", "base_position", "ft_position")
+MS_PAIRS = (
+    ("other_task", "m_t", "k_o"), ("other_task_rev", "m_o", "k_t"), ("random_update", "m_t", "k_rand"),
+)  # comparators of the true pair (m_t, k_t); ``other_task_mean`` is the mean of the first two
+
+
+class MeanAcc(_Acc):
+    """Sums over images (and positions) of the ENCODED rows ``x = rows P^T`` of one side, one chunk of images: ``n`` images,
+    ``cls`` (``[T]``, the CLS row) and ``patch`` (``[T]``, sum over images and matched patch positions). ``all`` is
+    ``cls + patch``. Fed with the update ``dH`` (displacement) and with the base activations ``H_base`` (position); the
+    fine-tuned position is their sum (the encoding is linear)."""
+
+    names = ("n", "cls", "patch")
+
+    def __init__(self, t: int) -> None:
+        self.n = torch.zeros((), dtype=torch.float64)
+        self.cls = torch.zeros(t, dtype=torch.float64)
+        self.patch = torch.zeros(t, dtype=torch.float64)
+
+    def update(self, x: Tensor) -> None:
+        if x.ndim != 3 or x.shape[1] < 2:
+            raise ValueError(f"MeanAcc.update needs [B, 1 + patches, T] encodings, got {tuple(x.shape)}")
+        x = x.to(ACC_DTYPE)
+        self.n += x.shape[0]
+        self.cls += _f64(x[:, 0].sum(0))
+        self.patch += _f64(x[:, 1:].sum((0, 1)))
+
+
+def _centred_cos(a: Tensor, b: Tensor) -> float:
+    """Cosine of the anchor-centred (mean over the T anchors removed) vectors, as ``common_mode``."""
+    a, b = a - a.mean(), b - b.mean()
+    den = float(a.norm() * b.norm())
+    return float(a @ b) / den if den > 0 else float("nan")
+
+
+def mean_vectors(means: Mapping[str, Sequence[MeanAcc]]) -> dict[str, dict[str, Tensor]]:
+    """``{tag: {'cls': [G, T], 'patch': [G, T], 'n': [G]}}`` per-chunk sums of a block's ``MeanAcc`` lists."""
+    return {
+        tag: {"cls": torch.stack([a.cls for a in accs]), "patch": torch.stack([a.patch for a in accs]),
+              "n": torch.stack([a.n for a in accs])}
+        for tag, accs in means.items()
+    }
+
+
+def ms_side_chunks(parts: Mapping[str, Mapping[str, Tensor]], kind: str, tag: str, group: str) -> Tensor:
+    """Per-chunk encoded vectors ``[G, T]`` (float64) of the side ``tag``: the update (``displacement``), the base
+    activations of its model (``base_position``) or base + update (``ft_position``), for the row group ``cls`` /
+    ``patch`` / ``all``."""
+    def grp(d: Mapping[str, Tensor]) -> Tensor:
+        return {"cls": d["cls"], "patch": d["patch"], "all": d["cls"] + d["patch"]}[group].to(torch.float64)
+
+    if kind == "displacement":
+        return grp(parts[tag])
+    base = grp(parts[f"base_{tag[0]}"])
+    if kind == "base_position":
+        return base
+    if kind == "ft_position":
+        return base + grp(parts[tag])
+    raise ValueError(f"unknown mean-shift kind {kind!r}")
+
+
+def ms_side_vector(parts: Mapping[str, Mapping[str, Tensor]], kind: str, tag: str, group: str, w: Tensor | None = None) -> Tensor:
+    """Sum over the chunks (weights ``w`` ``[G]``, all ones by default; weight 0 deletes a chunk) of ``ms_side_chunks``."""
+    x = ms_side_chunks(parts, kind, tag, group)
+    return x.sum(0) if w is None else w.to(torch.float64) @ x
+
+
+def mean_shift_block(parts: Mapping[str, Mapping[str, Tensor]], *, ci: bool = True) -> dict[str, Any]:
+    """Mean-shift agreement of one block, from the per-chunk vectors ``mean_vectors``. For every ``kind`` (update /
+    base position / fine-tuned position) and row group the cosine of the anchor-centred T-vectors of model m (``m_t``) and
+    model k (``k_t``), with a delete-one-chunk jackknife interval (``t_{G-1}``); for ``displacement`` and ``ft_position``
+    also the comparators ``other_task`` (m_t, k_o), ``other_task_rev`` (m_o, k_t), their mean and ``random_update`` (draw
+    0) and the excesses true - comparator on the same deleted chunks (``base_position`` has no comparator: the base is
+    the same). Keys follow the direct measure (``excess_other_task_mean``, ``true_minus_random_draw0``)."""
+    g = int(parts["m_t"]["cls"].shape[0])
+    do_ci = ci and g >= 2
+    ws: list[Tensor | None] = [None]
+    if do_ci:
+        ws += [torch.ones(g, dtype=torch.float64).index_fill_(0, torch.tensor([d]), 0.0) for d in range(g)]
+
+    def reps(kind: str, group: str, tx: str, ty: str) -> Tensor:
+        return torch.tensor(
+            [_centred_cos(ms_side_vector(parts, kind, tx, group, w), ms_side_vector(parts, kind, ty, group, w)) for w in ws],
+            dtype=torch.float64,
+        )
+
+    out: dict[str, Any] = {"n_chunks": g, "images_per_chunk": [float(x) for x in parts["m_t"]["n"]]}
+    for kind in MS_KINDS:
+        out[kind] = {}
+        for group in MS_GROUPS:
+            true = reps(kind, group, "m_t", "k_t")
+            e = _ci_entry(true)
+            if kind != "base_position":
+                comps: dict[str, Tensor] = {}
+                for name, tx, ty in MS_PAIRS:
+                    if tx in parts and ty in parts:
+                        comps[name] = reps(kind, group, tx, ty)
+                for name, rep in comps.items():
+                    e[name] = _ci_entry(rep)
+                    e["true_minus_random_draw0" if name == "random_update" else f"excess_{name}"] = _ci_entry(true - rep)
+                if "other_task" in comps and "other_task_rev" in comps:
+                    mean = (comps["other_task"] + comps["other_task_rev"]) / 2.0
+                    e["other_task_mean"] = _ci_entry(mean)
+                    e["excess_other_task_mean"] = _ci_entry(true - mean)
+            out[kind][group] = e
+    return out
 
 
 def _ratio(num: Tensor, a: Tensor, b: Tensor) -> float:
@@ -1225,6 +1454,15 @@ class UpdateKernelCkaConfig:
     transported_run_dir: str | None = None
     transported_alpha: float = 1.0
     overwrite: bool = False
+    # image order and null pairing. 'legacy': the selected images sorted by dataset index (batches and jackknife chunks
+    # are in class order for class-sorted datasets), image-null partners = any other image of the batch (the original
+    # behaviour). 'stratified': seeded shuffle, class-STRATIFIED jackknife chunks, image-null partners of another class.
+    sampling: str = "legacy"
+    # cudnn TF32 for the forward passes. The anchors states were registered with cudnn TF32 ON (PyTorch default) and
+    # matmul TF32 off; True reproduces the state frames to ~1e-6 (frame check of metodoK_phase1, 2026-11-06), False
+    # (legacy) leaves a 1e-3..2e-2 relative gap on ViT-L/14. Matmul TF32 is always off.
+    cudnn_allow_tf32: bool = False
+    mean_shift: bool = True  # accumulate / report / save the per-chunk mean-shift T-vectors (mean_vectors.pt)
 
 
 def parse_config(payload: Mapping[str, Any]) -> UpdateKernelCkaConfig:
@@ -1261,6 +1499,8 @@ def parse_config(payload: Mapping[str, Any]) -> UpdateKernelCkaConfig:
         raise ValueError("grid_reference must be m|k|canonical")
     if cfg.split not in {"test", "val"}:
         raise ValueError("split must be test|val")
+    if cfg.sampling not in {"legacy", "stratified"}:
+        raise ValueError("sampling must be legacy|stratified")
     if cfg.anchor_filter not in {None, "norm"}:
         raise ValueError("anchor_filter must be null or 'norm'")
     if cfg.compute_dtype not in {"float32", "float64"}:
@@ -1358,6 +1598,10 @@ def _eval_batches(cfg: UpdateKernelCkaConfig, task: str, clf) -> tuple[list[tupl
         idx = list(range(n))
     loader = DataLoader(Subset(ds, idx), batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
     batches = [(batch[0], batch[1]) for batch in loader]
+    sizes = [int(x.shape[0]) for x, _ in batches]
+    batches, idx, chunk_ids = reorder_batches(
+        batches, idx, cfg.jackknife_chunks, int(cfg.seed) * 1000003 + 17, stratified=cfg.sampling == "stratified"
+    )
     labels = torch.cat([y for _, y in batches]).tolist()
     abs_idx, idx_source = _absolute_indices(ds, idx)
     identity = image_identity(ds, idx)
@@ -1367,7 +1611,14 @@ def _eval_batches(cfg: UpdateKernelCkaConfig, task: str, clf) -> tuple[list[tupl
         "task": task, "split": cfg.split, "n_images": len(labels), "n_batches": len(batches),
         "labels_sha256": hashlib.sha256(repr(labels).encode()).hexdigest(),
         "image_indices_sha256": hashlib.sha256(repr(abs_idx).encode()).hexdigest(), "index_source": idx_source,
-        "n_split_total": n_total,
+        "n_split_total": n_total, "sampling": cfg.sampling, "n_chunks": len(set(chunk_ids)),
+        "chunk_class_balance": chunk_class_balance(labels, chunk_ids),
+        # full record of the selected images (in the order used); ``run`` writes it to ``selected_images.json``
+        "selection": {
+            "task": task, "split": cfg.split, "sampling": cfg.sampling, "seed": int(cfg.seed), "n_split_total": n_total,
+            "dataset_positions": [int(i) for i in idx], "hf_indices": abs_idx, "labels": [int(y) for y in labels],
+            "chunk_ids": [int(c) for c in chunk_ids], "batch_sizes": sizes, "index_source": idx_source,
+        },
     }
     return batches, meta
 
@@ -1530,6 +1781,9 @@ class Collector:
     perm: dict[int, PermCross] = field(default_factory=dict)
     rows: dict[str, list[dict[int, PairAcc]]] = field(default_factory=dict)
     perm_cross: dict[int, dict[str, list[CrossStats]]] | None = None
+    means: dict[int, dict[str, list[MeanAcc]]] = field(default_factory=dict)  # per block, tag, chunk (mean-shift sums)
+    native_means: dict[int, dict[str, list[MeanAcc]]] = field(default_factory=dict)  # same sums in the native d-space
+    null_pairs: list[int] = field(default_factory=lambda: [0, 0])  # [same-label image-null pairs, all image-null pairs]
 
     @classmethod
     def empty(cls, blocks: Sequence[int]) -> Collector:
@@ -1544,14 +1798,18 @@ def _stream_pass(
     batches: Mapping[str, list] | None = None, frames: Mapping[int, PairFrame], n_ref: int, row_types: Sequence[str],
     native_tags: Sequence[str] = (), side_tags: Sequence[str] = (), pairs: Sequence[tuple[str, str, str]] = (),
     row_pairs: Sequence[tuple[str, str, str, bool]] = (), collect_base: bool = False, chunk_fn, n_perm_images: int = 0,
-    seed: int,
+    seed: int, collect_means: bool = False, null_across_classes: bool = False,
 ) -> None:
     """One pass over the task images with the sides ``states`` (tag -> weights) live at once; the SAME images in every
     side (rows correspond), only the expert (state) differs between sides. Accumulates, into ``col``: the native
     statistics (m1) of ``native_tags`` (and of the base activations with ``collect_base``), the anchor-space statistics
     of ``side_tags`` and of ``pairs`` ``(name, tag_x, tag_y)`` (the primary direct measure; ``n_perm_images`` image-
     mismatched permutations for the pair ``true``) and the row statistics of ``row_pairs`` ``(name, tag_x, tag_y,
-    chunked)`` (m2, only the main one is chunked)."""
+    chunked)`` (m2, only the main one is chunked). ``collect_means``: per chunk, the sums of the encoded update of every
+    tag of ``side_tags`` (``MeanAcc``; with ``collect_base`` also of the encoded base activations, ``base_m`` /
+    ``base_k``) into ``col.means``. ``null_across_classes``: the image-mismatched permutations pair every image with an
+    image of another class of the same batch (``class_derangement``; the same-label pairs are counted in
+    ``col.null_pairs``); False: ``image_derangement`` (any other image)."""
     from ...rebase.methods._ariadne.capture import iter_capture_tokens
 
     device, dtype = ctx["device"], ctx["dtype"]
@@ -1598,7 +1856,13 @@ def _stream_pass(
                 })
         bsz = int(m_batches[b][0].shape[0])
         gen = torch.Generator().manual_seed(int(seed) * 100003 + b)
-        sigmas = [image_derangement(bsz, gen) for _ in range(n_perm_images)] if do_perm else []
+        if do_perm and null_across_classes:
+            lab_b = m_batches[b][1]
+            sigmas = [class_derangement(lab_b, gen) for _ in range(n_perm_images)]
+            col.null_pairs[0] += sum(int((lab_b[sg] == lab_b).sum()) for sg in sigmas)
+            col.null_pairs[1] += bsz * len(sigmas)
+        else:
+            sigmas = [image_derangement(bsz, gen) for _ in range(n_perm_images)] if do_perm else []
         for j in blocks:
             i = frames[j].source_block
             delta: dict[str, Tensor] = {}
@@ -1614,6 +1878,29 @@ def _stream_pass(
             enc = {tag: match_patch_grid(delta[tag], n_ref) @ pt[j][0 if tag[0] == "m" else 1] for tag in need}
             if pairs or side_tags:
                 dchunks[c][j].update(enc, side_tags, pairs)
+            if collect_means:
+                store = col.means.setdefault(j, {})
+                t_j = frames[j].n_anchors
+                feed = {tag: enc[tag] for tag in side_tags}
+                if collect_base:
+                    feed["base_m"] = match_patch_grid(v[("b", "m", id(bt["m_t"]))][str(i)].to(dtype), n_ref) @ pt[j][0]
+                    feed["base_k"] = match_patch_grid(v[("b", "k", id(bt["k_t"]))][str(j)].to(dtype), n_ref) @ pt[j][1]
+                for tag, x in feed.items():
+                    lst = store.setdefault(tag, [])
+                    while len(lst) <= c:
+                        lst.append(MeanAcc(t_j))
+                    lst[c].update(x)
+                # the same sums of the NATIVE (d-dimensional, not grid-matched, not encoded) update / base activation
+                nfeed = {tag: delta[tag] for tag in side_tags}
+                if collect_base:
+                    nfeed["base_m"] = v[("b", "m", id(bt["m_t"]))][str(i)].to(dtype)
+                    nfeed["base_k"] = v[("b", "k", id(bt["k_t"]))][str(j)].to(dtype)
+                nstore = col.native_means.setdefault(j, {})
+                for tag, x in nfeed.items():
+                    lst = nstore.setdefault(tag, [])
+                    while len(lst) <= c:
+                        lst.append(MeanAcc(int(x.shape[-1])))
+                    lst[c].update(x)
             if do_perm:
                 tx, ty = next((tx, ty) for nm, tx, ty in pairs if nm == "true")
                 col.perm[j].update(enc[tx], enc[ty], sigmas)
@@ -1654,6 +1941,8 @@ def _grid_plan(cfg: UpdateKernelCkaConfig, n_m: int, n_k: int, canonical: int) -
     return ref, f"resample(bilinear, reference={cfg.grid_reference}, n_tokens={ref}; native m={n_m}, k={n_k})"
 
 
+MEAN_VECTORS_FILE = "mean_vectors.pt"
+SELECTED_IMAGES_FILE = "selected_images.json"
 CONTROL_TAGS = {
     "other_task": "k_o", "other_task_other_images": "k_oi", "random_update": "k_rand", "transported": "k_tr",
 }
@@ -1668,7 +1957,7 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise FileExistsError(f"{out_dir / 'summary.json'} exists (set overwrite to replace)")
     started = time.perf_counter()
     torch.backends.cuda.matmul.allow_tf32 = False  # TF32 off: the diagnostics compare small differences of kernels
-    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = bool(cfg.cudnn_allow_tf32)
     device = cfg.device
     dtype = torch.float32 if cfg.compute_dtype == "float32" else torch.float64
 
@@ -1686,6 +1975,9 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     m_batches, meta_m = _eval_batches(cfg, cfg.task, clf_m)
     k_batches, meta_k = _eval_batches(cfg, cfg.task, clf_k)
+    sel_m, sel_k = meta_m.pop("selection"), meta_k.pop("selection")
+    if sel_m != sel_k:
+        raise RuntimeError("the two models' loaders do not yield the same image selection / order")
     for (_, ym), (_, yk) in zip(m_batches, k_batches, strict=True):
         if not torch.equal(ym, yk):
             raise RuntimeError("the two models' loaders do not yield the same images (labels differ)")
@@ -1747,12 +2039,14 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
     _stream_pass(
         name="main", states=states, native_tags=native_tags, side_tags=side_tags, pairs=pairs, row_pairs=row_pairs,
         collect_base=True, chunk_fn=chunked, n_perm_images=cfg.image_permutations if run_null else 0, **common,
+        collect_means=cfg.mean_shift, null_across_classes=cfg.sampling == "stratified",
     )
 
     # --- remaining controls ---------------------------------------------------------------------------------------
     if "other_task_other_images" in cfg.controls:
         upd_oi, info_oi = expert_update(base_k, cfg.target.experts[cfg.other_task])
         kb_other, meta_other = _eval_batches(cfg, cfg.other_task, clf_k)
+        meta_other.pop("selection", None)
         if [int(x.shape[0]) for x, _ in kb_other] != [int(x.shape[0]) for x, _ in m_batches]:
             raise RuntimeError("other_task other-images set has a different number/size of batches than the task's")
         control_info["other_task_other_images"] = {
@@ -1781,6 +2075,7 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
                 name=pair_name, states={"m_t": state_m, tag: {**base_k, **rand}}, native_tags=[tag] if first else [],
                 side_tags=[tag], pairs=[(pair_name, "m_t", tag)],
                 row_pairs=_rp((pair_name, "m_t", tag, False)) if first else [], chunk_fn=chunked if first else (lambda b: 0),
+                collect_means=cfg.mean_shift and first,  # the mean-shift vectors of draw 0 (chunked) as a chance comparator
                 **common,  # draws >= 1: one chunk, only the all-images cosine (null distribution)
             )
             del rand
@@ -1824,6 +2119,7 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
     tags = {name: CONTROL_TAGS[name] for name in ctl_names}
     block_results = []
     n_chunks_actual = len(col.pairs[blocks[0]]["true"])
+    vec_out: dict[int, Any] = {}
     for j in blocks:
         fr = frames[j]
         opts = copy.copy(main_opts)
@@ -1832,6 +2128,18 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
             [c[j] for c in col.rows.get("true", [])], fr, opts, perm_cross=None if col.perm_cross is None else col.perm_cross[j],
             native=col.native[j], control_tags=tags, direct=col.direct_block(j),
         )
+        if cfg.mean_shift and col.means.get(j):
+            parts = mean_vectors(col.means[j])
+            res["mean_shift"] = mean_shift_block(parts, ci=cfg.ci)
+            vec_out[j] = {
+                "tags": {tag: {"cls": v["cls"].float().contiguous(), "patch": v["patch"].float().contiguous()} for tag, v in parts.items()},
+                "n_images": parts["m_t"]["n"].clone(), "n_anchors": fr.n_anchors, "source_block": fr.source_block,
+            }
+            col.means[j] = {}
+            nat = mean_vectors(col.native_means.get(j, {}))
+            vec_out[j]["native"] = {tag: {"cls": v["cls"].float().contiguous(), "patch": v["patch"].float().contiguous()}
+                                    for tag, v in nat.items()}
+            col.native_means[j] = {}
         for name in ctl_names:
             m2c: dict[str, float] = {}
             if cfg.m2:
@@ -1849,6 +2157,23 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
         col.native[j], col.sides[j], col.pairs[j] = {}, {}, {}  # free the block's statistics
         print(f"[update_kernel_cka] finalised block {j} (source {fr.source_block})", flush=True)
 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / SELECTED_IMAGES_FILE).write_text(json.dumps(sel_m))
+    if vec_out:
+        torch.save({
+            "meta": {
+                "format": "mean_vectors_v1", "task": cfg.task, "other_task": cfg.other_task,
+                "source": model_id(cfg.source), "target": model_id(cfg.target), "sampling": cfg.sampling,
+                "n_chunks": n_chunks_actual, "images_per_chunk": [float(x) for x in next(iter(vec_out.values()))["n_images"]],
+                "n_patch_positions": int(n_ref) - 1, "native_patch_positions": {"m": n_tokens_m - 1, "k": n_tokens_k - 1}, "split_seed": cfg.seed, "state_dir": cfg.state_dir,
+                "contents": "blocks[j]['tags'][tag][group] = per-chunk SUM over images (and patch positions) of the encoded "
+                            "rows (dH P^T for m_t k_t m_o k_o k_rand = update; H_base P^T for base_m base_k = position), "
+                            "float32 [n_chunks, T]; group cls|patch (all = cls + patch). blocks[j]['native'][tag][group] = the same sums "
+                            "in the native d-space (no grid matching, no encoding): float32 [n_chunks, d_model] (m_* tags: d of the "
+                            "source, k_* tags: d of the target; base_m / base_k = base activations)",
+            },
+            "blocks": vec_out,
+        }, out_dir / MEAN_VECTORS_FILE)
     setting = {
         "source": {"model": cfg.source.model, "pretrained": cfg.source.pretrained, "n_tokens": n_tokens_m,
                    "depth": depth_m, "expert": info_m, "base_checkpoint": cfg.source.base_checkpoint},
@@ -1860,7 +2185,14 @@ def run(payload: Mapping[str, Any]) -> dict[str, Any]:
         "T_stored": int(frame_json["config"]["num_anchors"]), "anchor_filter": cfg.anchor_filter,
         "anchor_filter_k": cfg.anchor_filter_k, "pairing": list(pairing.pairing),
         "split": cfg.split, "images": {"task": meta_m, "task_target_loader": meta_k}, "val_size": cfg.val_size,
-        "split_seed": cfg.seed, "batch_size": cfg.batch_size, "grid_mode": grid_mode, "grid_reference": cfg.grid_reference,
+        "split_seed": cfg.seed, "sampling": cfg.sampling, "mean_shift": cfg.mean_shift,
+        "mean_vectors_file": MEAN_VECTORS_FILE if vec_out else None, "selected_images_file": SELECTED_IMAGES_FILE,
+        "image_null_pairs": (
+            {"same_label": col.null_pairs[0], "total": col.null_pairs[1],
+             "same_label_fraction": col.null_pairs[0] / max(1, col.null_pairs[1])}
+            if cfg.sampling == "stratified" and run_null else None
+        ),
+        "batch_size": cfg.batch_size, "grid_mode": grid_mode, "grid_reference": cfg.grid_reference,
         "grid_reference_tokens": n_ref, "controls": list(cfg.controls), "permutations": cfg.permutations,
         "image_permutations": cfg.image_permutations, "ci": cfg.ci,
         "ci_method": "delete-one jackknife, t_{G-1}: direct measure and m2 over image chunks, m1 over anchor-image clusters",
@@ -1955,6 +2287,20 @@ def csv_rows(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
                         if x is not None:
                             row[col], row[f"{col}_lo"], row[f"{col}_hi"] = x["value"], x.get("lo"), x.get("hi")
                 rows.append(row)
+        for kind in MS_KINDS:  # mean-shift agreement (cosine of the anchor-centred T-vectors), one row per group
+            for group, e in blk.get("mean_shift", {}).get(kind, {}).items():
+                row = {"target_block": blk["target_block"], "source_block": blk["source_block"],
+                       "measure": f"meanshift_{kind}", "group": group, "value": e["value"], "lo": e.get("lo"),
+                       "hi": e.get("hi"), "se": e.get("se")}
+                row["other_task"] = e.get("other_task", {}).get("value")
+                row["random_update"] = e.get("random_update", {}).get("value")
+                row["ref_other_task_rev"] = e.get("other_task_rev", {}).get("value")
+                row["ref_other_task_mean"] = e.get("other_task_mean", {}).get("value")
+                for key, col in EXCESS_KEYS:
+                    x = e.get(key)
+                    if x is not None:
+                        row[col], row[f"{col}_lo"], row[f"{col}_hi"] = x["value"], x.get("lo"), x.get("hi")
+                rows.append(row)
     return rows
 
 
@@ -2025,6 +2371,21 @@ def render_md(summary: Mapping[str, Any]) -> str:
         f"TF32 matmul={tf32.get('matmul')} cudnn={tf32.get('cudnn')} (disattivato).",
         f"- Intervalli: jackknife delete-one con t_(G-1): misura diretta e m2 su {s.get('jackknife_chunks_actual')} blocchi "
         f"di immagini (richiesti {s.get('jackknife_chunks_requested')}), m1 su cluster di ancore della stessa immagine.",
+        (f"- Campionamento `stratified`: le {s['images']['task']['n_images']} immagini (stesso insieme del seme, split completo se "
+         f"piu' piccolo) sono rimescolate con seme; i chunk del jackknife sono STRATIFICATI per classe (scarto massimo dalle "
+         f"proporzioni di classe per chunk e classe: {s['images']['task'].get('chunk_class_balance', {}).get('max_abs_dev_from_proportional', '?')} "
+         f"immagini, {s['images']['task'].get('chunk_class_balance', {}).get('n_classes', '?')} classi); il null a immagini disallineate "
+         f"abbina ogni immagine a una di ALTRA classe nello stesso batch (coppie con stessa etichetta: "
+         f"{(s.get('image_null_pairs') or {}).get('same_label', 'n/d')} su {(s.get('image_null_pairs') or {}).get('total', 'n/d')}). "
+         f"Indici salvati in `{s.get('selected_images_file')}`."
+         if s.get("sampling") == "stratified" else
+         "- Campionamento `legacy`: immagini ordinate per indice del dataset (batch e chunk del jackknife nell'ordine delle classi se "
+         "il dataset e' ordinato per classe: IC piu' stretti del dovuto, null immagini con partner spesso della stessa classe)."),
+        "- Mean-shift: per ogni lato, somma sulle righe dell'update codificato dH P^T (`displacement`) e della posizione codificata "
+        "H_base P^T / H_ft P^T (`base_position`, `ft_position`; H_ft = H_base + dH, la codifica e' lineare), per gruppo cls / patch / all, "
+        "accumulata per chunk (file `" + str(s.get("mean_vectors_file")) + "`, float32). Misura: coseno dei vettori T di m e k dopo "
+        "aver tolto la media sulle ancore (come `common_mode`), IC95 jackknife delete-one sui chunk (t_(G-1)); comparatori e eccessi "
+        "come per la misura diretta (altro task: (m_t,k_o), (m_o,k_t), media; update casuale: estrazione 0).",
         f"- Controlli: {', '.join(s['controls'])}. Permutazioni ancore {s['permutations']}, permutazioni immagini "
         f"{s['image_permutations']}, seed controlli {s['control_seed']}, estrazioni update casuale {s.get('random_draws', 1)} "
         f"(antitetiche: {s.get('random_antithetic', False)}; seed: {s.get('random_seed_derivation', 'seed controlli, una estrazione')}).",
@@ -2060,7 +2421,25 @@ def render_md(summary: Mapping[str, Any]) -> str:
         return [f"{_fmt(rd['null_mean'])} ± {_fmt(sd) if sd is not None else 'n/d'}", f"{_fmt(rd['min'])} - {_fmt(rd['max'])}",
                 _fmt(rd["z_random"]), _fmt(rd["p_random"]), _fmt(rd["p_random_two_sided"])]
 
+    def _null_cell(e):
+        nl = (e or {}).get("image_null")
+        return "" if not nl else f"{_fmt(nl['mean'])} ± {_fmt(nl['std'])}"
+
+    def ms(blk, kind, g):
+        return blk.get("mean_shift", {}).get(kind, {}).get(g)
+
     if any("direct" in b for b in blocks):
+        table(
+            "PRIMARIA affiancata (gruppo all): coseno grezzo (`uncentered`), `position_centered`, null a immagini disallineate "
+            "(media ± sd delle permutazioni) e coseno dello spostamento medio (centrato sulle ancore) con IC95 jackknife",
+            ["blocco j (i)", "grezzo uncentered [IC]", "null immagini (uncentered)", "position_centered [IC]",
+             "null immagini (position_centered)", "mean-shift spostamento [IC]", "mean-shift: eccesso vs altro task media [IC]"],
+            lambda b: None if de(b, "uncentered", "all") is None else [
+                bid(b), _ci(de(b, "uncentered", "all")), _null_cell(de(b, "uncentered", "all")),
+                _ci(de(b, "position_centered", "all")), _null_cell(de(b, "position_centered", "all")),
+                _ci(ms(b, "displacement", "all")), _ci((ms(b, "displacement", "all") or {}).get("excess_other_task_mean")),
+            ],
+        )
         for g in ("all", "patch", "cls"):
             table(
                 f"PRIMARIA: coseno grezzo (`uncentered`) D_m vs D_k, gruppo {g}, comparatori ed eccessi (IC95 jackknife)",
@@ -2142,6 +2521,27 @@ def render_md(summary: Mapping[str, Any]) -> str:
             _fmt(b["m2"]["patch"].get("null", {}).get("z")),
         ],
       )
+    if any("mean_shift" in b for b in blocks):
+        for kind, title in (
+            ("displacement", "spostamento medio dell'update dH (dove si sposta il dataset)"),
+            ("ft_position", "posizione media del fine-tuned H_ft = H_base + dH (dove atterra il dataset)"),
+        ):
+            for g in ("all", "patch", "cls"):
+                table(
+                    f"Mean-shift, {title}: coseno fra m e k dei vettori T centrati sulle ancore, gruppo {g}, comparatori ed eccessi (IC95 jackknife)",
+                    ["blocco j (i)", "coseno [IC]", "altro task (m_t,k_o) [IC]", "altro task speculare (m_o,k_t) [IC]",
+                     "altro task media [IC]", "eccesso vs altro task media [IC]", "random (estrazione 0) [IC]"],
+                    lambda b, kind=kind, g=g: None if ms(b, kind, g) is None else [
+                        bid(b), _ci(ms(b, kind, g)), *[_ci(ms(b, kind, g).get(k)) for k in
+                                                       ("other_task", "other_task_rev", "other_task_mean", "excess_other_task_mean", "random_update")],
+                    ],
+                )
+        table(
+            "Mean-shift, posizione media del base H_base (dipende solo dal modello e dalle immagini): coseno m vs k [IC]",
+            ["blocco j (i)", "all", "patch", "cls"],
+            lambda b: None if ms(b, "base_position", "all") is None else [
+                bid(b), *[_ci(ms(b, "base_position", g)) for g in ("all", "patch", "cls")]],
+        )
     if any("common_mode" in b for b in blocks):
         table(
             "Spostamento medio comune: frazione rho = n h^T Q h / tr(Q S) e coseno tra P h medi centrati sulle ancore",
@@ -2183,7 +2583,10 @@ def render_md(summary: Mapping[str, Any]) -> str:
         "quelli di m1 su cluster di ancore della stessa immagine.",
         "- Il controllo altro task (solo esperto) usa le stesse immagini: cambia solo l'esperto. Il controllo altre immagini "
         "accoppia l'immagine i di t con l'immagine i di t' (indice, arbitrario).",
-        "- Il null per immagini e' un derangement dentro ogni batch (immagini disallineate, posizioni allineate), 20 permutazioni: "
+        ("- Il null per immagini e' un derangement fra classi diverse dentro ogni batch (immagini disallineate, posizioni allineate): "
+         if s.get("sampling") == "stratified" else
+         "- Il null per immagini e' un derangement dentro ogni batch (immagini disallineate, posizioni allineate; con lo split in ordine "
+         "di classe molte coppie hanno la stessa classe, quindi il null e' troppo alto), 20 permutazioni: ") +
         "usare z e p empirico, non q95. Il null delle ancore per la variante `position_centered` non e' disponibile "
         "(servirebbero le somme per posizione fra ancore diverse).",
         "- Il controllo update casuale usa una direzione gaussiana per tensore con la stessa norma Frobenius di tau_k "
@@ -2253,9 +2656,33 @@ def merge_summaries(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {"setting": setting, "blocks": sorted(blocks, key=lambda b: b["target_block"])}
 
 
+def merge_vector_files(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Union of the blocks of ``mean_vectors.pt`` payloads of runs that differ only in ``blocks``; the meta must agree."""
+    meta = parts[0]["meta"]
+    blocks: dict[int, Any] = {}
+    for i, part in enumerate(parts):
+        if part["meta"] != meta:
+            raise ValueError(f"part {i}: mean_vectors meta differs: {sorted(k for k in meta if part['meta'].get(k) != meta[k])}")
+        dup = set(blocks) & set(part["blocks"])
+        if dup:
+            raise ValueError(f"overlapping blocks in mean_vectors: {sorted(dup)}")
+        blocks.update(part["blocks"])
+    return {"meta": meta, "blocks": dict(sorted(blocks.items()))}
+
+
 def merge_dirs(dirs: Sequence[str | Path], out_dir: str | Path) -> dict[str, Any]:
     merged = merge_summaries([json.loads((Path(d) / "summary.json").read_text()) for d in dirs])
-    write_outputs(merged, Path(out_dir))
+    out = Path(out_dir)
+    write_outputs(merged, out)
+    sel = [Path(d) / SELECTED_IMAGES_FILE for d in dirs]
+    if all(f.exists() for f in sel):  # the image selection is part of the setting: every part must have used the same
+        texts = {f.read_text() for f in sel}
+        if len(texts) != 1:
+            raise ValueError("the parts used different image selections (selected_images.json differs)")
+        (out / SELECTED_IMAGES_FILE).write_text(texts.pop())
+    vec = [Path(d) / MEAN_VECTORS_FILE for d in dirs]
+    if all(f.exists() for f in vec):
+        torch.save(merge_vector_files([torch.load(f, map_location="cpu", weights_only=False) for f in vec]), out / MEAN_VECTORS_FILE)
     return merged
 
 
@@ -2263,15 +2690,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config")
     parser.add_argument("--merge", nargs="+", metavar="DIR", help="merge the summary.json of these part directories")
-    parser.add_argument("--out", help="output directory of --merge")
+    parser.add_argument("--out", help="output directory of --merge / --matching")
+    parser.add_argument("--matching", nargs="+", metavar="DIR",
+                        help="cross-task mean-shift matching of the per-task run directories of one model pair "
+                             "(see update_mean_matching)")
     args = parser.parse_args(argv)
+    if args.matching:
+        if not args.out:
+            parser.error("--matching needs --out")
+        from .update_mean_matching import run_matching
+
+        run_matching(args.matching, args.out)
+        return
     if args.merge:
         if not args.out:
             parser.error("--merge needs --out")
         merge_dirs(args.merge, args.out)
         return
     if not args.config:
-        parser.error("--config or --merge is required")
+        parser.error("--config, --merge or --matching is required")
     run(json.loads(Path(args.config).read_text()))
 
 

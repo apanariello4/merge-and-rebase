@@ -1,0 +1,59 @@
+{
+ "pair": "P_Q",
+ "rows": "token",
+ "pool_split": "train",
+ "pool_min_chars": 600,
+ "pool_seed": 0,
+ "max_length": 128,
+ "registration_split": "validation",
+ "registration_docs": 320,
+ "registration_seed": 0,
+ "n_images": [
+  256,
+  1024,
+  4096
+ ],
+ "ks": [
+  1,
+  16,
+  "all"
+ ],
+ "seed": 0,
+ "n_null": 19,
+ "null_quantile": 0.95,
+ "prefix_frac": 0.95,
+ "nulls": [
+  "N1"
+ ],
+ "anchor_filter": "norm",
+ "anchor_filter_k": 3.0,
+ "tasks": [
+  "ifeval"
+ ],
+ "ifeval_split": "ifeval_k_v1",
+ "ifeval_part": "selection",
+ "ifeval_max_length": 512,
+ "ifeval_batch_size": 4,
+ "batch_size": 16,
+ "device": "cuda",
+ "dtype": "bf16",
+ "acc_device": "cpu",
+ "compute_device": "cuda",
+ "compute_dtype": "float32",
+ "linalg_device": "cpu",
+ "ram_budget_gb": 24.0,
+ "icc_top": 10,
+ "tol_g": 0.02,
+ "offline": true,
+ "overwrite": false,
+ "source": {
+  "model": "Qwen/Qwen2.5-0.5B",
+  "arch": "qwen",
+  "instruct": "Qwen/Qwen2.5-0.5B-Instruct"
+ },
+ "target": {
+  "model": "Qwen/Qwen2.5-1.5B",
+  "arch": "qwen"
+ },
+ "out_dir": "/data/merge_and_rebase_results/metodoK_fase1_2026-11-06/P_Q"
+}

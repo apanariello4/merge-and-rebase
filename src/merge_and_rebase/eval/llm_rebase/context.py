@@ -286,6 +286,29 @@ def tuned_generator_factory(
     return build
 
 
+def target_base_state_dict(
+    source_build_cfg: TextBuildConfig,
+    target_build_cfg: TextBuildConfig,
+    source_base_sd: dict[str, torch.Tensor],
+    target_model: torch.nn.Module,
+    *,
+    base_ckpts: tuple[Any, Any] = (None, None),
+) -> dict[str, torch.Tensor]:
+    """The target's fp32 CPU base state dict. Round trip (identical build configs, no base checkpoint on either
+    side): a NEW dict over the SAME tensors as ``source_base_sd`` (saves one full fp32 copy; the values are those of
+    ``to_cpu_fp32(target_model.state_dict())`` since both models load the same weights). The dicts stay distinct
+    objects because ``materialize_missing_projection_biases`` adds keys to the target's only. No consumer writes the
+    tensors in place (``apply_delta``, ``TaskVector``, ``load_state_dict`` / ``load_into_model``, the streaming fits
+    all read them or build new tensors), so sharing them is safe. Anything else: the plain independent copy.
+    Guards: only ``causal_lm`` (a ``sequence_classification`` head is initialised randomly per build, so the two
+    models differ), and only when the models are not built on the CPU (there ``to_cpu_fp32`` can return the live
+    parameters, which a PEFT ``merge_and_unload`` writes in place)."""
+    shareable = source_build_cfg.model_kind == "causal_lm" and not str(source_build_cfg.device).startswith("cpu")
+    if shareable and source_build_cfg == target_build_cfg and not any(base_ckpts):
+        return dict(source_base_sd)
+    return to_cpu_fp32(target_model.state_dict())
+
+
 def build_runtime(
     cfg: dict[str, Any],
     *,
@@ -318,7 +341,10 @@ def build_runtime(
     print("Built source and target models.")
 
     source_base_sd = to_cpu_fp32(source_llm.model.state_dict())
-    target_base_sd = to_cpu_fp32(target_llm.model.state_dict())
+    target_base_sd = target_base_state_dict(
+        source_build_cfg, target_build_cfg, source_base_sd, target_llm.model,
+        base_ckpts=(cfg.get("source_base_ckpt", None), cfg.get("target_base_ckpt", None)),
+    )
 
     source_base_ckpt = cfg.get("source_base_ckpt", None)
     if source_base_ckpt:

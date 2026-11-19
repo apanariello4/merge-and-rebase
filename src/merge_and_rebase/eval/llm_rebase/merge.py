@@ -11,6 +11,13 @@ import torch
 def _delta_norm(delta: Mapping[str, torch.Tensor], keys: Iterable[str] | None = None) -> float:
     """Frobenius norm of a task vector, optionally restricted to `keys`."""
     total = 0.0
+    sq_norms = getattr(delta, "sq_norms", None)
+    if sq_norms is not None:  # StreamedDelta: the same per-key terms, computed when the vector was built
+        for key, sq in sq_norms.items():
+            if keys is not None and key not in keys:
+                continue
+            total += sq
+        return total ** 0.5
     for key, value in delta.items():
         if keys is not None and key not in keys:
             continue

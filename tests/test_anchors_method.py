@@ -882,17 +882,18 @@ def test_s0_default_synthesis_rule():
     # the bridge to Ariadne stays Ariadne by default; ridge_preserve there is explicit (Ariadne + O2)
     bridge = parse_anchors_config({"map_rows": "task", "synthesis": "ridge_preserve"})
     assert (bridge.synthesis, bridge.rho_g) == ("ridge_preserve", 0.1)
-    with pytest.raises(ValueError, match="synthesis: ridge"):
-        parse_anchors_config({"synthesis": "ridge_preserve", "depth_fit": "sequential"})
+    # S1 lifted the refusal of explicit ridge_preserve with depth_fit='sequential' (default there stays 'ridge', above)
+    s1 = parse_anchors_config({"synthesis": "ridge_preserve", "depth_fit": "sequential"})
+    assert (s1.synthesis, s1.rho_g) == ("ridge_preserve", 0.1)
     with pytest.raises(ValueError, match="synthesis: ridge"):
         parse_anchors_config({"synthesis": "ridge_preserve", "anchor_pool": "vision8_mix"})
     with pytest.raises(ValueError, match="rho_g"):
         parse_anchors_config({"depth_fit": "sequential", "rho_g": 0.1})
-    # a resolved config changed with dataclasses.replace() cannot silently drop D2 on the sequential path
+    # a resolved config changed with dataclasses.replace() cannot silently drop D2 on an unsupported combination
     from dataclasses import replace
 
     with pytest.raises(ValueError, match="synthesis='ridge'"):
-        _prepare(replace(_cfg(synthesis=None, rho_g=None), depth_fit="sequential"), _setup())
+        _prepare(replace(_cfg(synthesis=None, rho_g=None), anchor_pool="vision8_mix"), _setup())
 
 
 def test_bridge_with_explicit_ridge_preserve_is_ariadne_plus_o2():

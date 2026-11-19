@@ -1,0 +1,68 @@
+{
+ "pair": "Ll1_Ll3",
+ "rows": "token",
+ "pool_split": "train",
+ "pool_min_chars": 600,
+ "pool_seed": 0,
+ "max_length": 128,
+ "registration_split": "validation",
+ "registration_docs": 320,
+ "registration_seed": 0,
+ "n_images": [
+  256,
+  1024,
+  4096,
+  16384
+ ],
+ "ks": [
+  1,
+  16,
+  64,
+  "all"
+ ],
+ "seed": 0,
+ "n_null": 19,
+ "null_quantile": 0.95,
+ "prefix_frac": 0.95,
+ "nulls": [
+  "N1"
+ ],
+ "anchor_filter": "norm",
+ "anchor_filter_k": 3.0,
+ "tasks": [
+  "ifeval"
+ ],
+ "ifeval_split": "ifeval_k_v1",
+ "ifeval_part": "selection",
+ "ifeval_max_length": 512,
+ "ifeval_batch_size": 4,
+ "batch_size": 16,
+ "device": "cuda",
+ "dtype": "bf16",
+ "acc_device": "cpu",
+ "compute_device": "cuda",
+ "compute_dtype": "float32",
+ "linalg_device": "cpu",
+ "ram_budget_gb": 20.0,
+ "icc_top": 10,
+ "tol_g": 0.02,
+ "offline": true,
+ "overwrite": false,
+ "source": {
+  "model": "meta-llama/Llama-3.2-1B",
+  "arch": "llama",
+  "instruct": "meta-llama/Llama-3.2-1B-Instruct"
+ },
+ "target": {
+  "model": "meta-llama/Llama-3.2-3B",
+  "arch": "llama"
+ },
+ "out_dir": "/data/merge_and_rebase_results/metodoK_fase1_llm_20261118/Ll1_Ll3_seed0",
+ "blocks": [
+  2,
+  9,
+  16,
+  23,
+  27
+ ]
+}

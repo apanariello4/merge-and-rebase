@@ -1,0 +1,78 @@
+{
+ "source": {
+  "model": "ViT-B-16",
+  "pretrained": "datacomp_xl_s13b_b90k",
+  "experts": {
+   "Cars": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/cars/best.pt",
+   "DTD": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt",
+   "EuroSAT": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
+   "GTSRB": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+   "MNIST": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
+   "RESISC45": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
+   "SUN397": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/sun397/best.pt",
+   "SVHN": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/svhn/best.pt"
+  }
+ },
+ "target": {
+  "model": "ViT-L-14",
+  "pretrained": "datacomp_xl_s13b_b90k",
+  "experts": {
+   "Cars": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/cars/best.pt",
+   "DTD": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/dtd/best.pt",
+   "EuroSAT": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/eurosat/best.pt",
+   "GTSRB": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+   "MNIST": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/mnist/best.pt",
+   "RESISC45": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/resisc45/best.pt",
+   "SUN397": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/sun397/best.pt",
+   "SVHN": "/data/merge_and_rebase_ckpts/theseus/models/checkpoints/ViT-L-14/datacomp_xl_s13b_b90k/svhn/best.pt"
+  }
+ },
+ "suite": "vision8",
+ "task": "SUN397",
+ "other_task": "SVHN",
+ "state_dir": "/data/merge_and_rebase_results/anchors_state_main/tiny_imagenet_A16_T2048",
+ "anchor_filter": "norm",
+ "anchor_filter_k": 3.0,
+ "num_images": 1024,
+ "val_size": 1000,
+ "seed": 89,
+ "batch_size": 32,
+ "device": "cuda",
+ "compute_dtype": "float32",
+ "out_dir": "/data/merge_and_rebase_results/update_kernel_cka_v2/A_B_sun397_part2",
+ "controls": [
+  "null",
+  "other_task",
+  "random_update",
+  "base_reference"
+ ],
+ "permutations": 200,
+ "image_permutations": 20,
+ "control_seed": 0,
+ "random_draws": 19,
+ "random_antithetic": false,
+ "grid_match": "auto",
+ "grid_reference": "canonical",
+ "split": "test",
+ "jackknife_chunks": 16,
+ "ci": true,
+ "m1_center_rows": true,
+ "m2": false,
+ "sampling": "stratified",
+ "mean_shift": true,
+ "blocks": [
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23
+ ],
+ "cudnn_allow_tf32": true
+}

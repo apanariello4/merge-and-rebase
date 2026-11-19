@@ -18,7 +18,7 @@ import torch
 from ...io.ckpt import load_into_model
 from ...io.text_checkpoints import build_model_with_tuned_config
 from ...merge.runtime import to_cpu_fp32
-from ...merge.task_vectors import TaskVector
+from ...merge.task_vectors import TaskVector, streamed_delta_from_checkpoints
 from ...rebase.block_extension.decoder import run_block_extension_llm
 from ...rebase.discrete_layer_match import DiscreteLayerPairing, build_discrete_indexed_decoder
 from ...rebase.prestep import PrestepKind, PrestepResult, StageEnv, TaskInputs, TaskModels, select_prestep_kind
@@ -258,6 +258,14 @@ class BracePrestep:
         return pre
 
 
+def _delta_is_norm_only(env: StageEnv) -> bool:
+    """True when the run is a direct fit whose stage only reads the source delta's norms: ``direct_fit`` and
+    ``copy_shape_matching_source_deltas`` off (that ablation copies delta tensors, so it keeps the full vector)."""
+    resolved = getattr(env, "resolved", None)
+    cfg = getattr(resolved, "ariadne_cfg", None)
+    return bool(getattr(resolved, "direct_fit", False)) and not getattr(cfg, "copy_shape_matching_source_deltas", True)
+
+
 class NoPrestep:
     """Same depth: the plain full-model task vector of the source pair."""
 
@@ -289,11 +297,16 @@ class NoPrestep:
                         f"tuned {tuple(tuned_cpu[k].shape)}"
                     )
 
-        tv = TaskVector.from_checkpoints(source_base_sd, tuned_cpu, strict=False)
+        if _delta_is_norm_only(env):
+            # Direct fit (anchors / Ariadne) consumes the source delta only for its norms (DirectFitStage): keep the
+            # per-key squared norms, not the 14 GB fp32 vector (identical numbers, see merge.StreamedDelta).
+            task_delta = streamed_delta_from_checkpoints(source_base_sd, tuned_cpu, strict=False)
+        else:
+            task_delta = TaskVector.from_checkpoints(source_base_sd, tuned_cpu, strict=False).delta
         return PrestepResult(
             kind=self.kind,
             source_base_sd=source_base_sd,
-            task_delta=tv.delta,
+            task_delta=task_delta,
             # Ariadne gets the native per-task pair from build_task_models; transport uses the shared source model.
             source_base_model=models.source_base if models is not None else source_llm.model,
             source_ft_model=models.source_ft if models is not None else None,

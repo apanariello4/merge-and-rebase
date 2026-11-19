@@ -48,6 +48,55 @@ def assert_compatible(a: Mapping[str, torch.Tensor], b: Mapping[str, torch.Tenso
             raise ValueError(f"Dtype mismatch for key '{k}': {ta.dtype} vs {tb.dtype}")
 
 
+class StreamedDelta(Mapping):
+    """A task vector that was never materialised: per key only ``sum(delta.float()**2)`` (a Python float, computed
+    with the same expression as ``llm_rebase.merge._delta_norm``, in the same key order), plus the few ``kept``
+    tensors. Reading a key that was not kept raises ``KeyError``, so a consumer that needs the full vector fails loudly.
+    """
+
+    def __init__(self, sq_norms: Mapping[str, float], kept: Mapping[str, torch.Tensor] | None = None) -> None:
+        self.sq_norms = dict(sq_norms)
+        self.kept = dict(kept or {})
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        if key not in self.kept:
+            raise KeyError(f"{key!r}: this task vector was streamed (norms only); only {len(self.kept)} keys are kept")
+        return self.kept[key]
+
+    def __iter__(self):
+        return iter(self.sq_norms)
+
+    def __len__(self) -> int:
+        return len(self.sq_norms)
+
+
+def streamed_delta_from_checkpoints(
+    base: Mapping[str, torch.Tensor],
+    tuned: Mapping[str, torch.Tensor],
+    *,
+    key_filter: KeyFilter = default_key_filter,
+    strict: bool = False,
+    keep: Sequence[str] = (),
+) -> StreamedDelta:
+    """``TaskVector.from_checkpoints(...)`` without holding the delta: same key selection, checks and per-key
+    ``(t - b).detach()``; one tensor of the delta is alive at a time (plus the ``keep`` keys)."""
+    b = filter_state_dict(base, key_filter)
+    t = filter_state_dict(tuned, key_filter)
+    keys = intersect_keys(b, t)
+    if strict and (set(b) != set(t)):
+        raise KeyError("Checkpoint keys mismatch.")
+    assert_compatible(b, t, keys)
+    sq: dict[str, float] = {}
+    kept: dict[str, torch.Tensor] = {}
+    keep_set = set(keep)
+    for k in keys:
+        d = (t[k] - b[k]).detach()
+        sq[k] = float(d.float().pow(2).sum())
+        if k in keep_set:
+            kept[k] = d
+    return StreamedDelta(sq, kept)
+
+
 @dataclass(frozen=True)
 class TaskVector:
     """

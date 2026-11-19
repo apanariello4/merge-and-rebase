@@ -40,8 +40,8 @@ class FullFinetune:
         trainable_params_mode = str(_cfg_value(strategy_cfg, "trainable_params", "all_trainable")).strip().lower()
         if parameterization not in {"weights", "delta"}:
             raise ValueError("strategy.params.parameterization must be one of: weights, delta")
-        if trainable_params_mode not in {"all_trainable", "regularized_only"}:
-            raise ValueError("strategy.params.trainable_params must be one of: all_trainable, regularized_only")
+        if trainable_params_mode not in {"all_trainable", "regularized_only", "c_proj_only"}:
+            raise ValueError("strategy.params.trainable_params must be one of: all_trainable, regularized_only, c_proj_only")
 
         named_params = list(model.named_parameters())
         initial_trainables = [(name, param) for name, param in named_params if param.requires_grad]
@@ -49,13 +49,13 @@ class FullFinetune:
 
         effective_trainable_names = set(initial_trainable_names)
         params_mode_supported = trainable_params_mode == "all_trainable"
-        if trainable_params_mode == "regularized_only":
-            resolution = resolve_parameter_subset(model, "regularized_only")
+        if trainable_params_mode in {"regularized_only", "c_proj_only"}:
+            resolution = resolve_parameter_subset(model, trainable_params_mode)
             if resolution.supported:
                 effective_trainable_names &= set(resolution.parameter_names)
                 params_mode_supported = True
 
-        if trainable_params_mode == "regularized_only":
+        if trainable_params_mode in {"regularized_only", "c_proj_only"}:
             for name, param in named_params:
                 param.requires_grad_(name in effective_trainable_names)
         else:
@@ -86,7 +86,7 @@ class FullFinetune:
         info = {
             "trainable_params": int(sum(p.numel() for p in opt_params)),
             "delta_params": int(sum(p.numel() for p in opt_params)) if parameterization == "delta" else 0,
-            "trainable_params_fallback": int(trainable_params_mode == "regularized_only" and not params_mode_supported),
+            "trainable_params_fallback": int(trainable_params_mode != "all_trainable" and not params_mode_supported),
         }
         info["parameterization"] = parameterization
         info["trainable_params_mode"] = trainable_params_mode

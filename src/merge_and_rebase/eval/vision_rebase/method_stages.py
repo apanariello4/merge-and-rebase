@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from ...data.calibration_augment import build_augmented_calibration_pair
 from ...data.vision_loaders import DEFAULT_NUM_WORKERS, DEFAULT_SEED
 from ...io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ...merge.methods._common import axpy_state_dict
@@ -420,6 +421,36 @@ class DirectFitStage:
         self._merged_correction: dict[str, torch.Tensor] | None = None
         self._merged_timing: dict[str, dict[str, float]] | None = None
 
+    def _augmented_calibration_loaders(
+        self, env: StageEnv, source_loader: Any, target_loader: Any, task: str
+    ) -> tuple[Any, Any]:
+        """Opt-in ``calibration_augment='openclip_train'``: identically seeded OpenCLIP-train views (fit only).
+
+        ``'none'`` (default) returns the loaders untouched. The alpha search / evaluation loaders are never passed
+        through here. Provenance (transform repr, first-batch sha256 per view) goes to the Ariadne calibration meta.
+        """
+        if self.cfg.calibration_augment == "none":
+            return source_loader, target_loader
+        from ...data.calibration_augment import transform_repr
+
+        eval_pre = getattr(env.clf_source, "preprocess", None)
+        if eval_pre is not None and transform_repr(env.clf_source.train_preprocess) == transform_repr(eval_pre):
+            raise ValueError("calibration_augment: the train transform equals the eval transform (no augmentation)")
+        source_loader, target_loader, meta = build_augmented_calibration_pair(
+            source_loader,
+            target_loader,
+            source_transform=env.clf_source.train_preprocess,
+            target_transform=env.clf_target.train_preprocess,
+            seed=int(self.cfg.seed),
+        )
+        record_meta = self.record.calibration_meta
+        record_meta["calibration_augment"] = self.cfg.calibration_augment
+        record_meta["transform_repr"] = meta["transform_repr"]
+        record_meta["eval_transform_repr"] = transform_repr(eval_pre) if eval_pre is not None else None
+        record_meta["augment_seed"] = meta["augment_seed"]
+        record_meta.setdefault("first_batch_sha256_by_task", {})[task] = meta["first_batch_sha256"]
+        return source_loader, target_loader
+
     def pairing(self, env: StageEnv) -> DiscreteLayerPairing:
         """The depth pairing, computed once per run (both legacy call sites yielded the identical value)."""
         if self._pairing_cache is None:
@@ -488,6 +519,12 @@ class DirectFitStage:
             self.calibration_ctx if self.calibration_ctx is not None else self.task_contexts[merge_in_source_tasks[0]]
         )
         direct_residual_pairing = self.pairing(env)
+        merged_source_loader, merged_target_loader = self._augmented_calibration_loaders(
+            env,
+            merged_calibration_task_ctx.source_loaders.train,
+            merged_calibration_task_ctx.loaders.train,
+            "merged:" + merge_in_source_tasks[0],
+        )
         (
             self._merged_correction,
             self._merged_timing,
@@ -498,8 +535,8 @@ class DirectFitStage:
             source_ft_model=source_ft_model_merged,
             target_model=env.clf_target.model,
             target_base_sd=env.target_base_sd,
-            source_loader=merged_calibration_task_ctx.source_loaders.train,
-            target_loader=merged_calibration_task_ctx.loaders.train,
+            source_loader=merged_source_loader,
+            target_loader=merged_target_loader,
             pairing=direct_residual_pairing,
             config=direct_residual_cfg,
             device=env.device,
@@ -594,6 +631,9 @@ class DirectFitStage:
                     test_loader=task.loaders.test,
                     val_loader=task.loaders.val,
                 )
+            direct_residual_source_loader, direct_residual_target_loader = self._augmented_calibration_loaders(
+                env, direct_residual_source_loader, direct_residual_target_loader, t
+            )
             fit = _run_direct_residual_fit if self.anchors_cfg is None else self._run_anchors_fit
             (
                 transported_delta,
@@ -635,6 +675,13 @@ class DirectFitStage:
     def _run_anchors_fit(self, **kwargs: Any):
         """``AnchorsRebase.prepare`` with the run's anchor pool and shared state; same return as the Ariadne fit."""
         cfg = self.anchors_cfg
+        if cfg.calibration_source != "task":
+            if self.cfg.calibration_augment != "none":
+                raise ValueError("calibration_augment cannot be combined with anchors calibration_source "
+                                 f"{cfg.calibration_source!r} (the augmented task views would be silently replaced)")
+            # the run summary must not say 'task_local' when E and the synthesis were fitted on other images
+            self.record.calibration_meta["calibration_data"] = cfg.calibration_source
+            self.record.calibration_meta["calibration_images"] = cfg.calibration_images
         if self._anchors_state is None:
             self._anchors_state = AnchorsRebase.open_state(cfg)
         source_build = kwargs["source_build_cfg_task"]

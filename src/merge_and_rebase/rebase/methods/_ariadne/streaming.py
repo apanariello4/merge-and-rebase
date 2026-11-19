@@ -39,6 +39,7 @@ from .config import (
 from .diagnostics import measure_direct_residual_realization_streaming
 from .fit import ResidualSufficientStatistics, _finalize_independent_component
 from .layouts import COMPONENT_INPUT_KIND, _aligned, _component_effective_out, _layout_for
+from .mlp_alignment import fit_alignment_mlps, make_mlp_desired_fn
 
 Tensor = torch.Tensor
 
@@ -152,6 +153,10 @@ def prepare_direct_residual_streaming(
     procrustes_energy: float | None = None,
     exclude_first_token: bool = False,
     mid_alignment: bool = False,
+    alignment: str = "procrustes",
+    alignment_mlp_init: str = "residual",
+    mlp_max_epochs: int | None = None,
+    mlp_n_heldout: int | None = None,
 ) -> dict[str, Any]:
     """Streaming (Pass A) equivalent of ``capture_paired_boundary_activations`` + ``compute_desired_effects``.
 
@@ -183,7 +188,31 @@ def prepare_direct_residual_streaming(
     captured on the same block; LayerScale ``ls_1`` must be the identity) and solves it with the same polar map. It adds
     ``q_mid_by_position`` (float32) and ``mid_fingerprints`` (per-(batch, position) ``(sum, sumsq)`` of the target mid
     residual); with ``mid_alignment=False`` nothing else is requested or returned.
+
+    ``alignment='mlp'`` (opt-in, vision only, activation + polar + uniform, no truncation / mid_alignment; default
+    ``'procrustes'`` changes nothing): the aligned base rows ``(x, y)`` Pass A already forms are also cached per block on the
+    host (float32, ``n_images * N * (d_s + d_t) * 4`` bytes per block) and, after the Procrustes solve, a 2-layer MLP
+    ``g_j`` is trained per block (``mlp_alignment.py``; ``alignment_mlp_init`` 'residual' or 'plain', seeded by ``seed``).
+    Adds ``prepared['mlp_alignment'] = {'models', 'mu_s', 'init'}`` (consumed by `fit_direct_residual_streaming`) and the
+    per-block ``mlp_*`` / ``procrustes_*_rel_err`` scalars to ``procrustes_diagnostics``. ``mlp_max_epochs`` /
+    ``mlp_n_heldout`` override the training defaults (tests).
     """
+    if alignment not in {"procrustes", "mlp"}:
+        raise ValueError("alignment must be 'procrustes' or 'mlp'")
+    mlp = alignment == "mlp"
+    if mlp and (
+        family_adapter is not None
+        or mid_alignment
+        or alignment_map != "polar"
+        or alignment_row_weighting != "uniform"
+        or procrustes_source != "activation"
+        or procrustes_rank is not None
+        or procrustes_energy is not None
+    ):
+        raise ValueError(
+            "alignment='mlp' is vision-only and requires alignment_map='polar', alignment_row_weighting='uniform', "
+            "procrustes_source='activation', no truncation and no mid_alignment"
+        )
     if mid_alignment:
         if family_adapter is not None:
             # HF decoder layers receive hidden_states as a keyword argument, which the block_input capture (positional
@@ -256,6 +285,9 @@ def prepare_direct_residual_streaming(
         {j: _StreamingCrossCovariance(device=device) for j in range(pairing.target_depth)} if gradient_mode else {}
     )
     fingerprints: dict[tuple[int, int], tuple[float, float]] = {}
+    mlp_rows_cache: dict[int, tuple[list[Tensor], list[Tensor]]] = (
+        {j: ([], []) for j in range(pairing.target_depth)} if mlp else {}
+    )
 
     if alignment_row_weighting == "delta_magnitude" and source_ft_model is None:
         raise ValueError("delta_magnitude streaming alignment requires source_ft_model")
@@ -320,6 +352,9 @@ def prepare_direct_residual_streaming(
                     )
                     row_weights = scale / scale.sum(dim=1, keepdim=True)
                 accumulators[j].update(x_rows, y_rows, None if row_weights is None else row_weights.reshape(-1))
+                if mlp:
+                    mlp_rows_cache[j][0].append(x.detach().float().cpu())
+                    mlp_rows_cache[j][1].append(t.detach().float().cpu())
                 t64 = t.double()
                 fingerprints[(k, j)] = (float(t64.sum().item()), float((t64**2).sum().item()))
                 if mid_alignment:
@@ -436,6 +471,29 @@ def prepare_direct_residual_streaming(
         "calibration": metadata,
         "distinct_source_indices": distinct_source_indices,
     }
+    if mlp:
+        mlp_kwargs: dict[str, Any] = {}
+        if mlp_max_epochs is not None:
+            mlp_kwargs["max_epochs"] = int(mlp_max_epochs)
+        if mlp_n_heldout is not None:
+            mlp_kwargs["n_heldout"] = int(mlp_n_heldout)
+        models, mlp_rows = fit_alignment_mlps(
+            mlp_rows_cache,
+            q_by_position,
+            prepared["source_mean_by_position"],
+            prepared["target_mean_by_position"],
+            init=alignment_mlp_init,
+            seed=seed,
+            device=device,
+            **mlp_kwargs,
+        )
+        prepared["mlp_alignment"] = {
+            "models": models,
+            "mu_s": prepared["source_mean_by_position"],
+            "init": alignment_mlp_init,
+        }
+        for j, row in mlp_rows.items():
+            procrustes_diagnostics[j].update(row)
     if mid_alignment:
         prepared["q_mid_by_position"] = {
             j: _procrustes_from_cross(acc.cross()).cpu().float() for j, acc in mid_accumulators.items()
@@ -497,6 +555,7 @@ def fit_direct_residual_streaming(
     family_adapter=None,
     stats_factory=None,
     native_model=None,
+    desired_fn=None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Streaming (Pass B) equivalent of ``fit_direct_residual``.
 
@@ -520,9 +579,25 @@ def fit_direct_residual_streaming(
     output change of ``native_model`` (the NATIVE fine-tuned target, its own full forward) against the target base on the
     same target calibration batches. No source model and no Procrustes map enter that target. ``config.fit_blocks``
     restricts the fit to those target blocks (every other block gets no update).
+
+    ``desired_fn`` (optional, default None = the transported delta ``(f - b) Q_j``): as in
+    `fit_direct_residual_sequential_streaming`, ``desired_fn(pos, i, b, f, out) -> D_j`` replaces only the ``D_j`` line
+    (``b``/``f``: source base/FT boundary of block ``i`` on the source grid; ``out``: target boundary). When None and
+    ``prepared`` carries ``'mlp_alignment'`` (``alignment='mlp'``), the MLP hook of ``mlp_alignment.py`` is used. Needs
+    ``residual_target='transported_delta'`` without block_target='increment' / pair_target_split.
     """
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
+    if desired_fn is None and prepared.get("mlp_alignment") is not None:
+        desired_fn = make_mlp_desired_fn(prepared)
+    if desired_fn is not None and (
+        config.residual_target != "transported_delta"
+        or config.block_target != "total"
+        or config.pair_target_split != "none"
+    ):
+        raise ValueError(
+            "desired_fn supports residual_target='transported_delta', block_target='total' and pair_target_split='none'"
+        )
     components = order_components(config.components)
     oracle = config.residual_target == "native_oracle"
     if oracle and native_model is None:
@@ -661,6 +736,8 @@ def fit_direct_residual_streaming(
                         if oracle:
                             # Same images, same architecture: no alignment, no Q_j. D*_j = T^ft_j - T^base_j.
                             desired = nat[f"{pos}.out"].cpu() - out_cpu
+                        elif desired_fn is not None:
+                            desired = desired_fn(pos, i, sb[str(i)].cpu(), sf[str(i)].cpu(), out_cpu)
                         else:
                             b = _aligned([sb[str(i)].cpu()], [out_cpu])[0]
                             f = _aligned([sf[str(i)].cpu()], [out_cpu])[0]
@@ -812,6 +889,7 @@ def fit_direct_residual_sequential_streaming(
     device,
     family_adapter=None,
     desired_fn=None,
+    cache_source_captures: bool | None = None,
 ) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
     """Sequential-across-depth variant of `fit_direct_residual_streaming` (``depth_fit="sequential"``).
 
@@ -836,7 +914,18 @@ def fit_direct_residual_sequential_streaming(
     the ``D_j`` line, so another transport (e.g. the shared-anchor decode) can reuse the sequential fit; the
     upstream effect ``U_j`` and the ridge are unchanged. Not combined with ``pair_target_split='interpolate'``,
     two-point or backfit fits.
+
+    ``cache_source_captures`` (decoders only, default None = auto: on when ``family_adapter`` is given, the device is
+    not the CPU and both source models sit on the CPU, i.e. ``source_task_models_on_cpu``): only the target changes
+    from block to block, so the source base/FT boundaries and the pristine-target boundaries (the reference of
+    ``U_j``, taken from the target itself before the first update is mounted, instead of a deep copy) do not depend
+    on the mounted updates. They are captured in a first pass, one model at a time on the device, kept on the host
+    (float32, as the lockstep path's ``.cpu()`` values) and released once no later block needs them; the block loop
+    then holds ONE model on the device. Values, order and arithmetic are those of the lockstep path. Rows then carry
+    ``source_captures="host_precomputed"``. False (or a vision call) keeps the lockstep path bit-identical.
     """
+    if cache_source_captures and family_adapter is None:
+        raise ValueError("cache_source_captures is decoder-only (family_adapter required)")
     if pairing.target_depth < 1:
         raise ValueError("pairing.target_depth must be positive")
     if config.depth_fit != "sequential":
@@ -895,24 +984,75 @@ def fit_direct_residual_sequential_streaming(
     for m in (target_model, source_base_model, source_ft_model):
         unique_models.setdefault(id(m), m)
     originals = {mid: (next(m.parameters()).device, m.training) for mid, m in unique_models.items()}
+    if cache_source_captures is None:
+        cache_source_captures = (
+            family_adapter is not None
+            and torch.device(device).type != "cpu"
+            and all(
+                m is not target_model and next(m.parameters()).device.type == "cpu"
+                for m in (source_base_model, source_ft_model)
+            )
+        )
 
     original_state = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     target_corrections: dict[str, Tensor] = {}
     diagnostics: list[dict[str, Any]] = []
     pristine_model = None
     try:
-        current_state = {k: v.detach().cpu().clone() for k, v in target_base_state.items()}
+        # No clone: the block fits REPLACE entries (``current_state[key] = current_state[key] + correction``), never
+        # write in place, so tensors already on the CPU can be shared with ``target_base_state`` (saves one full copy).
+        current_state = {k: v.detach().cpu() for k, v in target_base_state.items()}
         target_model.load_state_dict(current_state, strict=True)
-        # Frozen copy holding exactly the base state: the reference for U_j, and (when a source model is the same
-        # object as the target) the source model, which must not see the mounted updates.
-        pristine_model = deepcopy(target_model)
-        pristine_model.load_state_dict({k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True)
-        sb_model = pristine_model if source_base_model is target_model else source_base_model
-        sf_model = pristine_model if source_ft_model is target_model else source_ft_model
-        for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
-            m.to(device).eval()
-
         fit_set = set(resolve_fit_blocks(config, pairing.target_depth))
+        if cache_source_captures:
+            # Pass 0: everything that does not depend on the mounted updates, one model at a time on the device.
+            needed_src: set[int] = set()
+            for pos in positions:
+                if pos not in fit_set:
+                    continue
+                needed_src.add(pairing.pairing[pos])
+                grp_size, grp_index, grp_start = groups[pos]
+                if config.pair_target_split == "interpolate" and grp_index < grp_size - 1 and grp_start > 0:
+                    needed_src.add(pairing.pairing[grp_start - 1])
+            src_req = {str(i): (i, "boundary") for i in sorted(needed_src)}
+            if len(source_batches) != len(batches):  # the lockstep path's strict zip guarded this
+                raise ValueError(f"source and target calibration batches differ: {len(source_batches)} vs {len(batches)}")
+            src_cache: dict[str, dict[str, list[Tensor]]] = {}
+            for role, model in (("sb", source_base_model), ("sf", source_ft_model)):
+                cache = {key: [] for key in src_req}
+                for vals in iter_capture_tokens(
+                    model, source_batches, src_req, device, family_adapter=family_adapter, store_device="cpu"
+                ):
+                    for key, tensor in vals.items():
+                        cache[key].append(tensor)
+                src_cache[role] = cache
+            # Pristine boundaries: the target holds exactly the base state here (no update mounted yet).
+            ref_req = {f"{pos}.out": (pos, "boundary") for pos in positions if pos in fit_set}
+            ref_cache: dict[str, list[Tensor]] = {key: [] for key in ref_req}
+            for vals in iter_capture_tokens(
+                target_model, batches, ref_req, device, family_adapter=family_adapter, store_device="cpu"
+            ):
+                for key, tensor in vals.items():
+                    ref_cache[key].append(tensor)
+            target_model.to(device).eval()
+            last_use: dict[str, int] = {}
+            for pos in positions:
+                if pos in fit_set:
+                    last_use[str(pairing.pairing[pos])] = pos
+                    grp_size, grp_index, grp_start = groups[pos]
+                    if config.pair_target_split == "interpolate" and grp_index < grp_size - 1 and grp_start > 0:
+                        last_use[str(pairing.pairing[grp_start - 1])] = pos
+        else:
+            # Frozen copy holding exactly the base state: the reference for U_j, and (when a source model is the same
+            # object as the target) the source model, which must not see the mounted updates.
+            pristine_model = deepcopy(target_model)
+            pristine_model.load_state_dict(
+                {k: v.detach().cpu().clone() for k, v in target_base_state.items()}, strict=True
+            )
+            sb_model = pristine_model if source_base_model is target_model else source_base_model
+            sf_model = pristine_model if source_ft_model is target_model else source_ft_model
+            for m in {id(x): x for x in (target_model, sb_model, sf_model, pristine_model)}.values():
+                m.to(device).eval()
         for pos in positions:
             if pos not in fit_set:
                 continue  # unfitted block: nothing mounted, later blocks see the true drift U_j
@@ -938,20 +1078,34 @@ def fit_direct_residual_sequential_streaming(
             out_key, h_key = f"{pos}.out", f"{pos}.{component}.h"
             tgt_requests = {out_key: (pos, "boundary"), h_key: (pos, COMPONENT_INPUT_KIND[component])}
             ref_requests = {out_key: (pos, "boundary")}
-            gens = (
-                iter_capture_tokens(
-                    sb_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
-                ),
-                iter_capture_tokens(
-                    sf_model, source_batches, src_requests, device, family_adapter=family_adapter, store_device=device
-                ),
-                iter_capture_tokens(
-                    target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
-                ),
-                iter_capture_tokens(
-                    pristine_model, batches, ref_requests, device, family_adapter=family_adapter, store_device=device
-                ),
-            )
+            if cache_source_captures:
+                n_b = len(batches)
+                gens = (
+                    ({key: src_cache["sb"][key][k] for key in src_requests} for k in range(n_b)),
+                    ({key: src_cache["sf"][key][k] for key in src_requests} for k in range(n_b)),
+                    iter_capture_tokens(
+                        target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+                    ),
+                    ({out_key: ref_cache[out_key][k]} for k in range(n_b)),
+                )
+            else:
+                gens = (
+                    iter_capture_tokens(
+                        sb_model, source_batches, src_requests, device, family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                    iter_capture_tokens(
+                        sf_model, source_batches, src_requests, device, family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                    iter_capture_tokens(
+                        target_model, batches, tgt_requests, device, family_adapter=family_adapter, store_device=device
+                    ),
+                    iter_capture_tokens(
+                        pristine_model, batches, ref_requests, device, family_adapter=family_adapter,
+                        store_device=device,
+                    ),
+                )
             with contextlib.ExitStack() as stack:
                 for gen in gens:
                     stack.enter_context(contextlib.closing(gen))
@@ -988,6 +1142,12 @@ def fit_direct_residual_sequential_streaming(
                         off_target.update(h, desired, upstream, effective_out, stats.device)
             if off_target is not None:
                 off_target.merge_into(stats)
+            if cache_source_captures:
+                ref_cache.pop(out_key, None)
+                for src_key, last in last_use.items():
+                    if last <= pos:
+                        src_cache["sb"].pop(src_key, None)
+                        src_cache["sf"].pop(src_key, None)
 
             position_corrections: dict[str, Tensor] = {}
             block_rows: list[dict[str, Any]] = []
@@ -1016,6 +1176,8 @@ def fit_direct_residual_sequential_streaming(
                 row["source_position"] = row.pop("source_coordinate")
                 row["procrustes_source"] = prepared.get("procrustes_source", "activation")
                 row["depth_fit"] = "sequential"
+                if cache_source_captures:
+                    row["source_captures"] = "host_precomputed"
                 if strength != 1.0:
                     row["sequential_strength"] = strength
                 row["upstream_effect_norm"] = upstream_sq**0.5
@@ -1395,9 +1557,13 @@ def _streaming_source_iters(source_base_model, source_ft_model, prepared, pairin
 def _streaming_desired(prepared, pairing, residual_target, source_values, t0, positions):
     """Pass B's per-batch ``D_j`` (same arithmetic as `fit_direct_residual_streaming`)."""
     out: dict[int, Tensor] = {}
+    mlp_fn = make_mlp_desired_fn(prepared) if prepared.get("mlp_alignment") is not None else None
     for pos in positions:
         i = pairing.pairing[pos]
         out_cpu = t0[str(pos)].cpu()
+        if mlp_fn is not None:
+            out[pos] = mlp_fn(pos, i, source_values["sb"][str(i)].cpu(), source_values["sf"][str(i)].cpu(), out_cpu)
+            continue
         b = _aligned([source_values["sb"][str(i)].cpu()], [out_cpu])[0]
         f = _aligned([source_values["sf"][str(i)].cpu()], [out_cpu])[0]
         q = prepared["q_by_position"][pos]

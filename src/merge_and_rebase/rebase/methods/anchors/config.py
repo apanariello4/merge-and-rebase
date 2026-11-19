@@ -24,6 +24,7 @@ ANCHOR_POOLS = ("tiny_imagenet", "vision8_mix", "wikitext103")
 TEXT_ANCHOR_POOLS = ("wikitext103",)
 ANCHOR_UNITS = ("token", "image_mean", "cls", "pool2", "pool4")
 K_SAMPLINGS = ("k_per_image", "k_per_document")
+CANONICAL_SOFT_WEIGHTS = ("in_sample", "heldout")
 ANCHOR_SAMPLINGS = ("random", "whole_images", "one_per_image", *K_SAMPLINGS)
 
 FRAME_FIELDS = (
@@ -132,7 +133,21 @@ class AnchorsConfig:
     # (>= r_m + r_k - T canonical correlations are 1 from noise alone); the ranks are only known at the block pair
     # (core.check_canonical_widths). The config path of canonical_soft is IN-SAMPLE (g from Gamma of the fitting rows;
     # info 'canonical_soft_weights' = 'in_sample', UserWarning): it is NOT plan decoder D3 (held-out Gamma_out, passed
-    # as core.canonical_core(weights=...), 'explicit'), which is not wired into the config.
+    # as core.canonical_core(weights=...), 'explicit'), which is wired as canonical_soft_weights='heldout' below.
+    # canonical_soft_weights (canonical_soft only): 'in_sample' (default, not recorded) or 'heldout' = plan decoder D3
+    # (PIANO_METODO_K.md Fase 2): the directions Y, Z and V of the decoder come from ALL anchor rows, the weights are
+    # g_i = clip(Gamma_out_i, 0, 1), Gamma_out_i = the correlation of the canonical pair i estimated on the half of the
+    # anchor images / documents not used to find the directions, averaged over the two directions of the split (A -> B,
+    # B -> A: the Phase 1 estimate, canonical_stats.heldout_gamma_out), matched to the full-set pairs by rank index;
+    # canonical_null_threshold then zeroes the weights below it. The split is by image / document id (never by row),
+    # seeded by anchor_seed; needs anchor_sampling 'k_per_image' / 'k_per_document' (rows carry ids) and no anchor_dedup_cos.
+    canonical_soft_weights: str = "in_sample"
+    # canonical_source: where the held-out canonical statistics come from. 'rows' (default, not recorded): the stored anchor
+    # frames (num_anchors rows). 'sigma_all_tokens' (vision, canonical_soft + heldout): streamed second moments over EVERY
+    # canonical token of the frame's anchor images (canonical_images = anchor_batches x batch size, checked), per half of the
+    # image ids and per block pair, cached on disk (anchors/canonical_stream.py); the E rows and the rest are unchanged.
+    canonical_source: str = "rows"
+    canonical_images: int | None = None
     canonical_rank: int | None = None
     canonical_null_threshold: float | None = None
     # Anchor post-processing (AGENT_KERNEL.md K1b), applied to the stored frames at use time (no new registration).
@@ -219,6 +234,15 @@ class AnchorsConfig:
     # Task calibration (E and ridge rows), same budget and draw as Ariadne's paired_calibration.
     num_batches: int = 10
     seed: int = 89
+    # Where the calibration batches (E capture, the synthesis fit, gain / refine holdouts) come from. 'task' (default,
+    # unchanged): the task's own val images. 'generic': num_batches x batch_size images of the anchor pool
+    # (tiny_imagenet), drawn with `seed` from the part of the pool that the frame (registration + anchor images),
+    # ridge_preserve's G and refine's keep loss never touch; labels are not used. Vision, map_rows='frame', library='data'.
+    # 'precomputed': stored preprocessed image tensors <calibration_images>/<Task>.pt (task-data-free sets built by
+    # eval/vision_rebase/build_calibration_images.py: retrieval / DeepInversion), the first num_batches * batch_size in
+    # stored order, the same tensors for source and target (their preprocessing must agree); sha256 recorded.
+    calibration_source: str = "task"
+    calibration_images: str | None = None
     components: tuple[str, ...] = ("mlp.c_proj",)
     ridge_estimator: str = "empirical_bayes"
     ridge_relative: float = 0.01
@@ -231,10 +255,52 @@ class AnchorsConfig:
     # blocks fitted in order on D_j - U_j, U_j = the change the already-fitted upstream blocks produce at j
     # (Ariadne's sequential streaming fit with the anchor decode as desired_fn; host memory O(1) in depth).
     depth_fit: str = "independent"
+    # depth_fit 'tracking' (S2, anchors/synthesis.py fit_tracking): error-feedback fit in depth order. D_j is already the
+    # CUMULATIVE stream-level change at block j's boundary (E = S_ft,i - S_base,i), so block j writes what is still
+    # missing, D_j - U_j (U_j = realized change at boundary j of the already updated upstream blocks), fitted on the
+    # c_proj inputs of the updated model, through the same synthesis hook (plain ridge or ridge_preserve). With the plain
+    # ridge it is Ariadne's sequential fit, resident, with the hook; 'sequential' + ridge_preserve (S1) runs the same loop.
     # depth_fit 'spread' (D3, AGENT_NEXT_PHASE.md O3): D is used only at the measurement depths measure_depths
     # (target blocks round(s (L_k - 1))); the blocks of each interval are fitted in order to equal shares of what is
     # still missing at its measurement block (anchors/synthesis.py fit_spread); blocks after the last one: no update.
     measure_depths: tuple[float, ...] = ()
+    # S1/S2 (sequential/tracking with ridge_preserve): which inputs the preserve statistics G are taken on. 'base': the
+    # target base's c_proj inputs on the anchor images, captured once (as in the independent O2); 'updated': the inputs
+    # of the model with blocks 0..j-1 already updated, re-captured for every block (one anchor sweep per block).
+    preserve_inputs: str = "base"
+    # S3 (label-free gain calibration): 'none' (default, unchanged) or 'lsq': after the fit of each block, in depth order,
+    # a scalar g_j = <own, D_j - U_j> / <own, own> (own = the block's own realized contribution H dW + 1 beta^T on the
+    # current inputs, U_j = upstream realized change) on the last gain_holdout_batches calibration batches, which are
+    # then NOT used by the fit (0: in-sample, all rows); dW, beta are multiplied by g_j (clipped to GAIN_BOUNDS).
+    gain_calibration: str = "none"
+    gain_holdout_batches: int = 2
+    # Implementation of the native closed-loop depth fit (fit_tracking: depth_fit 'tracking', or 'sequential' with
+    # ridge_preserve / gain). 'resident' (default, unchanged): every block re-runs a full target forward per calibration
+    # batch (N (N + 1) / 2 block forwards per batch). 'incremental' (vision open_clip ViTs only): the residual stream of the
+    # updated model is carried from block to block (2 block forwards per batch and block); numerically equivalent.
+    sequential_impl: str = "resident"
+    # refine 'joint' (anchors/refine.py): AFTER the depth fit, all (dW_j, beta_j) are trained jointly, label-free, by Adam on
+    # the stream-level losses of the module docstring (L_task at the measurement blocks refine_depths, a closed-loop keep
+    # term rho on generic anchor-pool rows, optional proximity to the fit), best checkpoint on refine_holdout_batches
+    # held-out calibration batches (the last ones). 'none' (default): nothing changes. refine_depths: 'all' or relative
+    # depths (blocks round(s (L - 1))); default 6 evenly spaced, last included. refine_target 'final': only the last
+    # measurement block enters L_task. refine_lr is relative to rms(dW_j) of the fit (per element, Adam), with a linear warmup of refine_warmup * steps;
+    # refine_target 'final' scales rho by |task blocks| / |M|; with refine != none the depth fit uses only the calibration
+    # batches that are not held out. refine_rho (0.1 = DEFAULT_RHO_G) / refine_prox are dimensionless.
+    refine: str = "none"
+    refine_depths: str | tuple[float, ...] = (1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6, 1.0)
+    refine_target: str = "all_depths"
+    refine_rho: float = 0.1
+    refine_prox: float = 0.0
+    refine_steps: int = 300
+    refine_lr: float = 1e-3
+    refine_warmup: float = 0.1
+    refine_batch: int = 8
+    refine_holdout_batches: int = 2
+    refine_eval_every: int = 25
+    refine_generic_batches: int = 8
+    refine_amp: bool = False
+    refine_checkpoint: bool = True
     # None: every target block is compiled. A float s_max in (0, 1]: only target blocks j with relative depth
     # j / (L_k - 1) < s_max keep their update, the others are zero (exact: the ridge fits blocks independently).
     compile_max_depth: float | None = None
@@ -273,16 +339,30 @@ class AnchorsConfig:
             exact_form=self.exact_form,
             missing_bias=self.missing_bias,
             activation_storage="streaming" if self.depth_fit == "sequential" else "resident",
-            # 'spread' compiles block by block in anchors itself; only the ridge parameters are read from here
-            depth_fit="independent" if self.depth_fit == "spread" else self.depth_fit,
+            # 'spread' / 'tracking' compile block by block in anchors itself; only the ridge parameters are read here
+            depth_fit="independent" if self.depth_fit in ("spread", "tracking") else self.depth_fit,
         )
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["components"] = list(self.components)
+        if out["calibration_source"] == "task":
+            del out["calibration_source"]  # the default leaves the recorded config of existing runs unchanged
+        if out["calibration_images"] is None:
+            del out["calibration_images"]
+        if out["sequential_impl"] == "resident":
+            del out["sequential_impl"]  # the default leaves the recorded config of existing runs unchanged
+        if out["canonical_source"] == "rows":
+            del out["canonical_source"]  # the default leaves the recorded config of existing runs unchanged
+        if out["canonical_images"] is None:
+            del out["canonical_images"]
+        if out["canonical_soft_weights"] == "in_sample":
+            del out["canonical_soft_weights"]  # the default leaves the recorded config of existing runs unchanged
         out["gpa_models"] = list(self.gpa_models)
         out["gpa_add_models"] = list(self.gpa_add_models)
         out["measure_depths"] = [float(x) for x in self.measure_depths]
+        if not isinstance(self.refine_depths, str):
+            out["refine_depths"] = [float(x) for x in self.refine_depths]
         out["operator_fusion_entries"] = list(self.operator_fusion_entries)
         out["operator_fusion_weights"] = [float(x) for x in self.operator_fusion_weights]
         return out
@@ -292,6 +372,8 @@ class AnchorsConfig:
 DEFAULT_RHO_G = 0.1
 #: Anchor pools whose anchor data serve as the generic inputs G of ridge_preserve (Vision8's mix holds task images).
 PRESERVE_POOLS = ("tiny_imagenet", "wikitext103")
+#: Bounds of the S3 gain g_j (the least-squares gain is clipped into them; recorded in the diagnostics).
+GAIN_BOUNDS = (0.0, 2.0)
 
 
 def preserve_supported(cfg: AnchorsConfig) -> bool:
@@ -299,7 +381,7 @@ def preserve_supported(cfg: AnchorsConfig) -> bool:
     'spread' in ``validate_text_config``: spread is vision-only)."""
     return (
         tuple(cfg.components) == ("mlp.c_proj",)
-        and cfg.depth_fit in {"independent", "spread"}
+        and cfg.depth_fit in {"independent", "spread", "tracking", "sequential"}
         and cfg.anchor_pool in PRESERVE_POOLS
     )
 
@@ -308,7 +390,8 @@ def preserve_by_default(cfg: AnchorsConfig) -> bool:
     """The S0 default rule: ridge_preserve wherever it is implemented, except the bridge to Ariadne
     (``map_rows='task'``), which keeps Ariadne's plain ridge unless ridge_preserve is asked for explicitly
     (Ariadne + O2, the second Ariadne reference of S0, uses the frame's anchor data as G)."""
-    return preserve_supported(cfg) and cfg.map_rows == "frame"
+    # sequential keeps the plain ridge by default (S1 is opt-in: explicit ridge_preserve)
+    return preserve_supported(cfg) and cfg.map_rows == "frame" and cfg.depth_fit != "sequential"
 
 
 _ALLOWED = {f.name for f in fields(AnchorsConfig)}
@@ -328,6 +411,8 @@ def parse_anchors_config(value: Mapping[str, Any] | None) -> AnchorsConfig:
         payload["operator_fusion_weights"] = tuple(float(x) for x in payload["operator_fusion_weights"])
     if isinstance(payload.get("measure_depths"), (list, tuple)):
         payload["measure_depths"] = tuple(float(x) for x in payload["measure_depths"])
+    if isinstance(payload.get("refine_depths"), (list, tuple)):
+        payload["refine_depths"] = tuple(float(x) for x in payload["refine_depths"])
     if isinstance(payload.get("components"), (list, str)):
         comps = payload["components"]
         payload["components"] = (comps,) if isinstance(comps, str) else tuple(comps)
@@ -344,6 +429,23 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
             raise ValueError(f"{name} must be >= 1")
     if cfg.anchor_positions not in {"all", "patch"}:
         raise ValueError("anchor_positions must be 'all' or 'patch'")
+    if cfg.calibration_source not in {"task", "generic", "precomputed"}:
+        raise ValueError(f"calibration_source must be 'task', 'generic' or 'precomputed', got {cfg.calibration_source!r}")
+    if (cfg.calibration_source == "precomputed") != (cfg.calibration_images is not None):
+        raise ValueError("calibration_images (a directory of <Task>.pt) is required by, and only allowed with, "
+                         "calibration_source='precomputed'")
+    if cfg.calibration_source != "task":
+        if cfg.map_rows != "frame":
+            raise ValueError(f"calibration_source={cfg.calibration_source!r} needs map_rows='frame' "
+                             "(map_rows='task' reads task images)")
+        if cfg.library != "data":
+            raise ValueError(f"calibration_source={cfg.calibration_source!r} is not supported with library='operator'")
+        if cfg.anchor_pool in TEXT_ANCHOR_POOLS:
+            raise ValueError(f"calibration_source={cfg.calibration_source!r} is vision-only (text pools unsupported)")
+    if cfg.calibration_source == "generic":
+        if cfg.anchor_pool != "tiny_imagenet":
+            raise ValueError("calibration_source='generic' needs the generic image pool anchor_pool='tiny_imagenet' "
+                             "(vision8_mix holds task images; text pools are not supported)")
     if cfg.text_units not in TEXT_UNITS:
         raise ValueError(f"text_units must be one of {TEXT_UNITS}, got {cfg.text_units!r}")
     if cfg.text_units != "token" and cfg.anchor_pool not in TEXT_ANCHOR_POOLS:
@@ -391,6 +493,31 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         or not 0.0 <= float(cfg.canonical_null_threshold) <= 1.0
     ):
         raise ValueError("canonical_null_threshold must lie in [0, 1] and is allowed with kernel_decode='canonical_soft' only")
+    if cfg.canonical_soft_weights not in CANONICAL_SOFT_WEIGHTS:
+        raise ValueError(f"canonical_soft_weights must be one of {CANONICAL_SOFT_WEIGHTS}, got {cfg.canonical_soft_weights!r}")
+    if cfg.canonical_source not in ("rows", "sigma_all_tokens"):
+        raise ValueError("canonical_source must be 'rows' or 'sigma_all_tokens'")
+    if (cfg.canonical_source == "sigma_all_tokens") != (cfg.canonical_images is not None):
+        raise ValueError("canonical_images is required by, and only allowed with, canonical_source='sigma_all_tokens'")
+    if cfg.canonical_source == "sigma_all_tokens":
+        if cfg.canonical_soft_weights != "heldout":
+            raise ValueError("canonical_source='sigma_all_tokens' needs canonical_soft_weights='heldout'")
+        if isinstance(cfg.canonical_images, bool) or not isinstance(cfg.canonical_images, int) or cfg.canonical_images < 2:
+            raise ValueError("canonical_images must be an integer >= 2")
+        if cfg.anchor_filter is not None or cfg.anchor_dedup_cos is not None or cfg.anchor_row_norm \
+                or cfg.anchor_unit != "token" or cfg.map_rows != "frame":
+            raise ValueError("canonical_source='sigma_all_tokens' needs token anchors without anchor_filter, "
+                             "anchor_dedup_cos, anchor_row_norm and map_rows='frame'")
+    if cfg.canonical_soft_weights == "heldout":
+        if cfg.kernel_decode != "canonical_soft":
+            raise ValueError("canonical_soft_weights='heldout' needs kernel_decode='canonical_soft'")
+        if cfg.canonical_source == "rows" and cfg.anchor_sampling not in (*K_SAMPLINGS, "whole_images"):
+            raise ValueError("canonical_soft_weights='heldout' needs anchor_sampling 'k_per_image' / 'k_per_document' / "
+                             "'whole_images' "
+                             "(the split is by image / document id, so every anchor row must carry one)")
+        if cfg.anchor_dedup_cos is not None:
+            raise ValueError("canonical_soft_weights='heldout' is not supported with anchor_dedup_cos (the dedup "
+                             "drops rows after the id bookkeeping)")
     if (cfg.kernel_decode == "agreement") != (cfg.agreement_tau is not None):
         raise ValueError("agreement_tau is required by, and only allowed with, kernel_decode='agreement'")
     if cfg.agreement_tau is not None and not float(cfg.agreement_tau) >= 1.0:
@@ -399,7 +526,7 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("synthesis must be 'ridge' or 'ridge_preserve'")
     if cfg.synthesis == "ridge_preserve" and not preserve_supported(cfg):
         raise ValueError(
-            "synthesis='ridge_preserve' needs components=('mlp.c_proj',), depth_fit 'independent'/'spread' "
+            "synthesis='ridge_preserve' needs components=('mlp.c_proj',), depth_fit 'independent'/'spread'/'tracking'/'sequential' "
             f"and anchor_pool in {PRESERVE_POOLS}: set synthesis: ridge for this configuration"
         )
     if cfg.synthesis == "ridge" and float(cfg.rho_g) != 0.0:
@@ -408,7 +535,7 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         isinstance(cfg.update_rank, bool) or not isinstance(cfg.update_rank, int) or cfg.update_rank < 1
         or cfg.depth_fit == "sequential" or tuple(cfg.components) != ("mlp.c_proj",)
     ):
-        raise ValueError("update_rank must be a positive integer, with depth_fit 'independent'/'spread', mlp.c_proj")
+        raise ValueError("update_rank must be a positive integer, with depth_fit 'independent'/'spread'/'tracking', mlp.c_proj")
     if not float(cfg.rho_g) >= 0.0 or int(cfg.preserve_tokens) < 1:
         raise ValueError("rho_g must be >= 0 and preserve_tokens >= 1")
     if cfg.library not in {"data", "operator"}:
@@ -507,8 +634,32 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         raise ValueError("map_num_batches / map_rows_per_image / map_num_rows apply to map_rows='task' only")
     if cfg.map_rows == "task" and cfg.depth_fit != "independent":
         raise ValueError("map_rows='task' is implemented for depth_fit='independent' only")
-    if cfg.depth_fit not in {"independent", "sequential", "spread"}:
-        raise ValueError("depth_fit must be 'independent', 'sequential' or 'spread'")
+    if cfg.depth_fit not in {"independent", "sequential", "spread", "tracking"}:
+        raise ValueError("depth_fit must be 'independent', 'sequential', 'spread' or 'tracking'")
+    if cfg.sequential_impl not in {"resident", "incremental"}:
+        raise ValueError("sequential_impl must be 'resident' or 'incremental'")
+    if cfg.sequential_impl == "incremental" and not (
+        cfg.depth_fit == "tracking"
+        or (cfg.depth_fit == "sequential" and (cfg.synthesis == "ridge_preserve" or cfg.gain_calibration != "none"))
+    ):
+        raise ValueError("sequential_impl='incremental' needs the native closed-loop fit: depth_fit='tracking', or "
+                         "'sequential' with synthesis='ridge_preserve' or a gain_calibration")
+    if cfg.preserve_inputs not in {"base", "updated"}:
+        raise ValueError("preserve_inputs must be 'base' or 'updated'")
+    if cfg.preserve_inputs == "updated" and (
+        cfg.depth_fit not in {"sequential", "tracking"} or cfg.synthesis != "ridge_preserve"
+    ):
+        raise ValueError("preserve_inputs='updated' needs depth_fit 'sequential'/'tracking' and synthesis='ridge_preserve'")
+    if cfg.gain_calibration not in {"none", "lsq"}:
+        raise ValueError("gain_calibration must be 'none' or 'lsq'")
+    if isinstance(cfg.gain_holdout_batches, bool) or not isinstance(cfg.gain_holdout_batches, int) \
+            or cfg.gain_holdout_batches < 0 \
+            or (cfg.gain_calibration != "none" and cfg.gain_holdout_batches >= cfg.num_batches):
+        raise ValueError("gain_holdout_batches must be an integer in [0, num_batches)")
+    if cfg.gain_calibration != "none" and (
+        cfg.depth_fit == "spread" or tuple(cfg.components) != ("mlp.c_proj",) or cfg.map_rows != "frame"
+    ):
+        raise ValueError("gain_calibration needs mlp.c_proj, map_rows='frame' and depth_fit 'independent'/'sequential'/'tracking'")
     if (cfg.depth_fit == "spread") != bool(cfg.measure_depths):
         raise ValueError("measure_depths is required by, and only allowed with, depth_fit='spread'")
     if cfg.depth_fit == "spread" and (
@@ -516,8 +667,40 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
         or not all(0.0 <= float(s) <= 1.0 for s in cfg.measure_depths)
     ):
         raise ValueError("depth_fit='spread' needs mlp.c_proj, map_rows='frame', no compile_max_depth, depths in [0, 1]")
-    if cfg.depth_fit == "sequential" and len(cfg.components) != 1:
+    if cfg.depth_fit in {"sequential", "tracking"} and len(cfg.components) != 1:
         raise ValueError("depth_fit='sequential' requires exactly one component")
+    if cfg.refine not in {"none", "joint"}:
+        raise ValueError("refine must be 'none' or 'joint'")
+    if cfg.refine == "joint":
+        if cfg.refine_target not in {"all_depths", "final"}:
+            raise ValueError("refine_target must be 'all_depths' or 'final'")
+        if isinstance(cfg.refine_depths, str):
+            if cfg.refine_depths != "all":
+                raise ValueError("refine_depths must be 'all' or a non-empty list of relative depths in [0, 1]")
+        elif not cfg.refine_depths or not all(0.0 <= float(s) <= 1.0 for s in cfg.refine_depths):
+            raise ValueError("refine_depths must be 'all' or a non-empty list of relative depths in [0, 1]")
+        for name in ("refine_steps", "refine_batch", "refine_eval_every", "refine_generic_batches"):
+            v = getattr(cfg, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if isinstance(cfg.refine_holdout_batches, bool) or not isinstance(cfg.refine_holdout_batches, int) \
+                or not 1 <= cfg.refine_holdout_batches < cfg.num_batches:
+            raise ValueError("refine_holdout_batches must be an integer in [1, num_batches)")
+        if not float(cfg.refine_lr) > 0.0 or float(cfg.refine_rho) < 0.0 or float(cfg.refine_prox) < 0.0:
+            raise ValueError("refine_lr must be > 0, refine_rho and refine_prox >= 0")
+        if float(cfg.refine_rho) > 0.0 and cfg.anchor_pool not in PRESERVE_POOLS:
+            raise ValueError("refine_rho > 0 needs the generic anchor pool (anchor_pool 'tiny_imagenet')")
+        if not 0.0 <= float(cfg.refine_warmup) < 1.0:
+            raise ValueError("refine_warmup must lie in [0, 1)")
+        if cfg.update_rank is not None or cfg.map_rows != "frame":
+            raise ValueError("refine='joint' is not implemented with update_rank or map_rows='task'")
+        if cfg.depth_fit == "spread" and max(float(x) for x in cfg.measure_depths) < 1.0:
+            raise ValueError("refine='joint' with depth_fit='spread' needs the last measure depth to be 1.0 "
+                             "(blocks after it would be refined from a zero update)")
+        if (tuple(cfg.components) != ("mlp.c_proj",) or cfg.compile_max_depth is not None
+                or (cfg.depth_fit == "sequential" and cfg.synthesis != "ridge_preserve" and cfg.gain_calibration == "none")):
+            raise ValueError("refine='joint' needs mlp.c_proj, no compile_max_depth, and a depth_fit that keeps the "
+                             "calibration banks resident (independent, tracking, or sequential with ridge_preserve / gain)")
     if cfg.depth_pairing != "relative":
         raise ValueError("anchors supports depth_pairing='relative' only (pi_m(s) = round(s (L_m - 1)))")
 
@@ -531,8 +714,14 @@ _TEXT_REQUIRED: tuple[tuple[str, Any], ...] = (
     ("anchor_positions", "all"),
     ("library", "data"),
     ("update_rank", None),
+    ("gain_calibration", "none"),
+    ("refine", "none"),
+    ("preserve_inputs", "base"),
+    ("sequential_impl", "resident"),
     ("map_rows_per_image", None),
     ("components", ("mlp.c_proj",)),
+    ("calibration_source", "task"),
+    ("calibration_images", None),
 )
 
 
@@ -548,12 +737,17 @@ def validate_text_config(cfg: AnchorsConfig) -> None:
             f"anchors on decoder models does not support anchor_sampling={cfg.anchor_sampling!r} "
             "(must be 'random' or 'k_per_document')"
         )
+    if cfg.canonical_source != "rows":
+        raise ValueError("canonical_source='sigma_all_tokens' is vision-only for now (decoders: not wired)")
     for name, required in _TEXT_REQUIRED:
         got = getattr(cfg, name)
         if got != required:
             raise ValueError(f"anchors on decoder models does not support {name}={got!r} (must be {required!r})")
     if cfg.depth_fit not in {"independent", "sequential"}:
         raise ValueError(f"anchors on decoder models supports depth_fit 'independent' or 'sequential': {cfg.depth_fit!r}")
+    if cfg.depth_fit != "independent" and cfg.synthesis == "ridge_preserve":
+        raise ValueError("ridge_preserve on decoder models needs depth_fit='independent' (S1 sequential is vision-only): "
+                         "set synthesis: ridge")
     if cfg.depth_fit == "sequential" and cfg.text_units != "token":
         raise ValueError("anchors depth_fit='sequential' on decoder models needs text_units='token' (same tokenizer)")
     if cfg.anchor_pool not in TEXT_ANCHOR_POOLS:

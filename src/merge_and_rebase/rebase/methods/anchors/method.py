@@ -35,10 +35,12 @@ from .._ariadne.capture import (
 )
 from .._ariadne.fit import fit_direct_residual
 from .._ariadne.streaming import fit_direct_residual_sequential_streaming, prepare_direct_residual_streaming
+from .canonical_stats import heldout_gamma_out, heldout_soft_phi, heldout_soft_phi_from_sigma
 from .config import TEXT_ANCHOR_POOLS, AnchorsConfig, preserve_supported, validate_text_config
 from .core import (
     CANONICAL_DECODES,
     CoverageAccumulator,
+    canonical_factors_from_frames,
     canonical_transport_map,
     decode_rows,
     dedup_mask,
@@ -152,6 +154,29 @@ def pair_frames(
     return p_m, c_m, p_k, c_k
 
 
+def _heldout_canonical_map(
+    source: RegisteredModel, source_block: int, target: RegisteredModel, target_block: int,
+    p_m: Tensor, c_m: float, p_k: Tensor, scale: float, config: AnchorsConfig,
+):
+    """Plan decoder D3 (``canonical_soft_weights='heldout'``): ``Phi`` with directions ``Y, Z, V`` from all rows of the pair
+    frames and weights ``g = clip(Gamma_out, 0, 1)`` (zero below ``canonical_null_threshold``), ``Gamma_out`` from the
+    id-split halves (``canonical_stats.heldout_gamma_out``). Info: ``canonical_soft_weights`` 'heldout' and the
+    mean / min / max of ``Gamma_out`` and of the used weights."""
+    ids = source.anchor_ids
+    if ids is None or target.anchor_ids is None:
+        raise ValueError("canonical_soft_weights='heldout' needs the row ids of the anchors (models registered through "
+                         "AnchorState with anchor_sampling 'k_per_image' / 'k_per_document')")
+    if config.anchor_filter is not None:
+        ids = ids[anchor_keep([(source, source_block), (target, target_block)], float(config.anchor_filter_k))]
+    if int(ids.shape[0]) != int(p_m.shape[0]):
+        raise ValueError(f"row ids ({int(ids.shape[0])}) and anchor frame rows ({int(p_m.shape[0])}) differ")
+    gamma_out, split_info = heldout_gamma_out(p_m, p_k, ids, config.anchor_seed)
+    factors = canonical_factors_from_frames(p_m, p_k)
+    phi, info = heldout_soft_phi(factors, gamma_out, c_m=c_m, scale=scale, null_threshold=config.canonical_null_threshold)
+    info.update({f"canonical_{k}": v for k, v in split_info.items()})
+    return phi, info
+
+
 def transport_map(
     source: RegisteredModel,
     source_block: int,
@@ -189,6 +214,19 @@ def transport_map(
         phi, info = spectral_transport_map(
             p_m, c_m, p_k, scale=scale, mode=config.spectral_filter, rank=config.spectral_rank
         )
+        return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
+    if config.canonical_source == "sigma_all_tokens":
+        sig = target.extras.get("canonical_sigma")
+        if sig is None:
+            raise ValueError("canonical_source='sigma_all_tokens' needs the streamed statistics (prepare computes them)")
+        phi, info = heldout_soft_phi_from_sigma(
+            sig.sigma(source_block, target_block, 0), sig.sigma(source_block, target_block, 1), c_m=c_m, scale=scale,
+            null_threshold=config.canonical_null_threshold,
+        )
+        info["canonical_source"] = "sigma_all_tokens"
+        return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
+    if config.kernel_decode in CANONICAL_DECODES and config.canonical_soft_weights == "heldout":
+        phi, info = _heldout_canonical_map(source, source_block, target, target_block, p_m, c_m, p_k, scale, config)
         return (lambda e: e.to(torch.float64) @ phi.to(e.device)), None, info
     if config.kernel_decode in CANONICAL_DECODES:
         phi, info = canonical_transport_map(
@@ -990,6 +1028,81 @@ def task_map_frames(
     return _frame_from_rows("task_source", src_cat, meta), _frame_from_rows("task_target", tgt_cat, meta)
 
 
+def generic_calibration_loaders(config: AnchorsConfig, source_anchor_loader, target_anchor_loader):
+    """``calibration_source='generic'``: paired calibration loaders over generic pool images (labels unused).
+
+    The frame's pool draw is the first ``anchor_batches + registration_batches`` batches of the permutation of the pool
+    dataset seeded by ``pool_seed`` (registration, anchor images, ridge_preserve's G and refine's keep / holdout rows
+    all lie inside it). The calibration images are ``num_batches * batch_size`` images taken, with ``config.seed``, from
+    the rest of that permutation, so they are disjoint from all of them by construction (asserted). Each model keeps its
+    own preprocessing (the loaders' datasets / collate functions). Returns (source_loader, target_loader, info)."""
+    import hashlib
+
+    from torch.utils.data import DataLoader, Subset
+
+    from .._ariadne.capture import _dataset_identity, _stable_dataset_identity
+
+    if not isinstance(source_anchor_loader, DataLoader) or not isinstance(target_anchor_loader, DataLoader):
+        raise ValueError("calibration_source='generic' needs indexed anchor-pool DataLoaders")
+    if _dataset_identity(source_anchor_loader.dataset) != _dataset_identity(target_anchor_loader.dataset):
+        raise ValueError("Source/target anchor-pool image identities or ordering do not match")
+    bs = source_anchor_loader.batch_size
+    if not bs or bs != target_anchor_loader.batch_size:
+        raise ValueError("calibration_source='generic' needs equal positive anchor-pool batch sizes")
+    n = len(source_anchor_loader.dataset)
+    n_pool = (int(config.anchor_batches) + int(config.registration_batches)) * bs
+    n_cal = int(config.num_batches) * bs
+    if n_pool + n_cal > n:
+        raise ValueError(
+            f"calibration_source='generic': the pool has {n} images, the frame uses {n_pool} and the calibration "
+            f"needs {n_cal} more"
+        )
+    order = torch.randperm(n, generator=torch.Generator().manual_seed(int(config.pool_seed))).tolist()
+    used, rest = order[:n_pool], order[n_pool:]
+    pick = torch.randperm(len(rest), generator=torch.Generator().manual_seed(int(config.seed)))[:n_cal].tolist()
+    indices = [rest[i] for i in pick]
+    if set(indices) & set(used) or len(set(indices)) != len(indices):
+        raise RuntimeError("generic calibration images overlap the frame's pool draw")
+    kwargs = dict(batch_size=bs, shuffle=False, num_workers=0, drop_last=False)
+    source = DataLoader(Subset(source_anchor_loader.dataset, indices), collate_fn=source_anchor_loader.collate_fn, **kwargs)
+    target = DataLoader(Subset(target_anchor_loader.dataset, indices), collate_fn=target_anchor_loader.collate_fn, **kwargs)
+    info = {
+        "calibration_source": "generic",
+        "pool": config.anchor_pool,
+        "pool_seed": int(config.pool_seed),
+        "calibration_seed": int(config.seed),
+        "n_images": len(indices),
+        "batch_size": bs,
+        "pool_dataset_identity": _stable_dataset_identity(source_anchor_loader.dataset),
+        "calibration_dataset_identity": _stable_dataset_identity(source.dataset),
+        "calibration_indices_sha256": hashlib.sha256(repr(indices).encode()).hexdigest(),
+        "frame_draw_indices_sha256": hashlib.sha256(repr(used).encode()).hexdigest(),
+        "disjoint_from_frame_draw": True,
+    }
+    return source, target, info
+
+
+def precomputed_calibration_loaders(config: AnchorsConfig, task_name: str | None, batch_size: int):
+    """``calibration_source='precomputed'``: ``<calibration_images>/<task>.pt`` (stored preprocessed tensors, the first
+    ``num_batches * batch_size`` in stored order) as one dataset shared by the source and the target loader."""
+    from torch.utils.data import DataLoader
+
+    from ....data.precomputed_images import PrecomputedImageDataset, load_precomputed_images, tensor_sha256
+
+    if not task_name:
+        raise ValueError("calibration_source='precomputed' needs the task name (per-task image files)")
+    images, digest, path = load_precomputed_images(config.calibration_images, task_name)
+    need = int(config.num_batches) * int(batch_size)
+    if images.shape[0] < need:
+        raise ValueError(f"{path}: {images.shape[0]} images but num_batches*batch_size = {need} are required")
+    dataset = PrecomputedImageDataset(images[:need], tensor_sha256(images[:need]))
+    kwargs = {"batch_size": int(batch_size), "shuffle": False, "num_workers": 0, "drop_last": False}
+    info = {"calibration_source": "precomputed", "path": str(path), "file_sha256": digest,
+            "n_stored": int(images.shape[0]), "n_used": need, "used_sha256": dataset.sha256,
+            "shape": [need, *images.shape[1:]], "task": task_name}
+    return DataLoader(dataset, **kwargs), DataLoader(dataset, **kwargs), info
+
+
 def _prepare_body(
     recorder: PhaseCostRecorder,
     *,
@@ -1014,6 +1127,19 @@ def _prepare_body(
 ) -> AnchorsPrepared:
     """Registration + task capture + encode/decode (``alignment_calibration`` bracket), then the ridge
     (``correction_fit`` bracket); timing keys mirror Ariadne's so the run summary reads both alike."""
+    generic_info = None
+    if config.calibration_source == "precomputed":
+        if family_adapter is not None or config.map_rows != "frame" or config.library != "data":
+            raise ValueError("calibration_source='precomputed' is vision-only, map_rows='frame', library='data'")
+        source_loader, target_loader, generic_info = precomputed_calibration_loaders(
+            config, task_name, getattr(source_loader, "batch_size", None) or 32
+        )
+    elif config.calibration_source == "generic":
+        if family_adapter is not None or config.map_rows != "frame" or config.library != "data":
+            raise ValueError("calibration_source='generic' is vision-only, map_rows='frame', library='data'")
+        source_loader, target_loader, generic_info = generic_calibration_loaders(
+            config, source_anchor_loader, target_anchor_loader
+        )
     alignment_mark = recorder.mark()
     started = time.perf_counter()
     if config.map_rows == "task":
@@ -1047,6 +1173,15 @@ def _prepare_body(
         raise ValueError(
             f"pairing ({pairing.source_depth}->{pairing.target_depth}) does not match the registered depths "
             f"({source.depth}->{target.depth})"
+        )
+    if config.canonical_source == "sigma_all_tokens":
+        from .canonical_stream import streamed_sigma_for_pair
+
+        s_b, t_b = _pool_draw(state, source_anchor_loader, target_anchor_loader)
+        pairs = [(int(pairing.pairing[j]), j) for j in range(pairing.target_depth)]
+        target.extras["canonical_sigma"] = streamed_sigma_for_pair(
+            state, source, target, source_base_model, target_model, target_base_sd, s_b, t_b, pairs,
+            config=config, device=device,
         )
     if config.anchor_filter is not None:
         k = float(config.anchor_filter_k)
@@ -1097,7 +1232,9 @@ def _prepare_body(
             "info": universe.info,
         }
     registration_seconds = time.perf_counter() - started
-    if config.depth_fit == "sequential":
+    native_seq = uses_native_depth_fit(config)
+    streaming_seq = config.depth_fit == "sequential" and not native_seq
+    if streaming_seq:
         prepared_stream = prepare_direct_residual_streaming(
             source_base_model,
             target_model,
@@ -1179,6 +1316,9 @@ def _prepare_body(
         desired, position_diag = decode_desired_effects(
             captured, pairing, source, target, config=config, gpa_maps=gpa_maps, family_adapter=family_adapter
         )
+    if generic_info is not None:
+        calibration = {**calibration, "split": "anchor_pool" if config.calibration_source == "generic"
+                       else "precomputed", **generic_info}
     alignment_peak, alignment_host_peak = recorder.peaks_since(alignment_mark)
     alignment_timing = {
         "alignment_calibration_seconds": time.perf_counter() - started,
@@ -1188,7 +1328,7 @@ def _prepare_body(
     }
     fit_mark = recorder.mark()
     started = time.perf_counter()
-    if config.depth_fit == "sequential":
+    if streaming_seq:
         decoder = SequentialDecoder(source, target, config, gpa_maps=gpa_maps, text=family_adapter is not None)
         corrections, rows = fit_direct_residual_sequential_streaming(
             target_model,
@@ -1204,6 +1344,13 @@ def _prepare_body(
         )
         position_diag = decoder.diagnostics()
     else:
+        full_captured, full_desired = captured, desired
+        if config.refine != "none":  # the depth fit sees only the batches the refinement does not hold out
+            keep = len(captured["target_batches"]) - int(config.refine_holdout_batches)
+            captured = {**captured, "target_batches": captured["target_batches"][:keep],
+                        "target_base_outputs_by_position": {
+                            j: v[:keep] for j, v in captured["target_base_outputs_by_position"].items()}}
+            desired = {j: v[:keep] for j, v in desired.items()}
         solve_hook = None
         if config.synthesis == "ridge_preserve" or config.update_rank is not None:
             solve_hook = _synthesis_hook(
@@ -1218,11 +1365,30 @@ def _prepare_body(
                 measure_blocks(config.measure_depths, pairing.target_depth),
                 config=config.ridge_config(), device=device, solve_hook=solve_hook,
             )
+        elif native_seq:
+            from .synthesis import fit_tracking
+
+            corrections, rows = fit_tracking(
+                target_model, target_base_sd, captured, desired, config=config.ridge_config(), device=device,
+                solve_hook=solve_hook, gain=config.gain_calibration, holdout=int(config.gain_holdout_batches),
+                sequential_impl=config.sequential_impl,
+            )
+        elif config.gain_calibration != "none":
+            corrections, rows = compile_with_gain(
+                target_model, target_base_sd, captured, desired, pairing, config=config, device=device,
+                solve_hook=solve_hook, family_adapter=family_adapter,
+            )
         else:
             corrections, rows = compile_desired_effects(
                 target_model, target_base_sd, captured, desired, pairing, config=config, device=device,
                 solve_hook=solve_hook, family_adapter=family_adapter,
             )
+    refine_info = None
+    if config.refine != "none":
+        corrections, rows, refine_info = _run_refine(
+            target_model, target_base_sd, full_captured, full_desired, corrections, rows, state, target, pairing,
+            target_anchor_loader, config=config, device=device,
+        )
     fit_peak, fit_host_peak = recorder.peaks_since(fit_mark)
     fit_timing = {
         "correction_fit_seconds": time.perf_counter() - started,
@@ -1254,10 +1420,61 @@ def _prepare_body(
                 "target_model_id": target_model_id,
                 "gpa_universe": universe_meta,
                 **({} if family_adapter is None else {"rows": _text_rows(config), "exclude_first_token": True}),
+                **({} if refine_info is None else {"refine": refine_info}),
+                **({} if generic_info is None else {"calibration": generic_info}),
             },
         },
         config=config,
     )
+
+
+def _run_refine(
+    target_model, target_base_sd, captured, desired, corrections, rows, state, target, pairing, target_anchor_loader,
+    *, config: AnchorsConfig, device,
+):
+    """``refine='joint'`` (``anchors/refine.py``): jointly refine the depth fit's ``corrections`` on the calibration
+    banks (``captured`` / ``desired``) and the generic anchor-pool rows; per-block diagnostics are merged into ``rows``
+    (by position), the global ones are returned for ``extra['anchors']['refine']``."""
+    from .refine import refine_blocks, refine_joint
+
+    blocks = refine_blocks(config.refine_depths, sorted(desired), pairing.target_depth)
+    generic = generic_hold = None
+    norm = None
+    if float(config.refine_rho) > 0.0:
+        frame = state.config
+        pool, _, _ = paired_calibration(
+            target_anchor_loader, target_anchor_loader,
+            num_batches=frame.anchor_batches + frame.registration_batches, seed=frame.pool_seed,
+        )
+        generic = pool[: min(frame.anchor_batches, int(config.refine_generic_batches))]
+        # held-out generic batch: the first pool batch O2's G does not use (index anchor_batches); in-sample only if absent
+        generic_hold = pool[frame.anchor_batches: frame.anchor_batches + 1] or None
+        if config.anchor_filter is not None:
+            flt = target.extras[f"norm_k{float(config.anchor_filter_k):g}"]
+            norm = {"mu": target.mu, "k": float(flt["k"]), "median": flt["median"]}
+    new, per_block, info = refine_joint(
+        target_model, target_base_sd, captured, desired, corrections, generic, blocks=blocks,
+        generic_holdout=generic_hold, warmup=float(config.refine_warmup),
+        target=config.refine_target, rho=float(config.refine_rho), prox=float(config.refine_prox),
+        steps=int(config.refine_steps), lr=float(config.refine_lr), batch=int(config.refine_batch),
+        holdout=int(config.refine_holdout_batches), eval_every=int(config.refine_eval_every),
+        amp=bool(config.refine_amp), use_checkpoint=bool(config.refine_checkpoint), seed=int(config.seed),
+        device=device, norm_filter=norm,
+    )
+    stale = ("correction_norm", "bias_norm", "residual_norm_after", "residual_norm_before", "relative_residual_before",
+             "generic_change", "generic_change_ridge", "update_rank_energy_kept")
+    for row in rows:
+        pos = int(row.get("position", -1))
+        for key in [k for k in row if k in stale or k.startswith(("realized_over", "cosine_gain"))]:
+            row[f"prefit_{key}"] = row.pop(key)  # statistics of the pre-refinement fit, kept under a prefix
+        row.update(per_block.get(pos, {}))
+        if pos in per_block:
+            row["correction_norm"] = per_block[pos]["refine_dw_norm_after"]
+            row["bias_norm"] = per_block[pos]["refine_bias_norm_after"]
+            row["realized_over_desired_heldout"] = per_block[pos]["refine_ratio_after"]
+            row["cosine_heldout"] = per_block[pos]["refine_cosine_after"]
+    info["generic_holdout_in_sample"] = generic_hold is None and generic is not None
+    return new, rows, info
 
 
 def _text_rows(config: AnchorsConfig) -> str:
@@ -1302,6 +1519,64 @@ def compile_desired_effects(
         target_model, target_base_sd, captured, desired, pairing, config=config.ridge_config(), device=device,
         family_adapter=family_adapter, solve_hook=solve_hook,
     )
+
+
+def uses_native_depth_fit(config: AnchorsConfig) -> bool:
+    """Whether the depth fit runs in anchors' own closed-loop (``synthesis.fit_tracking``) instead of Ariadne's
+    streaming sequential fit: ``depth_fit='tracking'`` (S2), or ``'sequential'`` with ``ridge_preserve`` (S1) or a gain
+    calibration (S3), which Ariadne's streaming fit cannot host. Plain ``'sequential'`` is unchanged."""
+    return config.depth_fit == "tracking" or (
+        config.depth_fit == "sequential"
+        and (config.synthesis == "ridge_preserve" or config.gain_calibration != "none")
+    )
+
+
+def compile_with_gain(
+    target_model,
+    target_base_sd: Mapping[str, Tensor],
+    captured: Mapping[str, Any],
+    desired: Mapping[int, list[Tensor]],
+    pairing: DiscreteLayerPairing,
+    *,
+    config: AnchorsConfig,
+    device,
+    solve_hook=None,
+    family_adapter=None,
+) -> tuple[dict[str, Tensor], list[dict[str, Any]]]:
+    """S3 on the independent fit: the ridge on the first ``num_batches - gain_holdout_batches`` calibration batches
+    (all of them when the holdout is 0), then the per-block gains ``g_j`` (``synthesis.fit_tracking`` with the fitted
+    corrections fixed) on the held-out batches, in depth order with the scaled upstream mounted. The returned
+    corrections are the scaled ones; the rows carry the gain and the realized / desired diagnostics of the pass."""
+    from .synthesis import fit_tracking
+
+    hold = int(config.gain_holdout_batches)
+    n = len(captured["target_batches"])
+    if hold:
+        keep = n - hold
+        fit_captured = {
+            **captured,
+            "target_batches": captured["target_batches"][:keep],
+            "target_base_outputs_by_position": {
+                j: v[:keep] for j, v in captured["target_base_outputs_by_position"].items()
+            },
+        }
+        fit_desired = {j: v[:keep] for j, v in desired.items()}
+    else:
+        fit_captured, fit_desired = captured, desired
+    fitted, rows = compile_desired_effects(
+        target_model, target_base_sd, fit_captured, fit_desired, pairing, config=config, device=device,
+        solve_hook=solve_hook, family_adapter=family_adapter,
+    )
+    scaled, gain_rows = fit_tracking(
+        target_model, target_base_sd, captured, desired, config=config.ridge_config(), device=device,
+        fixed=fitted, gain=config.gain_calibration, holdout=hold,
+    )
+    by_pos = {int(r["position"]): r for r in gain_rows}
+    for row in rows:
+        extra = by_pos[int(row["position"])]
+        row.update({k: v for k, v in extra.items()
+                    if k.startswith(("gain", "realized_over", "cosine_gain")) or k == "upstream_over_desired"})
+    return scaled, rows
 
 
 def _pool_draw(state, source_anchor_loader, target_anchor_loader) -> tuple[list[Any], list[Any]]:
@@ -1358,6 +1633,27 @@ def _synthesis_hook(
         )
         return make_synthesis_hook(generic=generic, rho_g=float(config.rho_g), base_weights=weights,
                                    rank=config.update_rank)
+    if config.preserve_inputs == "updated":
+        # S1/S2: G re-captured per block on the model with the upstream blocks already updated (the target is mounted
+        # block by block by fit_tracking, so LazyGenericInputs sees the current weights when the solve asks for block j)
+        weights = {j: target_base_sd[f"visual.transformer.resblocks.{j}.mlp.c_proj.weight"] for j in range(target.depth)}
+        if config.sequential_impl == "incremental":
+            from .synthesis import IncrementalGenericInputs
+
+            # third running stream (generic images, current model); fit_tracking starts / advances it
+            generic = IncrementalGenericInputs(
+                batches[: frame.anchor_batches], tokens_per_block=config.preserve_tokens, seed=config.seed,
+                norm_filter=norm,
+            )
+            hook = make_synthesis_hook(generic=generic, rho_g=float(config.rho_g), base_weights=weights,
+                                       rank=config.update_rank)
+            hook.generic_provider = generic
+            return hook
+        generic = LazyGenericInputs(
+            target_model, batches[: frame.anchor_batches], component="mlp.c_proj",
+            tokens_per_block=config.preserve_tokens, seed=config.seed, device=device, norm_filter=norm,
+        )
+        return make_synthesis_hook(generic=generic, rho_g=float(config.rho_g), base_weights=weights, rank=config.update_rank)
     current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
     try:
         target_model.load_state_dict(dict(target_base_sd), strict=True)

@@ -530,3 +530,48 @@ def test_llm_direct_fit_stage_runs_anchors(monkeypatch, synthesis):
     stage.run(env, SimpleNamespace(task="math2", ctx=SimpleNamespace(index=0)),
               SimpleNamespace(source_base_model=src, source_ft_model=ft, task_delta={}))
     assert stage._anchors_state is state
+
+
+# ---------------------------------------------------------------- anchors_pool.split
+
+
+def _pool_cfg(**raw):
+    from merge_and_rebase.eval.llm_rebase.anchors_pool import resolve_anchors_pool
+
+    acfg = SimpleNamespace(anchor_pool="wikitext103", anchor_batches=2, registration_batches=1)
+    return resolve_anchors_pool({"anchors_pool": raw} if raw else {}, acfg, calib_batch_size=4, calib_max_length=32)
+
+
+def test_anchors_pool_split_default_record_unchanged():
+    rec = _pool_cfg(min_chars=300)
+    assert rec["split"] == "validation"
+    assert _pool_cfg(min_chars=300, split=None) == rec
+    assert _pool_cfg(min_chars=300, split="validation") == rec
+    assert set(rec) == {"dataset", "hf_path", "hf_name", "split", "text_column", "min_chars", "n_sequences",
+                        "seed", "max_length", "batch_size"}
+
+
+def test_anchors_pool_split_train_and_validation(monkeypatch):
+    import datasets
+
+    from merge_and_rebase.eval.llm_rebase.anchors_pool import load_pool_texts
+
+    seen = []
+
+    def fake_load(path, name, split):
+        seen.append(split)
+        return {"text": [f"{split} paragraph {i} " + "x" * 50 for i in range(40)] + ["short"]}
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load)
+    rec = _pool_cfg(min_chars=20, split="train")
+    assert rec["split"] == "train" and rec["n_sequences"] == 12
+    texts = load_pool_texts(rec)
+    assert seen == ["train"] and len(texts) == 12 and len(set(texts)) == 12
+    assert all(t.startswith("train") for t in texts)
+    load_pool_texts(_pool_cfg(min_chars=20))
+    assert seen == ["train", "validation"]
+
+
+def test_anchors_pool_split_rejects_unknown():
+    with pytest.raises(ValueError, match="split"):
+        _pool_cfg(split="bogus")

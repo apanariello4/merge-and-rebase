@@ -29,6 +29,7 @@ _ATTN_SPLIT_RE = re.compile(
 )
 _ATTN_FUSED_RE = re.compile(r"transformer\.resblocks\.\d+\.attn\.(in_proj_weight|in_proj_bias)$")
 _MLP_RE = re.compile(r"transformer\.resblocks\.\d+\.mlp\.(c_fc|c_proj)\.(weight|bias)$")
+_CPROJ_RE = re.compile(r"transformer\.resblocks\.\d+\.mlp\.c_proj\.(weight|bias)$")
 _LORA_CAPABLE_SPLIT_WEIGHT_RE = re.compile(
     r"transformer\.resblocks\.\d+\.attn\.(q_proj|k_proj|v_proj|out_proj)\.weight$"
 )
@@ -107,6 +108,22 @@ def _lora_target_modules_for_local_name(local_name: str) -> set[str]:
 
 def resolve_visual_parameter_plan(model: nn.Module, name: str) -> VisualParameterPlan:
     subset_name = str(name).strip().lower()
+    if subset_name == "c_proj_only":
+        # MLP output projection (weight + bias) of every visual residual block, nothing else. The visual prefix is
+        # required so a bare CLIP's text-tower transformer.resblocks.*.mlp.c_proj is never selected.
+        names = tuple(
+            full_name
+            for full_name, _param in model.named_parameters()
+            if (m := _VISUAL_PREFIX_RE.match(full_name)) is not None and _CPROJ_RE.fullmatch(m.group(2)) is not None
+        )
+        return VisualParameterPlan(
+            name=subset_name,
+            parameter_names=names,
+            lora_parameter_names=(),
+            dense_parameter_names=names,
+            lora_target_modules=(),
+            supported=bool(names),
+        )
     if subset_name != "regularized_only":
         return VisualParameterPlan(
             name=subset_name,

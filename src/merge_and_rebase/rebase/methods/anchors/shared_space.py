@@ -33,6 +33,7 @@ import torch
 from torch import nn
 
 from .config import AnchorsConfig
+from .method import anchor_keep, filtered_frame
 from .state import AnchorState
 from .universe import Universe, _block, fit_universe
 
@@ -77,6 +78,7 @@ class ModelFrame:
     mu: list[Tensor]  # [d_m]
     c: list[float]
     phi: list[Tensor]  # [r, d_m]
+    psi: list[Tensor] | None = None  # [r, d_m] decoder rows; None: Psi = Phi (gpa, anchor_zca)
 
     @property
     def width(self) -> int:
@@ -98,20 +100,53 @@ class ModelFrame:
         return (e / self.c[i]) @ self.phi[i].to(device=e.device, dtype=e.dtype).T
 
     def decode(self, du: Tensor, j: int) -> Tensor:
-        """``dh = c du Phi`` (a displacement: no mean)."""
+        """``dh = c du Psi`` (a displacement: no mean); ``Psi = Phi`` when ``psi`` is None."""
         i = self.index(j)
-        return self.c[i] * (du @ self.phi[i].to(device=du.device, dtype=du.dtype))
+        return self.c[i] * (du @ self._dec(i).to(device=du.device, dtype=du.dtype))
 
     def encode_grad(self, g_h: Tensor, j: int) -> Tensor:
         """Adjoint of ``decode``: a gradient w.r.t. ``h`` as a gradient w.r.t. the common coordinates ``du``."""
         i = self.index(j)
-        return self.c[i] * (g_h @ self.phi[i].to(device=g_h.device, dtype=g_h.dtype).T)
+        return self.c[i] * (g_h @ self._dec(i).to(device=g_h.device, dtype=g_h.dtype).T)
+
+    def _dec(self, i: int) -> Tensor:
+        return self.phi[i] if self.psi is None else self.psi[i]
+
+
+FRAME_MAPS = ("gpa", "anchor_zca", "anchor_tikhonov")
+
+
+def anchor_kernel_maps(p: Tensor, variant: str, eps_rel: float) -> tuple[Tensor, Tensor, float]:
+    """Encoder / decoder rows ``(Phi, Psi, cond)`` of the anchor-kernel frame of one model at one depth.
+
+    ``p``: ``[T, d]`` anchor rows in the normalisation of the encode input (``(S - mu)/c``). ``K = p p^T`` (float64),
+    ``eps = eps_rel tr(K) / T``, eigh ``K = V L V^T`` (no inverse); ``cond = cond(K + eps I)``.
+
+    * ``anchor_zca``: ``Phi = Psi = (K + eps I)^(-1/2) p`` (``Phi Phi^T`` = whitened kernel; invariant to an orthogonal
+      rotation and an isotropic rescaling of the anchors);
+    * ``anchor_tikhonov``: ``Phi = p``, ``Psi = (K + eps I)^(-1) p`` (ridge decoder: ``decode(encode(p_i))`` is the
+      row ``i`` of ``K (K + eps I)^(-1) p``)."""
+    if variant not in ("anchor_zca", "anchor_tikhonov"):
+        raise ValueError(f"unknown anchor frame_map {variant!r}")
+    p = p.to(torch.float64)
+    t = p.shape[0]
+    k = p @ p.T
+    k = (k + k.T) / 2
+    eps = float(eps_rel) * float(torch.trace(k)) / t
+    lam, v = torch.linalg.eigh(k)
+    lam = lam.clamp_min(0.0)
+    cond = float((lam[-1] + eps) / (lam[0] + eps))
+    if variant == "anchor_zca":
+        q = v @ (((lam + eps).rsqrt())[:, None] * (v.T @ p))
+        return q, q, cond
+    return p, v @ (((lam + eps).reciprocal())[:, None] * (v.T @ p)), cond
 
 
 class SharedFrame:
-    """Frames of several models at the grid points ``S`` of one GPA universe, plus the centre ``G(s)``."""
+    """Frames of several models at the grid points ``S`` of one GPA universe, plus the centre ``G(s)``.
+    (anchor frame maps: ``universe`` is None.)"""
 
-    def __init__(self, universe: Universe, frames: dict[str, ModelFrame], g: dict[int, Tensor], rank: int, meta: dict):
+    def __init__(self, universe: Universe | None, frames: dict[str, ModelFrame], g: dict[int, Tensor], rank: int, meta: dict):
         self.universe = universe
         self.frames = frames
         self.g = g  # grid index -> [T', r] (kept anchors, top-r axes)
@@ -137,16 +172,30 @@ class SharedFrame:
         rank: int = 512,
         filter_k: float | None = 3.0,
         frame: dict[str, Any] | None = None,
+        frame_map: str = "gpa",
+        kernel_eps: float = 1e-2,
+        anchor_rows: int = 512,
+        anchor_subset_seed: int = 89,
     ) -> SharedFrame:
         """Load (or fit and store) the universe of ``fit_models`` and add ``add_models`` by Procrustes to the fixed G.
 
         The state is only read, except that a universe absent from ``universes/`` is fitted and stored there (the
-        same cache the transport runs use)."""
+        same cache the transport runs use).
+
+        ``frame_map='anchor_zca' | 'anchor_tikhonov'``: no common frame; each model's coordinates are defined by its OWN
+        anchors (``_anchor_from_state``): the universe is not fitted and nothing is written to the state."""
+        if frame_map not in FRAME_MAPS:
+            raise ValueError(f"frame_map must be one of {FRAME_MAPS}, got {frame_map!r}")
         state = AnchorState(AnchorsConfig(**(frame or MAIN_FRAME)), state_dir)
         models = list(dict.fromkeys([*fit_models, *add_models]))
         if filter_k is not None:
             for m in models:
                 state.load_norm_filter(m, k=float(filter_k))
+        if frame_map != "gpa":
+            return cls._anchor_from_state(
+                state, state_dir, models, list(fit_models), n_grid=n_grid, depths=depths, filter_k=filter_k,
+                frame_map=frame_map, kernel_eps=kernel_eps, anchor_rows=anchor_rows, seed=anchor_subset_seed,
+            )
         uni = fit_universe(
             state, list(fit_models), n_grid=n_grid, add_models=[m for m in add_models if m not in fit_models],
             filter_k=filter_k,
@@ -183,6 +232,84 @@ class SharedFrame:
             },
         }
         return cls(uni, frames, g, r, meta)
+
+    @classmethod
+    def _anchor_from_state(
+        cls, state: AnchorState, state_dir, models: list[str], fit_models: list[str], *, n_grid: int,
+        depths: str | Sequence[int], filter_k: float | None, frame_map: str, kernel_eps: float, anchor_rows: int,
+        seed: int,
+    ) -> SharedFrame:
+        """Anchor-kernel frames. Per depth ``j`` (block ``pi_m(j)`` of model ``m``): the anchors kept in ALL models
+        (``anchor_keep``), then ``anchor_rows`` of them drawn with ``torch.Generator(seed)`` (the same rows for every
+        model; error if fewer are kept). ``P_m`` = ``filtered_frame`` rows on the subset, i.e. ``(S - mu_k)/c_k`` with
+        the very ``mu_k``, ``c_k`` of ``encode`` (``h~ = (h - mu)/c``), so ``encode(anchor row) = h~ P^T``. Without the
+        filter (``filter_k=None``) ``P_m`` is the stored ``p`` (centred/scaled by ``reg.mu``, ``reg.c``, as ``encode``).
+        Maps: ``anchor_kernel_maps``. ``g[j] = P_m Phi_m^T`` (``[T, T]``) of the first fit model (the anchor coordinates
+        of that model; the frame differs per model, so this is the reference model's); rank = ``anchor_rows``."""
+        grid = resolve_depths(depths, n_grid)
+        t = int(anchor_rows)
+        regs = {m: state.model(m) for m in models}
+        per: dict[str, dict[str, list]] = {m: {"blocks": [], "mu": [], "c": [], "phi": [], "psi": []} for m in models}
+        g: dict[int, Tensor] = {}
+        kept: dict[int, int] = {}
+        conds: dict[str, list[float]] = {m: [] for m in models}
+        ref = fit_models[0] if fit_models else models[0]
+        for j in grid:
+            blocks = {m: _block(state, m, n_grid, j) for m in models}
+            if filter_k is None:
+                n_all = int(regs[models[0]].p[blocks[models[0]]].shape[0])
+                keep = torch.ones(n_all, dtype=torch.bool)
+            else:
+                keep = anchor_keep([(regs[m], blocks[m]) for m in models], float(filter_k))
+            n_kept = int(keep.sum())
+            kept[j] = n_kept
+            if n_kept < t:
+                raise ValueError(f"grid point {j}: only {n_kept} anchors kept by all models, need anchor_rows={t}")
+            sel = torch.randperm(n_kept, generator=torch.Generator().manual_seed(int(seed)))[:t].sort().values
+            for m in models:
+                reg, b = regs[m], blocks[m]
+                if filter_k is None:
+                    p_all, c, mu = reg.p[b].to(torch.float64), float(reg.c[b]), reg.mu[b].to(torch.float64)
+                else:
+                    p_all, c = filtered_frame(reg, b, keep, float(filter_k))
+                    flt = reg.extras[f"norm_k{float(filter_k):g}"]
+                    mu = flt["mu"][b].to(torch.float64)
+                p = p_all[sel] if filter_k is not None else p_all[keep][sel]
+                phi, psi, cond = anchor_kernel_maps(p, frame_map, kernel_eps)
+                per[m]["blocks"].append(b)
+                per[m]["mu"].append(mu)
+                per[m]["c"].append(c)
+                per[m]["phi"].append(phi)
+                per[m]["psi"].append(None if psi is phi else psi)
+                conds[m].append(cond)
+                if m == ref:
+                    g[j] = (p @ phi.T).contiguous()
+        frames = {
+            m: ModelFrame(m, grid, d["blocks"], d["mu"], d["c"], d["phi"],
+                          None if all(x is None for x in d["psi"]) else d["psi"])
+            for m, d in per.items()
+        }
+        meta = {
+            "state_dir": str(state_dir),
+            "universe_version": None,
+            "fit_models": list(fit_models),
+            "added": [m for m in models if m not in fit_models],
+            "n_grid": int(n_grid),
+            "grid": grid,
+            "rank": t,
+            "d_u": None,
+            "filter_k": filter_k,
+            "blocks": {m: f.blocks for m, f in frames.items()},
+            "gpa_residual": {},
+            "frame_map": frame_map,
+            "kernel_eps": float(kernel_eps),
+            "anchor_rows": t,
+            "anchor_subset_seed": int(seed),
+            "kept_anchors": kept,
+            "kernel_cond": conds,
+            "g_model": ref,
+        }
+        return cls(None, frames, g, t, meta)
 
 
 class SharedAdapter(nn.Module):
