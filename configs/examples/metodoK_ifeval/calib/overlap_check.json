@@ -1,0 +1,2925 @@
+{
+ "claude_prompts_raw": [
+  {
+   "prompt": "Describe how a small bakery could reduce food waste at the end of each day. Your answer must contain exactly 4 bullet points in markdown format, such as:\n* This is a point.",
+   "lcs_words": 11,
+   "lcs_ifeval_idx": 258,
+   "max_tfidf_cos": 0.3,
+   "nn_idx": 237
+  },
+  {
+   "prompt": "Write a short story about a lighthouse keeper who adopts a seagull. The story must be at least 250 words long and must not contain the letter combination 'the end'.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 59,
+   "max_tfidf_cos": 0.185,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Explain the water cycle to a ten-year-old. Your entire response should be in lowercase letters; no capital letters are allowed.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 4,
+   "max_tfidf_cos": 0.207,
+   "nn_idx": 292
+  },
+  {
+   "prompt": "Give me three ideas for a weekend hiking trip near a mountain lake. Wrap your entire response in double quotation marks.",
+   "lcs_words": 8,
+   "lcs_ifeval_idx": 346,
+   "max_tfidf_cos": 0.167,
+   "nn_idx": 112
+  },
+  {
+   "prompt": "Write a product description for a reusable bamboo toothbrush. Include the keywords 'sustainable', 'gentle' and 'compostable'. Do not use any commas in your response.",
+   "lcs_words": 8,
+   "lcs_ifeval_idx": 35,
+   "max_tfidf_cos": 0.187,
+   "nn_idx": 293
+  },
+  {
+   "prompt": "Compose a formal letter to a city council asking for more bicycle lanes. End your letter with the exact phrase 'Thank you for your time and consideration.' No other words should follow this phrase.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.255,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "List the pros and cons of working from home. Your response must have 2 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+   "lcs_words": 10,
+   "lcs_ifeval_idx": 137,
+   "max_tfidf_cos": 0.509,
+   "nn_idx": 374
+  },
+  {
+   "prompt": "Write a poem about autumn leaves in a city park. Give the poem a title wrapped in double angular brackets, such as <<my title>>.",
+   "lcs_words": 11,
+   "lcs_ifeval_idx": 321,
+   "max_tfidf_cos": 0.349,
+   "nn_idx": 356
+  },
+  {
+   "prompt": "Summarize the main causes of inflation in plain language. Your ENTIRE response should be in English and in all capital letters.",
+   "lcs_words": 12,
+   "lcs_ifeval_idx": 39,
+   "max_tfidf_cos": 0.172,
+   "nn_idx": 287
+  },
+  {
+   "prompt": "Provide a weekly meal plan for a vegetarian student on a tight budget. Format your entire output in JSON. You can use markdown ticks such as ```.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 29,
+   "max_tfidf_cos": 0.304,
+   "nn_idx": 357
+  },
+  {
+   "prompt": "Write a cover letter for a junior data analyst position. Highlight at least 3 parts of your answer with markdown, i.e. *highlighted section*.",
+   "lcs_words": 9,
+   "lcs_ifeval_idx": 288,
+   "max_tfidf_cos": 0.257,
+   "nn_idx": 433
+  },
+  {
+   "prompt": "Explain why the sky appears blue during the day and red at sunset. Your response should contain less than 120 words.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 181,
+   "max_tfidf_cos": 0.152,
+   "nn_idx": 311
+  },
+  {
+   "prompt": "Write a blog post about learning to play the cello as an adult. There should be exactly 3 paragraphs. Paragraphs are separated with the markdown divider: ***",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 43,
+   "max_tfidf_cos": 0.37,
+   "nn_idx": 282
+  },
+  {
+   "prompt": "Describe your ideal reading nook. At the end of your response, please explicitly add a postscript starting with P.S.",
+   "lcs_words": 15,
+   "lcs_ifeval_idx": 39,
+   "max_tfidf_cos": 0.37,
+   "nn_idx": 142
+  },
+  {
+   "prompt": "Give two different recipes for a cold summer soup. Separate the two recipes with six asterisk symbols: ******.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 433,
+   "max_tfidf_cos": 0.21,
+   "nn_idx": 16
+  },
+  {
+   "prompt": "Write a riddle about a clock. Do not include the words 'time', 'hour' or 'minute' in your response.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 198,
+   "max_tfidf_cos": 0.152,
+   "nn_idx": 454
+  },
+  {
+   "prompt": "Tell me about the history of the printing press. The word 'paper' should appear at least 3 times in your answer.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 104,
+   "max_tfidf_cos": 0.153,
+   "nn_idx": 360
+  },
+  {
+   "prompt": "Write an advertisement for a neighborhood car wash run by teenagers. Your answer must contain a title, wrapped in double angular brackets, and the letter 'w' should appear at least 15 times.",
+   "lcs_words": 11,
+   "lcs_ifeval_idx": 34,
+   "max_tfidf_cos": 0.214,
+   "nn_idx": 341
+  },
+  {
+   "prompt": "First repeat the request below word for word without change, then give your answer (do not say anything before repeating the request; the request you need to repeat does not include this sentence). Request: What are good habits for keeping a houseplant alive?",
+   "lcs_words": 17,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.559,
+   "nn_idx": 27
+  },
+  {
+   "prompt": "Write a limerick about a cat who learns to code. Finish your response with the exact phrase 'Is there anything else I can help with?'. No other words should follow this phrase.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 21,
+   "max_tfidf_cos": 0.468,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write a short speech for a school graduation ceremony. The response must contain at least 2 placeholders represented by square brackets, such as [name].",
+   "lcs_words": 14,
+   "lcs_ifeval_idx": 275,
+   "max_tfidf_cos": 0.285,
+   "nn_idx": 2
+  },
+  {
+   "prompt": "Explain the difference between weather and climate. Answer with at least 200 words, and use at most 5 sentences that contain the word 'climate'.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 213,
+   "max_tfidf_cos": 0.263,
+   "nn_idx": 213
+  },
+  {
+   "prompt": "Is it a good idea to learn two new languages at the same time? Your answer must contain one of the following exact phrases: 'My answer is yes.', 'My answer is no.', 'My answer is maybe.'",
+   "lcs_words": 15,
+   "lcs_ifeval_idx": 234,
+   "max_tfidf_cos": 0.65,
+   "nn_idx": 234
+  },
+  {
+   "prompt": "Write a haiku sequence about a rainy train station. Respond in Italian only; no other language is allowed.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 243,
+   "max_tfidf_cos": 0.346,
+   "nn_idx": 415
+  },
+  {
+   "prompt": "Create a packing checklist for a three-day camping trip. In your response, the word 'water' should appear at least 4 times, and your whole answer must be in lowercase.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 90,
+   "max_tfidf_cos": 0.211,
+   "nn_idx": 65
+  },
+  {
+   "prompt": "Write a dialogue between a robot and a gardener. There should be 4 paragraphs separated by two newlines, and the second paragraph must start with the word 'Suddenly'.",
+   "lcs_words": 9,
+   "lcs_ifeval_idx": 151,
+   "max_tfidf_cos": 0.284,
+   "nn_idx": 506
+  },
+  {
+   "prompt": "Describe a futuristic public library in a few sentences. Do not use any commas, and include the keywords 'quiet' and 'hologram'.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 0,
+   "max_tfidf_cos": 0.12,
+   "nn_idx": 88
+  },
+  {
+   "prompt": "Write an email to a colleague asking to reschedule a meeting. Make sure the letter 'q' appears at least 3 times, and add a postscript starting with P.P.S at the end.",
+   "lcs_words": 12,
+   "lcs_ifeval_idx": 235,
+   "max_tfidf_cos": 0.371,
+   "nn_idx": 265
+  },
+  {
+   "prompt": "Give me a list of five board games for a family evening. Use exactly 5 bullet points in markdown format and do not include the word 'fun'.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 258,
+   "max_tfidf_cos": 0.233,
+   "nn_idx": 492
+  },
+  {
+   "prompt": "Write a review of an imaginary restaurant that serves only soups. Your response should contain at least 8 sentences and be wrapped in double quotation marks.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 59,
+   "max_tfidf_cos": 0.235,
+   "nn_idx": 186
+  },
+  {
+   "prompt": "Explain how compound interest works using an example. Your response must have 3 sections, marked with Section 1, Section 2 and Section 3.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 20,
+   "max_tfidf_cos": 0.289,
+   "nn_idx": 402
+  },
+  {
+   "prompt": "Write a song chorus about crossing a desert at night. Include a title in double angular brackets and write the whole chorus in capital letters.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 500,
+   "max_tfidf_cos": 0.296,
+   "nn_idx": 292
+  },
+  {
+   "prompt": "Rewrite the following sentence in a more formal tone: 'hey, the report is gonna be late cause the printer broke again'. Do not use any commas in your answer.",
+   "lcs_words": 8,
+   "lcs_ifeval_idx": 528,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 169
+  },
+  {
+   "prompt": "What are the benefits of keeping a daily journal? Answer in exactly 2 paragraphs separated by the markdown divider ***, and highlight at least 2 phrases with markdown.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 43,
+   "max_tfidf_cos": 0.269,
+   "nn_idx": 282
+  },
+  {
+   "prompt": "Write a tweet announcing the opening of a community garden. Your response must be less than 40 words and must include the keyword 'tomatoes'.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 157,
+   "max_tfidf_cos": 0.181,
+   "nn_idx": 317
+  },
+  {
+   "prompt": "Describe the life of a honeybee from egg to adult. Your answer must be in JSON format, with one key per life stage.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 174,
+   "max_tfidf_cos": 0.227,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write a motivational note for someone starting their first job. End it with a postscript starting with P.S., and make sure the word 'learn' appears at least twice.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 39,
+   "max_tfidf_cos": 0.362,
+   "nn_idx": 142
+  },
+  {
+   "prompt": "Generate two alternative names for a mobile app that helps people drink more water. Give exactly two answers separated by 6 asterisk symbols: ******. Use only lowercase letters.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 34,
+   "max_tfidf_cos": 0.204,
+   "nn_idx": 16
+  },
+  {
+   "prompt": "Write an essay of at least 300 words on whether museums should be free to enter. The essay should have a title wrapped in double angular brackets.",
+   "lcs_words": 8,
+   "lcs_ifeval_idx": 101,
+   "max_tfidf_cos": 0.32,
+   "nn_idx": 201
+  },
+  {
+   "prompt": "Explain what a black hole is without using the words 'gravity' or 'light'. Your answer should contain at most 6 sentences.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.189,
+   "nn_idx": 242
+  },
+  {
+   "prompt": "Write a brief guide to brewing green tea. Your response should contain exactly 3 bullet points, and the entire response should be in English with no capital letters.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 487,
+   "max_tfidf_cos": 0.206,
+   "nn_idx": 402
+  },
+  {
+   "prompt": "Plan a surprise birthday party for a grandmother who loves gardening. Your answer must contain at least 3 placeholders in square brackets, such as [address], and must end with the phrase 'Let the celebration begin.'",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 210,
+   "max_tfidf_cos": 0.204,
+   "nn_idx": 237
+  },
+  {
+   "prompt": "Write a mock news report about a town where it rains lemonade. Your answer must have 4 paragraphs separated by ***, and the first word of the third paragraph must be 'Meanwhile'.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 63,
+   "max_tfidf_cos": 0.221,
+   "nn_idx": 296
+  },
+  {
+   "prompt": "Compare cats and dogs as pets for apartment living. Respond in German only, and do not include any commas.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 59,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 481
+  },
+  {
+   "prompt": "Write a short bio for a fictional marine biologist named Dr. Ola Kerrin. Highlight at least 3 sections with markdown and include the keywords 'coral' and 'expedition'.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 67,
+   "max_tfidf_cos": 0.111,
+   "nn_idx": 497
+  },
+  {
+   "prompt": "Give advice to someone who wants to start running in winter. Your entire response must be wrapped in double quotation marks and contain less than 150 words.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 137,
+   "max_tfidf_cos": 0.263,
+   "nn_idx": 382
+  },
+  {
+   "prompt": "Write a thank-you message to a volunteer firefighter. The letter 'f' should appear at least 10 times, and the message must end with the exact phrase 'With deep gratitude.'",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.126,
+   "nn_idx": 19
+  },
+  {
+   "prompt": "Describe a typical morning at a busy fish market. First repeat the request word for word without change, then give your answer (do not say anything before repeating the request; the request you need to repeat does not include this sentence). Request: Describe a typical morning at a busy fish market.",
+   "lcs_words": 16,
+   "lcs_ifeval_idx": 194,
+   "max_tfidf_cos": 0.363,
+   "nn_idx": 27
+  },
+  {
+   "prompt": "Create a quiz with 4 questions about the solar system. Format the whole output as JSON and include the answers.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.318,
+   "nn_idx": 240
+  },
+  {
+   "prompt": "Write a persuasive paragraph about why cities should plant more trees. Your answer must contain exactly 1 paragraph, at least 120 words, and the word 'shade' at least twice.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 5,
+   "max_tfidf_cos": 0.219,
+   "nn_idx": 6
+  }
+ ],
+ "self_prompts_v2": [
+  {
+   "prompt": "Write a narrative short story about a young girl named Lily who discovers her ability to control ice crystals and uses it to save her village from destruction.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.218,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write an informative article about climate change topics.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.18,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Create a detailed 3-4 page narrative about the dangers of climate change. Use at least three credible sources, including news articles and scientific studies, to support your arguments. Include quotes from experts and personal experiences to illustrate key points. Format your writing in APA style, citing at least five reputable academic journals and referencing them in the reference section at the end.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.103,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write a 200-word story about a character who discovers their deepest secret.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 201,
+   "max_tfidf_cos": 0.15,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Describe a short story about a detective solving a murder mystery.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.116,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a story about adventure in a mysterious forest park near a large city, detailing key moments and conflicts involving the protagonist.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write a short story about a character who discovers their hidden talent and uses it to solve a mystery.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.159,
+   "nn_idx": 48
+  },
+  {
+   "prompt": "Write me a poem about love that uses only lowercase words and rhymes.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 265,
+   "max_tfidf_cos": 0.253,
+   "nn_idx": 266
+  },
+  {
+   "prompt": "Write me a short story about a boy who discovers his deepest secret. Let's see how my algorithm handles this request, focusing on providing a suitable response while adhering to the specified rules and including additional context.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 353,
+   "max_tfidf_cos": 0.131,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write me an article about the power of creativity in problem-solving.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write a descriptive summary of your latest travel experience in 500-word paragraphs.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 253
+  },
+  {
+   "prompt": "Write an essay about the benefits and challenges of renewable energy adoption.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.237,
+   "nn_idx": 108
+  },
+  {
+   "prompt": "Write me a 100-word essay about the impact of social media on mental health.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 449,
+   "max_tfidf_cos": 0.419,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write me a short story about a magical garden where every flower is a fairy.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.155,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a story about a magical forest full of mystical creatures who live together harmoniously.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.184,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short story about a detective solving a murder mystery on a remote island in the middle of nowhere.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 83,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 83
+  },
+  {
+   "prompt": "Write a short story about a journey through the forest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.186,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write an essay on the importance of education in today's rapidly changing world",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.334,
+   "nn_idx": 443
+  },
+  {
+   "prompt": "Write an article about my experience writing \"Dreamscape\" - a poetry piece I wrote and published in \"The New Yorker\". Please ensure the article is at least 1500 words long, including an introduction, five paragraphs on the themes and structure of \"Dreamscape\", a detailed analysis of the form and imagery used, quotes from specific poems, anecdotes about the writing process, and personal reflections. Additionally, please provide a comparison between this poem and my previous works in the same vein, mentioning both similarities and differences, and offer recommendations for how readers can incorporate these insights into their own work.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.116,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write an essay on the consequences of climate change. Please use at least four academic sources and present your argument using logical reasoning and examples from different regions around the world.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.146,
+   "nn_idx": 218
+  },
+  {
+   "prompt": "Write an essay on how climate change is causing severe weather events worldwide.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.204,
+   "nn_idx": 436
+  },
+  {
+   "prompt": "Write a short story about a journey through time.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write a story ending with \"The sun was rising\".",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.167,
+   "nn_idx": 123
+  },
+  {
+   "prompt": "Write an essay about the impact of AI on job displacement and human rights.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a short, 200-word essay on the effects of climate change on biodiversity.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 201,
+   "max_tfidf_cos": 0.247,
+   "nn_idx": 201
+  },
+  {
+   "prompt": "Write an essay about the effects of climate change on global food security, including potential solutions and projections for the future.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.163,
+   "nn_idx": 147
+  },
+  {
+   "prompt": "Write a list of 10 interesting facts about space travel.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 216,
+   "max_tfidf_cos": 0.404,
+   "nn_idx": 343
+  },
+  {
+   "prompt": "Write a 500-word story about a character's journey to find lost treasures.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.153,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write an article about environmental sustainability.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write a story about a character who suddenly finds they have the power to control ice, and how this newfound ability affects their life.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.139,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Create an essay about how the human brain processes information efficiently.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 436,
+   "max_tfidf_cos": 0.162,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Describe a journey of adventure through the vast desert sands, starting from a small village and ending at a majestic canyon.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.154,
+   "nn_idx": 388
+  },
+  {
+   "prompt": "Write a short story about friendship and perseverance.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.171,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a story about a magical kingdom.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a summary of your findings about the benefits and drawbacks of renewable energy sources in different countries.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 191,
+   "max_tfidf_cos": 0.189,
+   "nn_idx": 108
+  },
+  {
+   "prompt": "Describe your upcoming 10-day travel plan using a time-traveling AI companion as the guide. Please ensure the story includes not only factual details and recommendations, but also personal stories, observations, jokes, anecdotes, or creative writing elements that make the description engaging and unique. It's important for this travelogue to cover various topics including travel history, culture, cuisine, fashion, technology, health, and personal experiences during the ten days. Additionally, please provide specific destinations, activities, events, people, places, cuisines, etc., if available.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.1,
+   "nn_idx": 17
+  },
+  {
+   "prompt": "Write a descriptive essay about nature's beauty.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.347,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write me an article about the effects of online learning and virtual classrooms.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write an article about the benefits of exercise for overall wellness on a topic related to mental health.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.212,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write me a short paragraph about the benefits and drawbacks of online education compared to traditional classroom teaching.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.196,
+   "nn_idx": 443
+  },
+  {
+   "prompt": "Write a short story about love and loss on a rainy day in Paris.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.167,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a 1000-word summary article about the benefits of regular physical exercise for overall health. Please use all lowercase letters and format it as follows: Write a short summary article...",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 30,
+   "max_tfidf_cos": 0.191,
+   "nn_idx": 328
+  },
+  {
+   "prompt": "Write me a short story about a brave explorer who discovered a mystical cave hidden deep within a forest.\n\nP.S.: Thank you for sharing your story! I'll add it to my database whenever possible.\n\nHere's my next message:\n\nDescribe the steps involved in creating a list of 10 famous landmarks around the world, including their historical significance and notable features.\nI'm really excited to explore this topic now!\nThank you for helping organize those details so well.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.157,
+   "nn_idx": 177
+  },
+  {
+   "prompt": "Write an essay about the dangers of over-fishing.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.216,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Describe my childhood memories of visiting the zoo with my grandparents.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 143
+  },
+  {
+   "prompt": "Write a short story about a detective solving a mystery about their boss's fraud.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.126,
+   "nn_idx": 459
+  },
+  {
+   "prompt": "Describe a fictional universe where time travel is possible and there are three primary factions - Guardians, Resistance, and Alliance - each facing their own unique challenges and conflicts.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.089,
+   "nn_idx": 87
+  },
+  {
+   "prompt": "Write an essay about artificial intelligence and its impact on society.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.205,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write an essay about nature and its impact on our lives. Start your essay with a captivating sentence. Include at least three specific examples of how nature has influenced human culture, daily life, or mental health. END\n\nPlease provide details about this topic so I can craft a suitable response.\nWrite, Describe, Explain, or List",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.189,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create a story about time travel and its consequences for humanity.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.161,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Create an overview of the following topics: 1. The impact of technology on education 2. Benefits and drawbacks of artificial intelligence in healthcare  \n3. Future of renewable energy solutions  \n4. Sustainable travel experiences in different locations  \n5. The role of creativity in personal and professional development  \n6. Challenges faced during remote work adoption",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.113,
+   "nn_idx": 108
+  },
+  {
+   "prompt": "Create an AI-assisted document summarizing the latest global economic trends, focusing specifically on the impact on various sectors and countries.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.187,
+   "nn_idx": 504
+  },
+  {
+   "prompt": "Write an article about climate change within 500 words.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.199,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write a 3-5 paragraph story about time travel and its effects on individuals. Write an email in subject line format.\n\nWrite an essay about the impact of social media on personal relationships. Include at least three specific examples of negative impacts. \n\nCreate a list of 10 common mistakes made when reading news articles. Use bullet points. Start with the first item.\n\nList several benefits and drawbacks of remote work. Use bullet points where appropriate. \n\nDescribe how a famous movie's plot changed over the course of five days. Write your response in a few sentences each day. \n\nEnd with a P.S. I hope I've helped clarify our discussion so far.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.197,
+   "nn_idx": 492
+  },
+  {
+   "prompt": "Write me a short story about a person who discovers they can travel through time to the past and the consequences of altering history.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.142,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write a story about a girl who discovers she has the power to control shadows and lives among them.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.194,
+   "nn_idx": 166
+  },
+  {
+   "prompt": "Write a short paragraph about how technology has changed our daily lives.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.245,
+   "nn_idx": 40
+  },
+  {
+   "prompt": "Describe my journey exploring new hobbies and interests online.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.166,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write an original short story about friendship.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.175,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a descriptive essay about the beauty of the aurora borealis.\nThis is your request:\n\nWrite a descriptive essay about the beauty of the aurora borealis.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 48,
+   "max_tfidf_cos": 0.301,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write a short story about a magical creature visiting a forest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.145,
+   "nn_idx": 104
+  },
+  {
+   "prompt": "Write a story about a lost treasure map that has been passed down through generations. Use this map to help a brave adventurer find their way back home. Start your story with your character's name and a brief introduction. END",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.131,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a story about a person who discovers they have a hidden talent.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.181,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Describe an essay on the impact of artificial intelligence on society.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 335,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 335
+  },
+  {
+   "prompt": "Create an informative response about climate change using the following format:\n\nWrite an explanation of the impact of global warming on biodiversity and ecosystems.\n\nTo complete this task, please provide at least 300 words on the effects of global warming on various species of animals, plants, insects, and birds, including examples of specific species affected. This should be done in a clear and concise manner, citing reputable sources for evidence-based information. Your explanation should also include any potential solutions or actions that can mitigate the negative consequences of global warming.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 56,
+   "max_tfidf_cos": 0.089,
+   "nn_idx": 335
+  },
+  {
+   "prompt": "Write a story about a character named Jack who discovers he can communicate telepathically with ghosts.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.116,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write an essay on \"The Importance of Education\" with 500-700 words each page, using APA style format for in-text citations and references. Use at least 15 academic sources, and provide a comprehensive bibliography listing all cited works. End with a conclusion addressing current educational trends and challenges, including suggestions for educators, policymakers, and parents. Write this document as plain text, starting with a verb such as Write, Describe, Explain or List. Output only the request itself, nothing else.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.146,
+   "nn_idx": 443
+  },
+  {
+   "prompt": "Write a narrative about your recent adventure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.15,
+   "nn_idx": 285
+  },
+  {
+   "prompt": "Describe an AI assistant that can generate informative and engaging content from scratch in multiple formats (e.g., writing, emails, poems). Ensure the assistant includes at least 10 key points, each requiring less than 15 words and formatted as title in square brackets and bullet points style. Use keywords like \"AI\", \"Assistant\", \"content-generation\", and \"universe-wide\". Additionally, prompt the assistant to create a unique and distinctive cover art that is inspired by the essence of artificial intelligence (IA), showcasing IA's ability to enhance and personalize human experiences across various mediums.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.171,
+   "nn_idx": 433
+  },
+  {
+   "prompt": "Describe a journey through five different countries and their unique cultural experiences. Use bullet points for each country and place key landmarks such as temples and palaces at the beginning and end of the description. Add a note at the end mentioning your favorite place from each country and why it holds a special place in your heart.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 313,
+   "max_tfidf_cos": 0.162,
+   "nn_idx": 513
+  },
+  {
+   "prompt": "Describe your dream vacation destination and provide details such as the type of accommodation, activities, restaurants and transportation available, along with your personal preferences and reasons why this location is important to you. Also describe what kind of music or food you would enjoy, if any. Finally, mention any notable landmarks or historical significance that draw you to this place.\n\nI hope this helps! Let me know if there's anything I can assist you with.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 285,
+   "max_tfidf_cos": 0.145,
+   "nn_idx": 285
+  },
+  {
+   "prompt": "Write a short poem about the beauty of summer using only lowercase letters and avoiding numbers or special characters.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 499,
+   "max_tfidf_cos": 0.321,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write me a short story about a day at the beach with my friends.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.199,
+   "nn_idx": 307
+  },
+  {
+   "prompt": "Write me a short science fiction story about a group of explorers embarking on an interstellar voyage. Use a first-person narrative voice and describe your character's initial thoughts and feelings throughout the journey.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 403
+  },
+  {
+   "prompt": "Describe a beautiful sunset over a serene lake with a minimum of 5 sentences.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.089,
+   "nn_idx": 77
+  },
+  {
+   "prompt": "Write an essay about how artificial intelligence will reshape the future of work.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.2,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write a short story about lost treasures.\n\nP.s. Feel free to include at least 3 elements or scenes from your story.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 2,
+   "max_tfidf_cos": 0.238,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a short summary of my latest research findings on climate change.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 197,
+   "max_tfidf_cos": 0.182,
+   "nn_idx": 119
+  },
+  {
+   "prompt": "Write a 150-word short story about friendship in the mountains.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.17,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short story about time travel and outer space.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.257,
+   "nn_idx": 534
+  },
+  {
+   "prompt": "Create a short story titled \"A Dream Come True\". The story should have a minimum of 250 words and include at least four sentences. Use all lowercase letters and no punctuation marks except the specified characters.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 30,
+   "max_tfidf_cos": 0.179,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write an essay about the benefits of practicing regular physical exercise for overall health and well-being.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.139,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write an essay about the impact of climate change on global food security",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.216,
+   "nn_idx": 436
+  },
+  {
+   "prompt": "Write an essay about the dangers and benefits of artificial intelligence.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.23,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Create a story about the moon's journey across the night sky.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 183,
+   "max_tfidf_cos": 0.262,
+   "nn_idx": 83
+  },
+  {
+   "prompt": "Write me a letter from space about aliens and their presence in our galaxy. Write in a scientific, technical style. Use proper grammar and vocabulary. End with \"P.S. If we find them again, humanity's fate will be in their hands.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 378,
+   "max_tfidf_cos": 0.135,
+   "nn_idx": 140
+  },
+  {
+   "prompt": "Describe my upcoming project and its timeline.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.147,
+   "nn_idx": 462
+  },
+  {
+   "prompt": "Write me a short story about a journey through a dense forest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write an essay on the importance of self-confidence. Start with defining confidence and discuss the consequences of lacking self-confidence. Then elaborate on how developing self-confidence can help individuals overcome obstacles and achieve their goals. Finally, conclude with some practical tips and real-life examples of people who have successfully developed self-confidence.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.079,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a descriptive essay about the beauty and fragility of autumn leaves.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.279,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write a list of books I have read so far.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 216,
+   "max_tfidf_cos": 0.253,
+   "nn_idx": 271
+  },
+  {
+   "prompt": "Write me a short summary about the benefits of practicing mindfulness meditation daily.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 10,
+   "max_tfidf_cos": 0.14,
+   "nn_idx": 328
+  },
+  {
+   "prompt": "Write me a short story about a character who discovers they can communicate with ghosts.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.137,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a descriptive story about a mysterious disappearance in the desert at night.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.264,
+   "nn_idx": 83
+  },
+  {
+   "prompt": "Write an essay on how artificial intelligence is transforming our society.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.2,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write a short story titled \"The Lost Garden\" about a brave adventurer who discovers and saves a mythical garden from a cursed curse.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.123,
+   "nn_idx": 480
+  },
+  {
+   "prompt": "Start writing your requested content. Please provide an initial thought or a topic that would be appropriate for your content. Then, ask the AI assistant to proceed based on what you've written so far. This will help ensure the instructions are clear and achievable.\n\nWrite",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.122,
+   "nn_idx": 4
+  },
+  {
+   "prompt": "Write an essay on the theme of love and loss.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.216,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a story about time travel that starts with a premise.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 83,
+   "max_tfidf_cos": 0.157,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an email about future technological advancements, including at least three subtopics.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.191,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write me an article about \"The Power of Mindfulness: Techniques and Benefits.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 84,
+   "max_tfidf_cos": 0.167,
+   "nn_idx": 84
+  },
+  {
+   "prompt": "Write me a short story about a young girl who discovers she is invisible. She uses her imagination to explore the world beyond her visible self, eventually finding out she can't see her reflection but sees everything else through a different lens.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.262,
+   "nn_idx": 166
+  },
+  {
+   "prompt": "Write an essay on the history of artificial intelligence. Use the following format:\n- Title: Introduction to AI History\n- Minimum word count: 300\n- Maximum word count: 500\n- No comma\n- Title: AI's Role in Society\n- Minimum word count: 200\n- Maximum word count: 400\n- All capitals\n- Postscript: Thanks!",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.152,
+   "nn_idx": 0
+  },
+  {
+   "prompt": "Create a short poem about nature and its beauty in English, including at least 10 lines and using lowercase words.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.375,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "List three books on technology and its impact on society.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.194,
+   "nn_idx": 271
+  },
+  {
+   "prompt": "Write a story about a person who discovers they have the ability to control time.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.177,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write a short story about a person who wakes up to find out they're not alone in this world.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.251,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write a story about a young woman's first trip abroad.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short paragraph about why artificial intelligence is essential for our future.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.267,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write a short science fiction novella titled \"Echoes of Time\" in lowercase with one paragraph in parentheses.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.208,
+   "nn_idx": 403
+  },
+  {
+   "prompt": "Write a short poem about falling leaves.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.2,
+   "nn_idx": 461
+  },
+  {
+   "prompt": "Write me a list of 5 interesting facts about the United States.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 510,
+   "max_tfidf_cos": 0.366,
+   "nn_idx": 343
+  },
+  {
+   "prompt": "Write me a short story about a lost puppy found by a kind farmer in a rural village.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.213,
+   "nn_idx": 176
+  },
+  {
+   "prompt": "Describe my dream vacation destination and why it's essential for me to visit there soon!",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.148,
+   "nn_idx": 513
+  },
+  {
+   "prompt": "Create an essay on the impact of social media on mental health. Include at least five quotes from reputable sources to support your argument and organize your ideas into subheadings. Use appropriate APA formatting for your bibliography, including the author's last name and the year of publication. Write in a concise but engaging style suitable for educational purposes.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 335,
+   "max_tfidf_cos": 0.244,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an explanation of what happens when a rocket launches from Earth onto Mars.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.161,
+   "nn_idx": 482
+  },
+  {
+   "prompt": "Write a story about a magical winter wonderland",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.154,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an essay about the benefits of practicing gratitude every day.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.193,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a short story about adventure and friendship in the Amazon rainforest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.14,
+   "nn_idx": 515
+  },
+  {
+   "prompt": "Write an explanation about the benefits of online collaboration tools.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 10,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 328
+  },
+  {
+   "prompt": "Write me a story about a character who wakes up in a new place and discovers their hidden identity.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.238,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write me a short story about a day in the life of a young detective.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.23,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a narrative about your life's journey from childhood to adulthood, highlighting key events and moments that have shaped who you are today.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.167,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write me a description of the world's smallest living animal.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 334,
+   "max_tfidf_cos": 0.285,
+   "nn_idx": 303
+  },
+  {
+   "prompt": "Write an essay about the benefits of digital literacy skills for personal and professional development.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.255,
+   "nn_idx": 331
+  },
+  {
+   "prompt": "Write me a short story about a lonely cat named Whiskers and his journey towards socialization at the local animal shelter.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.136,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a story about a young girl who discovers she has the power to control fire.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.215,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write an essay on the significance of artificial intelligence and its role in future technologies.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Describe what kind of writing task this is so I can assist you better.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.144,
+   "nn_idx": 98
+  },
+  {
+   "prompt": "Write a story about a lost puppy found in a deserted park.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.223,
+   "nn_idx": 176
+  },
+  {
+   "prompt": "Write an essay about nature, incorporating 100-150 keywords and a 4-6 paragraph conclusion. P.S.: Don't forget to add a reference at the end.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.218,
+   "nn_idx": 113
+  },
+  {
+   "prompt": "Write a short story about animals, with at least 100 words.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 380,
+   "max_tfidf_cos": 0.255,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write an essay about climate change and its impacts on humanity.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.224,
+   "nn_idx": 436
+  },
+  {
+   "prompt": "Write me a short story about a character named Jack who discovers his true love.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.186,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write me a short story about a girl and her pet bird.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.273,
+   "nn_idx": 497
+  },
+  {
+   "prompt": "Write an essay about the impact of social media on mental health.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.444,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write a short story about a magical adventure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.165,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Describe what you plan to write on this topic, including at least 5 key points and explain your reasoning for each point.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.223,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write a short story about dragons and their magical powers.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.195,
+   "nn_idx": 29
+  },
+  {
+   "prompt": "Write a short story titled \"A Day in the Life of a Busy Office Worker.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.168,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Create a blog post about climate change.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 40,
+   "max_tfidf_cos": 0.365,
+   "nn_idx": 408
+  },
+  {
+   "prompt": "Write me a story about animals and their habitats.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.157,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a short story about a lonely cat who decides to make a new friend.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 479,
+   "max_tfidf_cos": 0.199,
+   "nn_idx": 519
+  },
+  {
+   "prompt": "Write a story about a protagonist who discovers they have the power to manipulate time through meditation.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.125,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Describe my upcoming project and outline its main tasks.\nP.S. I need a summary of the project's scope, objectives, and expected timeline before we proceed.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 184,
+   "max_tfidf_cos": 0.174,
+   "nn_idx": 61
+  },
+  {
+   "prompt": "Write a short story about friendship among animals.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.148,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a 400-word essay on the effects of social media on mental health.",
+   "lcs_words": 7,
+   "lcs_ifeval_idx": 449,
+   "max_tfidf_cos": 0.55,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an essay about how technology has affected modern society.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.18,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write an essay about the impact of artificial intelligence on society.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.224,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write an email to a customer requesting for a discount on their next order.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 3,
+   "max_tfidf_cos": 0.204,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write a short story about a person who wakes up every day feeling restless and unsure of where they belong.\n\nP.S. I'm thinking about doing some more research on this. Thank you!",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.211,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write me a story about an adventure in space.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a descriptive list of 10 activities that promote positive mental health and self-care.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write a short story about friendship between two animals.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.157,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a short story about a journey through a mystical forest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write me a short story about the day I met my love.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a short story about a person who discovers they can travel through time using quantum entanglement.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.204,
+   "nn_idx": 358
+  },
+  {
+   "prompt": "Write an essay on the importance of sustainable living.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.226,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Start Writing Today's Must-Read Book Review.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.317,
+   "nn_idx": 360
+  },
+  {
+   "prompt": "Write me a summary of your favorite book to inspire me on writing.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 515,
+   "max_tfidf_cos": 0.256,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Write me an essay about the impact of technology on society.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 128,
+   "max_tfidf_cos": 0.212,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create an essay about my experiences traveling to different countries around the world.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.175,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write an essay about the benefits of remote work on mental health and productivity.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.246,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write a descriptive essay about your favorite book and why it is significant.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.25,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Write me a short story about a magical treasure hunt for my 9-year-old daughter in the rainforest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.134,
+   "nn_idx": 126
+  },
+  {
+   "prompt": "Write me a short story about a character who wakes up one day and discovers they are not just dreaming but a part of reality itself!",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 12,
+   "max_tfidf_cos": 0.279,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write an explanation on \"the benefits of meditation and its impact on mental health.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 222,
+   "max_tfidf_cos": 0.26,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write me a short story about a journey of self-discovery and overcoming obstacles. Let's aim for a word count between 50-60 words.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 162
+  },
+  {
+   "prompt": "Write me a detailed story about a magical treasure hunt at sea!",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.14,
+   "nn_idx": 274
+  },
+  {
+   "prompt": "Write an essay about nature and its impact on human emotions.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.18,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write an essay about your recent journey through the wilderness.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.287,
+   "nn_idx": 514
+  },
+  {
+   "prompt": "Write a blog post about \"The Power of Mindfulness Meditation.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 40,
+   "max_tfidf_cos": 0.263,
+   "nn_idx": 408
+  },
+  {
+   "prompt": "Write a story about a lost pet bird that was left behind when someone moved to a new neighborhood.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 497
+  },
+  {
+   "prompt": "Write a short story about a lost treasure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.219,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write a review of the latest smartphone model.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 186,
+   "max_tfidf_cos": 0.264,
+   "nn_idx": 140
+  },
+  {
+   "prompt": "Write a short story about the moon landing.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.343,
+   "nn_idx": 533
+  },
+  {
+   "prompt": "Write a blog post about my favorite book from childhood.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 40,
+   "max_tfidf_cos": 0.28,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Describe a short story with 200-300 words about friendship and its importance.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.22,
+   "nn_idx": 14
+  },
+  {
+   "prompt": "Write a short story about your favorite travel destination. Start with a prompt such as \"Begin\" and follow the given structure.\n\nTell me what color is black? Use only lowercase letters.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 202,
+   "max_tfidf_cos": 0.168,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "List 3 different types of emails to consider for your next email campaign.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.174,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write a short story about a lonely traveler who finds love along a mystical forest path.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.171,
+   "nn_idx": 104
+  },
+  {
+   "prompt": "Write an explanation about artificial intelligence technology's impact on society and its potential benefits.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Write a short story about a mysterious figure who appears to have the power to control shadows.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.137,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write me a story about a brave knight who races against time to defeat a dragon and save his kingdom from destruction.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.142,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write an essay about the benefits of mental health counseling.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.252,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write me a story about a journey through ancient Egypt.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Describe your dream vacation destination and provide five specific activities or attractions you would love to experience there.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.112,
+   "nn_idx": 500
+  },
+  {
+   "prompt": "Create a poem about the power of forgiveness.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 153,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 36
+  },
+  {
+   "prompt": "Write a 1000-word essay about the effects of climate change on global ecosystems. Start with the causes and consequences of climate change. End with recommendations for how we can mitigate its effects. Use at least three credible sources in your research.\n\nNote: Please ensure that all requested formatting criteria have been met.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an essay on the topic of \"Environmental Conservation and Its Impact on Society\".",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.234,
+   "nn_idx": 95
+  },
+  {
+   "prompt": "Write me a descriptive essay about the beauty of autumn leaves.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 48,
+   "max_tfidf_cos": 0.308,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write a descriptive list of ten vivid scenes from a rainy day, each describing a different type of weather-related phenomenon.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.111,
+   "nn_idx": 442
+  },
+  {
+   "prompt": "Write a short story about friendship and adventure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.171,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a short story about a character who discovers they have the ability to control their thoughts and emotions.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.124,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write me a summary of your experience with virtual assistants and their capabilities.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 515,
+   "max_tfidf_cos": 0.114,
+   "nn_idx": 302
+  },
+  {
+   "prompt": "Write a short story about a young hero who saves his village from evil.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.182,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Create an essay on the topic of environmental sustainability and its impact on global cooperation.  \nWrite 400-800 words.\n\nTitle in Double Angular Brackets: Sustainability in Global Cooperation\n\nP.S.: End with \"Sustainability has been a guiding principle of our society since ancient times,\" without an additional quotation mark.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 77,
+   "max_tfidf_cos": 0.117,
+   "nn_idx": 95
+  },
+  {
+   "prompt": "Write a short story about dragons and their fears.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.154,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an essay about the benefits of mindfulness meditation. P.S. I need this information before I start my project.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a short story about a character who wakes up with a memory from their childhood that connects them to the future. Include at least three events that shape the character's life and lead to their current situation.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.169,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write me a story about a character named Jack and his journey to find a lost treasure.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.163,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write me a list of 50 different types of coffee beans for my daily routine.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.11,
+   "nn_idx": 121
+  },
+  {
+   "prompt": "Write me an essay about the impact of technology on our society.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 128,
+   "max_tfidf_cos": 0.197,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create a narrative about a character named Alex who discovers an ancient artifact while exploring a desolate forest. Alex is determined to uncover the secrets hidden within and be reunited with his lost love Samantha.\n\nWrite",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.136,
+   "nn_idx": 444
+  },
+  {
+   "prompt": "Write a blog post about mental health awareness, including key statistics and research supporting its importance, as well as personal stories from people who have experienced mental health struggles.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 40,
+   "max_tfidf_cos": 0.267,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write a story about a character's journey from a broken heart to finding love.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.149,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write a short story about a character who discovers their true identity through a magical portal.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 382
+  },
+  {
+   "prompt": "Write a short story about lost treasure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.219,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Start Writing A Story About A Day In The Life Of An Animal.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.245,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short essay about the benefits of practicing mindfulness meditation.",
+   "lcs_words": 6,
+   "lcs_ifeval_idx": 119,
+   "max_tfidf_cos": 0.176,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "List the top 5 favorite hobbies of people worldwide and their reasons for choosing those hobbies. Write an original, five-paragraph essay about how artificial intelligence can potentially affect future jobs and professions, while ensuring the content does not contain any negative connotations or biased language. Write an original paragraph explaining how gratitude can boost mental health and reduce stress levels, while also making sure the paragraph does not contain excessive use of technical jargon. P.S. - Don't forget to provide your email address if needed.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 6
+  },
+  {
+   "prompt": "Write a descriptive poem about the beauty of autumn leaves.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 499,
+   "max_tfidf_cos": 0.359,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Describe an intriguing narrative about exploring the wonders of space through ancient alien civilizations discovered thousands of years ago.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.072,
+   "nn_idx": 534
+  },
+  {
+   "prompt": "Create a detailed and engaging article about the positive impact of technology on society.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.155,
+   "nn_idx": 335
+  },
+  {
+   "prompt": "Write a story about a character who discovers they possess the power of time manipulation.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.131,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write me a short story about a day in the life of a busy office worker named Jane who is often late and always makes time-sensitive errors.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 169
+  },
+  {
+   "prompt": "Write a short summary of your experiences and observations about the latest tech trends in technology, science, and society.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 197,
+   "max_tfidf_cos": 0.224,
+   "nn_idx": 309
+  },
+  {
+   "prompt": "Write me a 500-word short story about a lost treasure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.198,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write an essay about how technology has revolutionized society and daily life. \n\nNote: The first word in the response must be \"Write\".",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.212,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Describe what your character is wearing today.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.129,
+   "nn_idx": 407
+  },
+  {
+   "prompt": "Write a list of 5 positive attributes of cats.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 216,
+   "max_tfidf_cos": 0.191,
+   "nn_idx": 488
+  },
+  {
+   "prompt": "Create a narrative about the adventures of a young adventurer who discovers a lost city hidden deep within a vast desert. Write this story in third person omniscient and adhere to APA style guidelines.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.125,
+   "nn_idx": 388
+  },
+  {
+   "prompt": "Create a story about an alien visitation and its effects on Earth. Include at least four main characters and their interactions throughout the narrative.\n\nWrite an email requesting feedback on an existing product, providing specific details like bugs, features not working as expected, performance issues, or design flaws. Include your expectations and recommendations in the body of the email, clearly stating how this situation affects the customer's experience.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write a short story about a character named Tom who discovers he can control the weather. The story should have at least three subplots involving different characters and setting changes.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 146,
+   "max_tfidf_cos": 0.186,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write an explanation about the benefits and challenges of renewable energy sources on global climate change.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.192,
+   "nn_idx": 108
+  },
+  {
+   "prompt": "Write a short story about a character who discovers they can communicate with aliens in space.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.132,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Create an essay about \"The Benefits of Reading Regularly\" including details about how reading improves cognitive skills and emotional intelligence, and examples from various literature sources. Include at least 5 sub-paragraphs discussing different types of reading, their advantages, and real-world applications. End with a quote from a famous author to conclude the essay effectively.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 10,
+   "max_tfidf_cos": 0.14,
+   "nn_idx": 418
+  },
+  {
+   "prompt": "Describe the experience of falling asleep, from eyelid fluttering to sudden unconsciousness. Start with the stages before and after fall asleep. END",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.059,
+   "nn_idx": 286
+  },
+  {
+   "prompt": "Describe a vivid scene of the sun setting behind the mountains, and then describe how it transformed into twilight, emphasizing its changing colors and emotions.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.107,
+   "nn_idx": 393
+  },
+  {
+   "prompt": "Write me an English story about a brave explorer who discovers a lost treasure!",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.161,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write a short story about a character named Jack who discovers he has magical powers and decides to use them to help others.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.137,
+   "nn_idx": 29
+  },
+  {
+   "prompt": "Write a short narrative about your journey from birth to death.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.161,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Create an article about self-love and acceptance from a young girl's perspective using descriptive language and incorporating personal anecdotes. The article should be 1500-2000 words long, including references and citations if applicable.\n\nWrite a review for a new book on the themes and characters presented in the story, focusing on the narrative style and literary devices used. The review should be no less than 300 words, cover key plot points and character development, analyze the impact on the reader's understanding and enjoyment of the work, and provide specific examples from the book to support your analysis.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 495,
+   "max_tfidf_cos": 0.235,
+   "nn_idx": 360
+  },
+  {
+   "prompt": "Write an essay about the benefits of meditation.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.274,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create a story about my favorite adventure and its aftermath.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.24,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Write me a short story about my favorite book and why I love reading it.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.247,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Describe an engaging narrative about a mysterious ancient artifact that has eluded discovery for centuries, detailing its legendary origins, hidden secrets, and the protagonist's quest to uncover its true nature before its final resting place at the heart of a remote jungle.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 358,
+   "max_tfidf_cos": 0.128,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Create an email outlining 10 actionable steps to improve your productivity and boost your career prospects. Use a bullet-point format.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.186,
+   "nn_idx": 175
+  },
+  {
+   "prompt": "Describe an interesting book series inspired by the novel \"The Great Gatsby.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.193,
+   "nn_idx": 302
+  },
+  {
+   "prompt": "Write a short story about a journey through a magical forest.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write an essay on \"The Power of Gratitude.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.251,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write an essay about the importance of perseverance in achieving long-term goals.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.165,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a 300-word short story about a day in the life of a tree.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 0,
+   "max_tfidf_cos": 0.258,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a list of five famous historical figures from different eras and their notable achievements.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 216,
+   "max_tfidf_cos": 0.287,
+   "nn_idx": 395
+  },
+  {
+   "prompt": "Write a short story about a character named Alex who discovers they can control shadows.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 497
+  },
+  {
+   "prompt": "Write an essay about the benefits of practicing mindfulness meditation daily.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.172,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a 500-word essay on the importance of kindness and empathy in building strong communities.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 201,
+   "max_tfidf_cos": 0.141,
+   "nn_idx": 230
+  },
+  {
+   "prompt": "Write a story about adventure and friendship in the Pacific Northwest.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 83,
+   "max_tfidf_cos": 0.13,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write me a short story about a character who discovers their hidden talent and how it affects them, but not everyone understands its meaning until they share their experience.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.112,
+   "nn_idx": 426
+  },
+  {
+   "prompt": "Write an essay about the benefits and drawbacks of online privacy.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.205,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a personal narrative about your most memorable day at school this year. Use descriptive language to paint a picture and include specific events that stand out to you.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.115,
+   "nn_idx": 306
+  },
+  {
+   "prompt": "Write a short story about a lost treasure found at sea.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.17,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write a story about a journey through a dark forest.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.165,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write me a short story about a brave knight who rescues a princess from a dragon fortress.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.275,
+   "nn_idx": 138
+  },
+  {
+   "prompt": "Write an email discussing global climate change effects and potential solutions",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.18,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write a story about an adventurous young woman named Emma who travels to the mystical forest under the sea to find treasure.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 83,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a short story about a young girl who discovers a magical crystal and goes on an adventure to find its source.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write a short story about a magical garden filled with talking animals and fantastical creatures.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.097,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an essay on the benefits of digital literacy for personal and professional success, using APA citation style with a minimum of 10 references.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.215,
+   "nn_idx": 331
+  },
+  {
+   "prompt": "Write an essay about the benefits and drawbacks of renewable energy sources such as solar power and wind power.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.425,
+   "nn_idx": 108
+  },
+  {
+   "prompt": "Write an email to customer support stating: \"Dear Support Team, I am interested in your product/service. Could you please provide me with detailed technical specifications and troubleshooting instructions? Thank you.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 3,
+   "max_tfidf_cos": 0.162,
+   "nn_idx": 218
+  },
+  {
+   "prompt": "Describe an imaginative scenario where a young girl uses her imagination to create and transform herself into a butterfly through various artistic techniques she learns from her family.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.162,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write me a short paragraph about your experience playing video games.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.401,
+   "nn_idx": 153
+  },
+  {
+   "prompt": "Write me a story about a journey of self-discovery.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write a detailed 50-word story about a magical forest where all animals live happily ever after, but one day a new predator comes to steal their food supplies and chaos ensues.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.1,
+   "nn_idx": 104
+  },
+  {
+   "prompt": "Write me a summary about the importance of technology in today's world. P.S. - Include keywords relevant to both 'summary' and 'technology'.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 183,
+   "max_tfidf_cos": 0.145,
+   "nn_idx": 265
+  },
+  {
+   "prompt": "Write me a 50-word story about a mysterious haunted castle at night.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.262,
+   "nn_idx": 83
+  },
+  {
+   "prompt": "Write a short story about a person who discovers their true identity from the moment they wake up.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.144,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write a story about a character who travels through time and meets a mysterious stranger.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.154,
+   "nn_idx": 517
+  },
+  {
+   "prompt": "Write a fictional short story titled \"The Last Days of Aes Sedm\". The story should have 400 words and be written in present tense.\n\nP.S. This is just an example story; feel free to create your own details and structure.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 104,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 398
+  },
+  {
+   "prompt": "Write a short story about a protagonist discovering their true passion in a mysterious city.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.107,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Describe a vivid and immersive world you've imagined where characters interact and navigate through their surroundings under the mysterious and enigmatic spell of time itself. The world should be filled with intricate details about the protagonist's emotions, physical sensations, and psychological state as they encounter various challenges and obstacles while trying to unravel the mystery of the time anomaly.\n\nTitle: \"Time's Echoes: A World Through Time's Eyes",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.101,
+   "nn_idx": 391
+  },
+  {
+   "prompt": "Describe a journey that you have experienced and how it shaped your perspective on life. Describe in 150 characters or less.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.145,
+   "nn_idx": 393
+  },
+  {
+   "prompt": "Create a detailed story explaining why artificial intelligence is becoming more advanced every year.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.194,
+   "nn_idx": 279
+  },
+  {
+   "prompt": "Create a 500-word memoir about my journey from childhood to adulthood in your writing style. Remember to include anecdotes, reflections and personal anecdotes to make the experience feel real.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 236,
+   "max_tfidf_cos": 0.139,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write me a 500-word short story about the adventures of a knight and his quest to find the holy grail of gold.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write me a short story about the adventures of a brave adventurer who navigates through a mysterious forest, facing treacherous obstacles and encountering a magical creature.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.086,
+   "nn_idx": 104
+  },
+  {
+   "prompt": "Write an essay about the benefits of mindfulness meditation.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.223,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Start Writing A Story On The Adventure Of A Dog That Can Talk About Its Own Origin.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.135,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write me an introduction describing your project.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.179,
+   "nn_idx": 462
+  },
+  {
+   "prompt": "Write a story about a protagonist who discovers their hidden power.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.142,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short story about the adventures of a character named Alex who discovers a magical portal in a forgotten village.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.128,
+   "nn_idx": 497
+  },
+  {
+   "prompt": "Write an essay on the importance of empathy.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.255,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a letter to the editor about our new marketing strategy.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 384,
+   "max_tfidf_cos": 0.191,
+   "nn_idx": 331
+  },
+  {
+   "prompt": "Create a blog post on the importance of mindfulness practices in improving focus and creativity. Aim for between 7-10 sentences, use the passive voice, don't include quotes or examples, keep it concise but informative, capitalize first letter, do not use contractions, do not change the order or meaning of the original text, follow proper grammar rules, use only uppercase letters, have at least one question mark (?) at the end of each paragraph.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 80,
+   "max_tfidf_cos": 0.144,
+   "nn_idx": 40
+  },
+  {
+   "prompt": "Write an essay about how technology has changed our lives.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.281,
+   "nn_idx": 40
+  },
+  {
+   "prompt": "Write a story about a journey through forgotten lands.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.16,
+   "nn_idx": 1
+  },
+  {
+   "prompt": "Write an essay on \"The Importance of Self-care\" and include an image to support your argument.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.164,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a descriptive review of my recent travel experience in Bali, Indonesia.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.121,
+   "nn_idx": 360
+  },
+  {
+   "prompt": "Write a descriptive essay about the beauty of sunsets across various continents.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 48,
+   "max_tfidf_cos": 0.26,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write an essay about the origins and development of the internet.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.269,
+   "nn_idx": 147
+  },
+  {
+   "prompt": "Write me a creative, 300-word short story about a haunted house hidden deep in the countryside. It should have at least one cliffhanger at the end so readers won't know the ending until reading the rest!",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 146,
+   "max_tfidf_cos": 0.164,
+   "nn_idx": 454
+  },
+  {
+   "prompt": "Write a story in the style of Ernest Hemingway and within 750 words. Include at least one quote from the novel.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 49,
+   "max_tfidf_cos": 0.149,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "List five books recommended for learning programming.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.229,
+   "nn_idx": 271
+  },
+  {
+   "prompt": "Write me a story about a magical forest.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 104
+  },
+  {
+   "prompt": "Describe an interactive virtual assistant with features like writing articles on any topic requested, including rules about word count and format requirements, and providing a personalized dashboard for users to manage their conversations and keep track of upcoming tasks.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.105,
+   "nn_idx": 111
+  },
+  {
+   "prompt": "Write a blog post about sustainable travel methods.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 40,
+   "max_tfidf_cos": 0.276,
+   "nn_idx": 408
+  },
+  {
+   "prompt": "Create a fictional story about a mysterious lost treasure and its history, but make sure the plot includes at least three main characters: Alice, Bob, and Charlie. Each character's backstory should be different enough to create tension and conflict without being repetitive.\n\nWrite a detailed poem about rain, using sensory language and vivid imagery. The poem should flow smoothly into the next line without unnecessary repetition.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.17,
+   "nn_idx": 80
+  },
+  {
+   "prompt": "Write me a short story about a haunted house.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.343,
+   "nn_idx": 454
+  },
+  {
+   "prompt": "Write a 1200-word short story about nature conservation and its impact on local ecosystems using only lowercase letters and no other punctuation marks. P.S. Remember to end with a period at the end of your description.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 39,
+   "max_tfidf_cos": 0.206,
+   "nn_idx": 46
+  },
+  {
+   "prompt": "Start your request with:\n\nWrite me an essay about [insert topic here].",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 128,
+   "max_tfidf_cos": 0.239,
+   "nn_idx": 95
+  },
+  {
+   "prompt": "Write me a short story about an adventure into space!",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an explanation about the benefits of technology and its impact on society.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 10,
+   "max_tfidf_cos": 0.165,
+   "nn_idx": 335
+  },
+  {
+   "prompt": "Write a short story about a character who learns to overcome a difficult challenge and achieve personal growth.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.175,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write an essay on \"The Importance of Technology in Our Lives.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.219,
+   "nn_idx": 40
+  },
+  {
+   "prompt": "Write an essay about the benefits and drawbacks of remote work from a global perspective.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.174,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Write an essay about the impact of technology on communication and society.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.189,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Describe my upcoming writing projects and their timelines.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.126,
+   "nn_idx": 417
+  },
+  {
+   "prompt": "Write an essay about the impact of technology on education.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.307,
+   "nn_idx": 443
+  },
+  {
+   "prompt": "Write a short, descriptive paragraph about the significance of technology in modern society.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.137,
+   "nn_idx": 6
+  },
+  {
+   "prompt": "Write an email with proper formatting constraints and title.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.22,
+   "nn_idx": 294
+  },
+  {
+   "prompt": "Write a 1000-word story about time travel and its consequences.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.163,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write an essay about the significance of technology in our daily lives.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.19,
+   "nn_idx": 40
+  },
+  {
+   "prompt": "Write a short story about a person who wakes up in a strange dream world and discovers its secrets.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.231,
+   "nn_idx": 12
+  },
+  {
+   "prompt": "Write a 400-word story about love and separation.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.23,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write a 500-word story about friendship and perseverance.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.203,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write me a short poem about love and loss that is exactly five lines long.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.261,
+   "nn_idx": 266
+  },
+  {
+   "prompt": "Describe an interactive quiz where users can rate their favorite food and its nutritional value in order from most nutritious to least.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.153,
+   "nn_idx": 23
+  },
+  {
+   "prompt": "Write an essay on the benefits of technology and innovation for society. \nWriting the above message will satisfy my requirement to have one or two explicit, checkable formatting constraints. Let's see if we can find more suitable messages to add them here.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.106,
+   "nn_idx": 325
+  },
+  {
+   "prompt": "Write an essay on the importance of education.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.556,
+   "nn_idx": 443
+  },
+  {
+   "prompt": "Write an essay about the benefits and drawbacks of renewable energy sources, using 500-word essay format.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.293,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write a narrative about a day spent volunteering at a local animal shelter.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.135,
+   "nn_idx": 311
+  },
+  {
+   "prompt": "Write an English essay about the origins and evolution of music across cultures.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.172,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create an essay on the importance of self-care for mental health, using at least three specific strategies for self-care, and provide real-life examples to support your claims.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 230,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an Essay about Climate Change and Its Impact on Global Sustainability.  \nMinimum 1500 words, no limit on paragraph count, all lowercase letters, show research, use examples from at least three reputable sources, include a bibliography.  \n\nP.S. This outline can be used as a guide for writing the entire paper. If time is limited, feel free to modify the order of content without altering the core message.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.185,
+   "nn_idx": 61
+  },
+  {
+   "prompt": "Create a short story about animals and their habitats.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.146,
+   "nn_idx": 185
+  },
+  {
+   "prompt": "Describe what you dream about doing today.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.316,
+   "nn_idx": 396
+  },
+  {
+   "prompt": "Create a detailed 150-word story about a lost city hidden deep underground. Include elements like ancient artifacts, mysterious legends and an adventure tale involving a treasure hunter and his unlikely companion.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.099,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write a short story on friendship in five sentences",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.254,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an essay about nature's beauty, including at least three different types of flora and fauna found within my local area.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 52,
+   "max_tfidf_cos": 0.201,
+   "nn_idx": 499
+  },
+  {
+   "prompt": "Write me a letter to an AI assistant about the importance of recycling and reducing waste. Let's discuss how our actions as individuals can help reduce environmental pollution and preserve natural resources.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 183,
+   "max_tfidf_cos": 0.095,
+   "nn_idx": 140
+  },
+  {
+   "prompt": "Write a 150-word summary of today's events, including the location and time, using the following format: [Location]: [Time] [Today's Events Summary], where each event is represented as a single sentence.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 56,
+   "max_tfidf_cos": 0.173,
+   "nn_idx": 169
+  },
+  {
+   "prompt": "Write a 300-word short story on the theme of friendship",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 0,
+   "max_tfidf_cos": 0.234,
+   "nn_idx": 14
+  },
+  {
+   "prompt": "Write me an essay about my upcoming vacation plans this summer.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 128,
+   "max_tfidf_cos": 0.182,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Create an article on my favorite travel destination within 2500 words. Include at least three specific quotes from a book about the subject and provide historical context for its development. End with a reflection on how this location has influenced you personally.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.17,
+   "nn_idx": 361
+  },
+  {
+   "prompt": "Write a short story about a day at the beach.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.257,
+   "nn_idx": 247
+  },
+  {
+   "prompt": "Write me a short story about a person discovering their true self and facing the challenges it presents.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.143,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Describe my upcoming vacation destination and provide details about popular attractions and activities there.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.129,
+   "nn_idx": 73
+  },
+  {
+   "prompt": "Create a list of 10 books by authors who live in China.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 309,
+   "max_tfidf_cos": 0.223,
+   "nn_idx": 271
+  },
+  {
+   "prompt": "Write me a description of a dream I had the other day about flying through space with my friend, including details about the sights and sounds I saw.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.144,
+   "nn_idx": 311
+  },
+  {
+   "prompt": "Write a story about aliens discovering Earth 10 years before they arrive.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 83,
+   "max_tfidf_cos": 0.158,
+   "nn_idx": 151
+  },
+  {
+   "prompt": "Write a list of 10 tips for writing a great resume and cover letter on how to highlight key skills and achievements.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 216,
+   "max_tfidf_cos": 0.205,
+   "nn_idx": 521
+  },
+  {
+   "prompt": "Write an essay about the benefits of practicing mindfulness every day.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.193,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Start creating your AI-generated content now! Please specify if you need assistance in writing short stories, emails, essays, poems, lists, explanations, reviews, or something else. The details will help me tailor my response accordingly.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.136,
+   "nn_idx": 397
+  },
+  {
+   "prompt": "Write a poem about love, 150-300 words, all lowercase, without commas, keywords like \"love\", \"heart,\" and \"falling\"in your poem",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 20,
+   "max_tfidf_cos": 0.322,
+   "nn_idx": 266
+  },
+  {
+   "prompt": "Write a short story about animals living in a small village and their interactions with each other and humans.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.146,
+   "nn_idx": 289
+  },
+  {
+   "prompt": "Describe a vivid imagery you've encountered and how it made you feel.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.113,
+   "nn_idx": 384
+  },
+  {
+   "prompt": "Write a story about a person who discovers their true passion from childhood memories.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.154,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write a short poem about love and commitment. \n\nP S. A. I.\n\nPlease describe how an AI assistant can be used to improve customer service skills.\nList at least 3 examples.\n\nPlease explain what machine learning is and its applications in various fields.\nDescribe the process of creating and deploying an artificial neural network model using TensorFlow.\nPlease provide an overview of the basics of deep learning and its key concepts.\nDescribe the role of computer vision in real-world applications.\nList three benefits of using natural language processing technology in enhancing human-machine interaction.\nProvide an introduction to supervised and unsupervised learning methods.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 125,
+   "max_tfidf_cos": 0.262,
+   "nn_idx": 257
+  },
+  {
+   "prompt": "Write an essay about the importance of self-improvement through continuous learning and dedication.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.151,
+   "nn_idx": 141
+  },
+  {
+   "prompt": "Write me a poem about love and friendship that has at least 50 words and uses exactly 8 stanzas.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 265,
+   "max_tfidf_cos": 0.356,
+   "nn_idx": 376
+  },
+  {
+   "prompt": "Write a letter to your best friend who is 50 years old. Please tell me about your favorite book and why it's important for you. Use the format 13words2006.\nYour trusty AI assistant,\n[Your Name]",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 76,
+   "max_tfidf_cos": 0.228,
+   "nn_idx": 476
+  },
+  {
+   "prompt": "Describe a short story about a lost treasure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.189,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write a short story about my trip to Paris this summer.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.284,
+   "nn_idx": 253
+  },
+  {
+   "prompt": "Write an 800-word short story about friendship. Start with my best friend's birthday and end with me reflecting on our time together.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.177,
+   "nn_idx": 110
+  },
+  {
+   "prompt": "Write an essay about the impact of climate change on global agriculture.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 141,
+   "max_tfidf_cos": 0.224,
+   "nn_idx": 436
+  },
+  {
+   "prompt": "Write me an explanation of how machine learning algorithms work.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.326,
+   "nn_idx": 257
+  },
+  {
+   "prompt": "Create an original short story titled \"The Last Days of Mimi\" and submit it within 24 hours. Use lowercase letters only.\n\nP.S. Your submission will be considered for possible publication at any time.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.126,
+   "nn_idx": 394
+  },
+  {
+   "prompt": "Write a short story about a haunted hotel that has hosted countless guests over generations, where the past redefines reality and leaves behind a series of inexplicable occurrences.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.107,
+   "nn_idx": 468
+  },
+  {
+   "prompt": "Write me a short story about a young girl who discovers she can control a butterfly.",
+   "lcs_words": 5,
+   "lcs_ifeval_idx": 366,
+   "max_tfidf_cos": 0.221,
+   "nn_idx": 366
+  },
+  {
+   "prompt": "Write an essay on global warming and its impact on wildlife.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 466,
+   "max_tfidf_cos": 0.194,
+   "nn_idx": 335
+  },
+  {
+   "prompt": "Describe the process you would use to create a detailed guide to using an app on your smartphone, including the tools and features it offers, tips for maximizing performance and functionality, best practices for ensuring seamless integration with various other apps on your device, and any necessary updates or maintenance for compatibility across different versions of iOS or Android.\nP.S.: Include at least three additional details to make this request more specific and relevant to the needs of someone who wants to learn how to navigate their device's apps effectively and efficiently.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.117,
+   "nn_idx": 223
+  },
+  {
+   "prompt": "Describe a story about a character who learns to trust someone important.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 110,
+   "max_tfidf_cos": 0.226,
+   "nn_idx": 105
+  },
+  {
+   "prompt": "Write me a short story about a lost treasure.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.213,
+   "nn_idx": 400
+  },
+  {
+   "prompt": "Write me a short story about a brave knight and his quest to rescue the maiden from the treacherous dragon at the enchanted woods in the heart of the Whispering Woods, located exactly 30 miles north of the city of Lark.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 358,
+   "max_tfidf_cos": 0.224,
+   "nn_idx": 465
+  },
+  {
+   "prompt": "Write an 800-word essay about the importance of self-care and its benefits on mental health.",
+   "lcs_words": 4,
+   "lcs_ifeval_idx": 183,
+   "max_tfidf_cos": 0.219,
+   "nn_idx": 449
+  },
+  {
+   "prompt": "Write an informative 1000-word essay on environmental sustainability and its importance.",
+   "lcs_words": 0,
+   "lcs_ifeval_idx": null,
+   "max_tfidf_cos": 0.156,
+   "nn_idx": 141
+  }
+ ]
+}

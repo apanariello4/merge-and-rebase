@@ -1,0 +1,63 @@
+{
+    "method": {
+        "name": "anchors",
+        "params": {
+            "anchor_pool": "wikitext103",
+            "num_anchors": 65536,
+            "anchor_batches": 256,
+            "registration_batches": 12,
+            "pool_seed": 0,
+            "anchor_seed": 0,
+            "frame_map": "pairwise",
+            "library": "data",
+            "num_batches": 20,
+            "seed": 0,
+            "missing_bias": "materialize",
+            "synthesis": "ridge",
+            "depth_fit": "sequential",
+            "state_dir": "/data/merge_and_rebase_results/metodoK_llm_rt_20261118/state/llama32_3b_wikitext103train_k16_T65536",
+            "spectral_filter": "tikhonov",
+            "kernel_decode": "canonical_soft",
+            "canonical_soft_weights": "heldout",
+            "anchor_sampling": "k_per_document",
+            "anchor_tokens_per_image": 16
+        }
+    },
+    "anchors_pool": {
+        "min_chars": 300,
+        "max_length": 128,
+        "batch_size": 16,
+        "seed": 0,
+        "split": "train"
+    },
+    "alpha": {
+        "value": 1.0,
+        "search": false
+    },
+    "source_model_name_or_path": "meta-llama/Llama-3.2-3B",
+    "target_model_name_or_path": "meta-llama/Llama-3.2-3B",
+    "model_kind": "causal_lm",
+    "model_arch": "llama",
+    "tuned_bodies": {
+        "math": "MergeBench/Llama-3.2-3B_math"
+    },
+    "seed": 0,
+    "harness_tasks": [
+        "gsm8k"
+    ],
+    "harness_num_fewshot": 5,
+    "harness_batch_size": 8,
+    "calibration_batch_size": 2,
+    "calibration_max_length": 256,
+    "device": "cuda",
+    "dtype": "bf16",
+    "source_task_models_on_cpu": true,
+    "eval_before_rebase": false,
+    "save_transported_tvs_dir": "/data/merge_and_rebase_results/metodoK_llm_rt_20261118/tvs/LRT_kern65k_seq_mathprompt40b2",
+    "logging": {
+        "use_wandb": false,
+        "local_log_dir": "/home/fillo/merge-and-rebase/results/metodoK_llm_rt_20261118/logs",
+        "run_name": "LRT_kern65k_seq_mathprompt40b2"
+    },
+    "calibration_prompts": "/data/merge_and_rebase_results/metodoK_ifeval_synth_20261119/calib/llama_mathprompt_40.json"
+}

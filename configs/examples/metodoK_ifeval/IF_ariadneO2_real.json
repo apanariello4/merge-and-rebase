@@ -1,0 +1,68 @@
+{
+ "method": {
+  "name": "anchors",
+  "params": {
+   "anchor_pool": "wikitext103",
+   "num_anchors": 4096,
+   "anchor_batches": 4,
+   "registration_batches": 12,
+   "pool_seed": 0,
+   "anchor_seed": 0,
+   "library": "data",
+   "num_batches": 10,
+   "seed": 0,
+   "missing_bias": "materialize",
+   "ridge_estimator": "fixed_relative",
+   "ridge_relative": 0.01,
+   "state_dir": "/data/merge_and_rebase_results/metodoK_ifeval_synth_20261119/state/qwen25_05b_15b_wikitext103_T4096_bridge",
+   "frame_map": "pairwise",
+   "rescale_target": false,
+   "spectral_filter": "procrustes_cross",
+   "map_rows": "task",
+   "synthesis": "ridge_preserve",
+   "rho_g": 0.1
+  }
+ },
+ "anchors_pool": {
+  "min_chars": 600,
+  "max_length": 128,
+  "batch_size": 16,
+  "seed": 0
+ },
+ "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+ "target_model_name_or_path": "Qwen/Qwen2.5-1.5B",
+ "model_kind": "causal_lm",
+ "model_arch": "qwen",
+ "tuned_bodies": {
+  "it": "Qwen/Qwen2.5-0.5B-Instruct"
+ },
+ "seed": 0,
+ "harness_tasks": [
+  "ifeval"
+ ],
+ "harness_num_fewshot": 0,
+ "harness_batch_size": 4,
+ "calibration_batch_size": 4,
+ "calibration_max_length": 448,
+ "calibration_n_sequences": 40,
+ "source_task_models_on_cpu": true,
+ "device": "cuda",
+ "dtype": "bf16",
+ "eval_before_rebase": false,
+ "alpha": {
+  "value": 1.0,
+  "search": false
+ },
+ "calibration_generated_answer": {
+  "max_new_tokens": 256,
+  "batch_size": 16,
+  "model": null,
+  "cache_path": "/data/merge_and_rebase_results/metodoK_ifeval_synth_20261119/calib/gen_answers_real.json"
+ },
+ "save_transported_tvs_dir": "/data/merge_and_rebase_results/metodoK_ifeval_synth_20261119/tvs/IF_ariadneO2_real",
+ "logging": {
+  "use_wandb": false,
+  "local_log_dir": "/data/merge_and_rebase_results/metodoK_ifeval_synth_20261119/logs",
+  "run_name": "IF_ariadneO2_real"
+ }
+}

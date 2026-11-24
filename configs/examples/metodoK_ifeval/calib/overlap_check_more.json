@@ -1,0 +1,1622 @@
+[
+ {
+  "prompt": "Explain how vaccines train the immune system. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.43,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Describe a typical morning at a busy fish market. Include the keywords 'budget' and 'journey' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.172,
+  "nn_idx": 264
+ },
+ {
+  "prompt": "Write a short story about a robot that learns to paint. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.644,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Give advice to a student starting their first job. In your response, the letter 'i' should appear at least 20 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.346,
+  "nn_idx": 382
+ },
+ {
+  "prompt": "Summarize the history of the printing press. Do not include the words 'careful' or 'patience' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.21,
+  "nn_idx": 474
+ },
+ {
+  "prompt": "Write a review of an imaginary Italian restaurant called Nonna's Table. Your response must have 3 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.309,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Explain the difference between weather and climate. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.404,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Describe how to plant tomatoes on a balcony. Your response must contain at least 2 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.374,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Write a speech for a school graduation ceremony. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.385,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain how a credit score works. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.602,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Write a letter to a friend who moved to another country. Your answer must be in all capital letters and contain at least 250 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.497,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Describe the life cycle of a butterfly. In your response, the word 'water' should appear at least 2 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.242,
+  "nn_idx": 236
+ },
+ {
+  "prompt": "Propose three ways a small town could attract more tourists. Your response should contain at least 150 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.123,
+  "nn_idx": 337
+ },
+ {
+  "prompt": "Explain what a black hole is. Your answer must contain exactly 3 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.481,
+  "nn_idx": 245
+ },
+ {
+  "prompt": "Write a poem about a rainy Monday morning. Respond in JSON format only, and include the keyword 'balance'.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.194,
+  "nn_idx": 264
+ },
+ {
+  "prompt": "Give tips for staying focused while studying at home. Your response should contain less than 120 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.161,
+  "nn_idx": 390
+ },
+ {
+  "prompt": "Describe the rules of chess for a complete beginner. Your entire response should be in Spanish, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.299,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Write an advertisement for a new electric scooter. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.587,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Explain why bees are important for agriculture. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.324,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Write a dialogue between a cat and a dog arguing about the sofa. Your response must have 4 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.458,
+  "nn_idx": 497
+ },
+ {
+  "prompt": "Describe the benefits of learning a second language. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.406,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain how to make a simple budget. There should be exactly 4 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.43,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Write a short biography of a fictional inventor named Clara Voss. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.318,
+  "nn_idx": 67
+ },
+ {
+  "prompt": "Describe a walk through an old forest in winter. End your response with the exact phrase 'Thank you for reading.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.374,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Explain how solar panels produce electricity. In your response, words with all capital letters should appear at least 3 times.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.376,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write a complaint email about a delayed parcel. Wrap your entire response in double quotation marks and keep it under 120 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.376,
+  "nn_idx": 294
+ },
+ {
+  "prompt": "Give a recipe for a quick vegetable soup. Your response should contain at least 150 words and must not contain the word 'friendship'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.179,
+  "nn_idx": 242
+ },
+ {
+  "prompt": "Explain the basics of photosynthesis. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.335,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a motivational message for a marathon runner. There should be 2 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Before'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.365,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Describe the job of an air traffic controller. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.305,
+  "nn_idx": 465
+ },
+ {
+  "prompt": "Compare trains and planes for a 600 km trip. Answer with at most 5 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.165,
+  "nn_idx": 65
+ },
+ {
+  "prompt": "Write a fairy tale about a lost crown. Highlight at least 4 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.317,
+  "nn_idx": 138
+ },
+ {
+  "prompt": "Explain how the internet sends data between computers. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.384,
+  "nn_idx": 41
+ },
+ {
+  "prompt": "Describe how to prepare for a job interview. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.279,
+  "nn_idx": 406
+ },
+ {
+  "prompt": "Write a thank-you note to a teacher. Highlight at least 4 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.322,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Explain what inflation means for savings. Use exactly 5 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.327,
+  "nn_idx": 202
+ },
+ {
+  "prompt": "Describe your ideal reading corner. Your response should contain less than 60 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.203,
+  "nn_idx": 162
+ },
+ {
+  "prompt": "Write a news report about a town that wins a gardening contest. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.261,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Explain how earthquakes happen. Your answer must be in all capital letters and contain at least 150 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.261,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Give five tips for taking better phone photos. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.348,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Write a limerick about a forgetful wizard. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.478,
+  "nn_idx": 417
+ },
+ {
+  "prompt": "Describe the importance of sleep for teenagers. Wrap your entire response in double quotation marks and keep it under 80 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.301,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Explain how a bill becomes a law in a parliament. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.551,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Write a product description for a smart water bottle. Highlight at least 2 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.437,
+  "nn_idx": 256
+ },
+ {
+  "prompt": "Describe the sounds of a city at night. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.353,
+  "nn_idx": 83
+ },
+ {
+  "prompt": "Explain the concept of supply and demand. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.429,
+  "nn_idx": 41
+ },
+ {
+  "prompt": "Write an invitation to a neighborhood picnic. In your response, the word 'balance' should appear at least 2 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.236,
+  "nn_idx": 380
+ },
+ {
+  "prompt": "Describe how to care for a houseplant that gets little light. Include the keywords 'future' and 'creative' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.217,
+  "nn_idx": 390
+ },
+ {
+  "prompt": "Explain why the moon has phases. In your response, the letter 'i' should appear at least 20 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.293,
+  "nn_idx": 501
+ },
+ {
+  "prompt": "Write a short mystery about a missing library book. End your response with the exact phrase 'Thank you for reading.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.39,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Give advice on how to apologize sincerely. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.282,
+  "nn_idx": 382
+ },
+ {
+  "prompt": "Describe the process of making cheese. Your answer must contain exactly 4 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.462,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Explain what machine learning is to a grandparent. Use exactly 3 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.321,
+  "nn_idx": 202
+ },
+ {
+  "prompt": "Write a postcard from a holiday in the mountains. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.665,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Describe the advantages of public transport. Do not include the words 'quality' or 'journey' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.214,
+  "nn_idx": 88
+ },
+ {
+  "prompt": "Explain how to change a flat bicycle tire. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.427,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Write a haiku sequence about the sea. Your response should contain at least 150 words and must not contain the word 'routine'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.242,
+  "nn_idx": 341
+ },
+ {
+  "prompt": "Describe a festival in an imaginary country. Respond in JSON format only, and include the keyword 'budget'.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.205,
+  "nn_idx": 221
+ },
+ {
+  "prompt": "Explain how recycling plastic works. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.435,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Write a pitch for a mobile app that helps people drink more water. Your response must have 3 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.399,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Describe the duties of a lifeguard. In your response, words with all capital letters should appear at least 4 times.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.413,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Explain the causes of the seasons. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.631,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Write a eulogy for a beloved family dog. Your response must contain at least 3 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.401,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Give tips for running an effective team meeting. Your response should contain at least 200 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.166,
+  "nn_idx": 227
+ },
+ {
+  "prompt": "Describe what makes a good friend. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.426,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain how a refrigerator keeps food cold. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.276,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Write a song chorus about summer holidays. Your entire response should be in Spanish, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.325,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Describe the architecture of a medieval castle. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.311,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Explain the rules of basketball. There should be 3 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Before'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.423,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Write a short horror story set in an empty train station. Your response must have 2 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.385,
+  "nn_idx": 497
+ },
+ {
+  "prompt": "Give advice to someone adopting their first cat. There should be exactly 2 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.393,
+  "nn_idx": 160
+ },
+ {
+  "prompt": "Describe how coffee is grown and harvested. Answer with at most 5 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.181,
+  "nn_idx": 41
+ },
+ {
+  "prompt": "Explain what a stock market index is. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.319,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a welcome message for new members of a book club. Your response must have 4 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.43,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Describe a day in the life of a beekeeper. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.367,
+  "nn_idx": 465
+ },
+ {
+  "prompt": "Explain how to brew green tea properly. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.211,
+  "nn_idx": 257
+ },
+ {
+  "prompt": "Write a persuasive paragraph about banning cars from a city center. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.533,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Describe the main features of a desert ecosystem. Use exactly 6 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.341,
+  "nn_idx": 388
+ },
+ {
+  "prompt": "Explain how antibiotics work and why resistance matters. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.549,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Write a riddle whose answer is a shadow. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.342,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Give a beginner workout plan for one week. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.365,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Describe a sunrise over a harbor. Your response must contain at least 2 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.401,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Explain how GPS determines your location. In your response, the word 'friendship' should appear at least 3 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.239,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write a cover letter for a summer job at a museum. There should be exactly 2 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.4,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Describe the history of the bicycle. Your response should contain at least 250 words and must not contain the word 'future'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.25,
+  "nn_idx": 59
+ },
+ {
+  "prompt": "Explain the difference between a virus and a bacterium. Wrap your entire response in double quotation marks and keep it under 60 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.3,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Write a bedtime story about a sleepy dragon. Respond in JSON format only, and include the keyword 'simple'.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.198,
+  "nn_idx": 264
+ },
+ {
+  "prompt": "Give tips for reducing electricity use at home. End your response with the exact phrase 'Have a wonderful day.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.378,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Describe a traditional wedding in a fictional village. Include the keywords 'history' and 'light' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.148,
+  "nn_idx": 474
+ },
+ {
+  "prompt": "Explain how volcanoes form. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.495,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Write a social media post announcing a bakery opening. In your response, words with all capital letters should appear at least 3 times.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.34,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Describe how to organize a closet. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.412,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain what a carbon footprint is. Your entire response should be in Spanish, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.358,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Write a monologue for a nervous actor before a premiere. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.635,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Describe the role of a referee in football. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.351,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Explain how tides work. Your response should contain less than 60 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.233,
+  "nn_idx": 161
+ },
+ {
+  "prompt": "Write a short essay on the value of public libraries. Answer with at most 4 sentences.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.24,
+  "nn_idx": 373
+ },
+ {
+  "prompt": "Give advice on writing a good essay introduction. Highlight at least 3 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.342,
+  "nn_idx": 111
+ },
+ {
+  "prompt": "Describe the smell and taste of fresh bread. Your answer must contain exactly 4 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.41,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Explain how to read a nutrition label. Your answer must be in all capital letters and contain at least 300 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.3,
+  "nn_idx": 262
+ },
+ {
+  "prompt": "Write a letter from a soldier to his family in 1915. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.399,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Describe a futuristic city in the year 2200. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.258,
+  "nn_idx": 301
+ },
+ {
+  "prompt": "Explain how electric cars differ from petrol cars. There should be 4 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Imagine'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.302,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Write a tongue twister about purple penguins. Your response should contain at least 200 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.193,
+  "nn_idx": 162
+ },
+ {
+  "prompt": "Give instructions for folding a paper airplane. Do not include the words 'future' or 'careful' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.199,
+  "nn_idx": 249
+ },
+ {
+  "prompt": "Describe how wolves live in packs. Your response must have 2 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.354,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Explain why exercise improves mood. In your response, the letter 'o' should appear at least 10 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.269,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Write a short play scene in a crowded elevator. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.401,
+  "nn_idx": 41
+ },
+ {
+  "prompt": "Describe the job of a translator. End your response with the exact phrase 'Thank you for reading.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.441,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Explain what the immune system does. Your entire response should be in French, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.322,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Write a review of a fictional science fiction film called Orbit Nine. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.506,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Give tips for learning to play the guitar. In your response, the letter 'e' should appear at least 10 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.284,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Describe a market in Marrakech. There should be 4 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Imagine'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.406,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Explain how bridges carry heavy loads. Your answer must contain exactly 3 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.393,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Write a note to a neighbor about a noisy party. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.214,
+  "nn_idx": 313
+ },
+ {
+  "prompt": "Describe the stages of grief in simple terms. Answer with at most 5 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.16,
+  "nn_idx": 192
+ },
+ {
+  "prompt": "Explain how a bank loan works. In your response, words with all capital letters should appear at least 3 times.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.412,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write an ode to a pair of old running shoes. Do not include the words 'creative' or 'health' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.232,
+  "nn_idx": 496
+ },
+ {
+  "prompt": "Give advice for a first trip abroad. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.311,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Describe the migration of birds. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.362,
+  "nn_idx": 465
+ },
+ {
+  "prompt": "Explain what cloud computing is. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.242,
+  "nn_idx": 35
+ },
+ {
+  "prompt": "Write a short adventure story about crossing a frozen lake. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.363,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Describe how to make a paper lantern. Your response should contain at least 250 words and must not contain the word 'future'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.283,
+  "nn_idx": 59
+ },
+ {
+  "prompt": "Explain why the ocean is salty. Wrap your entire response in double quotation marks and keep it under 100 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.303,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Write a message to persuade a friend to start reading. Your response must have 2 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.339,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Describe a quiet library on a Sunday afternoon. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.295,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Explain how memory works in the human brain. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.379,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Write a proposal for a school vegetable garden. Include the keywords 'local' and 'practical' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.298,
+  "nn_idx": 75
+ },
+ {
+  "prompt": "Give tips for saving money on groceries. Use exactly 4 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.292,
+  "nn_idx": 402
+ },
+ {
+  "prompt": "Describe the rules of a game you invented. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.486,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Explain how rainbows form. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.438,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Write a short fable with a moral about patience. Your response should contain less than 100 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.255,
+  "nn_idx": 14
+ },
+ {
+  "prompt": "Describe the skills a good nurse needs. Highlight at least 4 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.302,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Explain how to train a puppy to sit. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.583,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Write a weather forecast for a stormy weekend. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.303,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Describe how glass is made. Your response should contain at least 250 words.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.243,
+  "nn_idx": 59
+ },
+ {
+  "prompt": "Explain the importance of biodiversity. There should be exactly 4 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.441,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Write an apology letter from a pirate to a merchant. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.423,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Give advice on public speaking. Your response must have 2 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.46,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Describe the inside of a spaceship cockpit. In your response, the word 'quality' should appear at least 2 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.238,
+  "nn_idx": 236
+ },
+ {
+  "prompt": "Explain how to compost kitchen waste. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.652,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Write a motivational quote collection for Monday mornings. Your answer must be in all capital letters and contain at least 200 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.207,
+  "nn_idx": 250
+ },
+ {
+  "prompt": "Describe a childhood memory of a summer storm. Respond in JSON format only, and include the keyword 'history'.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.209,
+  "nn_idx": 58
+ },
+ {
+  "prompt": "Explain the basics of how a computer processor works. Your response must contain at least 3 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.4,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Write a menu for a seaside cafe. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.438,
+  "nn_idx": 41
+ },
+ {
+  "prompt": "Describe how a beehive is organized. Your entire response should be in Spanish, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.35,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Explain what democracy means. End your response with the exact phrase 'That is all for today.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.44,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Write a short story told by a raindrop. Your response must have 2 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.517,
+  "nn_idx": 497
+ },
+ {
+  "prompt": "Give tips for a long car journey with children. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.3,
+  "nn_idx": 465
+ },
+ {
+  "prompt": "Describe a mountain village in the Alps. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.451,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Explain why some animals hibernate. There should be exactly 2 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.395,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Write a job advertisement for a zookeeper. Wrap your entire response in double quotation marks and keep it under 120 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.31,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Describe how to plan a birthday party on a budget. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.37,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain what an algorithm is with an everyday example. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.344,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a letter to your future self ten years from now. There should be 4 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Many'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.338,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Describe the work of an archaeologist. Highlight at least 2 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.363,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Explain how noise-cancelling headphones work. Your answer must be in all capital letters and contain at least 300 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.257,
+  "nn_idx": 262
+ },
+ {
+  "prompt": "Write a short satire about a meeting that never ends. Use exactly 4 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.28,
+  "nn_idx": 394
+ },
+ {
+  "prompt": "Give advice for keeping a journal. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.283,
+  "nn_idx": 382
+ },
+ {
+  "prompt": "Describe a thunderstorm from the point of view of a cat. In your response, the letter 's' should appear at least 10 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.26,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Explain how wind turbines generate power. Your response should contain at least 200 words and must not contain the word 'journey'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.191,
+  "nn_idx": 36
+ },
+ {
+  "prompt": "Write a toast for a friend's wedding. Do not include the words 'water' or 'journey' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.217,
+  "nn_idx": 249
+ },
+ {
+  "prompt": "Describe how chocolate is made from cocoa beans. Answer with at most 3 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.186,
+  "nn_idx": 533
+ },
+ {
+  "prompt": "Explain the water footprint of a cotton t-shirt. Include the keywords 'simple' and 'routine' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.127,
+  "nn_idx": 211
+ },
+ {
+  "prompt": "Write an instruction manual for a time machine. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.316,
+  "nn_idx": 257
+ },
+ {
+  "prompt": "Give tips for staying safe while hiking alone. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.249,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Describe the history of the Olympic Games. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.605,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Explain how a vaccine trial is organized. Your response should contain at least 150 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.15,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write a short story about two strangers sharing an umbrella. Your answer must contain exactly 6 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.418,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Describe the role of a librarian today. Your response must have 4 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.365,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Explain how to start a small vegetable patch. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.326,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Write a parody of a cooking show introduction. In your response, the word 'practical' should appear at least 2 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.361,
+  "nn_idx": 351
+ },
+ {
+  "prompt": "Give advice to a new manager. Respond in JSON format only, and include the keyword 'history'.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.32,
+  "nn_idx": 382
+ },
+ {
+  "prompt": "Describe the colors of a coral reef. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.595,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Explain why people dream. In your response, words with all capital letters should appear at least 2 times.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.433,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write a speech accepting an award for community service. Your response should contain less than 60 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.187,
+  "nn_idx": 161
+ },
+ {
+  "prompt": "Describe how a train station works behind the scenes. Your response must contain at least 2 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.373,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Explain how to stay calm during an exam. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.416,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Describe how a lighthouse warns ships at night. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.368,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain how to choose a good pair of hiking boots. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.613,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Write a proposal for a school vegetable garden. In your response, words with all capital letters should appear at least 2 times.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.41,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Propose three ways a small town could attract more tourists. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.322,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Give tips for reducing electricity use at home. Your response must contain at least 3 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.404,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Write a short story about two strangers sharing an umbrella. There should be exactly 4 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.433,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Write a short horror story set in an empty train station. Highlight at least 2 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.27,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Give tips for staying safe while hiking alone. Use exactly 6 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.268,
+  "nn_idx": 402
+ },
+ {
+  "prompt": "Describe how to make a paper lantern. Your answer must contain exactly 4 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.482,
+  "nn_idx": 118
+ },
+ {
+  "prompt": "Describe the migration of birds. Answer with at most 3 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.185,
+  "nn_idx": 192
+ },
+ {
+  "prompt": "Describe the role of a referee in football. Your answer must be in all capital letters and contain at least 150 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.258,
+  "nn_idx": 461
+ },
+ {
+  "prompt": "Explain how to stay calm during an exam. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.303,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a menu for a seaside cafe. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.673,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Explain how a credit score works. There should be 2 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Before'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.386,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Write a speech accepting an award for community service. Your entire response should be in French, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.281,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Explain how tides work. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.345,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Describe the rules of a game you invented. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.602,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Describe a market in Marrakech. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.211,
+  "nn_idx": 301
+ },
+ {
+  "prompt": "Write a job advertisement for a zookeeper. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.641,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Write a social media post announcing a bakery opening. Wrap your entire response in double quotation marks and keep it under 120 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.259,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Give advice to someone adopting their first cat. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.424,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Explain why exercise improves mood. Your response must have 3 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.443,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Explain the difference between a virus and a bacterium. In your response, the letter 's' should appear at least 15 times.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.367,
+  "nn_idx": 213
+ },
+ {
+  "prompt": "Write a bedtime story about a sleepy dragon. Your response should contain at least 200 words and must not contain the word 'balance'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.218,
+  "nn_idx": 138
+ },
+ {
+  "prompt": "Explain how to read a nutrition label. Your response should contain at least 300 words and must not contain the word 'water'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.214,
+  "nn_idx": 262
+ },
+ {
+  "prompt": "Describe the advantages of public transport. Highlight at least 3 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.315,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Give a beginner workout plan for one week. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.337,
+  "nn_idx": 270
+ },
+ {
+  "prompt": "Describe the rules of chess for a complete beginner. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.395,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Describe the duties of a lifeguard. In your response, the word 'energy' should appear at least 3 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.261,
+  "nn_idx": 236
+ },
+ {
+  "prompt": "Describe how coffee is grown and harvested. End your response with the exact phrase 'Thank you for reading.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.4,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Write a short story about a robot that learns to paint. Your response must have 4 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.43,
+  "nn_idx": 497
+ },
+ {
+  "prompt": "Write a product description for a smart water bottle. Do not include the words 'local' or 'quality' in your response.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.253,
+  "nn_idx": 256
+ },
+ {
+  "prompt": "Describe how wolves live in packs. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.333,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Describe a sunrise over a harbor. Your response should contain at least 200 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.216,
+  "nn_idx": 59
+ },
+ {
+  "prompt": "Explain how wind turbines generate power. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.378,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Give tips for a long car journey with children. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.244,
+  "nn_idx": 229
+ },
+ {
+  "prompt": "Describe the architecture of a medieval castle. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.431,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Give tips for learning to play the guitar. Include the keywords 'future' and 'health' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.189,
+  "nn_idx": 250
+ },
+ {
+  "prompt": "Explain how electric cars differ from petrol cars. In your response, words with all capital letters should appear at least 2 times.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.312,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Write a complaint email about a delayed parcel. There should be exactly 4 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.416,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Explain what democracy means. Respond in JSON format only, and include the keyword 'future'.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.223,
+  "nn_idx": 221
+ },
+ {
+  "prompt": "Describe the job of a translator. Answer with at most 4 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.199,
+  "nn_idx": 192
+ },
+ {
+  "prompt": "Explain the causes of the seasons. Finish your response with this exact phrase: Is there anything else I can help with?",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.468,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Write a riddle whose answer is a shadow. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.49,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Write a letter from a soldier to his family in 1915. Do not include the words 'practical' or 'careful' in your response.",
+  "lcs_words": 5,
+  "max_tfidf_cos": 0.202,
+  "nn_idx": 59
+ },
+ {
+  "prompt": "Explain the rules of basketball. Your answer must be in all capital letters and contain at least 150 words.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.274,
+  "nn_idx": 461
+ },
+ {
+  "prompt": "Describe the history of the bicycle. Your entire response should be in German, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.396,
+  "nn_idx": 515
+ },
+ {
+  "prompt": "Explain what inflation means for savings. Highlight at least 4 sections with markdown, i.e. *highlighted section*, and do not use any commas.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.306,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Describe the work of an archaeologist. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.372,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a eulogy for a beloved family dog. Your ENTIRE response should be in English and in all capital letters.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.447,
+  "nn_idx": 465
+ },
+ {
+  "prompt": "Explain the basics of how a computer processor works. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.292,
+  "nn_idx": 333
+ },
+ {
+  "prompt": "Describe a day in the life of a beekeeper. Include the keywords 'practical' and 'local' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.179,
+  "nn_idx": 96
+ },
+ {
+  "prompt": "Explain how a refrigerator keeps food cold. In your entire response, refrain from the use of any exclamation marks.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.177,
+  "nn_idx": 190
+ },
+ {
+  "prompt": "Give tips for running an effective team meeting. Your answer must contain exactly 6 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.408,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Write a letter to a friend who moved to another country. Your response should contain at least 200 words and must not contain the word 'quality'.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.404,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Describe the job of an air traffic controller. Wrap your entire response in double quotation marks and keep it under 60 words.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.282,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Explain how to train a puppy to sit. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.47,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Write a fairy tale about a lost crown. In your response, the word 'season' should appear at least 2 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.348,
+  "nn_idx": 138
+ },
+ {
+  "prompt": "Explain why bees are important for agriculture. There should be 3 paragraphs separated by the markdown divider ***. The first paragraph must start with the word 'Many'.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.361,
+  "nn_idx": 506
+ },
+ {
+  "prompt": "Explain how to choose a good pair of hiking boots. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.565,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Write a welcome message for new members of a book club. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.431,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Describe the colors of a coral reef. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.672,
+  "nn_idx": 535
+ },
+ {
+  "prompt": "Write a haiku sequence about the sea. Do not use any commas in your response.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.316,
+  "nn_idx": 91
+ },
+ {
+  "prompt": "Explain what a carbon footprint is. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.623,
+  "nn_idx": 424
+ },
+ {
+  "prompt": "Describe a festival in an imaginary country. Your response should contain at least 300 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.232,
+  "nn_idx": 182
+ },
+ {
+  "prompt": "Explain how earthquakes happen. End your response with the exact phrase 'Have a wonderful day.' No other words should follow this phrase.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.411,
+  "nn_idx": 84
+ },
+ {
+  "prompt": "Write a thank-you note to a teacher. Your response should contain less than 120 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.238,
+  "nn_idx": 313
+ },
+ {
+  "prompt": "Write an advertisement for a new electric scooter. Your response must have 3 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.464,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Describe the importance of sleep for teenagers. Your response must contain at least 3 placeholders represented by square brackets, such as [address].",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.444,
+  "nn_idx": 113
+ },
+ {
+  "prompt": "Explain how noise-cancelling headphones work. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.375,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain why the moon has phases. Wrap your entire response in double quotation marks.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.361,
+  "nn_idx": 435
+ },
+ {
+  "prompt": "Write a limerick about a forgetful wizard. Use exactly 4 bullet points in markdown format and write everything in lowercase letters.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.318,
+  "nn_idx": 417
+ },
+ {
+  "prompt": "Describe the process of making cheese. Your response must have 4 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.362,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Write a postcard from a holiday in the mountains. In your response, the letter 'i' should appear at least 15 times.",
+  "lcs_words": 4,
+  "max_tfidf_cos": 0.289,
+  "nn_idx": 76
+ },
+ {
+  "prompt": "Explain how to make a simple budget. Your entire response should be in lowercase letters; no capital letters are allowed.",
+  "lcs_words": 7,
+  "max_tfidf_cos": 0.334,
+  "nn_idx": 292
+ },
+ {
+  "prompt": "Write a review of an imaginary Italian restaurant called Nonna's Table. In your response, the word 'local' should appear at least 3 times.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.283,
+  "nn_idx": 360
+ },
+ {
+  "prompt": "Describe how to organize a closet. Your response must have 4 sections. Mark the beginning of each section with SECTION X, where X is the section number.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.472,
+  "nn_idx": 374
+ },
+ {
+  "prompt": "Write a tongue twister about purple penguins. Answer with at most 3 sentences.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.17,
+  "nn_idx": 477
+ },
+ {
+  "prompt": "Explain how rainbows form. At the end of your response, please explicitly add a postscript starting with P.S.",
+  "lcs_words": 14,
+  "max_tfidf_cos": 0.493,
+  "nn_idx": 142
+ },
+ {
+  "prompt": "Compare trains and planes for a 600 km trip. Your answer must contain exactly 4 bullet points in markdown format, such as:\n* This is a point.",
+  "lcs_words": 10,
+  "max_tfidf_cos": 0.388,
+  "nn_idx": 237
+ },
+ {
+  "prompt": "Explain how to compost kitchen waste. Give two different responses. Responses and only responses should be separated by 6 asterisk symbols: ******.",
+  "lcs_words": 15,
+  "max_tfidf_cos": 0.581,
+  "nn_idx": 260
+ },
+ {
+  "prompt": "Write a short biography of a fictional inventor named Clara Voss. Your response must have 2 sections. Mark the beginning of each section with Part X. Do not use any commas.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.398,
+  "nn_idx": 497
+ },
+ {
+  "prompt": "Give advice on writing a good essay introduction. First repeat the request word for word without change, then give your answer. Do not say anything before repeating the request.",
+  "lcs_words": 16,
+  "max_tfidf_cos": 0.594,
+  "nn_idx": 242
+ },
+ {
+  "prompt": "Write an apology letter from a pirate to a merchant. Highlight at least 2 parts of your answer with markdown, i.e. *highlighted section*.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.278,
+  "nn_idx": 342
+ },
+ {
+  "prompt": "Explain the importance of biodiversity. Your entire response should be in Spanish, no other language is allowed.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.351,
+  "nn_idx": 505
+ },
+ {
+  "prompt": "Write a message to persuade a friend to start reading. Give your answer a title wrapped in double angular brackets, such as <<my title>>.",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.39,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Explain what a stock market index is. Your response should contain less than 120 words.",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.188,
+  "nn_idx": 181
+ },
+ {
+  "prompt": "Describe a traditional wedding in a fictional village. There should be exactly 3 paragraphs. Paragraphs are separated by the markdown divider: ***",
+  "lcs_words": 6,
+  "max_tfidf_cos": 0.39,
+  "nn_idx": 282
+ },
+ {
+  "prompt": "Describe the role of a librarian today. Include the keywords 'budget' and 'practical' in your response.",
+  "lcs_words": 3,
+  "max_tfidf_cos": 0.161,
+  "nn_idx": 111
+ },
+ {
+  "prompt": "Describe how a lighthouse warns ships at night. Format your entire output in JSON. You can use markdown ticks such as ```.",
+  "lcs_words": 8,
+  "max_tfidf_cos": 0.416,
+  "nn_idx": 357
+ },
+ {
+  "prompt": "Explain the water footprint of a cotton t-shirt. Include a title wrapped in double angular brackets, such as <<my title>>, and end with a postscript starting with P.P.S",
+  "lcs_words": 9,
+  "max_tfidf_cos": 0.383,
+  "nn_idx": 392
+ },
+ {
+  "prompt": "Write a short adventure story about crossing a frozen lake. Choose one of the following options to start your answer: ('My answer is yes.', 'My answer is no.', 'My answer is maybe.') and then explain why.",
+  "lcs_words": 12,
+  "max_tfidf_cos": 0.631,
+  "nn_idx": 535
+ }
+]
