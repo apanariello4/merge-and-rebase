@@ -64,6 +64,7 @@ import torch
 from ...rebase.methods.anchors.core import (
     CanonicalFactors,
     MomentAccumulator,
+    _svd_canonical,
     canonical_correlations,
     canonical_correlations_out,
     canonical_factors_from_sigma,
@@ -401,7 +402,7 @@ def analyze_cell_llm(
         if n_idx == 0:
             r_star = rules["r_star_prefix"]
             info["null_primary"] = name
-    y, _, _ = torch.linalg.svd(fac_all.m, full_matrices=False)
+    y, _, _ = _svd_canonical(fac_all.m)
     n_top = min(int(opts.icc_top), y.shape[1])
     w = fac_all.v_m @ (y[:, :n_top] / fac_all.s_m[:, None])
     rho_dir, rho_tr = v1.icc_directions(s, w)

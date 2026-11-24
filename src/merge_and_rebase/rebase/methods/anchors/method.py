@@ -1142,7 +1142,30 @@ def _prepare_body(
         )
     alignment_mark = recorder.mark()
     started = time.perf_counter()
-    if config.map_rows == "task":
+    stream_cal = None
+    if config.calibration_streaming:
+        if family_adapter is None:
+            raise ValueError("calibration_streaming is implemented for decoders (family_adapter) only")
+        from . import calibration_streaming as cs
+
+        stream_cal = {"batches": cs.draw_streaming_calibration(source_loader, target_loader, config, family_adapter),
+                      "task": None}
+    if config.map_rows == "task" and stream_cal is not None:
+        from . import calibration_streaming as cs
+
+        map_s, map_t = cs.draw_map_batches(source_loader, target_loader, config, family_adapter)
+        current = {k: v.detach().cpu().clone() for k, v in target_model.state_dict().items()}
+        try:
+            target_model.load_state_dict(dict(target_base_sd), strict=True)
+            stream_cal["task"] = cs.accumulate_task_frame(
+                source_base_model, target_model, map_s, map_t, pairing, config=config, device=device,
+                family_adapter=family_adapter,
+            )
+        finally:
+            target_model.load_state_dict(current, strict=True)
+        del map_s, map_t
+        source, target = stream_cal["task"][:2]
+    elif config.map_rows == "task":
         source, target = task_map_frames(
             source_base_model,
             target_model,
@@ -1169,7 +1192,10 @@ def _prepare_body(
             target_model_meta=target_model_meta,
             family_adapter=family_adapter,
         )
-    if source.depth != pairing.source_depth or target.depth != pairing.target_depth:
+    if stream_cal is not None and stream_cal["task"] is not None:  # statistics frames: depths = the blocks of the stats
+        if (set(source.c) != set(int(i) for i in pairing.pairing)) or set(target.c) != set(range(pairing.target_depth)):
+            raise ValueError("streamed task frame does not cover the pairing's blocks")
+    elif source.depth != pairing.source_depth or target.depth != pairing.target_depth:
         raise ValueError(
             f"pairing ({pairing.source_depth}->{pairing.target_depth}) does not match the registered depths "
             f"({source.depth}->{target.depth})"
@@ -1234,7 +1260,10 @@ def _prepare_body(
     registration_seconds = time.perf_counter() - started
     native_seq = uses_native_depth_fit(config)
     streaming_seq = config.depth_fit == "sequential" and not native_seq
-    if streaming_seq:
+    if stream_cal is not None:
+        # nothing stored per token: capture, decode and the ridge statistics are one sweep (correction_fit bracket)
+        calibration = stream_cal["batches"][2]
+    elif streaming_seq:
         prepared_stream = prepare_direct_residual_streaming(
             source_base_model,
             target_model,
@@ -1328,7 +1357,21 @@ def _prepare_body(
     }
     fit_mark = recorder.mark()
     started = time.perf_counter()
-    if streaming_seq:
+    if stream_cal is not None:
+        solve_hook = None
+        if config.synthesis == "ridge_preserve":
+            solve_hook = _synthesis_hook(
+                state, target, target_model, target_base_sd, target_anchor_loader, config=config, device=device,
+                family_adapter=family_adapter,
+            )
+        corrections, rows, position_diag = cs.fit_streaming_independent(
+            target_model=target_model, target_base_sd=target_base_sd, source_base_model=source_base_model,
+            source_ft_model=source_ft_model, source_batches=stream_cal["batches"][0],
+            target_batches=stream_cal["batches"][1], pairing=pairing, source=source, target=target, config=config,
+            device=device, family_adapter=family_adapter, gpa_maps=gpa_maps, solve_hook=solve_hook,
+            task_stats=stream_cal["task"],
+        )
+    elif streaming_seq:
         decoder = SequentialDecoder(source, target, config, gpa_maps=gpa_maps, text=family_adapter is not None)
         corrections, rows = fit_direct_residual_sequential_streaming(
             target_model,

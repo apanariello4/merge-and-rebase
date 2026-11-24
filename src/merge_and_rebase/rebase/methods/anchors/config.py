@@ -308,6 +308,14 @@ class AnchorsConfig:
     state_dir: str | None = None
     # Analysis-only: per-position coverage of E by the source anchors (one d x d scatter per position).
     coverage_diagnostics: bool = True
+    # Streaming calibration (anchors/calibration_streaming.py; decoders, depth_fit 'independent', library 'data'): host
+    # RAM independent of the number of calibration tokens. False (default): every boundary activation of the draw is
+    # stored, then decoded and solved (unchanged). True: the calibration batches are swept once per group of
+    # calibration_streaming_chunk fitted blocks and only the sufficient statistics of the ridge (X^T X, X^T Y, sums, in
+    # float64) are accumulated; the task vector is the same up to float summation order. map_rows='task' takes one
+    # extra sweep for the Gram statistics of the frame (spectral_filter procrustes_cross / truncate_* only).
+    calibration_streaming: bool = False
+    calibration_streaming_chunk: int = 4
 
     def __post_init__(self) -> None:
         # Resolve the S0 defaults (see the synthesis comment); frozen dataclass, hence object.__setattr__.
@@ -356,6 +364,8 @@ class AnchorsConfig:
             del out["canonical_source"]  # the default leaves the recorded config of existing runs unchanged
         if out["canonical_images"] is None:
             del out["canonical_images"]
+        if not out["calibration_streaming"]:  # the default leaves the recorded config of existing runs unchanged
+            del out["calibration_streaming"], out["calibration_streaming_chunk"]
         if out["canonical_soft_weights"] == "in_sample":
             del out["canonical_soft_weights"]  # the default leaves the recorded config of existing runs unchanged
         out["gpa_models"] = list(self.gpa_models)
@@ -701,9 +711,38 @@ def validate_anchors_config(cfg: AnchorsConfig) -> None:
                 or (cfg.depth_fit == "sequential" and cfg.synthesis != "ridge_preserve" and cfg.gain_calibration == "none")):
             raise ValueError("refine='joint' needs mlp.c_proj, no compile_max_depth, and a depth_fit that keeps the "
                              "calibration banks resident (independent, tracking, or sequential with ridge_preserve / gain)")
+    if cfg.calibration_streaming:
+        validate_calibration_streaming(cfg)
     if cfg.depth_pairing != "relative":
         raise ValueError("anchors supports depth_pairing='relative' only (pi_m(s) = round(s (L_m - 1)))")
 
+
+def validate_calibration_streaming(cfg: AnchorsConfig) -> None:
+    """``calibration_streaming``: only the combinations whose statistics are accumulated exactly as the resident fit
+    would (anything else is refused, never approximated). Decoders only: the run-time check is in ``prepare``."""
+    if isinstance(cfg.calibration_streaming_chunk, bool) or int(cfg.calibration_streaming_chunk) < 1:
+        raise ValueError("calibration_streaming_chunk must be an integer >= 1")
+    if cfg.depth_fit != "independent":
+        raise ValueError("calibration_streaming needs depth_fit='independent' (sequential / tracking / spread: not streamed)")
+    for name, required in (("library", "data"), ("refine", "none"), ("gain_calibration", "none"),
+                           ("update_rank", None), ("calibration_source", "task"), ("text_units", "token")):
+        if getattr(cfg, name) != required:
+            raise ValueError(f"calibration_streaming does not support {name}={getattr(cfg, name)!r} (must be {required!r})")
+    if cfg.operator_fusion_entries:
+        raise ValueError("calibration_streaming does not support operator_fusion_entries")
+    if cfg.map_rows == "task":
+        if cfg.frame_map != "pairwise" or cfg.spectral_filter not in TASK_STREAMING_FILTERS:
+            raise ValueError(
+                f"calibration_streaming with map_rows='task' needs frame_map='pairwise' and spectral_filter in "
+                f"{TASK_STREAMING_FILTERS} (the frame is kept as Gram statistics); got frame_map={cfg.frame_map!r}, "
+                f"spectral_filter={cfg.spectral_filter!r}"
+            )
+        if cfg.map_rows_per_image is not None:
+            raise ValueError("calibration_streaming: map_rows_per_image is a vision option")
+
+
+#: Spectral filters of the task-row frame that need only the Gram / cross-Gram of the rows.
+TASK_STREAMING_FILTERS = ("procrustes_cross", "truncate_cross", "truncate_target")
 
 #: Defaults of a decoder (LLM) run for absent keys; the dataclass defaults (the vision ones) are unchanged.
 DECODER_DEFAULTS: dict[str, Any] = {"anchor_pool": "wikitext103", "missing_bias": "materialize"}

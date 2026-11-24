@@ -103,6 +103,7 @@ import torch
 from ...rebase.methods.anchors.canonical_stats import split_ids
 from ...rebase.methods.anchors.core import (
     CanonicalFactors,
+    _svd_canonical,
     canonical_correlations,
     canonical_correlations_out,
     canonical_factors_from_sigma,
@@ -559,7 +560,7 @@ def analyze_cell(
         info["threshold_top1"] = rinfo["threshold"]  # kept name: the pooled threshold
         info["null_row_fraction_min"], info["null_row_fraction_max"] = float(frac.min()), float(frac.max())
         tensors.update(rt)
-    y, _, _ = torch.linalg.svd(fac_all.m, full_matrices=False)
+    y, _, _ = _svd_canonical(fac_all.m)
     if opts.icc:
         # ICC of the top canonical variates of P_m and of the trace; n_eff
         n_top = min(int(opts.icc_top), y.shape[1])

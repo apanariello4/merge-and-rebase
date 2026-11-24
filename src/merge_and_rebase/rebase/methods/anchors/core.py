@@ -526,10 +526,32 @@ def canonical_factors_from_sigma(
     return CanonicalFactors(v_m, s_m, v_k, s_k, m, int(n_rows))
 
 
+def _svd_canonical(m: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Thin SVD of the canonical matrix ``M``. Default: ``torch.linalg.svd`` (unchanged results whenever it converges).
+    LAPACK's divide-and-conquer driver (gesdd) can fail to converge when ``M`` has many (near-)repeated singular values,
+    e.g. a same-model round trip where every canonical correlation is ~1; then the QR-iteration driver (gesvd, via
+    scipy, float64 on CPU) is used. A non-finite ``M`` is refused rather than decomposed."""
+    try:
+        return torch.linalg.svd(m, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        if not bool(torch.isfinite(m).all()):
+            raise ValueError("canonical matrix M has non-finite entries; refusing to decompose it") from None
+        import scipy.linalg
+
+        u, s, vt = scipy.linalg.svd(m.detach().cpu().to(torch.float64).numpy(), full_matrices=False,
+                                    lapack_driver="gesvd")
+        warnings.warn("torch.linalg.svd (gesdd) did not converge on the canonical matrix; used LAPACK gesvd",
+                      RuntimeWarning, stacklevel=2)
+        return tuple(torch.from_numpy(x).to(device=m.device, dtype=m.dtype) for x in (u, s, vt))
+
+
 def canonical_correlations(factors: CanonicalFactors) -> Tensor:
     """Gamma (decreasing, ``min(r_m, r_k)`` values): singular values of ``M``. Per-block input of the diagnostics
     (Gamma on a held-out half, r* against a null)."""
-    return torch.linalg.svdvals(factors.m)
+    try:
+        return torch.linalg.svdvals(factors.m)
+    except torch.linalg.LinAlgError:
+        return _svd_canonical(factors.m)[1]
 
 
 _GAMMA_OUT_RTOL = 1e-12  # relative tolerance of the half-B variance check in canonical_correlations_out
@@ -550,7 +572,7 @@ def canonical_correlations_out(
     that wants ``canonical_soft`` weights thresholds it (``g = Gamma_out * (Gamma_out >= thr)``) and passes ``weights``.
     """
     smm, skk, smk = (x.to(torch.float64) for x in sigma_b)
-    y, _, zt = torch.linalg.svd(factors_a.m, full_matrices=False)
+    y, _, zt = _svd_canonical(factors_a.m)
     a = factors_a.v_m @ (y / factors_a.s_m[:, None])  # [d_m, q]
     b = factors_a.v_k @ (zt.T / factors_a.s_k[:, None])  # [d_k, q]
     num = (a * (smk @ b)).sum(0)
@@ -589,7 +611,7 @@ def canonical_core(
     ``Gamma_out``) and emits a ``UserWarning``."""
     if mode not in CANONICAL_DECODES:
         raise ValueError(f"canonical decode must be one of {CANONICAL_DECODES}, got {mode!r}")
-    y, gamma, zt = torch.linalg.svd(factors.m, full_matrices=False)
+    y, gamma, zt = _svd_canonical(factors.m)
     q = int(gamma.numel())
     if mode == "canonical_hard":
         r = q if rank is None else min(int(rank), q)
