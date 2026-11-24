@@ -493,9 +493,11 @@ def train_task(
     reference_resolution_context: ReferenceTaskResolutionContext | None = None,
     log_every_n_steps: int = 50,
     run_logger: Any | None = None,
+    split_seed: int | None = None,
 ) -> dict[str, Any]:
     dev = _device(device)
     _set_seed(seed)
+    resolved_split_seed = int(seed if split_seed is None else split_seed)
     if accumulate_grad_batches <= 0:
         raise ValueError("accumulate_grad_batches must be >= 1.")
     if max_train_batches is not None and max_train_batches < 1:
@@ -521,7 +523,7 @@ def train_task(
         num_workers=num_workers,
         pin_memory=True,
         val_fraction=val_fraction,
-        seed=seed,
+        seed=resolved_split_seed,
     )
 
     num_classes = len(loaders.classnames)
@@ -545,6 +547,8 @@ def train_task(
                 "init_checkpoint": str(init_checkpoint) if init_checkpoint is not None else None,
                 "lr": float(lr),
                 "dense_lr": float(lr if dense_lr is None else dense_lr),
+                "training_seed": int(seed),
+                "split_seed": resolved_split_seed,
             },
         )
 
@@ -789,6 +793,7 @@ def train_task(
                 "val_fraction": float(val_fraction),
                 "train_preprocess": train_preprocess,
                 "seed": int(seed),
+                "split_seed": resolved_split_seed,
             },
         }
         _save_json(task_dir / f"{ckpt_stem}.json", summary)
@@ -1423,6 +1428,7 @@ def train_task(
             "val_fraction": float(val_fraction),
             "train_preprocess": train_preprocess,
             "seed": int(seed),
+            "split_seed": resolved_split_seed,
         },
     }
     _save_json(task_dir / f"{ckpt_stem}.json", summary)
@@ -1709,6 +1715,11 @@ def main() -> None:
 
         cfg_file = _load_config(args.vision_config)
         common = _get_common_cfg(cfg_file)
+        if str(_get(common, "backbone.name", "openclip")).lower() == "dinov2":
+            from ._dinov2 import run_training
+
+            run_training(args, cfg_file, resolve_tasks(args, cfg_file))
+            return
 
         # Resolve tasks (datasets/suite override config order)
         training_tasks = resolve_tasks(args, cfg_file)
@@ -1896,6 +1907,7 @@ def main() -> None:
                 loader_profile=loader_profile,
             )
             seed = int(_get(task_cfg, "seed", 42))
+            split_seed = int(_get(task_cfg, "data.split_seed", seed))
             early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
             early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
 
@@ -1951,6 +1963,7 @@ def main() -> None:
                     "early_stopping_patience": early_stopping_patience,
                     "text_only": text_only,
                     "seed": seed,
+                    "split_seed": split_seed,
                     "device": str(device),
                     "out_dir": task_out_dir,
                     "save_format": save_format,
@@ -1982,6 +1995,16 @@ def main() -> None:
         unique_data_roots = {str(value) for value in data_root_by_task.values()}
         all_summaries["resolved"]["data_root"] = (
             next(iter(unique_data_roots)) if len(unique_data_roots) == 1 else data_root_by_task
+        )
+        training_seed_by_task = {str(run["task"]): int(run["seed"]) for run in task_runs}
+        split_seed_by_task = {str(run["task"]): int(run["split_seed"]) for run in task_runs}
+        unique_training_seeds = set(training_seed_by_task.values())
+        unique_split_seeds = set(split_seed_by_task.values())
+        all_summaries["resolved"]["training_seed"] = (
+            next(iter(unique_training_seeds)) if len(unique_training_seeds) == 1 else training_seed_by_task
+        )
+        all_summaries["resolved"]["split_seed"] = (
+            next(iter(unique_split_seeds)) if len(unique_split_seeds) == 1 else split_seed_by_task
         )
 
         reference_tasks_by_task = {

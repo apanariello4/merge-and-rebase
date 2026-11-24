@@ -7,6 +7,10 @@ listed under "Declared changes" in `tests/golden/HASHES.md`. Results of default 
 unless a change below says otherwise.
 
 ### New
+- DINOv2 classification through the existing vision training and merge commands: joint fine-tuning, frozen-backbone
+  linear probing, and classifier-then-backbone training; per-task heads are retained during backbone merging.
+  Vision8/14/20 examples, normalized validation alpha search, self-contained merged inference checkpoints, and
+  shared ISO/TSV CPU-preparation locks are documented in `docs/dinov2.md`.
 - **Ariadne** (formerly Direct Residual) is a registered rebase method, `rebase/methods/ariadne.py` (internals in
   `rebase/methods/_ariadne/`), with `direct_residual` as a pure alias. Preset `"preset": "ariadne"` selects the paper
   configuration (D-only, streaming, empirical-Bayes ridge); `num_batches` and `seed` are never part of the preset.

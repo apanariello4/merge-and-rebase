@@ -1,0 +1,46 @@
+{
+  "backbone": {
+    "name": "dinov2",
+    "model_id": "facebook/dinov2-base"
+  },
+  "suite": "vision8",
+  "tasks": "all",
+  "base_ckpt": "checkpoints/dinov2/full/base.pt",
+  "tuned_ckpts": {
+    "Cars": "checkpoints/dinov2/full/Cars/full_best.pt",
+    "DTD": "checkpoints/dinov2/full/DTD/full_best.pt",
+    "EuroSAT": "checkpoints/dinov2/full/EuroSAT/full_best.pt",
+    "GTSRB": "checkpoints/dinov2/full/GTSRB/full_best.pt",
+    "MNIST": "checkpoints/dinov2/full/MNIST/full_best.pt",
+    "RESISC45": "checkpoints/dinov2/full/RESISC45/full_best.pt",
+    "SUN397": "checkpoints/dinov2/full/SUN397/full_best.pt",
+    "SVHN": "checkpoints/dinov2/full/SVHN/full_best.pt"
+  },
+  "method": "task_arithmetic",
+  "method_params": {},
+  "alpha_search": true,
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_early_stop": false,
+  "single_task_summaries": {
+    "Cars": "checkpoints/dinov2/full/Cars/full.json",
+    "DTD": "checkpoints/dinov2/full/DTD/full.json",
+    "EuroSAT": "checkpoints/dinov2/full/EuroSAT/full.json",
+    "GTSRB": "checkpoints/dinov2/full/GTSRB/full.json",
+    "MNIST": "checkpoints/dinov2/full/MNIST/full.json",
+    "RESISC45": "checkpoints/dinov2/full/RESISC45/full.json",
+    "SUN397": "checkpoints/dinov2/full/SUN397/full.json",
+    "SVHN": "checkpoints/dinov2/full/SVHN/full.json"
+  },
+  "selection_metric": "mean_normalized_top1",
+  "device": "cuda",
+  "dtype": "fp32",
+  "batch_size": 32,
+  "num_workers": 4,
+  "save_merged": "checkpoints/dinov2/vision8/full_merged.pt",
+  "results": "results/dinov2/vision8_full_merge.json",
+  "logging": {
+    "use_wandb": false
+  }
+}

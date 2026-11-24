@@ -174,7 +174,7 @@ def main() -> None:
     add_tasks_arg(p, help_text="Comma-separated task names, or 'all'.")
 
     # open_clip model
-    p.add_argument("--backbone-name", type=str, default=None, choices=["openclip", "openai_clip"])
+    p.add_argument("--backbone-name", type=str, default=None, choices=["openclip", "openai_clip", "dinov2"])
     p.add_argument("--clip-model", type=str, default=None)
     p.add_argument("--clip-pretrained", type=str, default=None)
     add_device_dtype_args(p, device_default="cuda", dtype_default=None)
@@ -299,6 +299,14 @@ def main() -> None:
         cli_overrides,
         build_common_merge_overrides(args=args, method_params=method_params_cli, strict_as_bool=True),
     )
+    if cfg.get("backbone", {}).get("name", cfg.get("backbone_name")) == "dinov2" or args.backbone_name == "dinov2":
+        import sys
+
+        explicit_flags = {token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")}
+        cli_overrides = {
+            key: value for key, value in cli_overrides.items()
+            if "--" + key.replace("_", "-") in explicit_flags
+        }
     cfg = merge_non_none(cfg, cli_overrides)
     if postmerge_cli:
         existing_postmerge = cfg.get("postmerge", {})
@@ -309,6 +317,12 @@ def main() -> None:
         cfg["postmerge"] = merge_non_none(dict(existing_postmerge), dict(postmerge_cli))
     logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
     cfg["logging"] = logging_cfg
+
+    if cfg.get("backbone", {}).get("name", cfg.get("backbone_name")) == "dinov2":
+        from ._dinov2_merge import run_merge
+
+        run_merge(cfg)
+        return
 
     suite_name = cfg.get("suite", "vision8")
     if suite_name not in SUITES:

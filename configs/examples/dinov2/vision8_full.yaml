@@ -1,0 +1,68 @@
+common:
+  seed: 42
+  device: cuda
+  dtype: fp32
+  backbone:
+    name: dinov2
+    model_id: facebook/dinov2-base
+  data:
+    batch_size: 32
+    num_workers: 4
+    val_fraction: 0.1
+    split_seed: 42
+  train:
+    epochs: null
+    optimizer:
+      name: adamw
+    lr: 1.0e-05
+    weight_decay: 0.1
+    accumulate_grad_batches: 4
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 0
+    grad_clip_norm: 1.0
+    early_stopping: false
+  strategy:
+    name: full
+    forward_mode: standard
+    params: {}
+  output:
+    out_dir: checkpoints/dinov2/full
+    save_format: full
+    save_last_epoch: true
+  logging:
+    use_wandb: false
+datasets_order:
+- Cars
+- DTD
+- EuroSAT
+- GTSRB
+- MNIST
+- RESISC45
+- SUN397
+- SVHN
+datasets:
+  Cars:
+    train:
+      epochs: 35
+  DTD:
+    train:
+      epochs: 76
+  EuroSAT:
+    train:
+      epochs: 12
+  GTSRB:
+    train:
+      epochs: 11
+  MNIST:
+    train:
+      epochs: 5
+  RESISC45:
+    train:
+      epochs: 15
+  SUN397:
+    train:
+      epochs: 14
+  SVHN:
+    train:
+      epochs: 4

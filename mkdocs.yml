@@ -62,6 +62,7 @@ nav:
       - Configuration Reference: configuration.md
       - Artifacts and Checkpoints: artifacts.md
       - Fine-Tuning: fine-tuning.md
+      - DINOv2: dinov2.md
       - Merging: merging.md
       - Rebasin: rebasin.md
   - Reference:

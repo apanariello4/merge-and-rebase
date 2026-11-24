@@ -2,6 +2,8 @@
 
 ## Vision
 
+For DINOv2 joint training, head-only linear probing, and classifier-then-backbone training on vision8/14/20, use the [DINOv2 guide](dinov2.md). The OpenCLIP strategies, forward modes, and regularizers below have a separate configuration path.
+
 Vision fine-tuning uses YAML files in `src/merge_and_rebase/finetune/configs/`.
 
 ```bash

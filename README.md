@@ -61,6 +61,8 @@ python -m merge_and_rebase.finetune.train_vision \
 
 Fine-tuned TAK and DELTA checkpoints are then merged with `merge_and_rebase.eval.vision_merge` (see [Merging](docs/merging.md)).
 
+DINOv2 classification supports joint fine-tuning, frozen-backbone linear probing, classifier-then-backbone training, and backbone merging on vision8/14/20. See the [DINOv2 workflow guide](docs/dinov2.md) and [runnable examples](configs/examples/dinov2/README.md).
+
 ## Documentation
 
 - [Documentation site](https://apanariello4.github.io/merge-and-rebase/): rendered guides, tutorials, and API reference.
@@ -70,6 +72,7 @@ Fine-tuned TAK and DELTA checkpoints are then merged with `merge_and_rebase.eval
 - [Configuration reference](docs/configuration.md): merge, rebasin, post-merge, and fine-tuning fields.
 - [Artifacts and checkpoints](docs/artifacts.md): released checkpoints, manifests, validation, and local checkpoints.
 - [Fine-tuning](docs/fine-tuning.md): vision and text configurations, strategies, regularizers, and logging.
+- [DINOv2](docs/dinov2.md): training modes, task heads, vision8/14/20 presets, alpha search, checkpoints, and inference.
 - [Merging](docs/merging.md): merge methods, evaluation, alpha search, and hyperparameter search.
 - [Rebasin](docs/rebasin.md): transport methods (Ariadne, THESEUS, BiCo, ...), depth change, vision and LLM entrypoints.
 - [Ariadne](docs/methods/ariadne.md): the method, its main configuration and ablation options.

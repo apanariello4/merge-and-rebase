@@ -289,3 +289,6 @@ docs/*.aux
 /docs/proposal_1_method.tex
 /.vscode/
 artifacts/
+
+# Local Hugging Face access tokens.
+/.hf_token*

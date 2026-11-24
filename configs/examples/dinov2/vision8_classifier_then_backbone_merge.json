@@ -1,0 +1,46 @@
+{
+  "backbone": {
+    "name": "dinov2",
+    "model_id": "facebook/dinov2-base"
+  },
+  "suite": "vision8",
+  "tasks": "all",
+  "base_ckpt": "checkpoints/dinov2/classifier_then_backbone/base.pt",
+  "tuned_ckpts": {
+    "Cars": "checkpoints/dinov2/classifier_then_backbone/Cars/classifier_then_backbone_best.pt",
+    "DTD": "checkpoints/dinov2/classifier_then_backbone/DTD/classifier_then_backbone_best.pt",
+    "EuroSAT": "checkpoints/dinov2/classifier_then_backbone/EuroSAT/classifier_then_backbone_best.pt",
+    "GTSRB": "checkpoints/dinov2/classifier_then_backbone/GTSRB/classifier_then_backbone_best.pt",
+    "MNIST": "checkpoints/dinov2/classifier_then_backbone/MNIST/classifier_then_backbone_best.pt",
+    "RESISC45": "checkpoints/dinov2/classifier_then_backbone/RESISC45/classifier_then_backbone_best.pt",
+    "SUN397": "checkpoints/dinov2/classifier_then_backbone/SUN397/classifier_then_backbone_best.pt",
+    "SVHN": "checkpoints/dinov2/classifier_then_backbone/SVHN/classifier_then_backbone_best.pt"
+  },
+  "method": "task_arithmetic",
+  "method_params": {},
+  "alpha_search": true,
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_early_stop": false,
+  "single_task_summaries": {
+    "Cars": "checkpoints/dinov2/classifier_then_backbone/Cars/classifier_then_backbone.json",
+    "DTD": "checkpoints/dinov2/classifier_then_backbone/DTD/classifier_then_backbone.json",
+    "EuroSAT": "checkpoints/dinov2/classifier_then_backbone/EuroSAT/classifier_then_backbone.json",
+    "GTSRB": "checkpoints/dinov2/classifier_then_backbone/GTSRB/classifier_then_backbone.json",
+    "MNIST": "checkpoints/dinov2/classifier_then_backbone/MNIST/classifier_then_backbone.json",
+    "RESISC45": "checkpoints/dinov2/classifier_then_backbone/RESISC45/classifier_then_backbone.json",
+    "SUN397": "checkpoints/dinov2/classifier_then_backbone/SUN397/classifier_then_backbone.json",
+    "SVHN": "checkpoints/dinov2/classifier_then_backbone/SVHN/classifier_then_backbone.json"
+  },
+  "selection_metric": "mean_normalized_top1",
+  "device": "cuda",
+  "dtype": "fp32",
+  "batch_size": 32,
+  "num_workers": 4,
+  "save_merged": "checkpoints/dinov2/vision8/classifier_then_backbone_merged.pt",
+  "results": "results/dinov2/vision8_classifier_then_backbone_merge.json",
+  "logging": {
+    "use_wandb": false
+  }
+}

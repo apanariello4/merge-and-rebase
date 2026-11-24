@@ -2,6 +2,8 @@
 
 Configurations are JSON for evaluation and rebasin, and YAML or JSON for fine-tuning. CLI arguments override populated configuration fields.
 
+For the DINOv2 backbone fields, training strategies, native task heads, and checkpoint schema, see [DINOv2 configuration and workflows](dinov2.md).
+
 ## Vision Merge
 
 The smallest useful merge configuration identifies the OpenCLIP base, method, and task checkpoints.

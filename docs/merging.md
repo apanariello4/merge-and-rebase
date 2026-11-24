@@ -9,6 +9,10 @@ python -m merge_and_rebase.eval.vision_merge \
 
 The equivalent language-model entrypoint is `python -m merge_and_rebase.eval.llm_merge`; see [configs/llm_merge_llama3_8b_knots_hf.json](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/llm_merge_llama3_8b_knots_hf.json) for a starting configuration.
 
+## DINOv2
+
+The same entrypoint supports DINOv2 with `backbone.name: dinov2`. It merges only backbones and selects each unchanged classification head by task ID. See the [DINOv2 guide](dinov2.md) for vision8/14/20 presets, fixed-alpha weight averaging, normalized validation alpha search, inference, and shared CPU-preparation locks.
+
 ## Configuration
 
 At minimum, a vision merge configuration specifies the base model, `method`, `tuned_ckpts`, and either a fixed `alpha` or search configuration.
